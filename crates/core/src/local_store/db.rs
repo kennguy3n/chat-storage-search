@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    BackupEventJournalEntry, Conversation, MessageBody, MessageKind, MessageSkeleton, SCHEMA_SQL,
+    BackupEventJournalEntry, Conversation, MessageBody, MessageKind, MessageSkeleton, TimelineRow,
+    SCHEMA_SQL,
 };
 use super::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 
@@ -581,6 +582,162 @@ impl LocalStoreDb {
             None => Ok(None),
             Some((raw, body)) => Ok(Some((raw.into_skeleton()?, body))),
         }
+    }
+
+    /// Return the messages in `conversation_id` joined against
+    /// `message_body`, ordered by `created_at_ms DESC`. `before_ms`,
+    /// when `Some`, restricts the page to messages with
+    /// `created_at_ms < before_ms`. `limit` caps the returned page.
+    ///
+    /// Each [`TimelineRow`] is a flattened skeleton + optional
+    /// body-text shape so a chat-list UI can render the full
+    /// timeline without an extra round-trip per message.
+    pub fn get_timeline(
+        &self,
+        conversation_id: &str,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> DbResult<Vec<TimelineRow>> {
+        // The query mirrors get_message_with_body's LEFT JOIN so a
+        // dropped message_body row (e.g. delete_for_everyone) still
+        // returns the skeleton with text_content == None. The
+        // `(created_at_ms < ?2 OR ?2 IS NULL)` pattern keeps the
+        // single statement valid for both paginated and non-paginated
+        // calls without a runtime branch on the SQL string.
+        let mut stmt = self.conn.prepare(
+            "SELECT s.message_id, s.conversation_id, s.sender_id,
+                    s.created_at_ms, s.kind, s.body_state,
+                    s.reply_to, s.edited_at_ms, s.deleted_at_ms,
+                    b.text_content
+               FROM message_skeleton s
+               LEFT JOIN message_body b ON b.message_id = s.message_id
+              WHERE s.conversation_id = ?1
+                AND (s.created_at_ms < ?2 OR ?2 IS NULL)
+              ORDER BY s.created_at_ms DESC
+              LIMIT ?3",
+        )?;
+        let raw_rows = stmt
+            .query_map(params![conversation_id, before_ms, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(raw_rows.len());
+        for (
+            message_id,
+            conversation_id_col,
+            sender_id,
+            created_at_ms,
+            kind_str,
+            body_state_str,
+            reply_to,
+            edited_at_ms,
+            deleted_at_ms,
+            text_content,
+        ) in raw_rows
+        {
+            let kind = match kind_str.as_str() {
+                "text" => MessageKind::Text,
+                "media" => MessageKind::Media,
+                "system" => MessageKind::System,
+                other => return Err(DbError::InvalidState(format!("kind={other}"))),
+            };
+            let body_state: BodyState = body_state_str
+                .parse()
+                .map_err(|_| DbError::InvalidState(format!("body_state={body_state_str}")))?;
+            out.push(TimelineRow {
+                message_id,
+                conversation_id: conversation_id_col,
+                sender_id,
+                created_at_ms,
+                kind,
+                body_state,
+                text_content,
+                reply_to,
+                edited_at_ms,
+                deleted_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete a conversation along with every dependent row.
+    ///
+    /// The cascade order matches the schema's foreign-key direction:
+    ///
+    /// 1. `search_fuzzy` rows for every message in the conversation.
+    /// 2. `search_fts` rows for every message in the conversation.
+    /// 3. `message_body` rows for every message in the conversation.
+    /// 4. `message_skeleton` rows for the conversation.
+    /// 5. The `conversation` row itself.
+    ///
+    /// Everything runs inside a single `SAVEPOINT` so a failure mid-way
+    /// rolls back to the pre-call state — matching the pattern used by
+    /// [`crate::message::processor::MessagePersister`].
+    ///
+    /// Returns the number of `conversation` rows deleted (`0` when no
+    /// row matched, `1` on a successful cascade). Callers that want to
+    /// surface a missing-conversation error inspect the return value
+    /// (see [`crate::core_impl::CoreImpl::delete_conversation`]).
+    pub fn delete_conversation(&self, conversation_id: &str) -> DbResult<usize> {
+        let conn = &self.conn;
+        conn.execute_batch("SAVEPOINT delete_conversation;")?;
+        let result = self.delete_conversation_inner(conversation_id);
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE delete_conversation;")?;
+            }
+            Err(_) => {
+                let _ = conn
+                    .execute_batch("ROLLBACK TO delete_conversation; RELEASE delete_conversation;");
+            }
+        }
+        result
+    }
+
+    fn delete_conversation_inner(&self, conversation_id: &str) -> DbResult<usize> {
+        // Drop fuzzy-token rows first so the joined DELETE never
+        // hits a stale FK once the skeletons are gone.
+        self.conn.execute(
+            "DELETE FROM search_fuzzy
+              WHERE message_id IN (
+                  SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
+              )",
+            params![conversation_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM search_fts
+              WHERE message_id IN (
+                  SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
+              )",
+            params![conversation_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM message_body
+              WHERE message_id IN (
+                  SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
+              )",
+            params![conversation_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM message_skeleton WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        let n = self.conn.execute(
+            "DELETE FROM conversation WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        Ok(n)
     }
 
     /// Insert a row into `backup_event_journal`. The `event_seq`
@@ -1332,5 +1489,200 @@ mod tests {
         let row = db.get_conversation("c-1").unwrap().expect("conv");
         assert_eq!(row.last_message_id.as_deref(), Some("m-equal"));
         assert_eq!(row.last_activity_ms, 3_000);
+    }
+
+    // -----------------------------------------------------------------
+    // get_timeline
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn get_timeline_returns_newest_first() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        seed_timeline_message(&db, "m-1", "c-1", 100, "first");
+        seed_timeline_message(&db, "m-2", "c-1", 200, "second");
+        seed_timeline_message(&db, "m-3", "c-1", 300, "third");
+
+        let rows = db.get_timeline("c-1", None, 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-3", "m-2", "m-1"]);
+        let texts: Vec<Option<&str>> = rows.iter().map(|r| r.text_content.as_deref()).collect();
+        assert_eq!(texts, [Some("third"), Some("second"), Some("first")]);
+    }
+
+    #[test]
+    fn get_timeline_pagination_with_before_ms() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        for (i, ts) in [100, 200, 300, 400, 500].iter().enumerate() {
+            seed_timeline_message(&db, &format!("m-{i}"), "c-1", *ts, "x");
+        }
+
+        let page1 = db.get_timeline("c-1", None, 2).unwrap();
+        let ids: Vec<&str> = page1.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-4", "m-3"]);
+
+        let page2 = db.get_timeline("c-1", Some(400), 2).unwrap();
+        let ids: Vec<&str> = page2.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-2", "m-1"]);
+
+        let page3 = db.get_timeline("c-1", Some(200), 2).unwrap();
+        let ids: Vec<&str> = page3.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-0"]);
+
+        assert!(db.get_timeline("c-1", Some(100), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_timeline_respects_limit() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        for i in 0..5 {
+            seed_timeline_message(&db, &format!("m-{i}"), "c-1", 100 + i as i64, "x");
+        }
+        assert_eq!(db.get_timeline("c-1", None, 0).unwrap().len(), 0);
+        assert_eq!(db.get_timeline("c-1", None, 1).unwrap().len(), 1);
+        assert_eq!(db.get_timeline("c-1", None, 5).unwrap().len(), 5);
+        assert_eq!(db.get_timeline("c-1", None, 100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn get_timeline_returns_empty_for_unknown_conversation() {
+        let db = fresh_db();
+        assert!(db
+            .get_timeline("does-not-exist", None, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn get_timeline_carries_skeleton_metadata_and_missing_body() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        seed_timeline_message(&db, "m-1", "c-1", 100, "hello");
+        // Drop the body row to simulate delete_for_everyone — the
+        // skeleton must still surface, with text_content == None.
+        db.delete_message_body("m-1").unwrap();
+
+        let rows = db.get_timeline("c-1", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.message_id, "m-1");
+        assert_eq!(row.conversation_id, "c-1");
+        assert_eq!(row.sender_id, "user-1");
+        assert_eq!(row.kind, MessageKind::Text);
+        assert_eq!(row.body_state, BodyState::LocalPlainAvailable);
+        assert!(row.text_content.is_none(), "body row dropped");
+        assert!(row.reply_to.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // delete_conversation cascade
+    // -----------------------------------------------------------------
+
+    fn count_rows(db: &LocalStoreDb, table: &str, where_clause: &str) -> i64 {
+        db.connection()
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {where_clause}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn delete_conversation_cascades_to_every_dependent_row() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-doomed", 1_000, false))
+            .unwrap();
+        db.insert_conversation(&build_conv("c-keep", 1_000, false))
+            .unwrap();
+        seed_timeline_message(&db, "m-d-1", "c-doomed", 100, "alpha");
+        seed_timeline_message(&db, "m-d-2", "c-doomed", 200, "beta");
+        seed_timeline_message(&db, "m-keep", "c-keep", 300, "gamma");
+
+        // Stage matching FTS5 + fuzzy rows so the cascade really has
+        // something to delete.
+        for (mid, conv, text) in [
+            ("m-d-1", "c-doomed", "alpha"),
+            ("m-d-2", "c-doomed", "beta"),
+            ("m-keep", "c-keep", "gamma"),
+        ] {
+            db.connection()
+                .execute(
+                    "INSERT INTO search_fts(
+                        message_id, conversation_id, sender_id,
+                        created_at_ms, text_content
+                     ) VALUES (?1, ?2, 'user-1', 100, ?3)",
+                    params![mid, conv, text],
+                )
+                .unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO search_fuzzy(token, script, message_id)
+                     VALUES (?1, 'Latn', ?2)",
+                    params![text, mid],
+                )
+                .unwrap();
+        }
+
+        let n = db.delete_conversation("c-doomed").unwrap();
+        assert_eq!(n, 1, "exactly one conversation row removed");
+
+        // Doomed conversation: every dependent row gone.
+        assert_eq!(
+            count_rows(&db, "conversation", "conversation_id = 'c-doomed'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "message_skeleton", "conversation_id = 'c-doomed'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "message_body", "message_id LIKE 'm-d-%'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "search_fts", "conversation_id = 'c-doomed'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "search_fuzzy", "message_id LIKE 'm-d-%'"),
+            0
+        );
+
+        // Sibling conversation untouched.
+        assert_eq!(
+            count_rows(&db, "conversation", "conversation_id = 'c-keep'"),
+            1
+        );
+        assert_eq!(
+            count_rows(&db, "message_skeleton", "message_id = 'm-keep'"),
+            1
+        );
+        assert_eq!(count_rows(&db, "message_body", "message_id = 'm-keep'"), 1);
+        assert_eq!(count_rows(&db, "search_fts", "message_id = 'm-keep'"), 1);
+        assert_eq!(count_rows(&db, "search_fuzzy", "message_id = 'm-keep'"), 1);
+    }
+
+    #[test]
+    fn delete_conversation_returns_zero_for_missing_id() {
+        let db = fresh_db();
+        let n = db.delete_conversation("does-not-exist").unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn delete_conversation_on_empty_conversation_just_removes_the_row() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-empty", 1_000, false))
+            .unwrap();
+        let n = db.delete_conversation("c-empty").unwrap();
+        assert_eq!(n, 1);
+        assert!(db.get_conversation("c-empty").unwrap().is_none());
     }
 }
