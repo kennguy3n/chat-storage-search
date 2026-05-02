@@ -1,0 +1,12 @@
+[package]
+name = "kchat-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop (macOS / Windows) consumer crate for kchat-core. Phase 0 placeholder."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+kchat-core = { path = "../core" }

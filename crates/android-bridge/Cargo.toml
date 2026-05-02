@@ -1,0 +1,12 @@
+[package]
+name = "kchat-android-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Android JNI bridge for kchat-core. Phase 0 placeholder — actual JNI bindings land in Phase 1."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+kchat-core = { path = "../core" }

@@ -7,9 +7,48 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
-> Status: Phase 0 — Protocol and Test Vectors (NOT STARTED). This README
-> describes the target architecture, not the current implementation. See
+> Status: Phase 0 — Protocol and Test Vectors (in progress). The Rust
+> workspace, crypto module, ZK Object Fabric Pattern C interop, and
+> CI pipeline are landed; the higher-level modules are stubbed. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for build status.
+
+---
+
+## Quick start
+
+```sh
+# Build the workspace.
+cargo build --workspace
+
+# Run unit + cross-language interop tests.
+cargo test --workspace
+
+# Lint as CI does.
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The workspace ships four crates: `kchat-core` (platform-agnostic
+logic), and three thin bridges (`kchat-ios-bridge`,
+`kchat-android-bridge`, `kchat-desktop`). Phase 0 implements
+`kchat-core/src/crypto/`; the higher-level modules are stubbed and
+filled in across Phases 1–7 (see [docs/PHASES.md](docs/PHASES.md)).
+
+### Cross-language interop
+
+The Pattern C convergent-encryption path must produce **bit-identical**
+ciphertext to the Go SDK at
+`kennguy3n/zk-object-fabric/encryption/client_sdk/`. The contract is
+locked by the test vectors in
+`crates/core/tests/pattern_c_interop_vectors.json`, regenerated from
+the Go SDK by `tests/generate_vectors/main.go`:
+
+```sh
+cd tests/generate_vectors
+go run . > ../../crates/core/tests/pattern_c_interop_vectors.json
+cd ../..
+cargo test -p kchat-core --test pattern_c_interop_vectors
+```
 
 ---
 
@@ -276,3 +315,7 @@ chat-storage-search/
   (Phase 0 → Phase 7) with explicit decision gates.
 - [docs/PROGRESS.md](docs/PROGRESS.md) — phase-gated tracker
   matching `kennguy3n/zk-object-fabric/docs/PROGRESS.md`.
+
+## License
+
+Proprietary — All Rights Reserved. See [LICENSE](LICENSE).

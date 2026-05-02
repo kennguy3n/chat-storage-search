@@ -163,6 +163,16 @@ flowchart TD
 ciphertext routes through it, and `crypto` itself depends only on
 the standard library and chosen primitives.
 
+> **Phase 0 status.** As of the Phase 0 landing the crypto module
+> implements `content_hash`, `key_hierarchy`, `aead`, and
+> `convergent`. `key_wrap` is a Phase 0 stub; the platform-specific
+> wrappers (Keychain, Android Keystore, DPAPI) and `K_asset`
+> wrapping for archive / backup land in Phase 1 / Phase 2. All
+> non-`crypto` modules in `crates/core/src/` (`message`, `media`,
+> `search`, `archive`, `backup`, `offload`, `restore`,
+> `local_store`, `models`, `transport`, `scheduler`) are Phase 0
+> placeholders and are filled in across Phases 1 – 7.
+
 ---
 
 ## 3. Four-Store Data Flow

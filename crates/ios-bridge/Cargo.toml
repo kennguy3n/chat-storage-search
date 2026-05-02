@@ -1,0 +1,12 @@
+[package]
+name = "kchat-ios-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "iOS UniFFI bridge for kchat-core. Phase 0 placeholder — actual UniFFI bindings land in Phase 1."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+kchat-core = { path = "../core" }
