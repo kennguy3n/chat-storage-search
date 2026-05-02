@@ -87,8 +87,8 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
-> **Phase 0 closed; Phase 1 in flight.** Updates vs. the original
-> target structure below:
+> **Phase 0 closed; Phase 1 in flight (~90%).** Updates vs. the
+> original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
 >   CBOR wire-format types (segment frames, manifest spec, media
@@ -199,13 +199,33 @@ goes through the FFI bridge for the host platform.
 >   so the trait's `&self` API stays sync. `send_text` mints
 >   an `OutboxEntry` through `MessageProcessor::create_outbox_entry`
 >   and persists it via
->   `MessagePersister::persist_outbox_entry`; `search`
->   delegates to `QueryEngine::execute_search`. The
->   transport-driven `ingest_remote_messages` is a Phase-1
->   stub returning `IngestResult::default()` until the MLS
->   delivery client lands; the inherent
->   `CoreImpl::ingest_messages(&[IngestedMessage])` is the
->   batch-ingest path tests and bridges currently use.
+>   `MessagePersister::persist_outbox_entry`;
+>   `edit_message`, `delete_for_me`, and `delete_for_everyone`
+>   lock the db mutex and delegate to `MessagePersister` so
+>   the trait surfaces the full local message lifecycle.
+>   `get_message` and `get_conversation_messages` delegate to
+>   `LocalStoreDb::get_message_with_body` and
+>   `LocalStoreDb::get_conversation_messages` and re-shape the
+>   rows into the public `MessageView` (skeleton fields plus
+>   the optional decrypted body text) so the bindings never
+>   leak the internal schema. `search` delegates to
+>   `QueryEngine::execute_search`. The transport-driven
+>   `ingest_remote_messages` is now wired against an injected
+>   `Box<dyn DeliveryClient>` held in
+>   `Mutex<Option<…>>`: `CoreImpl::with_transport(config, key,
+>   client)` and the alternate `set_delivery_client(client)`
+>   install the implementation; the trait method calls
+>   `fetch_messages(conversation_id, after_cursor)`, converts
+>   each `RawDeliveryMessage` into `IngestedMessage` (parsing
+>   ids back to `Uuid`), and forwards into the existing
+>   `ingest_messages` pipeline so deduplication / FTS / fuzzy
+>   / journal writes are unchanged. When no transport is
+>   configured the trait method returns
+>   `Err(Error::Transport("no delivery client configured"))`
+>   so callers fail fast instead of silently no-oping. The
+>   inherent `CoreImpl::ingest_messages(&[IngestedMessage])`
+>   remains the batch-ingest path tests and bridges currently
+>   use without going through the transport.
 >   Inherent **conversation-management methods**
 >   (`create_conversation`, `list_conversations`,
 >   `get_conversation`, `update_conversation_pin`,
@@ -218,6 +238,24 @@ goes through the FFI bridge for the host platform.
 >   currently return `Err(Error::NotImplemented(<method>))` —
 >   the surface is locked but the implementation lands with
 >   the relevant later phase.
+> * `crates/core/src/transport/mod.rs` is the **Phase-1
+>   transport trait abstraction**. The module now exposes
+>   `DeliveryClient` (object-safe, `Send + Sync`),
+>   `FetchResult { messages, next_cursor }`,
+>   `RawDeliveryMessage` (string-typed wire shape with
+>   `message_id`, `conversation_id`, `sender_id`,
+>   `created_at_ms`, `text_content`, `media_descriptors`,
+>   `reply_to`), and `TransportError { Network, Auth, Server }`
+>   with `thiserror`-derived `Display` so upper layers can
+>   route on intent without parsing free-form text. A
+>   test-only `MockDeliveryClient` lets unit tests stage
+>   FIFO `(after_cursor → response)` mappings and asserts —
+>   inside `fetch_messages` — that the actual `after_cursor`
+>   matches the staged one, which is how the
+>   `core_impl::core_impl_ingest_remote_passes_cursor` test
+>   pins the cursor pass-through. The Phase-2+ HTTP / gRPC /
+>   MLS-blob transports layer on top of `DeliveryClient` in
+>   sibling sub-modules added when those engines arrive.
 > * `crates/core/benches/phase1_benchmarks.rs` is the **Phase-1
 >   performance benchmark suite** (criterion). Five benches
 >   exercise `MessagePersister::persist_ingested_message`
@@ -935,9 +973,41 @@ sequenceDiagram
     BE-->>Tr: "MLS application messages + new cursor"
     Core->>Core: "MLS-decrypt (KChat MLS layer)"
     Core->>Core: "persist message_skeleton, message_body, media_asset"
+    Core->>Core: "bump conversation.last_message_id / last_activity_ms"
     Core->>Core: "write backup + archive events"
     Core->>Core: "update FTS / fuzzy / vector / media indexes"
 ```
+
+> **Phase 1 transport implementation note.** `transport` is now a
+> Phase-1-implemented module (see §2): `core::transport::DeliveryClient`
+> is the trait the upper layer calls into,
+> `RawDeliveryMessage` / `FetchResult` describe the wire shape, and
+> `TransportError` flattens provider-specific failures into
+> `Network` / `Auth` / `Server`. `CoreImpl::ingest_remote_messages`
+> takes a `Box<dyn DeliveryClient>` (installed via
+> `with_transport(config, key, client)` or
+> `set_delivery_client(client)`), forwards `after_cursor` verbatim,
+> converts each `RawDeliveryMessage` into the internal
+> `IngestedMessage`, and runs the page through the existing
+> `MessagePersister` pipeline so deduplication, FTS / fuzzy
+> indexing, and journal writes happen exactly as in the local
+> `send_text` path. When no client is configured the trait method
+> returns `Err(Error::Transport("no delivery client configured"))`
+> so callers fail fast instead of silently no-oping.
+
+> **Conversation-metadata auto-update.** Both message-receive paths
+> (`MessagePersister::persist_ingested_message` for transport-driven
+> ingest and `MessagePersister::persist_outbox_entry` for the local
+> `send_text` flow) call
+> `LocalStoreDb::update_conversation_last_message(conversation_id,
+> message_id, created_at_ms)` from inside the same `SAVEPOINT` that
+> writes the skeleton + body + FTS row + journal entry. The
+> conversation row's `last_message_id` and `last_activity_ms` columns
+> therefore stay in lock-step with the message timeline atomically:
+> `KChatCore::list_conversations` re-orders to reflect the latest
+> activity without any additional call from the binding layer, and a
+> mid-ingest crash cannot leave the conversation row pointing at a
+> message that does not exist.
 
 ---
 

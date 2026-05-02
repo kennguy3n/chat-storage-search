@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~80%`.**
+> Search + MLS Integration — `In progress | ~90%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -35,7 +35,10 @@
 > FTS row + journal entry, idempotent on `message_id`, plus
 > `edit_message` / `delete_for_me` / `delete_for_everyone` with FTS
 > **and fuzzy-index** maintenance — every persisted body is now
-> dual-indexed into `search_fts` and `search_fuzzy`), the FTS5 text
+> dual-indexed into `search_fts` and `search_fuzzy`, and the
+> persistence path also bumps `conversation.last_message_id` /
+> `last_activity_ms` so `list_conversations` reflects the latest
+> message without an extra call from the binding layer), the FTS5 text
 > search engine (`search::text_search::TextSearchEngine` with
 > BM25-ordered queries, snippet highlighting, prefix-search and
 > phrase-quote handling), the unified query engine
@@ -47,8 +50,23 @@
 > (`search::fuzzy_search::{FuzzyTokenizer, FuzzySearchEngine}`,
 > trigrams for alphabetic scripts / bigrams for CJK), the
 > concrete **`CoreImpl`** `KChatCore` implementation
-> (`core_impl.rs`) wiring `send_text` / `ingest_messages` /
-> `search` to the SQLCipher store, the **conversation-management
+> (`core_impl.rs`) wiring `send_text` / `edit_message` /
+> `delete_for_me` / `delete_for_everyone` / `get_message` /
+> `get_conversation_messages` / `ingest_messages` /
+> `ingest_remote_messages` / `search` to the SQLCipher store, the
+> public **`MessageView`** shape that pairs the skeleton with the
+> optional decrypted body text so the timeline API never leaks
+> internal schema types, the **transport trait abstraction**
+> (`transport::DeliveryClient`,
+> `transport::FetchResult { messages, next_cursor }`,
+> `transport::RawDeliveryMessage`,
+> `transport::TransportError { Network, Auth, Server }`) plus a
+> test-only `MockDeliveryClient` so unit tests can stage
+> per-cursor responses, the **transport-driven
+> `ingest_remote_messages`** that pulls from a configured
+> `Box<dyn DeliveryClient>` and reuses the existing batch-ingest
+> pipeline (deduplication / FTS / fuzzy / journal writes
+> unchanged), the **conversation-management
 > API** on `CoreImpl` (`create_conversation` /
 > `list_conversations` / `get_conversation` /
 > `update_conversation_pin` / `update_conversation_mute`), the
@@ -65,10 +83,16 @@
 > (`crates/core/benches/phase1_benchmarks.rs`) validating the
 > < 20 ms / < 150 ms p95 budgets.
 >
-> Outstanding for Phase 1: UniFFI / JNI bridges, the
-> transport-driven `ingest_remote_messages` (MLS delivery client
-> still pending), and the platform-specific `K_local_db` wrap
-> (Keychain / Keystore / DPAPI). The higher-level engines
+> Outstanding for Phase 1: UniFFI / JNI bridges and the
+> platform-specific `K_local_db` wrap (Keychain / Keystore /
+> DPAPI). The transport surface and the transport-driven
+> `ingest_remote_messages` are now in place; what remains for
+> Phase 1 is the production MLS delivery-client implementation
+> of `DeliveryClient` (the trait itself, the
+> `RawDeliveryMessage` / `FetchResult` / `TransportError`
+> shapes, and the wiring through `CoreImpl::with_transport` /
+> `set_delivery_client` / `ingest_remote_messages` are all
+> landed). The higher-level engines
 > (`media`, `archive`, `backup`, `offload`, `restore`) remain
 > stubbed and land across Phases 2–7. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
@@ -131,7 +155,7 @@ chat-storage-search/
         offload/                            # placeholder (Phase 3)
         restore/                            # placeholder (Phase 4)
         scheduler/                          # placeholder (Phase 4 / 7)
-        transport/                          # placeholder (Phase 1 / 2 / 4)
+        transport/                          # Phase 1: DeliveryClient trait + MockDeliveryClient landed
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
       tests/
@@ -242,11 +266,33 @@ The Phase 0 + Phase 1 test surface covers:
   `KChatCore` round-trip tests: `send_text` → skeleton + body +
   FTS check, `ingest_messages` → search round-trip, duplicate
   rejection, `initialize` re-open at a new `data_dir`, the
+  **edit / delete surface** on the trait (`edit_message`
+  body-and-search update, `delete_for_me` removes from search
+  while keeping the body, `delete_for_everyone` drops the body
+  and tombstones the skeleton, missing-id error path), the
+  **timeline retrieval surface** (`get_message` round-trip,
+  `get_conversation_messages` newest-first ordering with
+  `before_ms` pagination and `limit` handling), the
+  **transport-driven `ingest_remote_messages`** (happy path
+  with three messages indexed + searchable, no-transport
+  `Error::Transport`, dedup on retry through the same mock
+  cursor, and cursor pass-through verified by the mock's
+  per-call assertion), the
   conversation-management surface (`create_conversation` /
-  `list_conversations` / `get_conversation` / pin / mute), and
+  `list_conversations` / `get_conversation` / pin / mute,
+  including `list_conversations_reflects_latest_message_activity`
+  which pins the auto-bump of `last_message_id` /
+  `last_activity_ms` from the persistence path), and
   the Phase-1 `Error::NotImplemented` stubs for `send_media` /
   `hydrate_message` / `run_incremental_backup` /
   `enforce_storage_budget` / `restore_from_backup`.
+* [`transport`](crates/core/src/transport/mod.rs) — unit tests
+  for the new `DeliveryClient` trait surface:
+  `TransportError` `Display` strings,
+  `FetchResult::default()` empty-page shape,
+  object-safety pin (`Box<dyn DeliveryClient>` constructs),
+  and the `MockDeliveryClient` staged-response / cursor
+  recording / panic-on-unexpected-cursor behaviour.
 * [`lib.rs`](crates/core/src/lib.rs) — public API type
   construction, default `SearchScope::IncludeCold`, P0–P5 ordering
   on `HydrationReason`, `Error` variant `Display` strings

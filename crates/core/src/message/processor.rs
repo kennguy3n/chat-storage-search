@@ -365,6 +365,18 @@ impl<'a> MessagePersister<'a> {
             FuzzySearchEngine::new(self.db).index_message(&skel.message_id, text)?;
         }
 
+        // Bump the owning conversation's last_message_id /
+        // last_activity_ms so list_conversations reflects the
+        // freshly-arrived message. A missing conversation row is
+        // not an error here — Phase 1 leaves conversation creation
+        // to the caller, and pre-existing tests insert a skeleton
+        // before its conversation has been registered.
+        self.db.update_conversation_last_message(
+            &skel.conversation_id,
+            &skel.message_id,
+            skel.created_at_ms,
+        )?;
+
         let payload = encode_event_payload(
             &skel.message_id,
             &skel.conversation_id,
@@ -463,6 +475,14 @@ impl<'a> MessagePersister<'a> {
             &entry.text_content,
         )?;
         FuzzySearchEngine::new(self.db).index_message(&mid, &entry.text_content)?;
+
+        // Bump the owning conversation's last_message_id /
+        // last_activity_ms so the conversation list surfaces the
+        // freshly-sent outbox entry. See
+        // `persist_ingested_message_inner` for the matching ingest
+        // side.
+        self.db
+            .update_conversation_last_message(&conv, &mid, entry.created_at_ms)?;
 
         let payload = encode_event_payload(&mid, &conv, "self", entry.created_at_ms);
         let journal = BackupEventJournalEntry {
@@ -1571,5 +1591,58 @@ mod tests {
         let entry = MessageProcessor::create_outbox_entry(conv, "lighthouse keeper", None).unwrap();
         let cmid = p.persist_outbox_entry(&entry).unwrap();
         assert!(fuzzy_count(&db, &cmid.0.to_string()) > 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Conversation metadata auto-update
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn persist_ingested_message_updates_conversation_metadata() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_500,
+            text_content: Some("first arrival".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        let row = db
+            .get_conversation(&conv.to_string())
+            .unwrap()
+            .expect("conv");
+        assert_eq!(
+            row.last_message_id.as_deref(),
+            Some(msg.message_id.to_string()).as_deref()
+        );
+        assert_eq!(row.last_activity_ms, 1_700_000_000_500);
+    }
+
+    #[test]
+    fn persist_outbox_entry_updates_conversation_metadata() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry = MessageProcessor::create_outbox_entry(conv, "outbox bump", None).unwrap();
+        let created_at = entry.created_at_ms;
+        let cmid = p.persist_outbox_entry(&entry).unwrap();
+
+        let row = db
+            .get_conversation(&conv.to_string())
+            .unwrap()
+            .expect("conv");
+        assert_eq!(
+            row.last_message_id.as_deref(),
+            Some(cmid.0.to_string()).as_deref()
+        );
+        assert_eq!(row.last_activity_ms, created_at);
     }
 }

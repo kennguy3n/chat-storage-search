@@ -318,6 +318,43 @@ pub struct RestoreResult {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupSource {}
 
+/// Public, schema-stable view of a stored message.
+///
+/// `MessageView` is the return shape of
+/// [`KChatCore::get_message`] and
+/// [`KChatCore::get_conversation_messages`]. It deliberately mirrors
+/// only the fields needed to render a chat bubble — sender, time,
+/// reply-to, edit / delete stamps, and the (optional) plaintext body
+/// — without leaking the internal `local_store::schema` types
+/// through the public API. Phase-2+ engines extend this with
+/// hydrated media descriptors, hydration provenance, and rich
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageView {
+    /// Stable message identifier.
+    pub message_id: Uuid,
+    /// Owning conversation.
+    pub conversation_id: Uuid,
+    /// Stable sender identifier.
+    pub sender_id: String,
+    /// Wall-clock millisecond timestamp set by the sender.
+    pub created_at_ms: i64,
+    /// Wall-clock millisecond timestamp at which this device
+    /// received (or originated) the message.
+    pub received_at_ms: i64,
+    /// Identifier of the message this is a reply to, if any.
+    pub reply_to: Option<Uuid>,
+    /// Wall-clock millisecond timestamp of the most recent edit, if
+    /// any.
+    pub edited_at_ms: Option<i64>,
+    /// Wall-clock millisecond timestamp of deletion, if any.
+    pub deleted_at_ms: Option<i64>,
+    /// Plaintext body. `None` for media-only messages and for
+    /// `delete_for_everyone` tombstones whose body row has been
+    /// dropped.
+    pub text_content: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // KChatCore trait
 // ---------------------------------------------------------------------------
@@ -364,6 +401,40 @@ pub trait KChatCore: Send + Sync {
     /// indexes (and, if `scope == IncludeCold`, the personal
     /// archive).
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>>;
+
+    /// Replace the text body of an existing local-plain message and
+    /// keep the FTS / fuzzy indexes in sync. Errors with
+    /// [`Error::Message`] when `message_id` does not exist, the
+    /// message is in a non-editable [`crate::local_store::state_machines::BodyState`],
+    /// or `new_text` is empty.
+    fn edit_message(&self, message_id: Uuid, new_text: &str) -> Result<()>;
+
+    /// Soft-delete a message locally. The body row is kept so the
+    /// message remains restorable, but the FTS / fuzzy rows are
+    /// removed so the message stops appearing in search.
+    fn delete_for_me(&self, message_id: Uuid) -> Result<()>;
+
+    /// Tombstone a message for everyone. The body row is removed so
+    /// the plaintext is gone, the FTS / fuzzy rows are removed, and
+    /// the skeleton stays in place with
+    /// `body_state = deleted_for_everyone` so the timeline can
+    /// render a tombstone.
+    fn delete_for_everyone(&self, message_id: Uuid) -> Result<()>;
+
+    /// Fetch a single message (skeleton + optional body text) by id.
+    /// Returns `Ok(None)` when no such message exists.
+    fn get_message(&self, message_id: Uuid) -> Result<Option<MessageView>>;
+
+    /// Return the most recent messages in `conversation_id`,
+    /// ordered newest-first. `before_ms` is an optional pagination
+    /// cursor — only messages with `created_at_ms < before_ms` are
+    /// returned. `limit` caps the page size.
+    fn get_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MessageView>>;
 
     /// Send an outbound media message: copy / encrypt the file at
     /// `local_file`, persist a media descriptor + body row, and
