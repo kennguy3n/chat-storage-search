@@ -87,21 +87,40 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
-> **Phase 0 update.** Two changes vs. the original target structure
-> below:
+> **Phase 0 closed; Phase 1 in flight.** Updates vs. the original
+> target structure below:
 >
-> * `crates/core/src/formats/` is a **new module** added in Phase 0
->   for the CBOR wire-format types (segment frames, manifest spec,
->   media descriptor, search index shard). It was not shown in the
+> * `crates/core/src/formats/` is a **Phase-0 addition** for the
+>   CBOR wire-format types (segment frames, manifest spec, media
+>   descriptor, search index shard). It was not shown in the
 >   original target structure but is required by the Phase 0
 >   checklist; the formats need to exist in code before the
 >   higher-level engines (`archive`, `backup`, `search`, `restore`)
 >   that consume them.
-> * `crates/core/src/crypto/key_wrap.rs` is now **implemented**
+> * `crates/core/src/crypto/key_wrap.rs` is **implemented**
 >   (AES-256-KW per RFC 3394) and is no longer a stub. The
 >   platform-specific wraps for `K_local_db` (Keychain / Keystore /
 >   DPAPI) still arrive in Phase 1; they layer on top of the same
 >   `wrap_key` / `unwrap_key` primitives.
+> * `crates/core/src/search/tokenizer.rs` is the **Phase-0 closing**
+>   multilingual tokenization spec: `TokenizerConfig`,
+>   `FallbackMode::{Icu, Unicode61}`, ISO-15924 `ScriptClass`, the
+>   `FuzzyGranularity` mapping, and `detect_script` /
+>   `segment_by_script` for mixed-script runs.
+> * `crates/core/src/local_store/schema.rs` is the **Phase-1
+>   foundation** for the SQLCipher schema: typed Rust row structs
+>   for every table in §4 plus the `SCHEMA_SQL` constant carrying
+>   the `CREATE TABLE` / `CREATE VIRTUAL TABLE` statements.
+> * `crates/core/src/local_store/state_machines.rs` defines the
+>   `body_state`, `media_state`, `archive_state`, `backup_state`,
+>   and `restore_state` enums with `try_transition`, `Display` /
+>   `FromStr`, and serde support — every transition not in the
+>   diagrams in §5 is rejected.
+> * `crates/core/src/message/processor.rs` is the **Phase-1 message
+>   processor skeleton**: `IngestedMessage`, `OutboxEntry`,
+>   `OutboxStatus`, `IngestResult`, and the static
+>   `validate_ingest` / `is_duplicate` / `create_outbox_entry`
+>   helpers.
 
 The workspace ships four crates: a core that knows nothing about
 platforms, and three thin bridges.
@@ -179,15 +198,22 @@ flowchart TD
 ciphertext routes through it, and `crypto` itself depends only on
 the standard library and chosen primitives.
 
-> **Phase 0 status.** As of the Phase 0 landing the crypto module
-> implements `content_hash`, `key_hierarchy`, `aead`, and
-> `convergent`. `key_wrap` is a Phase 0 stub; the platform-specific
-> wrappers (Keychain, Android Keystore, DPAPI) and `K_asset`
-> wrapping for archive / backup land in Phase 1 / Phase 2. All
-> non-`crypto` modules in `crates/core/src/` (`message`, `media`,
-> `search`, `archive`, `backup`, `offload`, `restore`,
-> `local_store`, `models`, `transport`, `scheduler`) are Phase 0
-> placeholders and are filled in across Phases 1 – 7.
+> **Phase 0 closed; Phase 1 in flight.** The crypto module
+> implements `content_hash`, `key_hierarchy`, `aead`, `convergent`,
+> and `key_wrap` (AES-256-KW). The platform-specific wrappers
+> (Keychain, Android Keystore, DPAPI) and `K_asset` wrapping for
+> archive / backup land in Phase 1 / Phase 2 and layer on top of
+> the same `wrap_key` / `unwrap_key` primitives.
+>
+> Phase 1 has additionally landed the `local_store::schema`,
+> `local_store::state_machines`, `message::processor`, and
+> `search::tokenizer` modules, plus the expanded `KChatCore`
+> public-API trait in `lib.rs` (`SearchQuery`, `SearchScope`,
+> `SearchResult`, `HydrationReason`, `BackupReason`,
+> `StoragePressureReason`, `ClientMessageId`, `DeliveryCursor`).
+> The remaining higher-level modules (`media`, `archive`, `backup`,
+> `offload`, `restore`, `models`, `transport`, `scheduler`) are
+> Phase-0 placeholders and are filled in across Phases 1 – 7.
 
 ---
 
