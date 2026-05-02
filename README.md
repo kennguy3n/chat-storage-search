@@ -258,9 +258,9 @@ content from day one.
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Tokenization (FTS5)      | SQLite FTS5 with **ICU tokenizer** (`tokenize = 'icu'`); falls back to `unicode61` only if ICU is unavailable on the platform.      |
 | Fuzzy matching           | Trigrams for Latin / Cyrillic / Greek; bigrams for CJK (Chinese, Japanese, Korean); script-aware Levenshtein.                       |
-| Text embeddings          | `multilingual-e5-small` (100+ languages) or `XLM-RoBERTa-small`, INT8 ONNX. English-only MiniLM-L6 is **rejected**.                 |
+| Text embeddings          | `XLM-R` (100+ languages, ~80–100 MB INT8 ONNX) — same encoder used by `kennguy3n/slm-guardrail`, unifying the text encoder across the platform. English-only MiniLM-L6 is **rejected**. |
 | OCR                      | Apple Vision (18+ languages) on iOS / macOS; ML Kit Text Recognition v2 (50+ languages) on Android; multilingual fallback on desktop. |
-| Audio transcription      | Whisper-small / Whisper-tiny multilingual ONNX, INT8, gated on battery and thermal state.                                           |
+| Audio transcription      | `Whisper-base` (~140 MB) / `Whisper-tiny` (~75 MB) multilingual INT8 ONNX, gated on battery and thermal state.                       |
 | Mixed-script messages    | A single message may interleave scripts (e.g. `Meeting at 3pm 会議室で`). ICU and the ML stack handle this natively per run.        |
 
 ## Tech stack
@@ -276,8 +276,10 @@ content from day one.
 - **HNSW** (in-Rust, e.g. `instant-distance` or `hnsw_rs`) for
   approximate vector search.
 - **ONNX Runtime** via the [`ort`](https://crates.io/crates/ort)
-  crate for on-device ML inference (text embeddings, image
-  embeddings, Whisper).
+  crate for on-device ML inference: `XLM-R` text embeddings
+  (~80–100 MB INT8), `MobileCLIP-S2` image / video embeddings
+  (~80 MB INT8), `Whisper-base` (~140 MB) / `Whisper-tiny`
+  (~75 MB) audio transcription.
 - **BLAKE3** for content hashing (matches `kennguy3n/zk-object-fabric`'s
   Pattern C convergent dedup so backup interop is bit-identical).
 - **XChaCha20-Poly1305** as the default AEAD; **AES-256-GCM** as
@@ -418,9 +420,9 @@ chat-storage-search/
           search_shard.rs         # SearchIndexShard (text / fuzzy / vector / media)
         models/                   # on-device ML model management
           mod.rs
-          embeddings.rs           # multilingual text embedding (multilingual-e5-small via ONNX)
-          clip.rs                 # CLIP image/video embeddings (ONNX)
-          whisper.rs              # Whisper audio transcription (ONNX, multilingual)
+          embeddings.rs           # multilingual text embedding (XLM-R via ONNX)
+          clip.rs                 # MobileCLIP-S2 image/video embeddings (ONNX)
+          whisper.rs              # Whisper-base / Whisper-tiny audio transcription (ONNX, multilingual)
           ocr.rs                  # platform OCR bridge (Vision on iOS, ML Kit on Android)
           model_manager.rs        # model download, versioning, quantization
         transport/                # backend API client for blob/archive/delivery

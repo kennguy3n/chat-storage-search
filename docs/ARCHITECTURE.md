@@ -432,7 +432,7 @@ flowchart TD
         FTS["FTS5<br/>(exact + prefix + BM25,<br/>tokenize = 'icu')"]
         FZ["Fuzzy index<br/>(trigram for Latn / Cyrl,<br/>bigram for CJK)"]
         STRUCT["Structured index<br/>(sender, date, conversation)"]
-        EMB["Multilingual embedding<br/>(multilingual-e5-small)"]
+        EMB["Multilingual embedding<br/>(XLM-R)"]
         HNSW["HNSW vector index"]
     end
 
@@ -822,7 +822,7 @@ sequenceDiagram
 | OCR                        | `VNRecognizeTextRequest` (multilingual; 18+ languages supported in current iOS)                              |
 | ML inference               | Core ML (preferred) or ONNX Runtime CoreML EP                                                                |
 | iCloud backup              | App's iCloud container file storage for encrypted backup files                                               |
-| Audio session              | Foreground for live recording; background-friendly transcription via Whisper-tiny / Whisper-small            |
+| Audio session              | Foreground for live recording; background-friendly transcription via Whisper-tiny / Whisper-base             |
 
 ### 11.2 Android
 

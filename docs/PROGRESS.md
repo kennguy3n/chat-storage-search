@@ -382,13 +382,15 @@ semantic text search — all multilingual.
 Checklist:
 
 - [ ] ONNX Runtime integration via the `ort` crate.
-- [ ] Multilingual text embedding model (`multilingual-e5-small`,
-      INT8 ONNX). English-only MiniLM-L6 is rejected.
+- [ ] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
+      ONNX). Same encoder as `kennguy3n/slm-guardrail`, unifying
+      the text encoder across the platform. English-only
+      MiniLM-L6 is rejected.
 - [ ] HNSW vector index for semantic text search.
-- [ ] CLIP image / video embeddings.
+- [ ] `MobileCLIP-S2` image / video embeddings (~80 MB INT8 ONNX).
 - [ ] Video keyframe sampling.
-- [ ] Whisper multilingual transcription (`whisper-small` default;
-      `whisper-tiny` on low-end Android).
+- [ ] Whisper multilingual transcription (`whisper-base` default,
+      ~140 MB; `whisper-tiny` on low-end Android, ~75 MB).
 - [ ] Platform OCR bridge (Vision on iOS / macOS; ML Kit on
       Android; `Windows.Media.Ocr` / Tesseract on Windows).
 - [ ] Document text extraction (PDF, DOCX) with page-level indexing.
@@ -453,6 +455,18 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-02 — Model stack optimization
+
+- Unified text embedding model: dropped `multilingual-e5-small` (~120 MB) and
+  `XLM-RoBERTa-small` (~100 MB), standardized on **XLM-R** (~80–100 MB INT8 ONNX)
+  — same encoder as slm-guardrail, eliminating cross-repo model redundancy.
+- Changed default audio transcription from `Whisper-small` (~240 MB) to
+  **`Whisper-base`** (~140 MB INT8 ONNX). Saves ~100 MB on mobile.
+  `Whisper-tiny` (~75 MB) remains the low-end Android fallback.
+- Replaced `CLIP ViT-B/32` (~150 MB) with **`MobileCLIP-S2`** (~80 MB INT8 ONNX)
+  for image/video embeddings. Apple's MobileCLIP-S2 is designed for on-device
+  inference and has native Core ML support.
 
 - 2026-05-02: Phase 0 scaffold + crypto landed (PR #2).
 - 2026-05-02: CBOR wire formats, manifest spec (Ed25519), media

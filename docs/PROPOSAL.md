@@ -275,7 +275,7 @@ CREATE TABLE search_fuzzy (
 CREATE TABLE search_vector (
     message_id    TEXT NOT NULL,
     embedding     BLOB NOT NULL,                        -- INT8-quantized vector
-    model_version TEXT NOT NULL,                        -- 'multilingual-e5-small@v1'
+    model_version TEXT NOT NULL,                        -- 'xlmr@v1'
     PRIMARY KEY (message_id, model_version)
 );
 
@@ -633,7 +633,7 @@ flowchart TD
     TOK["ICU tokenize"]
     FTS["FTS5 lookup<br/>(exact + prefix + BM25)"]
     FZ["Fuzzy lookup<br/>(trigram for Latn/Cyrl,<br/>bigram for CJK)"]
-    EMB["Multilingual embedding<br/>(multilingual-e5-small)"]
+    EMB["Multilingual embedding<br/>(XLM-R)"]
     HNSW["HNSW vector lookup"]
     MERGE["Merge candidates"]
     RR["Rerank<br/>(see §7.5)"]
@@ -692,17 +692,24 @@ older or larger conversations from search, which contradicts the
 
 ### 7.6 On-device ML models (multilingual)
 
-| Model                                | Purpose                       | Size (INT8 ONNX) | Languages            | Platform                        |
-| ------------------------------------ | ----------------------------- | ---------------- | -------------------- | ------------------------------- |
-| `multilingual-e5-small`              | Text embeddings (default)     | ~120 MB          | 100+                 | All (CPU)                       |
-| `XLM-RoBERTa-small`                  | Text embeddings (alternative) | ~100 MB          | 100+                 | All (CPU)                       |
-| `CLIP ViT-B/32` (multilingual head)  | Image / video embeddings      | ~150 MB          | language-agnostic    | All (CPU)                       |
-| `Whisper-small` (multilingual)       | Audio transcription           | ~240 MB          | 99                   | All (CPU)                       |
-| `Whisper-tiny` (multilingual)        | Low-end audio transcription   | ~75 MB           | 99                   | All (CPU); low-end Android default |
+| Model                          | Purpose                     | Size (INT8 ONNX) | Languages            | Platform                        |
+| ------------------------------ | --------------------------- | ---------------- | -------------------- | ------------------------------- |
+| `XLM-R`                        | Text embeddings             | ~80–100 MB       | 100+                 | All (CPU)                       |
+| `MobileCLIP-S2`                | Image / video embeddings    | ~80 MB           | language-agnostic    | All (CPU)                       |
+| `Whisper-base` (multilingual)  | Audio transcription         | ~140 MB          | 99                   | All (CPU)                       |
+| `Whisper-tiny` (multilingual)  | Low-end audio transcription | ~75 MB           | 99                   | All (CPU); low-end Android default |
 
-English-only MiniLM-L6 (~30 MB) is **rejected**. The ~90 MB delta
-between MiniLM-L6 and `multilingual-e5-small` is the price of
-multilingual coverage and is paid by:
+`XLM-R` is the same encoder used by the guardrail system
+(`kennguy3n/slm-guardrail`). Standardizing on it here unifies the
+text encoder across the platform — the guardrail and the search
+pipeline share one ONNX artifact instead of bundling two
+semantically-similar multilingual encoders side by side, which
+eliminates a redundant ~120 MB model from the on-device footprint
+and keeps cross-repo embedding semantics aligned. English-only
+MiniLM-L6 (~30 MB) remains **rejected** because it does not
+support the 100+ languages KChat targets. The remaining ~50–70 MB
+delta between MiniLM-L6 and `XLM-R` is the price of multilingual
+coverage and is paid by:
 
 - Lazy download on first semantic-search use, not at install time.
 - INT8 quantization on disk and at inference time.
@@ -1015,7 +1022,7 @@ is *include cold*, with a small ranking penalty per §7.5.
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ICU tokenizer unavailable on some platforms                       | Static-link ICU; ship `unicode61` as a documented fallback; cross-platform tokenizer test vectors so any deviation is caught in CI.                                                     |
 | Multilingual embedding model size (~120 MB)                       | Lazy download on first semantic-search use; INT8 quantization on disk and at inference; per-device opt-out with graceful degradation to FTS + fuzzy.                                    |
-| Whisper multilingual too slow on low-end Android                  | Default to `whisper-tiny` on devices below a perf threshold; queue transcription for charging cycles; allow user to opt out per conversation.                                           |
+| Whisper multilingual too slow on low-end Android                  | Default to `whisper-tiny` on devices below a perf threshold (`whisper-base` elsewhere); queue transcription for charging cycles; allow user to opt out per conversation.                  |
 | SQLCipher + FTS5 + ICU combined binary size                       | Static linking with LTO; strip unused features; target ~15–20 MB added per platform; budget tracked in CI.                                                                              |
 | UniFFI / JNI bridge overhead for search results                   | Batch results across the boundary; return cursor handles for pagination; use shared memory / FlatBuffers for large payloads.                                                            |
 | Windows CPU-only search latency                                   | INT8 quantized models; pre-computed embeddings; cap concurrent inference; document a "no semantic on Windows < this CPU class" envelope.                                                |
