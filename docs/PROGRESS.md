@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`In progress | ~55%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`In progress | ~90%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -17,7 +17,7 @@ the full delivery plan, see [PHASES.md](PHASES.md).
 
 ## Phase 0: Protocol and Test Vectors
 
-**Status**: `In progress | ~55%`
+**Status**: `In progress | ~90%`
 
 **Goal**: Lock the shared binary formats, crypto specs, and
 cross-platform / cross-language test vectors **before** writing
@@ -26,15 +26,34 @@ iOS, Android, desktop, and the ZK Object Fabric backup path.
 
 Checklist:
 
-- [ ] Shared binary formats spec (CBOR for wire payloads; internal
-      Rust structs ↔ CBOR mapping).
+- [x] Shared binary formats spec (CBOR for wire payloads; internal
+      Rust structs ↔ CBOR mapping). _(See
+      `crates/core/src/formats/`: `BackupSegmentFrame`,
+      `ArchiveSegmentFrame`, `SegmentType`, plus the manifest,
+      media-descriptor, and search-shard sub-modules. All types
+      round-trip through `serde_cbor::to_vec` /
+      `serde_cbor::from_slice` and use `serde_bytes` for compact
+      byte-string encoding.)_
 - [x] Crypto container spec (AEAD construction, AAD format, chunk
       layout) covering both KChat-internal AAD and ZK Object Fabric
       Pattern C.
-- [ ] Manifest spec (backup manifest, archive manifest;
-      `previous_manifest_hash` chain; Ed25519 signature).
-- [ ] Media descriptor spec.
-- [ ] Search index shard spec (text, fuzzy, vector, media).
+- [x] Manifest spec (backup manifest, archive manifest;
+      `previous_manifest_hash` chain; Ed25519 signature). _(See
+      `crates/core/src/formats/manifest.rs`. `BackupManifest` and
+      `ArchiveManifest` share the canonical-CBOR signing payload,
+      `compute_manifest_hash` powers the generation chain, and the
+      integration test at `crates/core/tests/manifest_signing.rs`
+      walks gen 0 → gen 1 → gen 2 end-to-end.)_
+- [x] Media descriptor spec. _(See
+      `crates/core/src/formats/media_descriptor.rs`:
+      `MediaDescriptor` carries `asset_id`, `mime_type`,
+      `bytes_total`, `chunk_count`, BLAKE3 `merkle_root`,
+      `blob_id`, and AES-256-KW-wrapped `K_asset`.)_
+- [x] Search index shard spec (text, fuzzy, vector, media). _(See
+      `crates/core/src/formats/search_shard.rs`:
+      `SearchIndexShard` with the four-variant `IndexType` enum,
+      `KCHAT_INDEX_SHARD_V1` magic, and zstd / XChaCha20-Poly1305
+      framing per `docs/PROPOSAL.md §7.8`.)_
 - [ ] Multilingual tokenization spec (ICU configuration, script-
       specific rules, fallback behavior, fuzzy-index granularity
       per script).
@@ -78,6 +97,22 @@ Notes:
   and Go-ciphertext → Rust-decrypt round-trip across four input
   shapes (single-chunk, single-byte, 4 KiB × 256-byte chunks,
   128-byte × 64-byte chunks). Status: 6/6 passing locally.
+- 2026-05-02: Shared binary formats landed
+  (`crates/core/src/formats/`): backup / archive segment frames,
+  `BackupManifest` / `ArchiveManifest` with Ed25519 signing over
+  the canonical-CBOR payload and a `previous_manifest_hash` chain
+  (genesis manifests anchor to the all-zero hash),
+  `MediaDescriptor`, and `SearchIndexShard` (text / fuzzy / vector
+  / media). Integration tests at
+  `crates/core/tests/manifest_signing.rs` and
+  `crates/core/tests/key_wrap_hierarchy.rs` exercise the manifest
+  chain and the AES-256-KW wrap-by-archive-vs-backup-root split.
+- 2026-05-02: AES-256-KW (RFC 3394) key wrapping landed at
+  `crates/core/src/crypto/key_wrap.rs` (no longer a stub).
+  `wrap_key` / `unwrap_key` plus the `wrap_k_asset` /
+  `unwrap_k_asset` convenience helpers operate on the
+  `KeyMaterial` from the hierarchy; wrapped output is exactly 40
+  bytes (32 + 8-byte integrity check).
 
 ---
 
@@ -351,15 +386,7 @@ Notes:
 
 ## Changelog
 
-- 2026-05-02: Phase 0 — Rust workspace scaffold (`crates/core`,
-  `crates/ios-bridge`, `crates/android-bridge`, `crates/desktop`),
-  crypto module (BLAKE3 content hashing, HKDF-SHA256 key hierarchy
-  rooted at `K_user_master`, zeroizing `KeyMaterial`,
-  XChaCha20-Poly1305, AES-256-GCM, `KCHAT_BLOB_CHUNK_V1` per-chunk
-  AAD), Pattern C convergent encryption bit-identical to the Go SDK
-  at `kennguy3n/zk-object-fabric/encryption/client_sdk/`,
-  cross-language test vectors (Go generator at
-  `tests/generate_vectors/main.go`, Rust interop test at
-  `crates/core/tests/pattern_c_interop_vectors.rs`), CI pipeline
-  (GitHub Actions: `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo build --workspace`, `cargo test --workspace`).
+- 2026-05-02: Phase 0 scaffold + crypto landed (PR #2).
+- 2026-05-02: CBOR wire formats, manifest spec (Ed25519), media
+  descriptor, search index shard spec, key wrap module landed.
+  Phase 0 ~90%.

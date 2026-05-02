@@ -185,7 +185,9 @@ pub fn decrypt_object_pattern_c(
     let key: &chacha20poly1305::Key = dek.into();
     let cipher = XChaCha20Poly1305::new(key);
 
-    let max_ct = (chunk_size + TAG_LEN) as u32;
+    let max_ct: u32 = (chunk_size + TAG_LEN)
+        .try_into()
+        .map_err(|_| CryptoError::Frame(format!("chunk_size {chunk_size} exceeds u32 range")))?;
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor < ciphertext.len() {

@@ -87,6 +87,22 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
+> **Phase 0 update.** Two changes vs. the original target structure
+> below:
+>
+> * `crates/core/src/formats/` is a **new module** added in Phase 0
+>   for the CBOR wire-format types (segment frames, manifest spec,
+>   media descriptor, search index shard). It was not shown in the
+>   original target structure but is required by the Phase 0
+>   checklist; the formats need to exist in code before the
+>   higher-level engines (`archive`, `backup`, `search`, `restore`)
+>   that consume them.
+> * `crates/core/src/crypto/key_wrap.rs` is now **implemented**
+>   (AES-256-KW per RFC 3394) and is no longer a stub. The
+>   platform-specific wraps for `K_local_db` (Keychain / Keystore /
+>   DPAPI) still arrive in Phase 1; they layer on top of the same
+>   `wrap_key` / `unwrap_key` primitives.
+
 The workspace ships four crates: a core that knows nothing about
 platforms, and three thin bridges.
 
