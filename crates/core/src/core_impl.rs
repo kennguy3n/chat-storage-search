@@ -30,6 +30,7 @@
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use uuid::Uuid;
@@ -38,13 +39,14 @@ use zeroize::Zeroizing;
 
 use crate::config::KChatCoreConfig;
 use crate::local_store::db::LocalStoreDb;
+use crate::local_store::schema::Conversation;
 use crate::message::processor::{
     IngestResult, IngestedMessage, MessagePersister, MessageProcessor, ProcessorError,
 };
 use crate::search::query_engine::QueryEngine;
 use crate::{
-    ClientMessageId, DeliveryCursor, Error, KChatCore, Result, SearchQuery, SearchResult,
-    SearchScope,
+    BackupResult, BackupSource, ClientMessageId, DeliveryCursor, Error, HydratedMessage, KChatCore,
+    OffloadResult, RestoreResult, Result, SearchQuery, SearchResult, SearchScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +138,87 @@ impl CoreImpl {
         let db = self.db.lock().expect("db mutex poisoned");
         f(&db)
     }
+
+    // ----------------------------------------------------------------
+    // Conversation management — Task 4 (`docs/PROPOSAL.md §12`)
+    // ----------------------------------------------------------------
+
+    /// Insert a new `conversation` row with the given id and optional
+    /// title. The conversation is created un-pinned, un-muted, with
+    /// `last_activity_ms` initialized to the supplied wall-clock
+    /// timestamp.
+    ///
+    /// **Phase-1 note.** Title encryption (`K_local_db`-AEAD-sealed
+    /// `title_cipher`) lands with the conversation-metadata
+    /// roadmap in Phase 2. For now `title` is stored verbatim as
+    /// UTF-8 bytes so the bridge can already round-trip the field
+    /// through the public API.
+    pub fn create_conversation(
+        &self,
+        conversation_id: Uuid,
+        title: Option<&str>,
+        last_activity_ms: i64,
+    ) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let conv = Conversation {
+            conversation_id: conversation_id.to_string(),
+            title_cipher: title.map(|t| t.as_bytes().to_vec()),
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms,
+        };
+        db.insert_conversation(&conv)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List every conversation, pinned-first then by descending
+    /// `last_activity_ms`.
+    pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.list_conversations()
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Fetch a single conversation by id. Returns `Ok(None)` when
+    /// the row does not exist.
+    pub fn get_conversation(&self, conversation_id: Uuid) -> Result<Option<Conversation>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.get_conversation(&conversation_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Update the `pinned` flag for `conversation_id`. Errors with
+    /// [`Error::Storage`] when the row does not exist so callers can
+    /// surface the failure to the user instead of silently no-op'ing.
+    pub fn update_conversation_pin(&self, conversation_id: Uuid, pinned: bool) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let n = db
+            .update_conversation_pin(&conversation_id.to_string(), pinned)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if n == 0 {
+            return Err(Error::Storage(format!(
+                "no conversation with id={conversation_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Update the `muted` flag for `conversation_id`. Errors with
+    /// [`Error::Storage`] when the row does not exist.
+    pub fn update_conversation_mute(&self, conversation_id: Uuid, muted: bool) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let n = db
+            .update_conversation_mute(&conversation_id.to_string(), muted)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if n == 0 {
+            return Err(Error::Storage(format!(
+                "no conversation with id={conversation_id}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl KChatCore for CoreImpl {
@@ -186,6 +269,42 @@ impl KChatCore for CoreImpl {
         engine
             .execute_search(&query, &scope)
             .map_err(|e| Error::Search(e.to_string()))
+    }
+
+    fn send_media(
+        &self,
+        _conversation_id: Uuid,
+        _local_file: &Path,
+        _caption: Option<&str>,
+    ) -> Result<ClientMessageId> {
+        // Phase-1 stub: media chunking, AEAD encryption, descriptor
+        // signing, and outbox bookkeeping land in Phase 2 alongside
+        // the media-search index.
+        Err(Error::NotImplemented("send_media"))
+    }
+
+    fn hydrate_message(&self, _message_id: Uuid, _reason: &str) -> Result<HydratedMessage> {
+        // Phase-1 stub: rehydration arrives with the offload engine
+        // in Phase 3.
+        Err(Error::NotImplemented("hydrate_message"))
+    }
+
+    fn run_incremental_backup(&self, _reason: &str) -> Result<BackupResult> {
+        // Phase-1 stub: backup segment packing + manifest signing
+        // arrives in Phase 4.
+        Err(Error::NotImplemented("run_incremental_backup"))
+    }
+
+    fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
+        // Phase-1 stub: storage-budget enforcement / offload tier
+        // demotion arrives in Phase 3.
+        Err(Error::NotImplemented("enforce_storage_budget"))
+    }
+
+    fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
+        // Phase-1 stub: backup restore + journal replay arrives in
+        // Phase 4.
+        Err(Error::NotImplemented("restore_from_backup"))
     }
 }
 
@@ -390,5 +509,150 @@ mod tests {
         let core = fresh_core();
         assert_eq!(core.config().tenant_id, "tenant-test");
         assert_eq!(core.config().platform, Platform::MacOs);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase-1 stub trait methods — Task 3
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn send_media_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core
+            .send_media(Uuid::now_v7(), Path::new("/tmp/none"), Some("caption"))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("send_media")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn hydrate_message_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core
+            .hydrate_message(Uuid::now_v7(), "search-result-tap")
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("hydrate_message")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn run_incremental_backup_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core.run_incremental_backup("scheduled").unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("run_incremental_backup")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_storage_budget_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core.enforce_storage_budget("app-launch").unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("enforce_storage_budget")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn restore_from_backup_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core
+            .restore_from_backup(BackupSource::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("restore_from_backup")),
+            "got {err:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Conversation management — Task 4
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn create_and_list_conversations() {
+        let core = fresh_core();
+        let c_old = Uuid::now_v7();
+        let c_mid = Uuid::now_v7();
+        let c_new = Uuid::now_v7();
+        core.create_conversation(c_old, Some("old"), 1_000).unwrap();
+        core.create_conversation(c_mid, None, 2_000).unwrap();
+        core.create_conversation(c_new, Some("new"), 3_000).unwrap();
+
+        let list = core.list_conversations().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].conversation_id, c_new.to_string());
+        assert_eq!(list[1].conversation_id, c_mid.to_string());
+        assert_eq!(list[2].conversation_id, c_old.to_string());
+        assert_eq!(list[0].title_cipher.as_deref(), Some(b"new" as &[u8]));
+        assert_eq!(list[1].title_cipher, None);
+    }
+
+    #[test]
+    fn get_conversation_returns_none_for_missing() {
+        let core = fresh_core();
+        assert_eq!(core.get_conversation(Uuid::now_v7()).unwrap(), None);
+    }
+
+    #[test]
+    fn pin_and_mute_round_trip() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        core.create_conversation(conv, Some("daily-standup"), 1_000)
+            .unwrap();
+        let row = core.get_conversation(conv).unwrap().unwrap();
+        assert!(!row.pinned);
+        assert!(!row.muted);
+
+        core.update_conversation_pin(conv, true).unwrap();
+        core.update_conversation_mute(conv, true).unwrap();
+        let row = core.get_conversation(conv).unwrap().unwrap();
+        assert!(row.pinned);
+        assert!(row.muted);
+
+        core.update_conversation_pin(conv, false).unwrap();
+        core.update_conversation_mute(conv, false).unwrap();
+        let row = core.get_conversation(conv).unwrap().unwrap();
+        assert!(!row.pinned);
+        assert!(!row.muted);
+    }
+
+    #[test]
+    fn pin_missing_conversation_errors() {
+        let core = fresh_core();
+        let err = core
+            .update_conversation_pin(Uuid::now_v7(), true)
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mute_missing_conversation_errors() {
+        let core = fresh_core();
+        let err = core
+            .update_conversation_mute(Uuid::now_v7(), true)
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn list_conversations_orders_pinned_first() {
+        let core = fresh_core();
+        let c_a = Uuid::now_v7();
+        let c_b = Uuid::now_v7();
+        core.create_conversation(c_a, None, 1_000).unwrap();
+        core.create_conversation(c_b, None, 2_000).unwrap();
+        core.update_conversation_pin(c_a, true).unwrap();
+
+        let list = core.list_conversations().unwrap();
+        assert_eq!(list[0].conversation_id, c_a.to_string());
+        assert!(list[0].pinned);
+        assert_eq!(list[1].conversation_id, c_b.to_string());
     }
 }

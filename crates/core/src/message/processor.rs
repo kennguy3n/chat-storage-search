@@ -29,6 +29,7 @@ use crate::local_store::schema::{
 use crate::local_store::state_machines::{
     ArchiveState, BackupState, BodyState, StateTransitionError,
 };
+use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::ClientMessageId;
 
 // ---------------------------------------------------------------------------
@@ -361,6 +362,7 @@ impl<'a> MessagePersister<'a> {
                 skel.created_at_ms,
                 text,
             )?;
+            FuzzySearchEngine::new(self.db).index_message(&skel.message_id, text)?;
         }
 
         let payload = encode_event_payload(
@@ -460,6 +462,7 @@ impl<'a> MessagePersister<'a> {
             entry.created_at_ms,
             &entry.text_content,
         )?;
+        FuzzySearchEngine::new(self.db).index_message(&mid, &entry.text_content)?;
 
         let payload = encode_event_payload(&mid, &conv, "self", entry.created_at_ms);
         let journal = BackupEventJournalEntry {
@@ -582,6 +585,9 @@ impl<'a> MessagePersister<'a> {
             skel.created_at_ms,
             new_text,
         )?;
+        let fuzzy = FuzzySearchEngine::new(self.db);
+        fuzzy.remove_message(&skel.message_id)?;
+        fuzzy.index_message(&skel.message_id, new_text)?;
         let payload = encode_edit_event_payload(&skel.message_id, edited_at_ms);
         let entry = BackupEventJournalEntry {
             event_seq: 0,
@@ -662,6 +668,7 @@ impl<'a> MessagePersister<'a> {
         self.db
             .update_skeleton_deleted(&skel.message_id, deleted_at_ms, target)?;
         self.db.delete_fts_row(&skel.message_id)?;
+        FuzzySearchEngine::new(self.db).remove_message(&skel.message_id)?;
         if matches!(scope, DeleteScope::ForEveryone) {
             self.db.delete_message_body(&skel.message_id)?;
         }
@@ -1454,5 +1461,115 @@ mod tests {
             matches!(err, ProcessorError::IllegalTransition(_)),
             "expected IllegalTransition; got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Fuzzy index maintenance — Task 1
+    // -----------------------------------------------------------------
+
+    fn fuzzy_count(db: &LocalStoreDb, message_id: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM search_fuzzy WHERE message_id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fuzzy_token_match_count(db: &LocalStoreDb, token: &str, message_id: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM search_fuzzy
+                  WHERE token = ?1 AND message_id = ?2",
+                params![token, message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn persist_ingested_message_indexes_fuzzy_tokens() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+
+        // The fuzzy index must carry every distinct trigram of the
+        // lowercased text against this message id.
+        assert!(
+            fuzzy_count(&db, &mid_s) > 0,
+            "expected search_fuzzy rows for {mid_s}"
+        );
+        assert_eq!(fuzzy_token_match_count(&db, "lig", &mid_s), 1);
+        assert_eq!(fuzzy_token_match_count(&db, "use", &mid_s), 1);
+        assert_eq!(fuzzy_token_match_count(&db, "kee", &mid_s), 1);
+    }
+
+    #[test]
+    fn edit_message_updates_fuzzy_tokens() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+
+        // Pre-edit: original trigrams are present.
+        assert_eq!(fuzzy_token_match_count(&db, "lig", &mid_s), 1);
+        assert_eq!(fuzzy_token_match_count(&db, "kee", &mid_s), 1);
+
+        p.edit_message(&mid_s, "fresh banana smoothie")
+            .expect("edit");
+
+        // Post-edit: old trigrams are gone, new trigrams are present.
+        assert_eq!(fuzzy_token_match_count(&db, "lig", &mid_s), 0);
+        assert_eq!(fuzzy_token_match_count(&db, "kee", &mid_s), 0);
+        assert_eq!(fuzzy_token_match_count(&db, "fre", &mid_s), 1);
+        assert_eq!(fuzzy_token_match_count(&db, "ban", &mid_s), 1);
+        assert_eq!(fuzzy_token_match_count(&db, "smo", &mid_s), 1);
+    }
+
+    #[test]
+    fn delete_for_me_removes_fuzzy_tokens() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+        assert!(fuzzy_count(&db, &mid_s) > 0);
+
+        p.delete_for_me(&mid_s).expect("delete_for_me");
+        assert_eq!(fuzzy_count(&db, &mid_s), 0);
+    }
+
+    #[test]
+    fn delete_for_everyone_removes_fuzzy_tokens() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+        assert!(fuzzy_count(&db, &mid_s) > 0);
+
+        p.delete_for_everyone(&mid_s).expect("delete_for_everyone");
+        assert_eq!(fuzzy_count(&db, &mid_s), 0);
+    }
+
+    #[test]
+    fn persist_outbox_entry_indexes_fuzzy_tokens() {
+        // The outbox path also writes through to FTS5, so it must
+        // keep the fuzzy index in lock-step.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry = MessageProcessor::create_outbox_entry(conv, "lighthouse keeper", None).unwrap();
+        let cmid = p.persist_outbox_entry(&entry).unwrap();
+        assert!(fuzzy_count(&db, &cmid.0.to_string()) > 0);
     }
 }

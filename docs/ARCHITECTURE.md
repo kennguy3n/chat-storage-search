@@ -153,26 +153,43 @@ goes through the FFI bridge for the host platform.
 >   `"phrase"` and trailing-`*` prefix queries plus the explicit
 >   `AND` / `OR` / `NOT` / `NEAR` operators.
 > * `crates/core/src/search/query_engine.rs` is the **Phase-1
->   unified search engine**: `QueryEngine::execute_search`
->   intersects FTS hits with structured `WHERE` clauses on
->   `message_skeleton` (`sender_filter`, `conversation_filter`,
->   `date_from` / `date_to`, `content_kind`) by `message_id`,
->   maps the rows to `SearchResult { snippet, rank_score,
->   is_cold }`, and short-circuits to a recency-ordered skeleton
->   scan when the query string is empty. `SearchScope::LocalOnly`
->   is honored — no archive fan-out attempts in Phase 1.
+>   unified search engine**: `QueryEngine::execute_search` fans
+>   out to both `TextSearchEngine::search_fts` and
+>   `FuzzySearchEngine::search_fuzzy`, deduplicates the union by
+>   `message_id`, and weights the merged scores with
+>   `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0` per
+>   `docs/PROPOSAL.md §7.5` so exact hits always outrank
+>   fuzzy-only hits on the same query. Fuzzy-only rows are
+>   skeleton-hydrated through one
+>   `fetch_skeleton_basic_info()` batch query so the engine
+>   does not pay one round-trip per fuzzy hit. The same
+>   structured `WHERE` clause on `message_skeleton`
+>   (`sender_filter`, `conversation_filter`, `date_from` /
+>   `date_to`, `content_kind`) filters both engine outputs via
+>   the unified `allowed_skeleton_ids()` helper. The result is
+>   mapped to `SearchResult { snippet, rank_score, is_cold }`
+>   and short-circuits to a recency-ordered skeleton scan when
+>   the query string is empty. `SearchScope::LocalOnly` is
+>   honored — no archive fan-out attempts in Phase 1.
 > * `crates/core/src/search/fuzzy_search.rs` is the **early
->   Phase-5 foundation** for the fuzzy index: `FuzzyTokenizer`
->   splits text into per-script runs via `segment_by_script` and
->   emits trigrams or bigrams per `fuzzy_granularity(script)`
->   from §3 of `docs/PROPOSAL.md`. Tokens are lowercased for
->   case-insensitive matching and never straddle ASCII whitespace
->   / punctuation / digit boundaries. `FuzzySearchEngine` writes
->   into the `search_fuzzy` table (`message_id`, `token`,
->   `script`) with `INSERT OR IGNORE` semantics, supports
->   `remove_message`, and ranks `search_fuzzy` results by
->   token-overlap ratio. The encrypted-shard / archive fan-out
->   path arrives later in Phase 5.
+>   Phase-5 foundation** for the fuzzy index, now wired into the
+>   Phase-1 hot path. `FuzzyTokenizer` splits text into
+>   per-script runs via `segment_by_script` and emits trigrams
+>   or bigrams per `fuzzy_granularity(script)` from §3 of
+>   `docs/PROPOSAL.md`. Tokens are lowercased for
+>   case-insensitive matching and never straddle ASCII
+>   whitespace / punctuation / digit boundaries.
+>   `FuzzySearchEngine` writes into the `search_fuzzy` table
+>   (`message_id`, `token`, `script`) with `INSERT OR IGNORE`
+>   semantics, supports `remove_message`, and ranks
+>   `search_fuzzy` results by token-overlap ratio.
+>   `MessagePersister` (above) calls `index_message` from
+>   `persist_ingested_message` / `persist_outbox_entry`,
+>   `remove_message` + `index_message` from `edit_message`, and
+>   `remove_message` from `delete_for_me` /
+>   `delete_for_everyone` so the FTS5 and fuzzy indexes stay in
+>   lock-step on every body mutation. The encrypted-shard /
+>   archive fan-out path arrives later in Phase 5.
 > * `crates/core/src/core_impl.rs` is the **Phase-1 concrete
 >   `KChatCore` implementation**. `CoreImpl::new(config, key)`
 >   opens the SQLCipher store, retains the 32-byte
@@ -189,6 +206,18 @@ goes through the FFI bridge for the host platform.
 >   delivery client lands; the inherent
 >   `CoreImpl::ingest_messages(&[IngestedMessage])` is the
 >   batch-ingest path tests and bridges currently use.
+>   Inherent **conversation-management methods**
+>   (`create_conversation`, `list_conversations`,
+>   `get_conversation`, `update_conversation_pin`,
+>   `update_conversation_mute`) wrap the matching helpers on
+>   `LocalStoreDb` and surface `Error::Storage` when the
+>   conversation does not exist so the bridge layer can show
+>   the failure to the user. The Phase-2/3/4 trait methods
+>   `send_media`, `hydrate_message`, `run_incremental_backup`,
+>   `enforce_storage_budget`, and `restore_from_backup`
+>   currently return `Err(Error::NotImplemented(<method>))` —
+>   the surface is locked but the implementation lands with
+>   the relevant later phase.
 > * `crates/core/benches/phase1_benchmarks.rs` is the **Phase-1
 >   performance benchmark suite** (criterion). Five benches
 >   exercise `MessagePersister::persist_ingested_message`
@@ -282,18 +311,33 @@ the standard library and chosen primitives.
 > the same `wrap_key` / `unwrap_key` primitives.
 >
 > Phase 1 has additionally landed the `local_store::schema`,
-> `local_store::db` (SQLCipher binding + CRUD helpers),
+> `local_store::db` (SQLCipher binding + CRUD helpers + the
+> conversation-management helpers `list_conversations` /
+> `update_conversation_pin` / `update_conversation_mute`),
 > `local_store::state_machines`, `message::processor` (validators
-> *and* DB-backed `MessagePersister` with edit / delete operations),
+> *and* DB-backed `MessagePersister` that now indexes both
+> `search_fts` and `search_fuzzy` on every body mutation
+> through edit / delete),
 > `search::tokenizer`, `search::text_search` (FTS5 BM25 engine),
-> `search::query_engine` (unified FTS + structured search), and
-> the early-Phase-5 `search::fuzzy_search` (script-aware n-gram
-> indexer) modules, plus the expanded `KChatCore` public-API
-> trait in `lib.rs` (`SearchQuery`, `SearchScope`, `SearchResult`,
-> `HydrationReason`, `BackupReason`, `StoragePressureReason`,
-> `ClientMessageId`, `DeliveryCursor`) and its concrete
-> implementation `core_impl::CoreImpl` wiring `send_text` /
-> `ingest_messages` / `search` to the SQLCipher store. A
+> `search::query_engine` (unified FTS + fuzzy + structured
+> search merged by `message_id` with PROPOSAL.md §7.5 weights),
+> and the early-Phase-5 `search::fuzzy_search` (script-aware
+> n-gram indexer) modules, plus the expanded `KChatCore`
+> public-API trait in `lib.rs` (`SearchQuery`, `SearchScope`,
+> `SearchResult`, `HydrationReason`, `BackupReason`,
+> `StoragePressureReason`, `ClientMessageId`, `DeliveryCursor`,
+> the new placeholder result types `HydratedMessage` /
+> `BackupResult` / `OffloadResult` / `RestoreResult` /
+> `BackupSource`, and `Error::NotImplemented(&'static str)`)
+> and its concrete implementation `core_impl::CoreImpl` wiring
+> `send_text` / `ingest_messages` / `search` to the SQLCipher
+> store, exposing inherent conversation-management methods
+> (`create_conversation` / `list_conversations` /
+> `get_conversation` / `update_conversation_pin` /
+> `update_conversation_mute`), and stubbing the Phase-2/3/4
+> trait methods (`send_media` / `hydrate_message` /
+> `run_incremental_backup` / `enforce_storage_budget` /
+> `restore_from_backup`) with `Error::NotImplemented`. A
 > criterion benchmark suite at
 > `crates/core/benches/phase1_benchmarks.rs` enforces the
 > < 20 ms / < 150 ms p95 budgets from §13 of

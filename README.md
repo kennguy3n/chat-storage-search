@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~70%`.**
+> Search + MLS Integration — `In progress | ~80%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -28,24 +28,40 @@
 > with `try_transition` (`local_store::state_machines`),
 > SQLCipher-backed local store (`local_store::db::LocalStoreDb` with
 > `PRAGMA key`, foreign-key enforcement, ICU/`unicode61` schema
-> bring-up, conversation/skeleton/body CRUD), the message processor
+> bring-up, conversation/skeleton/body CRUD plus
+> `list_conversations` / `update_conversation_pin` /
+> `update_conversation_mute`), the message processor
 > with DB-backed `MessagePersister` (transactional skeleton + body +
 > FTS row + journal entry, idempotent on `message_id`, plus
 > `edit_message` / `delete_for_me` / `delete_for_everyone` with FTS
-> + journal maintenance), the FTS5 text search engine
-> (`search::text_search::TextSearchEngine` with BM25-ordered
-> queries, snippet highlighting, prefix-search and phrase-quote
-> handling), the unified query engine
-> (`search::query_engine::QueryEngine` combining FTS5 with
-> structured `sender` / `conversation` / `date_from` / `date_to` /
+> **and fuzzy-index** maintenance — every persisted body is now
+> dual-indexed into `search_fts` and `search_fuzzy`), the FTS5 text
+> search engine (`search::text_search::TextSearchEngine` with
+> BM25-ordered queries, snippet highlighting, prefix-search and
+> phrase-quote handling), the unified query engine
+> (`search::query_engine::QueryEngine` merging FTS5 + fuzzy hits by
+> `message_id` with PROPOSAL.md §7.5 ranking weights
+> `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0` plus structured
+> `sender` / `conversation` / `date_from` / `date_to` /
 > `content_kind` filters), the script-aware **fuzzy token indexer**
 > (`search::fuzzy_search::{FuzzyTokenizer, FuzzySearchEngine}`,
 > trigrams for alphabetic scripts / bigrams for CJK), the
 > concrete **`CoreImpl`** `KChatCore` implementation
 > (`core_impl.rs`) wiring `send_text` / `ingest_messages` /
-> `search` to the SQLCipher store, the multilingual integration
-> test at `crates/core/tests/multilingual_search.rs`, and the
-> Phase-1 **criterion benchmark suite**
+> `search` to the SQLCipher store, the **conversation-management
+> API** on `CoreImpl` (`create_conversation` /
+> `list_conversations` / `get_conversation` /
+> `update_conversation_pin` / `update_conversation_mute`), the
+> **Phase-1 stub trait surface** for the rest of
+> `docs/PROPOSAL.md §12` (`send_media`, `hydrate_message`,
+> `run_incremental_backup`, `enforce_storage_budget`,
+> `restore_from_backup`) returning
+> `Err(Error::NotImplemented(<method>))`, the multilingual
+> integration tests at `crates/core/tests/multilingual_search.rs`
+> + `crates/core/tests/multilingual_fuzzy_search.rs` (combined
+> FTS5 + fuzzy across Latin / Cyrillic / Arabic / Thai trigrams,
+> CJK bigrams, mixed script, dedup, ranking, and structured
+> filters), and the Phase-1 **criterion benchmark suite**
 > (`crates/core/benches/phase1_benchmarks.rs`) validating the
 > < 20 ms / < 150 ms p95 budgets.
 >
@@ -121,7 +137,8 @@ chat-storage-search/
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
-        multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari round-trip
+        multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
+        multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
         pattern_c_interop_vectors.json
     ios-bridge/                             # UniFFI → Swift (Phase 1)
@@ -192,23 +209,30 @@ The Phase 0 + Phase 1 test surface covers:
   SQLCipher bring-up (`PRAGMA key`, foreign-key enforcement,
   ICU→`unicode61` schema fallback), `LocalStoreDb` CRUD round-trip
   for conversation / skeleton / body / `update_body_state` /
-  `insert_backup_event`, FK-violation enforcement.
+  `insert_backup_event`, FK-violation enforcement, and the
+  conversation-management helpers `list_conversations` (pinned
+  first, then descending `last_activity_ms`),
+  `update_conversation_pin`, `update_conversation_mute`.
 * [`message::processor`](crates/core/src/message/processor.rs) —
   `validate_ingest`, deduplication, outbox creation with monotonic
   UUID v7, plus the `MessagePersister` integration tests for
   transactional skeleton + body + FTS5 + journal writes,
   duplicate rejection, `mark_sent` event-journal entries, and the
   edit / delete operations (`edit_message`, `delete_for_me`,
-  `delete_for_everyone`) with FTS5 maintenance, body-state
-  transition validation, and `"message_edited"` /
-  `"message_deleted"` journal entries.
+  `delete_for_everyone`) with FTS5 **and fuzzy-index** maintenance
+  (`search_fuzzy` rows are written / re-written / removed in
+  lock-step with FTS), body-state transition validation, and
+  `"message_edited"` / `"message_deleted"` journal entries.
 * [`search::text_search`](crates/core/src/search/text_search.rs) —
   BM25 ordering, snippet highlighting, prefix queries, phrase
   quoting, special-character escaping in free-text input.
 * [`search::query_engine`](crates/core/src/search/query_engine.rs)
   — sender / conversation / date / content-kind filters, FTS
-  combined with structured filters by `message_id` intersection,
-  `SearchScope::LocalOnly` invariant.
+  **merged with fuzzy** by `message_id` (PROPOSAL.md §7.5
+  `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0`), exact > fuzzy
+  ranking, dedup on cross-engine hits, batch skeleton-hydration
+  for fuzzy-only rows, structured filters narrowing the unioned
+  candidates, and the `SearchScope::LocalOnly` invariant.
 * [`search::fuzzy_search`](crates/core/src/search/fuzzy_search.rs)
   — script-aware n-gram tokenization (trigrams for alphabetic
   scripts, bigrams for CJK), index / remove / search round-trip
@@ -217,19 +241,37 @@ The Phase 0 + Phase 1 test surface covers:
 * [`core_impl`](crates/core/src/core_impl.rs) — concrete
   `KChatCore` round-trip tests: `send_text` → skeleton + body +
   FTS check, `ingest_messages` → search round-trip, duplicate
-  rejection, `initialize` re-open at a new `data_dir`.
+  rejection, `initialize` re-open at a new `data_dir`, the
+  conversation-management surface (`create_conversation` /
+  `list_conversations` / `get_conversation` / pin / mute), and
+  the Phase-1 `Error::NotImplemented` stubs for `send_media` /
+  `hydrate_message` / `run_incremental_backup` /
+  `enforce_storage_budget` / `restore_from_backup`.
 * [`lib.rs`](crates/core/src/lib.rs) — public API type
   construction, default `SearchScope::IncludeCold`, P0–P5 ordering
-  on `HydrationReason`, `Error` variant `Display` strings.
+  on `HydrationReason`, `Error` variant `Display` strings
+  (including the new `Error::NotImplemented(&'static str)` so
+  callers can pattern-match on missing capabilities), plus serde
+  round-trip for the Phase-1 placeholder result types
+  `HydratedMessage`, `BackupResult`, `OffloadResult`,
+  `RestoreResult`, and the `BackupSource` input type.
 * Integration tests under
   [`crates/core/tests/`](crates/core/tests/) — cross-language
   Pattern C vectors, manifest signing, key-wrap-by-hierarchy-root,
-  and the [multilingual search
+  the [multilingual FTS5 search
   round-trip](crates/core/tests/multilingual_search.rs) covering
   Latin / Cyrillic / Han / Hiragana-Katakana / Arabic / Thai /
-  Devanagari / mixed-script messages. CJK and Thai word-level
-  searches require an ICU-linked SQLCipher build and soft-skip on
-  the bundled `unicode61`-only configuration.
+  Devanagari / mixed-script messages, and the [combined FTS5 +
+  fuzzy multilingual
+  suite](crates/core/tests/multilingual_fuzzy_search.rs)
+  exercising Latin / Cyrillic / Arabic / Thai trigram typo
+  recovery, CJK bigram match, mixed-script same-row hits via two
+  different queries, cross-engine deduplication, exact-vs-fuzzy
+  ranking, and `conversation_filter` / `sender_filter` narrowing
+  of fuzzy candidates. CJK and Thai word-level FTS searches
+  require an ICU-linked SQLCipher build and soft-skip on the
+  bundled `unicode61`-only configuration; the fuzzy half runs
+  unconditionally because the n-gram tokenizer is pure Rust.
 
 > SQLCipher is bundled by `rusqlite`'s
 > `bundled-sqlcipher-vendored-openssl` feature, so `cargo test` does

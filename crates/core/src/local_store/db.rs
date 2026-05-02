@@ -273,6 +273,55 @@ impl LocalStoreDb {
             .map_err(DbError::from)
     }
 
+    /// List every conversation row, newest activity first.
+    ///
+    /// Pinned conversations come first (still ordered by activity)
+    /// because the public KChatCore surface treats pinning as a
+    /// recency-override flag.
+    pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT conversation_id, title_cipher, pinned, muted,
+                    last_message_id, last_activity_ms
+               FROM conversation
+              ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Conversation {
+                    conversation_id: row.get(0)?,
+                    title_cipher: row.get(1)?,
+                    pinned: row.get::<_, i64>(2)? != 0,
+                    muted: row.get::<_, i64>(3)? != 0,
+                    last_message_id: row.get(4)?,
+                    last_activity_ms: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Toggle the `pinned` flag for `conversation_id`. Returns the
+    /// number of rows that were updated (`0` when the conversation
+    /// does not exist).
+    pub fn update_conversation_pin(&self, conversation_id: &str, pinned: bool) -> DbResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE conversation SET pinned = ?1 WHERE conversation_id = ?2",
+            params![pinned as i64, conversation_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Toggle the `muted` flag for `conversation_id`. Returns the
+    /// number of rows that were updated (`0` when the conversation
+    /// does not exist).
+    pub fn update_conversation_mute(&self, conversation_id: &str, muted: bool) -> DbResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE conversation SET muted = ?1 WHERE conversation_id = ?2",
+            params![muted as i64, conversation_id],
+        )?;
+        Ok(n)
+    }
+
     /// Fetch a message skeleton by id, if present.
     pub fn get_message_skeleton(&self, message_id: &str) -> DbResult<Option<MessageSkeleton>> {
         let row = self
@@ -844,5 +893,88 @@ mod tests {
         assert_eq!(count, 0);
         // Second delete on a missing row is still Ok.
         db.delete_fts_row("m").unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Conversation management — Task 4
+    // -----------------------------------------------------------------
+
+    fn build_conv(id: &str, last_activity_ms: i64, pinned: bool) -> Conversation {
+        Conversation {
+            conversation_id: id.into(),
+            title_cipher: None,
+            pinned,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms,
+        }
+    }
+
+    #[test]
+    fn list_conversations_orders_by_pinned_then_activity() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-old", 1_000, false))
+            .unwrap();
+        db.insert_conversation(&build_conv("c-mid", 2_000, false))
+            .unwrap();
+        db.insert_conversation(&build_conv("c-new", 3_000, false))
+            .unwrap();
+        // Pinned conversation rises to the top regardless of recency.
+        db.insert_conversation(&build_conv("c-pin", 500, true))
+            .unwrap();
+
+        let list = db.list_conversations().unwrap();
+        let ids: Vec<&str> = list.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert_eq!(ids, ["c-pin", "c-new", "c-mid", "c-old"]);
+    }
+
+    #[test]
+    fn list_conversations_returns_empty_for_fresh_db() {
+        let db = fresh_db();
+        assert!(db.list_conversations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_conversation_pin_round_trip() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        let n = db.update_conversation_pin("c-1", true).unwrap();
+        assert_eq!(n, 1);
+        let row = db.get_conversation("c-1").unwrap().unwrap();
+        assert!(row.pinned);
+        let n = db.update_conversation_pin("c-1", false).unwrap();
+        assert_eq!(n, 1);
+        let row = db.get_conversation("c-1").unwrap().unwrap();
+        assert!(!row.pinned);
+    }
+
+    #[test]
+    fn update_conversation_pin_returns_zero_for_missing_id() {
+        let db = fresh_db();
+        let n = db.update_conversation_pin("does-not-exist", true).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn update_conversation_mute_round_trip() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        let n = db.update_conversation_mute("c-1", true).unwrap();
+        assert_eq!(n, 1);
+        let row = db.get_conversation("c-1").unwrap().unwrap();
+        assert!(row.muted);
+        let n = db.update_conversation_mute("c-1", false).unwrap();
+        assert_eq!(n, 1);
+        let row = db.get_conversation("c-1").unwrap().unwrap();
+        assert!(!row.muted);
+    }
+
+    #[test]
+    fn update_conversation_mute_returns_zero_for_missing_id() {
+        let db = fresh_db();
+        let n = db.update_conversation_mute("does-not-exist", true).unwrap();
+        assert_eq!(n, 0);
     }
 }

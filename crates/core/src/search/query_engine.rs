@@ -1,31 +1,47 @@
-//! Unified query engine combining FTS5 with structured filters.
+//! Unified query engine combining FTS5, fuzzy search, and structured
+//! filters.
 //!
 //! `docs/PROPOSAL.md §12` defines the [`SearchQuery`] /
 //! [`SearchScope`] / [`SearchResult`] surface. Phase 1 lands the
 //! local-store half: the engine reads from `search_fts` for free-text
-//! queries, applies the structured filters (sender / conversation /
-//! date range / content kind) as SQL `WHERE` clauses against
-//! `message_skeleton`, and merges the two using a JOIN keyed on
-//! `message_id`.
+//! queries, fans the same query out to the script-aware fuzzy index
+//! ([`FuzzySearchEngine`]) for typo / partial / cross-script matches,
+//! applies the structured filters (sender / conversation / date range
+//! / content kind) as SQL `WHERE` clauses against `message_skeleton`,
+//! and merges the two using a `message_id`-keyed dedup.
 //!
 //! When the query string is empty the engine returns skeleton rows
 //! ordered by recency. When it is non-empty the engine intersects
-//! the FTS5 hits with the structured filters and returns the union
-//! ordered by BM25 (highest-relevance first).
+//! the FTS5 + fuzzy hits with the structured filters and returns the
+//! union ordered by `rank_score` (highest-relevance first).
+//!
+//! Ranking weights follow `docs/PROPOSAL.md §7.5`: BM25 is weighted
+//! at `2.0` and fuzzy-token-overlap at `1.0`, so a fuzzy-only hit
+//! always ranks below an FTS hit on the same query — and a row that
+//! matches both engines accumulates both contributions.
 //!
 //! [`SearchScope::IncludeCold`] is treated identically to
 //! [`SearchScope::LocalOnly`] for now — the personal-archive fan-out
 //! lands later in Phase 3 / Phase 5. Both scopes return only local
 //! rows in Phase 1, with `is_cold = false`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params_from_iter, types::Value};
 use uuid::Uuid;
 
 use crate::local_store::db::{DbResult, LocalStoreDb};
+use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::text_search::TextSearchEngine;
 use crate::{ContentKind, SearchQuery, SearchResult, SearchScope};
+
+/// BM25 contribution weight in the merged rank score
+/// (`docs/PROPOSAL.md §7.5`).
+const BM25_WEIGHT: f64 = 2.0;
+
+/// Fuzzy-token-overlap contribution weight in the merged rank score
+/// (`docs/PROPOSAL.md §7.5`).
+const FUZZY_WEIGHT: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // QueryEngine
@@ -73,7 +89,7 @@ impl<'a> QueryEngine<'a> {
         if trimmed.is_empty() {
             self.execute_structured_only(query, limit)
         } else {
-            self.execute_fts_with_filters(query, trimmed, limit)
+            self.execute_fts_and_fuzzy_with_filters(query, trimmed, limit)
         }
     }
 
@@ -130,31 +146,42 @@ impl<'a> QueryEngine<'a> {
     }
 
     // ----------------------------------------------------------------
-    // FTS + structured-filters path
+    // FTS + fuzzy + structured-filters path
     // ----------------------------------------------------------------
 
-    fn execute_fts_with_filters(
+    fn execute_fts_and_fuzzy_with_filters(
         &self,
         query: &SearchQuery,
         query_string: &str,
         limit: usize,
     ) -> DbResult<Vec<SearchResult>> {
         let fts_engine = TextSearchEngine::new(self.db);
-        // Pull a generous over-fetch so post-filtering still has
+        let fuzzy_engine = FuzzySearchEngine::new(self.db);
+        // Over-fetch each engine so the post-filter / dedup still has
         // enough rows to satisfy `limit`. 4× is a heuristic; the
         // structured-only path applies a hard ceiling.
         let fetch = limit.saturating_mul(4).max(limit);
-        let hits = fts_engine.search_fts(query_string, fetch)?;
-        if hits.is_empty() {
+        let fts_hits = fts_engine.search_fts(query_string, fetch)?;
+        let fuzzy_hits = fuzzy_engine.search_fuzzy(query_string, fetch)?;
+        if fts_hits.is_empty() && fuzzy_hits.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Apply the structured filters by `message_id` set
-        // intersection.
-        let allowed_ids = self.allowed_skeleton_ids(query, &hits)?;
+        // Apply the structured filters across the union of FTS and
+        // fuzzy candidates. We pass the candidate ids in once so
+        // structured filtering is a single SQL round-trip.
+        let candidate_ids: Vec<String> = fts_hits
+            .iter()
+            .map(|h| h.message_id.clone())
+            .chain(fuzzy_hits.iter().map(|f| f.message_id.clone()))
+            .collect();
+        let allowed_ids = self.allowed_skeleton_ids(query, &candidate_ids)?;
 
-        let mut out = Vec::with_capacity(limit.min(hits.len()));
-        for h in hits {
+        // Merge FTS hits first — they carry conversation / sender /
+        // created_at_ms inline, so we never need a per-row skeleton
+        // lookup for them.
+        let mut by_id: HashMap<String, SearchResult> = HashMap::new();
+        for h in fts_hits {
             if let Some(allow) = &allowed_ids {
                 if !allow.contains(&h.message_id) {
                     continue;
@@ -163,21 +190,79 @@ impl<'a> QueryEngine<'a> {
             let mid_uuid = Uuid::parse_str(&h.message_id).unwrap_or(Uuid::nil());
             let cid_uuid = Uuid::parse_str(&h.conversation_id).unwrap_or(Uuid::nil());
             // FTS5's bm25() returns negative values — more negative is
-            // more relevant. Flip the sign so the public surface
-            // says "higher = better".
-            out.push(SearchResult {
-                message_id: mid_uuid,
-                conversation_id: cid_uuid,
-                sender_id: h.sender_id,
-                created_at_ms: h.created_at_ms,
-                snippet: Some(h.snippet),
-                rank_score: -h.bm25_score,
-                is_cold: false,
-            });
-            if out.len() >= limit {
-                break;
-            }
+            // more relevant. Flip the sign and weight per
+            // `docs/PROPOSAL.md §7.5`.
+            by_id.insert(
+                h.message_id.clone(),
+                SearchResult {
+                    message_id: mid_uuid,
+                    conversation_id: cid_uuid,
+                    sender_id: h.sender_id,
+                    created_at_ms: h.created_at_ms,
+                    snippet: Some(h.snippet),
+                    rank_score: -h.bm25_score * BM25_WEIGHT,
+                    is_cold: false,
+                },
+            );
         }
+
+        // Resolve skeleton info for any fuzzy-only hit so we can
+        // synthesize a SearchResult row without a snippet.
+        let fuzzy_only_ids: Vec<String> = fuzzy_hits
+            .iter()
+            .filter(|f| !by_id.contains_key(&f.message_id))
+            .map(|f| f.message_id.clone())
+            .collect();
+        let skel_info = if fuzzy_only_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.fetch_skeleton_basic_info(&fuzzy_only_ids)?
+        };
+
+        for f in fuzzy_hits {
+            if let Some(allow) = &allowed_ids {
+                if !allow.contains(&f.message_id) {
+                    continue;
+                }
+            }
+            if let Some(existing) = by_id.get_mut(&f.message_id) {
+                // Both engines hit this row: accumulate the fuzzy
+                // contribution on top of the FTS rank.
+                existing.rank_score += f.score * FUZZY_WEIGHT;
+            } else if let Some(info) = skel_info.get(&f.message_id) {
+                let mid_uuid = Uuid::parse_str(&f.message_id).unwrap_or(Uuid::nil());
+                let cid_uuid = Uuid::parse_str(&info.conversation_id).unwrap_or(Uuid::nil());
+                by_id.insert(
+                    f.message_id.clone(),
+                    SearchResult {
+                        message_id: mid_uuid,
+                        conversation_id: cid_uuid,
+                        sender_id: info.sender_id.clone(),
+                        created_at_ms: info.created_at_ms,
+                        // Fuzzy rows do not produce highlighted
+                        // snippets — those come from FTS5's snippet().
+                        snippet: None,
+                        rank_score: f.score * FUZZY_WEIGHT,
+                        is_cold: false,
+                    },
+                );
+            }
+            // If the skeleton lookup turned up nothing, the row was
+            // tombstoned out from under us between the fuzzy index
+            // and the skeleton table; drop it silently.
+        }
+
+        let mut out: Vec<SearchResult> = by_id.into_values().collect();
+        // Higher rank_score first; tie-break on created_at_ms DESC so
+        // the order is deterministic.
+        out.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -187,7 +272,7 @@ impl<'a> QueryEngine<'a> {
     fn allowed_skeleton_ids(
         &self,
         query: &SearchQuery,
-        candidates: &[crate::search::text_search::FtsMatch],
+        candidate_message_ids: &[String],
     ) -> DbResult<Option<HashSet<String>>> {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
@@ -195,15 +280,18 @@ impl<'a> QueryEngine<'a> {
         if clauses.is_empty() {
             return Ok(None);
         }
+        if candidate_message_ids.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
 
-        // Restrict the structured query to the FTS candidate set so
-        // we never scan the full skeleton table.
-        let placeholders = (0..candidates.len())
+        // Restrict the structured query to the candidate set so we
+        // never scan the full skeleton table.
+        let placeholders = (0..candidate_message_ids.len())
             .map(|i| format!("?{}", binds.len() + i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        for h in candidates {
-            binds.push(Value::Text(h.message_id.clone()));
+        for mid in candidate_message_ids {
+            binds.push(Value::Text(mid.clone()));
         }
 
         let mut sql = String::from("SELECT message_id FROM message_skeleton WHERE ");
@@ -221,6 +309,56 @@ impl<'a> QueryEngine<'a> {
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(Some(rows))
     }
+
+    /// Fetch skeleton basic info (`conversation_id`, `sender_id`,
+    /// `created_at_ms`) for `message_ids`. Returns one entry per
+    /// message id that exists in `message_skeleton`; missing ids are
+    /// silently dropped.
+    fn fetch_skeleton_basic_info(
+        &self,
+        message_ids: &[String],
+    ) -> DbResult<HashMap<String, SkeletonBasicInfo>> {
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..message_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms
+               FROM message_skeleton
+              WHERE message_id IN ({placeholders})"
+        );
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Value> = Vec::with_capacity(message_ids.len());
+        for mid in message_ids {
+            binds.push(Value::Text(mid.clone()));
+        }
+        let rows = stmt
+            .query_map(params_from_iter(binds.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SkeletonBasicInfo {
+                        conversation_id: row.get(1)?,
+                        sender_id: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+}
+
+/// Skeleton columns the merged search path needs for fuzzy-only
+/// matches that have no inline FTS row to read from.
+#[derive(Debug)]
+struct SkeletonBasicInfo {
+    conversation_id: String,
+    sender_id: String,
+    created_at_ms: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -576,5 +714,182 @@ mod tests {
             .execute_search_with_limit(&q, &SearchScope::LocalOnly, 2)
             .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ----------------------------------------------------------------
+    // Fuzzy-merged search — Task 2
+    // ----------------------------------------------------------------
+    //
+    // These tests insert messages via MessagePersister so both FTS
+    // and search_fuzzy are populated automatically (per Task 1's
+    // wiring). The QueryEngine then runs the unified search path
+    // and asserts on the merged ranking + dedup behavior.
+
+    use crate::message::processor::{IngestedMessage, MessagePersister};
+
+    fn fuzzy_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[0xFA; 32]).unwrap()
+    }
+
+    fn seed_conv(db: &LocalStoreDb, id: Uuid) {
+        db.insert_conversation(&crate::local_store::schema::Conversation {
+            conversation_id: id.to_string(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        })
+        .unwrap();
+    }
+
+    fn persist(p: &MessagePersister<'_>, conv: Uuid, sender: &str, ts: i64, text: &str) -> Uuid {
+        let mid = Uuid::now_v7();
+        p.persist_ingested_message(&IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: sender.into(),
+            created_at_ms: ts,
+            text_content: Some(text.into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        })
+        .expect("persist");
+        mid
+    }
+
+    #[test]
+    fn fuzzy_search_finds_typo_matches() {
+        // FTS5's "lighthose" query would NOT match an indexed
+        // "lighthouse keeper" row (different word). The script-aware
+        // fuzzy index, however, shares 5 of 7 trigrams between the
+        // two strings, so the unified engine surfaces the row.
+        let db = fuzzy_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv);
+        let mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "lighthose".into(),
+            ..Default::default()
+        };
+        let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert!(
+            results.iter().any(|r| r.message_id == mid),
+            "fuzzy should surface a near-miss against an FTS-only term; got {results:?}"
+        );
+    }
+
+    #[test]
+    fn combined_fts_and_fuzzy_deduplicates() {
+        // When the same row matches both engines, the merged result
+        // set must contain it exactly once.
+        let db = fuzzy_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv);
+        let mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let hits_for_mid = results.iter().filter(|r| r.message_id == mid).count();
+        assert_eq!(
+            hits_for_mid, 1,
+            "exact-term query should produce exactly one merged row; got {results:?}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_results_have_lower_rank_than_exact() {
+        // Insert two messages: one is an FTS5 exact match for the
+        // query word, the other only matches via fuzzy n-grams.
+        // The exact-match row must outrank the fuzzy-only row.
+        let db = fuzzy_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv);
+        let mid_exact = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
+        let mid_fuzzy = persist(&p, conv, "bob", 2_000, "lighthose typeo only");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+
+        let exact_pos = results
+            .iter()
+            .position(|r| r.message_id == mid_exact)
+            .expect("exact-match row must be present");
+        let fuzzy_pos = results
+            .iter()
+            .position(|r| r.message_id == mid_fuzzy)
+            .expect("fuzzy-only row must be present");
+        assert!(
+            exact_pos < fuzzy_pos,
+            "exact match must rank above fuzzy: {results:?}"
+        );
+        assert!(
+            results[exact_pos].rank_score > results[fuzzy_pos].rank_score,
+            "exact rank_score must exceed fuzzy rank_score: {:?} vs {:?}",
+            results[exact_pos].rank_score,
+            results[fuzzy_pos].rank_score
+        );
+    }
+
+    #[test]
+    fn fuzzy_only_results_carry_skeleton_metadata() {
+        // Fuzzy hits do not flow through search_fts — we have to
+        // hydrate conversation_id / sender_id / created_at_ms from
+        // message_skeleton. Verify that hydration is wired up.
+        let db = fuzzy_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv);
+        let mid = persist(&p, conv, "alice", 1_700_000_000_000, "lighthouse keeper");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "lighthose".into(),
+            ..Default::default()
+        };
+        let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let row = results.iter().find(|r| r.message_id == mid).expect("hit");
+        assert_eq!(row.conversation_id, conv);
+        assert_eq!(row.sender_id, "alice");
+        assert_eq!(row.created_at_ms, 1_700_000_000_000);
+        // Fuzzy-only rows have no FTS5 snippet to attach.
+        assert!(row.snippet.is_none());
+        assert!(row.rank_score > 0.0);
+    }
+
+    #[test]
+    fn fuzzy_search_respects_structured_filters() {
+        // Apply sender_filter on top of the merged FTS+fuzzy path
+        // and verify only matching senders survive.
+        let db = fuzzy_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv);
+        let _alice_mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
+        let bob_mid = persist(&p, conv, "bob", 2_000, "lighthose typeo only");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            sender_filter: Some("bob".into()),
+            ..Default::default()
+        };
+        let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, bob_mid);
+        assert_eq!(results[0].sender_id, "bob");
     }
 }

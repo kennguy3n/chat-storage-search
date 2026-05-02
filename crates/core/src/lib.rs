@@ -57,6 +57,8 @@ pub mod transport;
 pub use config::KChatCoreConfig;
 pub use core_impl::CoreImpl;
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -92,6 +94,13 @@ pub enum Error {
     /// fetch, MLS delivery cursor, …).
     #[error("transport: {0}")]
     Transport(String),
+
+    /// The requested API is part of the public trait surface but its
+    /// implementation has not landed yet. The string is the method
+    /// name (e.g. `"send_media"`) so callers can pattern-match on
+    /// which capability is missing without parsing free-form text.
+    #[error("not yet implemented: {0}")]
+    NotImplemented(&'static str),
 }
 
 /// Crate-wide [`Result`] alias.
@@ -259,6 +268,57 @@ impl Default for ClientMessageId {
 pub struct DeliveryCursor(pub String);
 
 // ---------------------------------------------------------------------------
+// Phase-1 placeholder result / source types
+// ---------------------------------------------------------------------------
+//
+// `docs/PROPOSAL.md §12` specifies a richer return shape for each of
+// these APIs; until the matching Phase-2 / Phase-3 / Phase-4 engines
+// land, the trait carries zero-field placeholders that round-trip
+// through serde so bridge crates can already pin the types in their
+// FFI surface.
+
+/// Result of [`KChatCore::hydrate_message`].
+///
+/// Phase-1 placeholder. The full hydration contract
+/// (decrypted body, decrypted media descriptors, hydration
+/// provenance) lands when the rehydration / restore engines arrive
+/// in Phase 2 / Phase 4.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedMessage {}
+
+/// Result of [`KChatCore::run_incremental_backup`].
+///
+/// Phase-1 placeholder. The full backup contract (segment count,
+/// manifest hash, byte budget consumed, …) lands with the backup
+/// engine in Phase 4.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupResult {}
+
+/// Result of [`KChatCore::enforce_storage_budget`].
+///
+/// Phase-1 placeholder. The full offload contract (rows demoted,
+/// bytes freed, archive segment refs created, …) lands with the
+/// offload engine in Phase 3.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffloadResult {}
+
+/// Result of [`KChatCore::restore_from_backup`].
+///
+/// Phase-1 placeholder. The full restore contract (manifest chain
+/// verified, segments installed, deferred rehydration plan, …)
+/// lands with the restore engine in Phase 4.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreResult {}
+
+/// Source descriptor for [`KChatCore::restore_from_backup`].
+///
+/// Phase-1 placeholder. The full source contract (backup root key
+/// reference, manifest chain head, transport handle for the backup
+/// sink, …) lands with the restore engine in Phase 4.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSource {}
+
+// ---------------------------------------------------------------------------
 // KChatCore trait
 // ---------------------------------------------------------------------------
 
@@ -304,6 +364,57 @@ pub trait KChatCore: Send + Sync {
     /// indexes (and, if `scope == IncludeCold`, the personal
     /// archive).
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>>;
+
+    /// Send an outbound media message: copy / encrypt the file at
+    /// `local_file`, persist a media descriptor + body row, and
+    /// queue the resulting outbox entry. Returns the new message's
+    /// [`ClientMessageId`].
+    ///
+    /// **Phase-1 stub.** The media-send pipeline (chunking, MLS
+    /// encryption, descriptor signing) lands in Phase 2. Until then
+    /// this method returns
+    /// `Err(Error::NotImplemented("send_media"))`.
+    fn send_media(
+        &self,
+        conversation_id: Uuid,
+        local_file: &Path,
+        caption: Option<&str>,
+    ) -> Result<ClientMessageId>;
+
+    /// Hydrate a previously offloaded message back into the local
+    /// store. `reason` is recorded in the rehydration journal so
+    /// rate-limited offload eviction can take the most-recent reason
+    /// into account.
+    ///
+    /// **Phase-1 stub.** The rehydration pipeline lands in Phase 3.
+    /// Until then this method returns
+    /// `Err(Error::NotImplemented("hydrate_message"))`.
+    fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage>;
+
+    /// Walk the backup event journal, pack new segments, and push
+    /// them to the configured backup sink.
+    ///
+    /// **Phase-1 stub.** The backup engine lands in Phase 4. Until
+    /// then this method returns
+    /// `Err(Error::NotImplemented("run_incremental_backup"))`.
+    fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult>;
+
+    /// Apply the storage budget defined by [`KChatCoreConfig`] —
+    /// demote message bodies to the offload tier, drop FTS / fuzzy
+    /// rows on demoted messages, and rewrite the backup journal.
+    ///
+    /// **Phase-1 stub.** The offload engine lands in Phase 3. Until
+    /// then this method returns
+    /// `Err(Error::NotImplemented("enforce_storage_budget"))`.
+    fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult>;
+
+    /// Verify the manifest chain pointed at by `source` and replay
+    /// every journal segment back into the local store.
+    ///
+    /// **Phase-1 stub.** The restore engine lands in Phase 4. Until
+    /// then this method returns
+    /// `Err(Error::NotImplemented("restore_from_backup"))`.
+    fn restore_from_backup(&self, source: BackupSource) -> Result<RestoreResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,5 +559,51 @@ mod tests {
         assert!(format!("{e}").contains("message:"));
         let e = Error::Transport("t".into());
         assert!(format!("{e}").contains("transport:"));
+        let e = Error::NotImplemented("send_media");
+        assert!(format!("{e}").contains("not yet implemented: send_media"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase-1 placeholder result / source types — Task 3
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn hydrated_message_round_trips_through_serde() {
+        let v = HydratedMessage::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: HydratedMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn backup_result_round_trips_through_serde() {
+        let v = BackupResult::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: BackupResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn offload_result_round_trips_through_serde() {
+        let v = OffloadResult::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: OffloadResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn restore_result_round_trips_through_serde() {
+        let v = RestoreResult::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: RestoreResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn backup_source_round_trips_through_serde() {
+        let v = BackupSource::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: BackupSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
     }
 }

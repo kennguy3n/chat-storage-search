@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~70%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~80%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -138,7 +138,7 @@ Notes:
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `In progress | ~70%`
+**Status**: `In progress | ~80%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
@@ -221,25 +221,60 @@ Checklist:
 - [ ] UniFFI bridge for iOS / Swift.
 - [ ] JNI bridge for Android / Kotlin.
 - [x] Core public API surface: `initialize`, `register_device`,
-      `send_text`, `ingest_remote_messages`, `search`. _(Types and
-      trait method signatures defined in `crates/core/src/lib.rs`:
-      `KChatCore` trait, `SearchQuery`, `SearchScope`,
-      `SearchResult`, `HydrationReason` (P0–P5), `BackupReason`,
-      `StoragePressureReason`, `ClientMessageId`,
-      `DeliveryCursor`. Concrete implementation at
-      `crates/core/src/core_impl.rs`: `CoreImpl::new(config, key)`
-      opens the SQLCipher store, the trait `send_text` mints an
-      outbox entry through `MessageProcessor` and persists it
-      via `MessagePersister`, `search` delegates to
-      `QueryEngine::execute_search`, `initialize` re-opens the
-      DB at the new `data_dir` using the retained
-      `K_local_db`. The transport-driven
+      `send_text`, `ingest_remote_messages`, `search`,
+      `send_media`, `hydrate_message`, `run_incremental_backup`,
+      `enforce_storage_budget`, `restore_from_backup`. _(Types
+      and trait method signatures defined in
+      `crates/core/src/lib.rs`: `KChatCore` trait, `SearchQuery`,
+      `SearchScope`, `SearchResult`, `HydrationReason` (P0–P5),
+      `BackupReason`, `StoragePressureReason`, `ClientMessageId`,
+      `DeliveryCursor`, plus the Phase-1 placeholder result
+      types `HydratedMessage`, `BackupResult`, `OffloadResult`,
+      `RestoreResult`, and the `BackupSource` input type — all
+      `Default + Serialize + Deserialize` so the bridge layer
+      can already round-trip them. A new
+      `Error::NotImplemented(&'static str)` variant lets callers
+      pattern-match on the missing capability without parsing
+      free-form text.
+
+      Concrete implementation at `crates/core/src/core_impl.rs`:
+      `CoreImpl::new(config, key)` opens the SQLCipher store,
+      the trait `send_text` mints an outbox entry through
+      `MessageProcessor` and persists it via `MessagePersister`,
+      `search` delegates to `QueryEngine::execute_search`,
+      `initialize` re-opens the DB at the new `data_dir` using
+      the retained `K_local_db`. The transport-driven
       `ingest_remote_messages` is a Phase-1 stub returning
       `IngestResult::default()`; the inherent
       `CoreImpl::ingest_messages(&[IngestedMessage])` is the
       batch-ingest entry point tests and bridges currently use.
-      Methods are sync `Result<_>`-returning placeholders that
-      flip to `async fn` once the MLS delivery client lands.)_
+      The Phase-2/3/4 trait methods (`send_media`,
+      `hydrate_message`, `run_incremental_backup`,
+      `enforce_storage_budget`, `restore_from_backup`) return
+      `Err(Error::NotImplemented(<method_name>))` — the surface
+      is locked but the implementation lands with the relevant
+      later phase. Methods are sync `Result<_>`-returning
+      placeholders that flip to `async fn` once the MLS delivery
+      client lands.)_
+- [x] Conversation management API. _(Inherent methods on
+      `CoreImpl` at `crates/core/src/core_impl.rs`:
+      `create_conversation(uuid, title, last_activity_ms)`
+      inserts a `conversation` row with the title stored
+      verbatim in `title_cipher` (proper AEAD-sealed titles
+      land in Phase 2); `list_conversations()` returns rows
+      ordered pinned-first then by descending
+      `last_activity_ms`; `get_conversation(uuid)` returns
+      `Ok(None)` when the row is missing;
+      `update_conversation_pin(uuid, pinned)` and
+      `update_conversation_mute(uuid, muted)` toggle the
+      respective flags and surface `Error::Storage` when the
+      conversation does not exist. `LocalStoreDb` at
+      `crates/core/src/local_store/db.rs` grew matching
+      `list_conversations`, `update_conversation_pin`, and
+      `update_conversation_mute` helpers backed by parameterized
+      SQL, with six new unit tests covering ordering, missing
+      rows, and pin / mute round-trips, plus six new
+      `core_impl` tests covering the public surface.)_
 - [x] Fuzzy token indexer foundation. _(Phase-5 foundation landed
       early at `crates/core/src/search/fuzzy_search.rs`:
       `FuzzyTokenizer::generate_tokens` segments input by script
@@ -252,6 +287,41 @@ Checklist:
       `search_fuzzy` returns matches ordered by token-overlap
       ratio. The encrypted-shard / archive fan-out lands later
       in Phase 5.)_
+- [x] Fuzzy token indexing wired into the message lifecycle.
+      _(`MessagePersister` at `crates/core/src/message/processor.rs`
+      now indexes every persisted body into `search_fuzzy`:
+      `persist_ingested_message` and `persist_outbox_entry` call
+      `FuzzySearchEngine::new(self.db).index_message(...)` after
+      writing the FTS5 row, `edit_message` re-runs
+      `remove_message` + `index_message` so old trigrams /
+      bigrams are dropped before the new ones land, and
+      `delete_for_me` / `delete_for_everyone` call
+      `remove_message` so deleted bodies leave no fuzzy residue.
+      Five processor unit tests pin the round-trip:
+      `persist_ingested_message_indexes_fuzzy_tokens`,
+      `persist_outbox_entry_indexes_fuzzy_tokens`,
+      `edit_message_updates_fuzzy_tokens`,
+      `delete_for_me_removes_fuzzy_tokens`, and
+      `delete_for_everyone_removes_fuzzy_tokens`.)_
+- [x] Unified FTS5 + fuzzy query engine.
+      _(`QueryEngine::execute_search` at
+      `crates/core/src/search/query_engine.rs` now fans out to
+      both `TextSearchEngine::search_fts` and
+      `FuzzySearchEngine::search_fuzzy`, deduplicates the union
+      by `message_id`, and applies `BM25_WEIGHT = 2.0` /
+      `FUZZY_WEIGHT = 1.0` per `docs/PROPOSAL.md §7.5` so exact
+      hits always outrank fuzzy-only hits on the same query.
+      Fuzzy-only rows are hydrated through a single
+      `fetch_skeleton_basic_info()` batch query so the merged
+      result list does not pay one round-trip per fuzzy hit.
+      The same structured `WHERE` clause filters both engines
+      via the unified `allowed_skeleton_ids()` helper.
+      Five new unit tests pin the merge:
+      `fuzzy_search_finds_typo_matches`,
+      `combined_fts_and_fuzzy_deduplicates`,
+      `fuzzy_results_have_lower_rank_than_exact`,
+      `fuzzy_only_results_carry_skeleton_metadata`,
+      `fuzzy_search_respects_structured_filters`.)_
 - [x] Performance benchmarks (criterion). _(Suite at
       `crates/core/benches/phase1_benchmarks.rs`:
       `insert_text_message`, `insert_batch_100`,
@@ -271,7 +341,18 @@ Checklist:
       `unicode61` and is required on every build; CJK / Thai
       tests soft-skip when the SQLCipher build does not link
       against ICU. Combined FTS-plus-conversation-filter and
-      sender / date-range filters are also covered.)_
+      sender / date-range filters are also covered. A companion
+      integration suite at
+      `crates/core/tests/multilingual_fuzzy_search.rs` then
+      drives the full **FTS5 + fuzzy** pipeline:
+      Latin / Cyrillic / Arabic / Thai trigram typo recovery,
+      CJK bigram match, mixed-script same-row hits via two
+      different queries, cross-engine deduplication on exact
+      matches, exact-vs-fuzzy ranking, and structured
+      `conversation_filter` / `sender_filter` narrowing of
+      fuzzy candidates. Eleven cases run unconditionally
+      because the fuzzy half is pure Rust; the Thai FTS path
+      soft-skips on non-ICU builds.)_
 - [x] Performance validation: insert text < 20 ms p95; search
       recent < 150 ms p95. _(Smoke runs of the criterion suite on
       the development VM measure `insert_text_message` at
@@ -364,6 +445,48 @@ Notes:
   prefix queries. Smoke runs on the development VM measure
   ~100 µs / ~70 µs, two orders of magnitude below the
   20 ms / 150 ms budgets in `docs/PROPOSAL.md §13`.
+- 2026-05-02: Fuzzy index wired through the message lifecycle
+  and merged into the unified search path. `MessagePersister`
+  (`crates/core/src/message/processor.rs`) now indexes
+  ingested + outbox bodies into `search_fuzzy` and removes /
+  re-indexes on edit / delete; `QueryEngine`
+  (`crates/core/src/search/query_engine.rs`) fans out to both
+  `TextSearchEngine::search_fts` and
+  `FuzzySearchEngine::search_fuzzy`, deduplicates by
+  `message_id`, and weights the union per
+  `docs/PROPOSAL.md §7.5` (`BM25_WEIGHT = 2.0`,
+  `FUZZY_WEIGHT = 1.0`). Fuzzy-only rows are skeleton-hydrated
+  through a single batch query (`fetch_skeleton_basic_info`).
+  Ten new unit tests + an eleven-case integration suite at
+  `crates/core/tests/multilingual_fuzzy_search.rs` pin
+  Latin / Cyrillic / Arabic / Thai typo recovery, CJK bigram
+  match, mixed-script hits, cross-engine dedup, ranking, and
+  `conversation_filter` / `sender_filter` narrowing of fuzzy
+  candidates.
+- 2026-05-02: Public `KChatCore` surface caught up to
+  `docs/PROPOSAL.md §12`. The trait now carries
+  `send_media`, `hydrate_message`, `run_incremental_backup`,
+  `enforce_storage_budget`, and `restore_from_backup` along
+  with the matching placeholder result types
+  (`HydratedMessage`, `BackupResult`, `OffloadResult`,
+  `RestoreResult`) and the `BackupSource` input type — all
+  `Default + Serialize + Deserialize`. A new
+  `Error::NotImplemented(&'static str)` variant lets callers
+  pattern-match on the missing capability; the matching
+  `CoreImpl` stubs return
+  `Err(Error::NotImplemented("<method>"))` until the
+  Phase-2/3/4 implementations land. Every result type
+  round-trips through serde and every stub asserts the
+  expected error variant in unit tests.
+- 2026-05-02: Conversation management API landed on
+  `CoreImpl`. New inherent methods cover
+  `create_conversation` / `list_conversations` /
+  `get_conversation` / `update_conversation_pin` /
+  `update_conversation_mute`, backed by matching SQL helpers
+  on `LocalStoreDb`. Listing is pinned-first then by
+  descending `last_activity_ms`; pin / mute updates surface
+  `Error::Storage` when the conversation does not exist so
+  the bridge layer can show the failure to the user.
 
 ---
 
@@ -626,3 +749,15 @@ Notes:
   (`crates/core/src/message/processor.rs`), and the expanded
   `KChatCore` public API in `crates/core/src/lib.rs`.
   Phase 0 ~90%.
+- 2026-05-02: Phase 1 caught up to ~80%. Fuzzy index is wired
+  through `MessagePersister` (ingest / outbox / edit / delete)
+  and merged into `QueryEngine::execute_search` with
+  PROPOSAL.md §7.5 weights. The `KChatCore` trait grew the
+  remaining `send_media` / `hydrate_message` /
+  `run_incremental_backup` / `enforce_storage_budget` /
+  `restore_from_backup` surface, all stubbed via
+  `Error::NotImplemented`. Conversation management
+  (create / list / get / pin / mute) landed on `CoreImpl`
+  and `LocalStoreDb`. New combined FTS5 + fuzzy multilingual
+  integration suite at
+  `crates/core/tests/multilingual_fuzzy_search.rs`.
