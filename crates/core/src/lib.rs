@@ -41,6 +41,7 @@
 pub mod archive;
 pub mod backup;
 pub mod config;
+pub mod core_impl;
 pub mod crypto;
 pub mod formats;
 pub mod local_store;
@@ -54,6 +55,7 @@ pub mod search;
 pub mod transport;
 
 pub use config::KChatCoreConfig;
+pub use core_impl::CoreImpl;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

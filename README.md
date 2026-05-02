@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~55%`.**
+> Search + MLS Integration — `In progress | ~70%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -30,22 +30,31 @@
 > `PRAGMA key`, foreign-key enforcement, ICU/`unicode61` schema
 > bring-up, conversation/skeleton/body CRUD), the message processor
 > with DB-backed `MessagePersister` (transactional skeleton + body +
-> FTS row + journal entry, idempotent on `message_id`), the FTS5
-> text search engine (`search::text_search::TextSearchEngine` with
-> BM25-ordered queries, snippet highlighting, prefix-search and
-> phrase-quote handling), the unified query engine
+> FTS row + journal entry, idempotent on `message_id`, plus
+> `edit_message` / `delete_for_me` / `delete_for_everyone` with FTS
+> + journal maintenance), the FTS5 text search engine
+> (`search::text_search::TextSearchEngine` with BM25-ordered
+> queries, snippet highlighting, prefix-search and phrase-quote
+> handling), the unified query engine
 > (`search::query_engine::QueryEngine` combining FTS5 with
 > structured `sender` / `conversation` / `date_from` / `date_to` /
-> `content_kind` filters), and the multilingual integration test
-> at `crates/core/tests/multilingual_search.rs` covering Latin /
-> Cyrillic / CJK / Arabic / Thai / Devanagari / mixed-script
-> messages.
+> `content_kind` filters), the script-aware **fuzzy token indexer**
+> (`search::fuzzy_search::{FuzzyTokenizer, FuzzySearchEngine}`,
+> trigrams for alphabetic scripts / bigrams for CJK), the
+> concrete **`CoreImpl`** `KChatCore` implementation
+> (`core_impl.rs`) wiring `send_text` / `ingest_messages` /
+> `search` to the SQLCipher store, the multilingual integration
+> test at `crates/core/tests/multilingual_search.rs`, and the
+> Phase-1 **criterion benchmark suite**
+> (`crates/core/benches/phase1_benchmarks.rs`) validating the
+> < 20 ms / < 150 ms p95 budgets.
 >
-> Outstanding for Phase 1: UniFFI / JNI bridges, platform-specific
-> `K_local_db` wrap (Keychain / Keystore / DPAPI), and performance
-> validation against the < 20 ms / < 150 ms p95 targets. The
-> higher-level engines (`media`, `archive`, `backup`, `offload`,
-> `restore`) remain stubbed and land across Phases 2–7. See
+> Outstanding for Phase 1: UniFFI / JNI bridges, the
+> transport-driven `ingest_remote_messages` (MLS delivery client
+> still pending), and the platform-specific `K_local_db` wrap
+> (Keychain / Keystore / DPAPI). The higher-level engines
+> (`media`, `archive`, `backup`, `offload`, `restore`) remain
+> stubbed and land across Phases 2–7. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
 
 ---
@@ -72,6 +81,7 @@ chat-storage-search/
       src/
         lib.rs                              # Phase 1: KChatCore trait + public API types
         config.rs                           # KChatCoreConfig
+        core_impl.rs                        # Phase 1: concrete CoreImpl implementing KChatCore
         crypto/                             # Phase 0: COMPLETE
           mod.rs
           aead.rs                           # XChaCha20-Poly1305 / AES-256-GCM
@@ -89,14 +99,15 @@ chat-storage-search/
           db.rs                             # SQLCipher-backed LocalStoreDb + CRUD helpers
           schema.rs                         # SCHEMA_SQL + typed row structs
           state_machines.rs                 # body / media / archive / backup / restore
-        message/                            # Phase 1: persister landed
+        message/                            # Phase 1: persister + edit / delete landed
           mod.rs
-          processor.rs                      # IngestedMessage / OutboxEntry / MessagePersister
-        search/                             # Phase 1: FTS5 + structured search landed
+          processor.rs                      # IngestedMessage / OutboxEntry / MessagePersister (edit / delete)
+        search/                             # Phase 1: FTS5 + structured + fuzzy search landed
           mod.rs
           tokenizer.rs                      # ICU + ScriptClass + FuzzyGranularity
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
+          fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
         archive/                            # placeholder (Phase 3)
         backup/                             # placeholder (Phase 4)
         media/                              # placeholder (Phase 2)
@@ -105,6 +116,8 @@ chat-storage-search/
         restore/                            # placeholder (Phase 4)
         scheduler/                          # placeholder (Phase 4 / 7)
         transport/                          # placeholder (Phase 1 / 2 / 4)
+      benches/
+        phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
@@ -146,6 +159,19 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --verbose
 ```
 
+The Phase-1 performance benchmarks live under
+[`crates/core/benches/`](crates/core/benches/) and run with
+[criterion](https://docs.rs/criterion). Run them with:
+
+```sh
+cargo bench -p kchat-core --bench phase1_benchmarks
+```
+
+HTML reports land under `target/criterion/`. Local p95 numbers on
+the development VM measure ~100 µs / ~70 µs for single-insert /
+1k-row FTS5 search, two orders of magnitude below the 20 ms /
+150 ms targets in `docs/PROPOSAL.md §13`.
+
 The Phase 0 + Phase 1 test surface covers:
 
 * [`crypto`](crates/core/src/crypto/) — content hash, key
@@ -171,7 +197,11 @@ The Phase 0 + Phase 1 test surface covers:
   `validate_ingest`, deduplication, outbox creation with monotonic
   UUID v7, plus the `MessagePersister` integration tests for
   transactional skeleton + body + FTS5 + journal writes,
-  duplicate rejection, and `mark_sent` event-journal entries.
+  duplicate rejection, `mark_sent` event-journal entries, and the
+  edit / delete operations (`edit_message`, `delete_for_me`,
+  `delete_for_everyone`) with FTS5 maintenance, body-state
+  transition validation, and `"message_edited"` /
+  `"message_deleted"` journal entries.
 * [`search::text_search`](crates/core/src/search/text_search.rs) —
   BM25 ordering, snippet highlighting, prefix queries, phrase
   quoting, special-character escaping in free-text input.
@@ -179,6 +209,15 @@ The Phase 0 + Phase 1 test surface covers:
   — sender / conversation / date / content-kind filters, FTS
   combined with structured filters by `message_id` intersection,
   `SearchScope::LocalOnly` invariant.
+* [`search::fuzzy_search`](crates/core/src/search/fuzzy_search.rs)
+  — script-aware n-gram tokenization (trigrams for alphabetic
+  scripts, bigrams for CJK), index / remove / search round-trip
+  against the `search_fuzzy` table, token-overlap scoring,
+  case-insensitive matching, and word-boundary handling.
+* [`core_impl`](crates/core/src/core_impl.rs) — concrete
+  `KChatCore` round-trip tests: `send_text` → skeleton + body +
+  FTS check, `ingest_messages` → search round-trip, duplicate
+  rejection, `initialize` re-open at a new `data_dir`.
 * [`lib.rs`](crates/core/src/lib.rs) — public API type
   construction, default `SearchScope::IncludeCold`, P0–P5 ordering
   on `HydrationReason`, `Error` variant `Display` strings.

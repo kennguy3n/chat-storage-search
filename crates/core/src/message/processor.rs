@@ -26,7 +26,9 @@ use crate::local_store::db::{DbError, LocalStoreDb};
 use crate::local_store::schema::{
     BackupEventJournalEntry, MessageBody, MessageKind, MessageSkeleton,
 };
-use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+use crate::local_store::state_machines::{
+    ArchiveState, BackupState, BodyState, StateTransitionError,
+};
 use crate::ClientMessageId;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,10 @@ pub enum ProcessorError {
     /// A `rusqlite` call failed inside [`MessagePersister`].
     #[error("db: {0}")]
     Db(#[from] DbError),
+
+    /// A body-state transition rejected by the state machine.
+    #[error("illegal state transition: {0}")]
+    IllegalTransition(#[from] StateTransitionError),
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +515,167 @@ impl<'a> MessagePersister<'a> {
         Ok(())
     }
 
+    /// Replace the text body of an existing local-plain message and
+    /// keep the FTS index in sync.
+    ///
+    /// Inside one `SAVEPOINT` boundary the persister:
+    ///
+    /// 1. Loads the skeleton (must exist; `body_state` must be
+    ///    [`BodyState::LocalPlainAvailable`]).
+    /// 2. Updates `message_body.text_content` and
+    ///    `message_skeleton.edited_at_ms`.
+    /// 3. Refreshes the `search_fts` row by deleting the old entry
+    ///    and re-inserting with the new text.
+    /// 4. Writes a `"message_edited"` entry to
+    ///    `backup_event_journal` (CBOR map carrying `message_id` and
+    ///    `edited_at_ms`).
+    ///
+    /// `new_text` must be non-empty.
+    pub fn edit_message(&self, message_id: &str, new_text: &str) -> Result<(), ProcessorError> {
+        if new_text.is_empty() {
+            return Err(ProcessorError::InvalidMessage(
+                "edit text_content must not be empty".into(),
+            ));
+        }
+        let skel = self.db.get_message_skeleton(message_id)?.ok_or_else(|| {
+            ProcessorError::InvalidMessage(format!("no message with id={message_id}"))
+        })?;
+        if skel.body_state != BodyState::LocalPlainAvailable {
+            return Err(ProcessorError::InvalidMessage(format!(
+                "edit requires body_state=local_plain_available, found {}",
+                skel.body_state
+            )));
+        }
+
+        let edited_at_ms = now_ms();
+        let conn = self.db.connection();
+        conn.execute_batch("SAVEPOINT edit_message;")
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        let result = self.edit_message_inner(&skel, new_text, edited_at_ms);
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE edit_message;")
+                    .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK TO edit_message; RELEASE edit_message;");
+            }
+        }
+        result
+    }
+
+    fn edit_message_inner(
+        &self,
+        skel: &MessageSkeleton,
+        new_text: &str,
+        edited_at_ms: i64,
+    ) -> Result<(), ProcessorError> {
+        self.db
+            .update_message_body_text(&skel.message_id, new_text)?;
+        self.db
+            .update_skeleton_edited(&skel.message_id, edited_at_ms)?;
+        self.db.delete_fts_row(&skel.message_id)?;
+        self.insert_fts_row(
+            &skel.message_id,
+            &skel.conversation_id,
+            &skel.sender_id,
+            skel.created_at_ms,
+            new_text,
+        )?;
+        let payload = encode_edit_event_payload(&skel.message_id, edited_at_ms);
+        let entry = BackupEventJournalEntry {
+            event_seq: 0,
+            event_type: "message_edited".into(),
+            payload,
+            created_at_ms: edited_at_ms,
+        };
+        self.db.insert_backup_event(&entry)?;
+        Ok(())
+    }
+
+    /// Soft-delete a message locally (`delete-for-me`). The body row
+    /// is kept so the message remains restorable, but the FTS row is
+    /// removed so the message stops appearing in search.
+    ///
+    /// Inside one `SAVEPOINT` boundary:
+    ///
+    /// 1. Loads the skeleton; `try_transition(body_state, DeletedForMe)`
+    ///    must succeed.
+    /// 2. Updates `body_state` to [`BodyState::DeletedForMe`] and
+    ///    `deleted_at_ms` to now.
+    /// 3. Removes the `search_fts` row.
+    /// 4. Writes a `"message_deleted"` journal entry with
+    ///    `{"scope": "for_me"}`.
+    pub fn delete_for_me(&self, message_id: &str) -> Result<(), ProcessorError> {
+        self.delete_inner(message_id, DeleteScope::ForMe)
+    }
+
+    /// Tombstone a message for everyone (`delete-for-everyone`). The
+    /// body row is removed so the plaintext is gone; the FTS row is
+    /// removed so the message stops appearing in search; the
+    /// skeleton stays in place with `body_state = deleted_for_everyone`
+    /// so the timeline can render a tombstone.
+    ///
+    /// Same `SAVEPOINT` shape as [`Self::delete_for_me`], but the
+    /// state machine transition is to [`BodyState::DeletedForEveryone`]
+    /// and the `message_body` row is also dropped.
+    pub fn delete_for_everyone(&self, message_id: &str) -> Result<(), ProcessorError> {
+        self.delete_inner(message_id, DeleteScope::ForEveryone)
+    }
+
+    fn delete_inner(&self, message_id: &str, scope: DeleteScope) -> Result<(), ProcessorError> {
+        let skel = self.db.get_message_skeleton(message_id)?.ok_or_else(|| {
+            ProcessorError::InvalidMessage(format!("no message with id={message_id}"))
+        })?;
+        let target = match scope {
+            DeleteScope::ForMe => BodyState::DeletedForMe,
+            DeleteScope::ForEveryone => BodyState::DeletedForEveryone,
+        };
+        // try_transition validates the legal-transition table; the
+        // returned state is always equal to `target` on success.
+        BodyState::try_transition(skel.body_state, target)?;
+
+        let deleted_at_ms = now_ms();
+        let conn = self.db.connection();
+        conn.execute_batch("SAVEPOINT delete_message;")
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        let result = self.delete_inner_tx(&skel, scope, target, deleted_at_ms);
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE delete_message;")
+                    .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK TO delete_message; RELEASE delete_message;");
+            }
+        }
+        result
+    }
+
+    fn delete_inner_tx(
+        &self,
+        skel: &MessageSkeleton,
+        scope: DeleteScope,
+        target: BodyState,
+        deleted_at_ms: i64,
+    ) -> Result<(), ProcessorError> {
+        self.db
+            .update_skeleton_deleted(&skel.message_id, deleted_at_ms, target)?;
+        self.db.delete_fts_row(&skel.message_id)?;
+        if matches!(scope, DeleteScope::ForEveryone) {
+            self.db.delete_message_body(&skel.message_id)?;
+        }
+        let payload = encode_delete_event_payload(&skel.message_id, scope.label());
+        let entry = BackupEventJournalEntry {
+            event_seq: 0,
+            event_type: "message_deleted".into(),
+            payload,
+            created_at_ms: deleted_at_ms,
+        };
+        self.db.insert_backup_event(&entry)?;
+        Ok(())
+    }
+
     fn skeleton_exists(&self, message_id: &str) -> Result<bool, ProcessorError> {
         let count: i64 = self
             .db
@@ -542,6 +709,49 @@ impl<'a> MessagePersister<'a> {
             .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         Ok(())
     }
+}
+
+/// Whether a delete affects only the local user (`delete-for-me`)
+/// or everyone in the conversation (`delete-for-everyone`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteScope {
+    ForMe,
+    ForEveryone,
+}
+
+impl DeleteScope {
+    fn label(self) -> &'static str {
+        match self {
+            DeleteScope::ForMe => "for_me",
+            DeleteScope::ForEveryone => "for_everyone",
+        }
+    }
+}
+
+/// Encode the CBOR map payload for a `"message_edited"` journal
+/// entry: `{ "message_id": <str>, "edited_at_ms": <int> }`.
+fn encode_edit_event_payload(message_id: &str, edited_at_ms: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    // Map of 2 entries.
+    out.push(0xa2);
+    push_cbor_text(&mut out, "message_id");
+    push_cbor_text(&mut out, message_id);
+    push_cbor_text(&mut out, "edited_at_ms");
+    push_cbor_int(&mut out, edited_at_ms);
+    out
+}
+
+/// Encode the CBOR map payload for a `"message_deleted"` journal
+/// entry: `{ "message_id": <str>, "scope": "for_me" | "for_everyone" }`.
+fn encode_delete_event_payload(message_id: &str, scope: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    // Map of 2 entries.
+    out.push(0xa2);
+    push_cbor_text(&mut out, "message_id");
+    push_cbor_text(&mut out, message_id);
+    push_cbor_text(&mut out, "scope");
+    push_cbor_text(&mut out, scope);
+    out
 }
 
 /// Encode a `[message_id, conversation_id, sender_id, created_at_ms]`
@@ -1043,5 +1253,206 @@ mod tests {
             p.mark_sent("does-not-exist"),
             Err(ProcessorError::InvalidMessage(_))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // edit_message / delete_for_me / delete_for_everyone
+    // -----------------------------------------------------------------
+
+    fn fts_count(db: &LocalStoreDb, message_id: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fts_text_match_count(db: &LocalStoreDb, term: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+                params![term],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn journal_count(db: &LocalStoreDb, event_type: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM backup_event_journal WHERE event_type = ?1",
+                params![event_type],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn persist_text_message(p: &MessagePersister<'_>, conv: Uuid, text: &str) -> Uuid {
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some(text.into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+        msg.message_id
+    }
+
+    #[test]
+    fn edit_message_updates_body_and_fts() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "old text snippet");
+        let mid_s = mid.to_string();
+
+        // Old text is searchable.
+        assert_eq!(fts_text_match_count(&db, "old"), 1);
+        assert_eq!(fts_text_match_count(&db, "fresh"), 0);
+
+        p.edit_message(&mid_s, "fresh text snippet").expect("edit");
+
+        // Body row carries new text; old text no longer searchable.
+        let body = db.get_message_body(&mid_s).unwrap().expect("body");
+        assert_eq!(body.text_content.as_deref(), Some("fresh text snippet"));
+        assert_eq!(fts_text_match_count(&db, "old"), 0);
+        assert_eq!(fts_text_match_count(&db, "fresh"), 1);
+
+        // Skeleton edited_at_ms is set.
+        let skel = db.get_message_skeleton(&mid_s).unwrap().expect("skeleton");
+        assert!(
+            skel.edited_at_ms.unwrap() > 0,
+            "edited_at_ms should be populated"
+        );
+    }
+
+    #[test]
+    fn edit_message_rejects_deleted_message() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "hello");
+        let mid_s = mid.to_string();
+
+        p.delete_for_me(&mid_s).expect("delete");
+        let err = p.edit_message(&mid_s, "world").unwrap_err();
+        assert!(
+            matches!(err, ProcessorError::InvalidMessage(_)),
+            "expected InvalidMessage; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn edit_message_rejects_missing_id() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let err = p.edit_message("does-not-exist", "hi").unwrap_err();
+        assert!(matches!(err, ProcessorError::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn edit_message_rejects_empty_text() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "hello");
+        let err = p.edit_message(&mid.to_string(), "").unwrap_err();
+        assert!(matches!(err, ProcessorError::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn edit_writes_journal_entry() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "hello");
+        assert_eq!(journal_count(&db, "message_edited"), 0);
+        p.edit_message(&mid.to_string(), "goodbye").unwrap();
+        assert_eq!(journal_count(&db, "message_edited"), 1);
+    }
+
+    #[test]
+    fn delete_for_me_transitions_state_and_removes_fts() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "hello");
+        let mid_s = mid.to_string();
+
+        p.delete_for_me(&mid_s).expect("delete_for_me");
+        let skel = db.get_message_skeleton(&mid_s).unwrap().expect("skeleton");
+        assert_eq!(skel.body_state, BodyState::DeletedForMe);
+        assert!(skel.deleted_at_ms.unwrap() > 0);
+
+        // FTS row gone.
+        assert_eq!(fts_count(&db, &mid_s), 0);
+        // Body row preserved (delete-for-me is restorable).
+        assert!(db.get_message_body(&mid_s).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_for_everyone_removes_body_and_fts() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "secret");
+        let mid_s = mid.to_string();
+
+        p.delete_for_everyone(&mid_s).expect("delete_for_everyone");
+        let skel = db.get_message_skeleton(&mid_s).unwrap().expect("skeleton");
+        assert_eq!(skel.body_state, BodyState::DeletedForEveryone);
+        assert!(skel.deleted_at_ms.unwrap() > 0);
+
+        assert_eq!(fts_count(&db, &mid_s), 0);
+        assert!(db.get_message_body(&mid_s).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_writes_journal_entry() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid_a = persist_text_message(&p, conv, "a-text");
+        let mid_b = persist_text_message(&p, conv, "b-text");
+
+        p.delete_for_me(&mid_a.to_string()).unwrap();
+        p.delete_for_everyone(&mid_b.to_string()).unwrap();
+
+        assert_eq!(journal_count(&db, "message_deleted"), 2);
+    }
+
+    #[test]
+    fn delete_for_me_rejects_missing_id() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let err = p.delete_for_me("does-not-exist").unwrap_err();
+        assert!(matches!(err, ProcessorError::InvalidMessage(_)));
+    }
+
+    #[test]
+    fn delete_for_me_rejects_already_deleted() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "hello");
+        p.delete_for_me(&mid.to_string()).unwrap();
+        let err = p.delete_for_me(&mid.to_string()).unwrap_err();
+        assert!(
+            matches!(err, ProcessorError::IllegalTransition(_)),
+            "expected IllegalTransition; got {err:?}"
+        );
     }
 }

@@ -345,6 +345,66 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Replace `message_body.text_content` for `message_id`.
+    ///
+    /// Used by the edit pipeline. The FTS row has to be maintained
+    /// separately by the caller — see
+    /// [`crate::message::processor::MessagePersister::edit_message`].
+    pub fn update_message_body_text(&self, message_id: &str, new_text: &str) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE message_body SET text_content = ?1 WHERE message_id = ?2",
+            params![new_text, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp `message_skeleton.edited_at_ms` for `message_id`.
+    pub fn update_skeleton_edited(&self, message_id: &str, edited_at_ms: i64) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE message_skeleton SET edited_at_ms = ?1 WHERE message_id = ?2",
+            params![edited_at_ms, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update both `body_state` and `deleted_at_ms` for `message_id`
+    /// in a single statement.
+    pub fn update_skeleton_deleted(
+        &self,
+        message_id: &str,
+        deleted_at_ms: i64,
+        new_body_state: BodyState,
+    ) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE message_skeleton
+                SET body_state = ?1, deleted_at_ms = ?2
+              WHERE message_id = ?3",
+            params![new_body_state.to_string(), deleted_at_ms, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete the `message_body` row for `message_id`. Used by the
+    /// `delete_for_everyone` pipeline; `delete_for_me` keeps the
+    /// body row in place so the message remains restorable.
+    pub fn delete_message_body(&self, message_id: &str) -> DbResult<()> {
+        self.conn.execute(
+            "DELETE FROM message_body WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the `search_fts` row for `message_id`. Idempotent —
+    /// a missing row is not an error.
+    pub fn delete_fts_row(&self, message_id: &str) -> DbResult<()> {
+        self.conn.execute(
+            "DELETE FROM search_fts WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
     /// Insert a row into `backup_event_journal`. The `event_seq`
     /// field is `AUTOINCREMENT` in the schema; the value provided
     /// here is honored if non-zero, otherwise the backend assigns
@@ -685,5 +745,104 @@ mod tests {
         let s = create_schema_with_unicode61_fallback();
         assert!(!s.contains("tokenize = 'icu'"));
         assert!(s.contains("tokenize = 'unicode61 remove_diacritics 2'"));
+    }
+
+    fn seed_skeleton_with_body(db: &LocalStoreDb, mid: &str, conv: &str, text: &str) {
+        let conversation = Conversation {
+            conversation_id: conv.to_string(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        db.insert_conversation(&conversation).unwrap();
+        let skel = MessageSkeleton {
+            message_id: mid.into(),
+            conversation_id: conv.into(),
+            sender_id: "user-1".into(),
+            created_at_ms: 100,
+            received_at_ms: 110,
+            kind: MessageKind::Text,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: None,
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        db.insert_message_skeleton(&skel).unwrap();
+        let body = MessageBody {
+            message_id: mid.into(),
+            text_content: Some(text.into()),
+            detected_language: None,
+            rich_meta: None,
+        };
+        db.insert_message_body(&body).unwrap();
+    }
+
+    #[test]
+    fn update_message_body_text_replaces_content() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m", "c", "old");
+        db.update_message_body_text("m", "new").unwrap();
+        let body = db.get_message_body("m").unwrap().expect("body");
+        assert_eq!(body.text_content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn update_skeleton_edited_stamps_timestamp() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m", "c", "x");
+        db.update_skeleton_edited("m", 12_345).unwrap();
+        let skel = db.get_message_skeleton("m").unwrap().expect("skeleton");
+        assert_eq!(skel.edited_at_ms, Some(12_345));
+    }
+
+    #[test]
+    fn update_skeleton_deleted_sets_state_and_timestamp() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m", "c", "x");
+        db.update_skeleton_deleted("m", 9_999, BodyState::DeletedForEveryone)
+            .unwrap();
+        let skel = db.get_message_skeleton("m").unwrap().expect("skeleton");
+        assert_eq!(skel.body_state, BodyState::DeletedForEveryone);
+        assert_eq!(skel.deleted_at_ms, Some(9_999));
+    }
+
+    #[test]
+    fn delete_message_body_removes_row() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m", "c", "x");
+        db.delete_message_body("m").unwrap();
+        assert!(db.get_message_body("m").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_fts_row_is_idempotent() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m", "c", "x");
+        db.connection()
+            .execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["m", "c", "user-1", 100i64, "x"],
+            )
+            .unwrap();
+        db.delete_fts_row("m").unwrap();
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                params!["m"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        // Second delete on a missing row is still Ok.
+        db.delete_fts_row("m").unwrap();
     }
 }
