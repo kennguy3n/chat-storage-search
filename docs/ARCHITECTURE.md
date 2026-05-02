@@ -136,9 +136,14 @@ goes through the FFI bridge for the host platform.
 >   (`validate_ingest`, `is_duplicate`, `create_outbox_entry`),
 >   and the DB-backed `MessagePersister` that wraps skeleton +
 >   body + FTS row + `"message_received"` /
->   `"outbox_pending"` / `"outbox_sent"` journal writes inside one
->   `SAVEPOINT` so a crash mid-ingest cannot leave the FTS index
->   out of sync with the skeleton table.
+>   `"outbox_pending"` / `"outbox_sent"` /
+>   `"message_edited"` / `"message_deleted"` journal writes
+>   inside one `SAVEPOINT` so a crash mid-ingest cannot leave
+>   the FTS index out of sync with the skeleton table.
+>   `edit_message`, `delete_for_me`, and `delete_for_everyone`
+>   call `try_transition` on `body_state` from §5 before
+>   touching the FTS / body rows, and the for-everyone path
+>   drops `message_body` in addition to clearing the FTS row.
 > * `crates/core/src/search/text_search.rs` is the **Phase-1 FTS5
 >   text search engine**: `TextSearchEngine::search_fts` runs
 >   `bm25(search_fts)`-ordered queries returning
@@ -156,6 +161,42 @@ goes through the FFI bridge for the host platform.
 >   is_cold }`, and short-circuits to a recency-ordered skeleton
 >   scan when the query string is empty. `SearchScope::LocalOnly`
 >   is honored — no archive fan-out attempts in Phase 1.
+> * `crates/core/src/search/fuzzy_search.rs` is the **early
+>   Phase-5 foundation** for the fuzzy index: `FuzzyTokenizer`
+>   splits text into per-script runs via `segment_by_script` and
+>   emits trigrams or bigrams per `fuzzy_granularity(script)`
+>   from §3 of `docs/PROPOSAL.md`. Tokens are lowercased for
+>   case-insensitive matching and never straddle ASCII whitespace
+>   / punctuation / digit boundaries. `FuzzySearchEngine` writes
+>   into the `search_fuzzy` table (`message_id`, `token`,
+>   `script`) with `INSERT OR IGNORE` semantics, supports
+>   `remove_message`, and ranks `search_fuzzy` results by
+>   token-overlap ratio. The encrypted-shard / archive fan-out
+>   path arrives later in Phase 5.
+> * `crates/core/src/core_impl.rs` is the **Phase-1 concrete
+>   `KChatCore` implementation**. `CoreImpl::new(config, key)`
+>   opens the SQLCipher store, retains the 32-byte
+>   `K_local_db` in a `Zeroizing<[u8; 32]>` so
+>   `initialize(new_config)` can re-open at a different
+>   `data_dir`, and stores the `LocalStoreDb` behind a `Mutex`
+>   so the trait's `&self` API stays sync. `send_text` mints
+>   an `OutboxEntry` through `MessageProcessor::create_outbox_entry`
+>   and persists it via
+>   `MessagePersister::persist_outbox_entry`; `search`
+>   delegates to `QueryEngine::execute_search`. The
+>   transport-driven `ingest_remote_messages` is a Phase-1
+>   stub returning `IngestResult::default()` until the MLS
+>   delivery client lands; the inherent
+>   `CoreImpl::ingest_messages(&[IngestedMessage])` is the
+>   batch-ingest path tests and bridges currently use.
+> * `crates/core/benches/phase1_benchmarks.rs` is the **Phase-1
+>   performance benchmark suite** (criterion). Five benches
+>   exercise `MessagePersister::persist_ingested_message`
+>   (single insert + 100-row batch),
+>   `QueryEngine::execute_search` against a 1k-row corpus
+>   (single needle, structured filters, prefix queries) so the
+>   < 20 ms / < 150 ms p95 budgets in §13 of
+>   `docs/PROPOSAL.md` are continuously verifiable.
 
 The workspace ships four crates: a core that knows nothing about
 platforms, and three thin bridges.
@@ -243,16 +284,23 @@ the standard library and chosen primitives.
 > Phase 1 has additionally landed the `local_store::schema`,
 > `local_store::db` (SQLCipher binding + CRUD helpers),
 > `local_store::state_machines`, `message::processor` (validators
-> *and* DB-backed `MessagePersister`), `search::tokenizer`,
-> `search::text_search` (FTS5 BM25 engine), and
-> `search::query_engine` (unified FTS + structured search) modules,
-> plus the expanded `KChatCore` public-API trait in `lib.rs`
-> (`SearchQuery`, `SearchScope`, `SearchResult`, `HydrationReason`,
-> `BackupReason`, `StoragePressureReason`, `ClientMessageId`,
-> `DeliveryCursor`). The remaining higher-level modules (`media`,
-> `archive`, `backup`, `offload`, `restore`, `models`, `transport`,
-> `scheduler`) are Phase-0 placeholders and are filled in across
-> Phases 1 – 7.
+> *and* DB-backed `MessagePersister` with edit / delete operations),
+> `search::tokenizer`, `search::text_search` (FTS5 BM25 engine),
+> `search::query_engine` (unified FTS + structured search), and
+> the early-Phase-5 `search::fuzzy_search` (script-aware n-gram
+> indexer) modules, plus the expanded `KChatCore` public-API
+> trait in `lib.rs` (`SearchQuery`, `SearchScope`, `SearchResult`,
+> `HydrationReason`, `BackupReason`, `StoragePressureReason`,
+> `ClientMessageId`, `DeliveryCursor`) and its concrete
+> implementation `core_impl::CoreImpl` wiring `send_text` /
+> `ingest_messages` / `search` to the SQLCipher store. A
+> criterion benchmark suite at
+> `crates/core/benches/phase1_benchmarks.rs` enforces the
+> < 20 ms / < 150 ms p95 budgets from §13 of
+> `docs/PROPOSAL.md`. The remaining higher-level modules
+> (`media`, `archive`, `backup`, `offload`, `restore`, `models`,
+> `transport`, `scheduler`) are Phase-0 placeholders and are
+> filled in across Phases 1 – 7.
 
 ---
 

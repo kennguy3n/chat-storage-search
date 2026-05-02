@@ -10,6 +10,7 @@
 //! [`ScriptClass`]: tokenizer::ScriptClass
 //! [`FuzzyGranularity`]: tokenizer::FuzzyGranularity
 
+pub mod fuzzy_search;
 pub mod query_engine;
 pub mod text_search;
 pub mod tokenizer;
