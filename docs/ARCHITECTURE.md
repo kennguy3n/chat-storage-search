@@ -234,9 +234,17 @@ goes through the FFI bridge for the host platform.
 >   `Error::Storage` when the conversation does not exist so
 >   the bridge layer can show the failure to the user.
 >   `delete_conversation` cascades through every dependent
->   row (`search_fuzzy` → `search_fts` → `message_body` →
+>   row (`media_search_index` → `search_fuzzy` → `search_fts`
+>   → `search_vector` → `media_asset` → `message_body` →
 >   `message_skeleton` → `conversation`) inside a single
->   `SAVEPOINT`, leaving sibling conversations untouched.
+>   `SAVEPOINT`, leaving sibling conversations untouched. The
+>   ordering is dictated by the schema's foreign-key
+>   direction: `media_search_index.asset_id` references
+>   `media_asset(asset_id)` and `media_asset.message_id`
+>   references `message_skeleton(message_id)`, so both must
+>   drain top-down before the skeleton delete runs;
+>   `search_vector` carries no FK but the rows are
+>   message-scoped and never want to outlive the skeleton.
 >   Inherent **timeline + single-message helpers**
 >   (`get_timeline(uuid, before_ms, limit)` for newest-first
 >   `TimelineRow` pages, plus `get_message_with_body(uuid)`

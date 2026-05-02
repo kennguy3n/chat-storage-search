@@ -673,13 +673,33 @@ impl LocalStoreDb {
 
     /// Delete a conversation along with every dependent row.
     ///
-    /// The cascade order matches the schema's foreign-key direction:
+    /// The cascade order is dictated by the schema's foreign-key
+    /// direction (`PRAGMA foreign_keys = ON` is active so the SQL
+    /// engine itself rejects an out-of-order delete): per-message
+    /// search artefacts and media-search-index rows must go before
+    /// their parent rows, `media_asset` must go before
+    /// `message_skeleton` (because `media_asset.message_id`
+    /// references it), and `message_skeleton` must go before
+    /// `conversation`.
     ///
-    /// 1. `search_fuzzy` rows for every message in the conversation.
-    /// 2. `search_fts` rows for every message in the conversation.
-    /// 3. `message_body` rows for every message in the conversation.
-    /// 4. `message_skeleton` rows for the conversation.
-    /// 5. The `conversation` row itself.
+    /// 1. `media_search_index` rows for every asset attached to a
+    ///    message in the conversation. Must precede the
+    ///    `media_asset` delete because of the
+    ///    `media_search_index.asset_id REFERENCES media_asset(asset_id)`
+    ///    FK.
+    /// 2. `search_fuzzy` rows for every message in the conversation.
+    /// 3. `search_fts` rows for every message in the conversation.
+    /// 4. `search_vector` rows for every message in the conversation.
+    ///    The table has no FK against `message_skeleton`, but the
+    ///    rows are message-scoped data we never want to outlive the
+    ///    skeleton.
+    /// 5. `media_asset` rows for every message in the conversation.
+    ///    Must precede the `message_skeleton` delete because of the
+    ///    `media_asset.message_id REFERENCES message_skeleton(message_id)`
+    ///    FK.
+    /// 6. `message_body` rows for every message in the conversation.
+    /// 7. `message_skeleton` rows for the conversation.
+    /// 8. The `conversation` row itself.
     ///
     /// Everything runs inside a single `SAVEPOINT` so a failure mid-way
     /// rolls back to the pre-call state — matching the pattern used by
@@ -706,8 +726,20 @@ impl LocalStoreDb {
     }
 
     fn delete_conversation_inner(&self, conversation_id: &str) -> DbResult<usize> {
-        // Drop fuzzy-token rows first so the joined DELETE never
-        // hits a stale FK once the skeletons are gone.
+        // media_search_index → media_asset → message_skeleton chains
+        // through two FKs, so it has to drain top-down before any
+        // skeleton delete runs.
+        self.conn.execute(
+            "DELETE FROM media_search_index
+              WHERE asset_id IN (
+                  SELECT asset_id FROM media_asset
+                   WHERE message_id IN (
+                       SELECT message_id FROM message_skeleton
+                        WHERE conversation_id = ?1
+                   )
+              )",
+            params![conversation_id],
+        )?;
         self.conn.execute(
             "DELETE FROM search_fuzzy
               WHERE message_id IN (
@@ -717,6 +749,20 @@ impl LocalStoreDb {
         )?;
         self.conn.execute(
             "DELETE FROM search_fts
+              WHERE message_id IN (
+                  SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
+              )",
+            params![conversation_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM search_vector
+              WHERE message_id IN (
+                  SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
+              )",
+            params![conversation_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM media_asset
               WHERE message_id IN (
                   SELECT message_id FROM message_skeleton WHERE conversation_id = ?1
               )",
@@ -1605,8 +1651,13 @@ mod tests {
         seed_timeline_message(&db, "m-d-2", "c-doomed", 200, "beta");
         seed_timeline_message(&db, "m-keep", "c-keep", 300, "gamma");
 
-        // Stage matching FTS5 + fuzzy rows so the cascade really has
-        // something to delete.
+        // Stage matching FTS5 + fuzzy + vector + media rows so the
+        // cascade really has something to delete in every dependent
+        // table. The media tables are exercised here even though
+        // Phase-1 code paths do not yet insert into them, because the
+        // FK constraints between media_search_index → media_asset →
+        // message_skeleton would block a future delete the moment
+        // Phase-2 media support lands.
         for (mid, conv, text) in [
             ("m-d-1", "c-doomed", "alpha"),
             ("m-d-2", "c-doomed", "beta"),
@@ -1628,12 +1679,38 @@ mod tests {
                     params![text, mid],
                 )
                 .unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO search_vector(message_id, embedding, model_version)
+                     VALUES (?1, X'0102', 'test-v1')",
+                    params![mid],
+                )
+                .unwrap();
+            let asset_id = format!("asset-{mid}");
+            db.connection()
+                .execute(
+                    "INSERT INTO media_asset(
+                        asset_id, message_id, mime_type, bytes_total, bytes_local,
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id
+                     ) VALUES (?1, ?2, 'image/png', 4, 4, 'local', X'00', 1, X'00', 'blob-x')",
+                    params![asset_id, mid],
+                )
+                .unwrap();
+            db.connection()
+                .execute(
+                    "INSERT INTO media_search_index(asset_id, kind, text)
+                     VALUES (?1, 'ocr', ?2)",
+                    params![asset_id, text],
+                )
+                .unwrap();
         }
 
         let n = db.delete_conversation("c-doomed").unwrap();
         assert_eq!(n, 1, "exactly one conversation row removed");
 
-        // Doomed conversation: every dependent row gone.
+        // Doomed conversation: every dependent row gone, including
+        // media_asset / media_search_index / search_vector which had
+        // no explicit cleanup in the original cascade.
         assert_eq!(
             count_rows(&db, "conversation", "conversation_id = 'c-doomed'"),
             0
@@ -1654,8 +1731,20 @@ mod tests {
             count_rows(&db, "search_fuzzy", "message_id LIKE 'm-d-%'"),
             0
         );
+        assert_eq!(
+            count_rows(&db, "search_vector", "message_id LIKE 'm-d-%'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "media_asset", "message_id LIKE 'm-d-%'"),
+            0
+        );
+        assert_eq!(
+            count_rows(&db, "media_search_index", "asset_id LIKE 'asset-m-d-%'"),
+            0
+        );
 
-        // Sibling conversation untouched.
+        // Sibling conversation untouched, including its media rows.
         assert_eq!(
             count_rows(&db, "conversation", "conversation_id = 'c-keep'"),
             1
@@ -1667,6 +1756,15 @@ mod tests {
         assert_eq!(count_rows(&db, "message_body", "message_id = 'm-keep'"), 1);
         assert_eq!(count_rows(&db, "search_fts", "message_id = 'm-keep'"), 1);
         assert_eq!(count_rows(&db, "search_fuzzy", "message_id = 'm-keep'"), 1);
+        assert_eq!(count_rows(&db, "search_vector", "message_id = 'm-keep'"), 1);
+        assert_eq!(
+            count_rows(&db, "media_asset", "message_id = 'm-keep'"),
+            1
+        );
+        assert_eq!(
+            count_rows(&db, "media_search_index", "asset_id = 'asset-m-keep'"),
+            1
+        );
     }
 
     #[test]
