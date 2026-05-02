@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`In progress | ~90%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~15%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -17,7 +17,7 @@ the full delivery plan, see [PHASES.md](PHASES.md).
 
 ## Phase 0: Protocol and Test Vectors
 
-**Status**: `In progress | ~90%`
+**Status**: `COMPLETE`
 
 **Goal**: Lock the shared binary formats, crypto specs, and
 cross-platform / cross-language test vectors **before** writing
@@ -54,9 +54,15 @@ Checklist:
       `SearchIndexShard` with the four-variant `IndexType` enum,
       `KCHAT_INDEX_SHARD_V1` magic, and zstd / XChaCha20-Poly1305
       framing per `docs/PROPOSAL.md §7.8`.)_
-- [ ] Multilingual tokenization spec (ICU configuration, script-
+- [x] Multilingual tokenization spec (ICU configuration, script-
       specific rules, fallback behavior, fuzzy-index granularity
-      per script).
+      per script). _(See `crates/core/src/search/tokenizer.rs`:
+      `TokenizerConfig` (locale, NFKC, case fold, accent fold),
+      `FallbackMode::{Icu, Unicode61}`, ISO-15924 `ScriptClass`,
+      `FuzzyGranularity::{Trigram, Bigram}` mapped via
+      `fuzzy_granularity`, `fts5_tokenizer_config` returning
+      `tokenize = 'icu'`, and `detect_script` / `segment_by_script`
+      for mixed-script runs per `docs/PROPOSAL.md §3.4`.)_
 - [x] iOS / Android / desktop / Rust cross-platform crypto test
       vectors. _(Rust-side complete: BLAKE3 known vectors,
       HKDF derivation determinism, AEAD round-trip / wrong-key /
@@ -118,7 +124,7 @@ Notes:
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~15%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
@@ -127,22 +133,47 @@ Checklist:
 
 - [ ] SQLCipher integration; `K_local_db` wrapped by Keychain /
       Keystore / DPAPI.
-- [ ] Local schema (`conversation`, `message_skeleton`,
+- [x] Local schema (`conversation`, `message_skeleton`,
       `message_body`, `media_asset`, `backup_event_journal`,
-      `archive_segment_map`, `restore_state`).
+      `archive_segment_map`, `restore_state`). _(Types defined in
+      `crates/core/src/local_store/schema.rs`; the
+      `SCHEMA_SQL` constant carries the `CREATE TABLE` /
+      `CREATE VIRTUAL TABLE` statements verbatim from
+      `docs/ARCHITECTURE.md §4`. SQLCipher binding follows.)_
 - [ ] Message processor: ingest MLS-decrypted messages, outbox,
-      idempotency.
+      idempotency. _(Skeleton landed at
+      `crates/core/src/message/processor.rs`:
+      `IngestedMessage`, `OutboxEntry`, `OutboxStatus`,
+      `IngestResult`, plus pure validators
+      `validate_ingest`, `is_duplicate`, and
+      `create_outbox_entry` minting UUID v7. DB-backed
+      implementation lands with the SQLCipher binding.)_
 - [ ] FTS5 with **ICU tokenizer** (`tokenize = 'icu'`) for
       multilingual full-text search; documented `unicode61` fallback.
+      _(Tokenizer spec landed in Phase 0 — see
+      `crates/core/src/search/tokenizer.rs` and `SCHEMA_SQL`'s
+      `search_fts` virtual table.)_
 - [ ] Structured search (sender, date range, conversation, content
-      kind).
-- [ ] Body state machine (`local_plain_available`,
+      kind). _(API types `SearchQuery`, `ContentKind`, `SearchScope`,
+      `SearchResult` defined in `crates/core/src/lib.rs`.)_
+- [x] Body state machine (`local_plain_available`,
       `local_encrypted_available`, `delivery_store_only`,
       `deleted_for_me`, `deleted_for_everyone`, `unavailable`).
+      _(Plus media / archive / backup / restore state machines.
+      See `crates/core/src/local_store/state_machines.rs`:
+      every enum implements `try_transition`, `Display` /
+      `FromStr`, and serde with snake_case wire form.)_
 - [ ] UniFFI bridge for iOS / Swift.
 - [ ] JNI bridge for Android / Kotlin.
-- [ ] Core public API surface: `initialize`, `register_device`,
-      `send_text`, `ingest_remote_messages`, `search`.
+- [x] Core public API surface: `initialize`, `register_device`,
+      `send_text`, `ingest_remote_messages`, `search`. _(Types and
+      trait method signatures defined in `crates/core/src/lib.rs`:
+      `KChatCore` trait, `SearchQuery`, `SearchScope`,
+      `SearchResult`, `HydrationReason` (P0–P5), `BackupReason`,
+      `StoragePressureReason`, `ClientMessageId`,
+      `DeliveryCursor`. Methods are sync `Result<_>`-returning
+      placeholders that flip to `async fn` once the SQLCipher /
+      transport plumbing exists.)_
 - [ ] Multilingual unit + integration tests.
 - [ ] Performance validation: insert text < 20 ms p95; search
       recent < 150 ms p95.
@@ -153,7 +184,44 @@ and Android.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-02: Multilingual tokenization spec landed at
+  `crates/core/src/search/tokenizer.rs`. ICU is the primary FTS5
+  tokenizer (`tokenize = 'icu'`); `unicode61 remove_diacritics 2`
+  is the documented fallback. The script-aware fuzzy split is
+  bigrams for logographic CJK (Hani / Hira / Kana) and trigrams
+  for everything else (Latn / Cyrl / Grek / Arab / Hebr / Deva /
+  Beng / Hang / Thai / Khmr / Laoo / Mymr / Unknown).
+  `segment_by_script` splits mixed-script text per
+  `docs/PROPOSAL.md §3.3` (e.g.
+  `"Meeting at 3pm 会議室で"` → Latn / Hani / Hira runs).
+- 2026-05-02: Local store schema types landed at
+  `crates/core/src/local_store/schema.rs`: `Conversation`,
+  `MessageSkeleton`, `MessageBody`, `MediaAsset`,
+  `BackupEventJournalEntry`, `ArchiveSegmentMapEntry`,
+  `RestoreStateEntry`, plus `MessageKind`, the `SCHEMA_SQL`
+  constant (CREATE TABLE / CREATE VIRTUAL TABLE statements
+  verbatim from `docs/ARCHITECTURE.md §4`), and the `TABLES`
+  registry.
+- 2026-05-02: State-machine enums landed at
+  `crates/core/src/local_store/state_machines.rs`. Every
+  transition not in the `docs/ARCHITECTURE.md §5` state diagrams
+  returns `StateTransitionError::Illegal`. `Display` / `FromStr`
+  use snake_case strings that match the SQL text columns.
+- 2026-05-02: Message processor skeleton landed at
+  `crates/core/src/message/processor.rs`: `IngestedMessage`,
+  `OutboxEntry`, `OutboxStatus`, `IngestResult`, and the static
+  `validate_ingest` / `is_duplicate` / `create_outbox_entry`
+  helpers. UUID v7 is enforced for outbox client message ids.
+- 2026-05-02: Public API surface expanded in
+  `crates/core/src/lib.rs`. New types: `SearchQuery`,
+  `ContentKind`, `SearchScope` (default `IncludeCold`),
+  `SearchResult`, `HydrationReason` (P0–P5), `BackupReason`,
+  `StoragePressureReason`, `ClientMessageId`, `DeliveryCursor`.
+  New `Error` variants: `Storage`, `Search`, `Message`,
+  `Transport`. `KChatCore` trait gained `initialize`,
+  `send_text`, `ingest_remote_messages`, `search` (sync
+  placeholders that turn into `async fn` once Phase 1 plumbing
+  exists).
 
 ---
 
@@ -388,5 +456,17 @@ Notes:
 
 - 2026-05-02: Phase 0 scaffold + crypto landed (PR #2).
 - 2026-05-02: CBOR wire formats, manifest spec (Ed25519), media
-  descriptor, search index shard spec, key wrap module landed.
+  descriptor, search index shard spec, key wrap module landed
+  (PR #3).
+- 2026-05-02: Phase 0 closed. Multilingual tokenization spec
+  (ICU primary, `unicode61` fallback, ISO-15924 `ScriptClass`,
+  trigram-vs-bigram per-script split, mixed-script segmentation)
+  landed at `crates/core/src/search/tokenizer.rs`.
+- 2026-05-02: Phase 1 foundation landed. Local store schema types
+  + `SCHEMA_SQL` (`crates/core/src/local_store/schema.rs`),
+  per-message state machines with `try_transition` and snake_case
+  Display / FromStr (`crates/core/src/local_store/state_machines.rs`),
+  message processor skeleton
+  (`crates/core/src/message/processor.rs`), and the expanded
+  `KChatCore` public API in `crates/core/src/lib.rs`.
   Phase 0 ~90%.

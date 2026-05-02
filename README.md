@@ -7,19 +7,108 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
-> Status: Phase 0 — Protocol and Test Vectors (`In progress | ~90%`).
-> Landed: Rust workspace scaffold, crypto module (BLAKE3, HKDF-SHA256
-> hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD, Pattern C
-> convergent encryption with bit-identical Go SDK interop, AES-256-KW
-> key wrap), CBOR wire formats (`formats::{BackupSegmentFrame,
-> ArchiveSegmentFrame, manifest::{BackupManifest, ArchiveManifest},
+> Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
+> Search + MLS Integration — `In progress | ~15%`.**
+>
+> Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
+> HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
+> Pattern C convergent encryption with bit-identical Go SDK interop,
+> AES-256-KW key wrap), CBOR wire formats
+> (`formats::{BackupSegmentFrame, ArchiveSegmentFrame,
+> manifest::{BackupManifest, ArchiveManifest},
 > media_descriptor::MediaDescriptor, search_shard::SearchIndexShard}`),
-> Ed25519 manifest signing with a `previous_manifest_hash` chain, and
-> a CI pipeline. Outstanding: multilingual tokenization spec. The
-> higher-level engines (`message`, `media`, `search`, `archive`,
-> `backup`, `offload`, `restore`) are stubbed and land across
-> Phases 1–7. See [docs/PROGRESS.md](docs/PROGRESS.md) for the full
-> tracker.
+> Ed25519 manifest signing with a `previous_manifest_hash` chain,
+> the multilingual tokenization spec
+> (`search::tokenizer::{TokenizerConfig, FallbackMode, ScriptClass,
+> FuzzyGranularity, fts5_tokenizer_config, detect_script,
+> segment_by_script}`), and a CI pipeline.
+>
+> Landed in Phase 1 so far: typed local-store schema row structs +
+> `SCHEMA_SQL` (`local_store::schema`), per-message state machines
+> with `try_transition` (`local_store::state_machines`), the
+> message-processor skeleton (`message::processor`), and the
+> expanded `KChatCore` public API
+> (`SearchQuery`, `SearchScope`, `SearchResult`, `HydrationReason`,
+> `BackupReason`, `StoragePressureReason`, `ClientMessageId`,
+> `DeliveryCursor`).
+>
+> Outstanding for Phase 1: SQLCipher integration, FTS5 query
+> engine, UniFFI / JNI bridges, structured-search query parser. The
+> higher-level engines (`media`, `archive`, `backup`, `offload`,
+> `restore`) remain stubbed and land across Phases 2–7. See
+> [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
+
+---
+
+## Project structure
+
+The current shape of `crates/core/src/`. Bold modules carry real
+implementation; the rest are still placeholders that fill in across
+Phases 2–7.
+
+```
+chat-storage-search/
+  Cargo.toml                                # workspace root
+  README.md
+  LICENSE
+  docs/
+    PROPOSAL.md
+    ARCHITECTURE.md
+    PHASES.md
+    PROGRESS.md
+  crates/
+    core/                                   # platform-agnostic Rust core
+      Cargo.toml
+      src/
+        lib.rs                              # Phase 1: KChatCore trait + public API types
+        config.rs                           # KChatCoreConfig
+        crypto/                             # Phase 0: COMPLETE
+          mod.rs
+          aead.rs                           # XChaCha20-Poly1305 / AES-256-GCM
+          content_hash.rs                   # BLAKE3 content hash
+          convergent.rs                     # Pattern C convergent encryption (Go SDK interop)
+          key_hierarchy.rs                  # HKDF-SHA256 derivation tree
+          key_wrap.rs                       # AES-256-KW (RFC 3394)
+        formats/                            # Phase 0: CBOR wire formats — COMPLETE
+          mod.rs                            # BackupSegmentFrame / ArchiveSegmentFrame
+          manifest.rs                       # BackupManifest / ArchiveManifest + Ed25519
+          media_descriptor.rs               # MediaDescriptor
+          search_shard.rs                   # SearchIndexShard (text/fuzzy/vector/media)
+        local_store/                        # Phase 1: foundation landed
+          mod.rs
+          schema.rs                         # SCHEMA_SQL + typed row structs
+          state_machines.rs                 # body / media / archive / backup / restore
+        message/                            # Phase 1: skeleton landed
+          mod.rs
+          processor.rs                      # IngestedMessage / OutboxEntry / validators
+        search/                             # Phase 1: tokenizer landed
+          mod.rs
+          tokenizer.rs                      # ICU + ScriptClass + FuzzyGranularity
+        archive/                            # placeholder (Phase 3)
+        backup/                             # placeholder (Phase 4)
+        media/                              # placeholder (Phase 2)
+        models/                             # placeholder (Phase 6)
+        offload/                            # placeholder (Phase 3)
+        restore/                            # placeholder (Phase 4)
+        scheduler/                          # placeholder (Phase 4 / 7)
+        transport/                          # placeholder (Phase 1 / 2 / 4)
+      tests/
+        manifest_signing.rs                 # generation chain end-to-end
+        key_wrap_hierarchy.rs               # archive vs backup root wrap split
+        pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
+        pattern_c_interop_vectors.json
+    ios-bridge/                             # UniFFI → Swift (Phase 1)
+    android-bridge/                         # JNI → Kotlin (Phase 1)
+    desktop/                                # macOS + Windows (Phase 7)
+  tests/
+    generate_vectors/
+      main.go                               # Pattern C vector generator (calls Go SDK)
+```
+
+The full target shape (including the `archive/` / `backup/` /
+`media/` / `models/` / `transport/` engines) lives in
+[docs/ARCHITECTURE.md §2](docs/ARCHITECTURE.md) and the
+"Target repo structure" section below.
 
 ---
 
@@ -43,19 +132,39 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --verbose
 ```
 
-The Phase 0 test surface covers the [`crypto`](crates/core/src/crypto/)
-module (content hash, key hierarchy, AEAD, convergent encryption,
-key wrap), the [`formats`](crates/core/src/formats/) module (CBOR
-round-trip, manifest sign / verify / chain, media descriptor,
-search shard), and the integration tests under
-[`crates/core/tests/`](crates/core/tests/) (cross-language Pattern C
-vectors, manifest signing, key-wrap-by-hierarchy-root).
+The Phase 0 + Phase 1 test surface covers:
+
+* [`crypto`](crates/core/src/crypto/) — content hash, key
+  hierarchy, AEAD, convergent encryption, key wrap.
+* [`formats`](crates/core/src/formats/) — CBOR round-trip,
+  manifest sign / verify / chain, media descriptor, search shard.
+* [`search::tokenizer`](crates/core/src/search/tokenizer.rs) —
+  script detection, mixed-script segmentation, fuzzy-granularity
+  mapping, FTS5 config strings, `TokenizerConfig` serde.
+* [`local_store::schema`](crates/core/src/local_store/schema.rs) —
+  struct round-trip through serde, SQL schema validity (every
+  documented table is present, parentheses balance, statements
+  terminate cleanly).
+* [`local_store::state_machines`](crates/core/src/local_store/state_machines.rs) —
+  every legal transition succeeds, every illegal transition
+  errors, `Display` / `FromStr` round-trip, serde round-trip.
+* [`message::processor`](crates/core/src/message/processor.rs) —
+  `validate_ingest`, deduplication, outbox creation with
+  monotonic UUID v7.
+* [`lib.rs`](crates/core/src/lib.rs) — public API type
+  construction, default `SearchScope::IncludeCold`, P0–P5 ordering
+  on `HydrationReason`, `Error` variant `Display` strings.
+* Integration tests under
+  [`crates/core/tests/`](crates/core/tests/) — cross-language
+  Pattern C vectors, manifest signing, key-wrap-by-hierarchy-root.
 
 The workspace ships four crates: `kchat-core` (platform-agnostic
 logic), and three thin bridges (`kchat-ios-bridge`,
-`kchat-android-bridge`, `kchat-desktop`). Phase 0 implements
-`kchat-core/src/crypto/`; the higher-level modules are stubbed and
-filled in across Phases 1–7 (see [docs/PHASES.md](docs/PHASES.md)).
+`kchat-android-bridge`, `kchat-desktop`). The non-`crypto` /
+non-`formats` / non-`search::tokenizer` / non-`local_store` /
+non-`message::processor` modules in `kchat-core/src/` are stubbed
+and filled in across Phases 2–7 (see
+[docs/PHASES.md](docs/PHASES.md)).
 
 ### Cross-language interop
 
@@ -331,7 +440,7 @@ chat-storage-search/
     PROGRESS.md
 ```
 
-## Quick links
+## Documentation
 
 - [docs/PROPOSAL.md](docs/PROPOSAL.md) — full technical design,
   scope, key hierarchy, state machines, search architecture,
