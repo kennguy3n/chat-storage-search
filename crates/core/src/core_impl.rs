@@ -254,6 +254,77 @@ impl CoreImpl {
         }
         Ok(())
     }
+
+    /// Delete `conversation_id` along with every dependent row
+    /// (skeletons, bodies, FTS rows, fuzzy tokens). Errors with
+    /// [`Error::Storage`] when the row does not exist.
+    ///
+    /// Backed by [`LocalStoreDb::delete_conversation`], which runs
+    /// the cascade inside a single `SAVEPOINT` for atomicity.
+    pub fn delete_conversation(&self, conversation_id: Uuid) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let n = db
+            .delete_conversation(&conversation_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if n == 0 {
+            return Err(Error::Storage(format!(
+                "no conversation with id={conversation_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return the messages in `conversation_id` as a flat
+    /// timeline view (skeleton fields + optional plaintext body),
+    /// ordered newest-first. `before_ms`, when `Some`, restricts
+    /// the page to messages with `created_at_ms < before_ms`;
+    /// `limit` caps the returned page.
+    ///
+    /// Wraps [`LocalStoreDb::get_timeline`].
+    pub fn get_timeline(
+        &self,
+        conversation_id: Uuid,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::TimelineRow>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.get_timeline(&conversation_id.to_string(), before_ms, limit)
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Fetch a single message's skeleton plus its (optional) body
+    /// in one DB round-trip. Returns `Ok(None)` when no skeleton
+    /// row matches `message_id`, or `Ok(Some((skel, None)))` when
+    /// the skeleton exists but the body has been dropped (e.g.
+    /// after [`KChatCore::delete_for_everyone`]).
+    ///
+    /// Distinct from the trait-level [`KChatCore::get_message`]
+    /// (which returns the public [`MessageView`] shape): this
+    /// inherent method exposes the **raw** schema rows so binding
+    /// crates and integration tests can pin lifecycle state
+    /// without re-shaping through `MessageView`. Wraps
+    /// [`LocalStoreDb::get_message_with_body`].
+    pub fn get_message_with_body(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Option<(MessageSkeleton, Option<MessageBody>)>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.get_message_with_body(&message_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Fetch a single message's body, if any. Returns `Ok(None)`
+    /// when no body row exists for `message_id` (the message may
+    /// not exist, may be media-only, or its body may have been
+    /// dropped by [`KChatCore::delete_for_everyone`]).
+    ///
+    /// Used by the hydration display path. Wraps
+    /// [`LocalStoreDb::get_message_body`].
+    pub fn get_message_body(&self, message_id: Uuid) -> Result<Option<MessageBody>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.get_message_body(&message_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 impl KChatCore for CoreImpl {
@@ -1177,5 +1248,247 @@ mod tests {
             Some(mid.0.to_string()).as_deref()
         );
         assert!(list[0].last_activity_ms >= 1_000);
+    }
+
+    // ----------------------------------------------------------------
+    // Task 3 — get_timeline (CoreImpl)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn core_impl_get_timeline_round_trip_after_send_text() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mid = core.send_text(conv, "first message", None).unwrap();
+
+        let rows = core.get_timeline(conv, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, mid.0.to_string());
+        assert_eq!(rows[0].conversation_id, conv.to_string());
+        assert_eq!(rows[0].text_content.as_deref(), Some("first message"));
+    }
+
+    #[test]
+    fn core_impl_get_timeline_round_trip_after_ingest_messages() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let msgs = vec![
+            IngestedMessage {
+                message_id: m1,
+                conversation_id: conv,
+                sender_id: "user-1".into(),
+                created_at_ms: 1_700_000_000_000,
+                text_content: Some("ingested one".into()),
+                media_descriptors: vec![],
+                reply_to: None,
+            },
+            IngestedMessage {
+                message_id: m2,
+                conversation_id: conv,
+                sender_id: "user-1".into(),
+                created_at_ms: 1_700_000_000_500,
+                text_content: Some("ingested two".into()),
+                media_descriptors: vec![],
+                reply_to: None,
+            },
+        ];
+        core.ingest_messages(&msgs).expect("ingest");
+
+        let rows = core.get_timeline(conv, None, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest-first.
+        assert_eq!(rows[0].message_id, m2.to_string());
+        assert_eq!(rows[1].message_id, m1.to_string());
+    }
+
+    #[test]
+    fn core_impl_get_timeline_paginates_across_pages() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mut msgs = Vec::new();
+        for i in 0..5 {
+            msgs.push(IngestedMessage {
+                message_id: Uuid::now_v7(),
+                conversation_id: conv,
+                sender_id: "user-1".into(),
+                created_at_ms: 1_700_000_000_000 + i,
+                text_content: Some(format!("page msg {i}")),
+                media_descriptors: vec![],
+                reply_to: None,
+            });
+        }
+        core.ingest_messages(&msgs).expect("ingest");
+
+        let page1 = core.get_timeline(conv, None, 2).unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().unwrap().created_at_ms;
+
+        let page2 = core.get_timeline(conv, Some(cursor), 2).unwrap();
+        assert_eq!(page2.len(), 2);
+        assert!(page2.iter().all(|r| r.created_at_ms < cursor));
+
+        let cursor2 = page2.last().unwrap().created_at_ms;
+        let page3 = core.get_timeline(conv, Some(cursor2), 2).unwrap();
+        assert_eq!(page3.len(), 1);
+
+        let empty = core
+            .get_timeline(conv, Some(page3[0].created_at_ms), 2)
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Task 4 — get_message_with_body / get_message_body
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn core_impl_get_message_returns_none_for_missing() {
+        let core = fresh_core();
+        assert!(core
+            .get_message_with_body(Uuid::now_v7())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn core_impl_get_message_returns_skeleton_and_body_after_send_text() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "hi there", None).unwrap();
+
+        let (skel, body) = core
+            .get_message_with_body(mid.0)
+            .unwrap()
+            .expect("found message");
+        assert_eq!(skel.message_id, mid.0.to_string());
+        assert_eq!(skel.conversation_id, conv.to_string());
+        let body = body.expect("body present");
+        assert_eq!(body.text_content.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn core_impl_get_message_returns_skeleton_only_after_delete_for_everyone() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "tombstone fodder", None).unwrap();
+
+        core.delete_for_everyone(mid.0).expect("delete");
+
+        let (skel, body) = core
+            .get_message_with_body(mid.0)
+            .unwrap()
+            .expect("skel still present");
+        assert_eq!(skel.message_id, mid.0.to_string());
+        assert_eq!(
+            skel.body_state,
+            crate::local_store::state_machines::BodyState::DeletedForEveryone
+        );
+        assert!(body.is_none(), "body row dropped");
+    }
+
+    #[test]
+    fn core_impl_get_message_body_returns_none_for_missing() {
+        let core = fresh_core();
+        assert!(core.get_message_body(Uuid::now_v7()).unwrap().is_none());
+    }
+
+    #[test]
+    fn core_impl_get_message_body_returns_body_after_ingest() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mid = Uuid::now_v7();
+        let msgs = vec![IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("body via ingest".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        }];
+        core.ingest_messages(&msgs).expect("ingest");
+
+        let body = core.get_message_body(mid).unwrap().expect("body present");
+        assert_eq!(body.text_content.as_deref(), Some("body via ingest"));
+    }
+
+    // ----------------------------------------------------------------
+    // Task 5 — delete_conversation
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn core_impl_delete_conversation_removes_messages_and_search() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let m_send = core.send_text(conv, "send-text alpha", None).expect("send");
+        let m_ingest = Uuid::now_v7();
+        core.ingest_messages(&[IngestedMessage {
+            message_id: m_ingest,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("ingested beta".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        }])
+        .expect("ingest");
+
+        // Pre-delete sanity: search hits both rows.
+        let pre = core
+            .search(
+                SearchQuery {
+                    query_string: "alpha".into(),
+                    ..SearchQuery::default()
+                },
+                SearchScope::LocalOnly,
+            )
+            .unwrap();
+        assert_eq!(pre.len(), 1);
+
+        core.delete_conversation(conv).expect("delete_conversation");
+
+        // Conversation row gone.
+        assert!(core.get_conversation(conv).unwrap().is_none());
+
+        // Both messages gone.
+        assert!(core.get_message_with_body(m_send.0).unwrap().is_none());
+        assert!(core.get_message_with_body(m_ingest).unwrap().is_none());
+
+        // No search hits for either token.
+        for token in ["alpha", "beta"] {
+            let hits = core
+                .search(
+                    SearchQuery {
+                        query_string: token.into(),
+                        ..SearchQuery::default()
+                    },
+                    SearchScope::LocalOnly,
+                )
+                .unwrap();
+            assert!(
+                hits.is_empty(),
+                "expected no hits for `{token}` after delete_conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn core_impl_delete_conversation_errors_on_missing_id() {
+        let core = fresh_core();
+        let err = core.delete_conversation(Uuid::now_v7()).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
     }
 }

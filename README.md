@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~90%`.**
+> Search + MLS Integration — `In progress | ~95%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -92,7 +92,21 @@
 > `RawDeliveryMessage` / `FetchResult` / `TransportError`
 > shapes, and the wiring through `CoreImpl::with_transport` /
 > `set_delivery_client` / `ingest_remote_messages` are all
-> landed). The higher-level engines
+> landed). The broader transport surface for Phases 2–4
+> also lives on the core today: `transport::TransportClient`
+> defines the cursor-paginated message fetch, chunked blob
+> upload (`init_blob_upload` / `upload_chunk` / `commit_blob`
+> with whole-object Merkle-root verification),
+> `fetch_blob_range` for ranged downloads, archive manifest +
+> segment fetch, and encrypted index-shard fetch — backed by a
+> `NoopTransportClient` that returns
+> `Error::NotImplemented("transport")` from every method.
+> `CoreImpl` also exposes the message-timeline page
+> (`get_timeline`), single-message retrieval
+> (`get_message_with_body`, `get_message_body`), and
+> conversation-deletion cascade (`delete_conversation`) used
+> by the rendering and storage-management paths in the
+> bindings. The higher-level engines
 > (`media`, `archive`, `backup`, `offload`, `restore`) remain
 > stubbed and land across Phases 2–7. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
@@ -155,7 +169,7 @@ chat-storage-search/
         offload/                            # placeholder (Phase 3)
         restore/                            # placeholder (Phase 4)
         scheduler/                          # placeholder (Phase 4 / 7)
-        transport/                          # Phase 1: DeliveryClient trait + MockDeliveryClient landed
+        transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
       tests/
@@ -233,10 +247,18 @@ The Phase 0 + Phase 1 test surface covers:
   SQLCipher bring-up (`PRAGMA key`, foreign-key enforcement,
   ICU→`unicode61` schema fallback), `LocalStoreDb` CRUD round-trip
   for conversation / skeleton / body / `update_body_state` /
-  `insert_backup_event`, FK-violation enforcement, and the
+  `insert_backup_event`, FK-violation enforcement, the
   conversation-management helpers `list_conversations` (pinned
   first, then descending `last_activity_ms`),
-  `update_conversation_pin`, `update_conversation_mute`.
+  `update_conversation_pin`, `update_conversation_mute`, plus
+  the message-timeline pagination (`get_timeline` newest-first
+  with `before_ms` cursor, body-row drop surfaces as
+  `text_content == None`) and the conversation-deletion
+  cascade (`delete_conversation` removes
+  `search_fuzzy` → `search_fts` → `message_body` →
+  `message_skeleton` → `conversation` in a single
+  `SAVEPOINT`, leaves sibling conversations untouched, and is
+  a no-op for missing ids).
 * [`message::processor`](crates/core/src/message/processor.rs) —
   `validate_ingest`, deduplication, outbox creation with monotonic
   UUID v7, plus the `MessagePersister` integration tests for
@@ -270,29 +292,49 @@ The Phase 0 + Phase 1 test surface covers:
   body-and-search update, `delete_for_me` removes from search
   while keeping the body, `delete_for_everyone` drops the body
   and tombstones the skeleton, missing-id error path), the
-  **timeline retrieval surface** (`get_message` round-trip,
-  `get_conversation_messages` newest-first ordering with
-  `before_ms` pagination and `limit` handling), the
+  **timeline retrieval surface** (trait-level `get_message`
+  round-trip, `get_conversation_messages` newest-first
+  ordering with `before_ms` pagination and `limit` handling,
+  the inherent `get_timeline` `TimelineRow` page after
+  `send_text` / `ingest_messages` plus multi-page cursor
+  walks, and the inherent single-message helpers
+  `get_message_with_body` / `get_message_body` covering
+  missing-id `Ok(None)`, body-present after `send_text` /
+  `ingest_messages`, and skeleton-with-`None`-body after
+  `delete_for_everyone`), the
   **transport-driven `ingest_remote_messages`** (happy path
   with three messages indexed + searchable, no-transport
   `Error::Transport`, dedup on retry through the same mock
   cursor, and cursor pass-through verified by the mock's
   per-call assertion), the
   conversation-management surface (`create_conversation` /
-  `list_conversations` / `get_conversation` / pin / mute,
-  including `list_conversations_reflects_latest_message_activity`
+  `list_conversations` / `get_conversation` / pin / mute /
+  `delete_conversation`, including
+  `list_conversations_reflects_latest_message_activity`
   which pins the auto-bump of `last_message_id` /
-  `last_activity_ms` from the persistence path), and
+  `last_activity_ms` from the persistence path, plus the
+  cascade test that confirms messages and search hits are
+  gone after `delete_conversation` and the missing-id
+  `Error::Storage` path), and
   the Phase-1 `Error::NotImplemented` stubs for `send_media` /
   `hydrate_message` / `run_incremental_backup` /
   `enforce_storage_budget` / `restore_from_backup`.
 * [`transport`](crates/core/src/transport/mod.rs) — unit tests
-  for the new `DeliveryClient` trait surface:
-  `TransportError` `Display` strings,
-  `FetchResult::default()` empty-page shape,
-  object-safety pin (`Box<dyn DeliveryClient>` constructs),
-  and the `MockDeliveryClient` staged-response / cursor
-  recording / panic-on-unexpected-cursor behaviour.
+  for both transport surfaces: the narrower **`DeliveryClient`**
+  used by `ingest_remote_messages` (`TransportError` `Display`
+  strings, `FetchResult::default()` empty-page shape,
+  object-safety pin via `Box<dyn DeliveryClient>`, and the
+  `MockDeliveryClient` staged-response / cursor recording /
+  panic-on-unexpected-cursor behaviour), and the broader
+  **`TransportClient`** for Phases 2–4 (object safety,
+  serde round-trips for `FetchMessagesResponse` /
+  `BlobUploadHandle` / `ChunkReceipt` /
+  `CommitBlobResponse` / `EncryptedManifest` / `BlobClass`,
+  and `NoopTransportClient` returning
+  `Error::NotImplemented("transport")` from every method —
+  message fetch, blob upload init / chunk / commit / range
+  fetch, archive manifest + segment fetch, and
+  index-shard fetch).
 * [`lib.rs`](crates/core/src/lib.rs) — public API type
   construction, default `SearchScope::IncludeCold`, P0–P5 ordering
   on `HydrationReason`, `Error` variant `Display` strings

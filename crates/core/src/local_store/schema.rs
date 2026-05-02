@@ -331,6 +331,43 @@ pub struct RestoreStateEntry {
     pub notes: Option<String>,
 }
 
+/// One row of the message-timeline view returned by
+/// [`super::db::LocalStoreDb::get_timeline`] and
+/// [`crate::core_impl::CoreImpl::get_timeline`].
+///
+/// Skeleton fields plus the optional plaintext body string from
+/// `message_body`. The view is deliberately **flat** — it exists
+/// to render a chat timeline without an extra round-trip per
+/// message — so it lives here next to the schema row types
+/// rather than inside `core_impl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineRow {
+    /// Stable message identifier (UUID, serialized as string).
+    pub message_id: String,
+    /// Owning conversation.
+    pub conversation_id: String,
+    /// Stable sender identifier.
+    pub sender_id: String,
+    /// Wall-clock millisecond timestamp set by the sender.
+    pub created_at_ms: i64,
+    /// Message kind discriminator.
+    pub kind: MessageKind,
+    /// Body lifecycle state.
+    pub body_state: BodyState,
+    /// Plaintext body (`message_body.text_content`) if a body row
+    /// exists for this skeleton, otherwise `None`. Media-only
+    /// messages and rows whose body has been dropped (e.g.
+    /// `delete_for_everyone`) carry `None`.
+    pub text_content: Option<String>,
+    /// Identifier of the message this is a reply to, if any.
+    pub reply_to: Option<String>,
+    /// Wall-clock millisecond timestamp of the most recent edit.
+    pub edited_at_ms: Option<i64>,
+    /// Wall-clock millisecond timestamp of deletion (when the row is
+    /// in `deleted_for_*`).
+    pub deleted_at_ms: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

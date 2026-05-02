@@ -56,6 +56,11 @@ pub mod transport;
 
 pub use config::KChatCoreConfig;
 pub use core_impl::CoreImpl;
+pub use local_store::schema::TimelineRow;
+pub use transport::{
+    BlobUploadHandle, ChunkReceipt, CommitBlobResponse, EncryptedManifest, FetchMessagesResponse,
+    NoopTransportClient, TransportClient,
+};
 
 use std::path::Path;
 

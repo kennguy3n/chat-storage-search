@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~90%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~95%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -138,7 +138,7 @@ Notes:
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `In progress | ~90%`
+**Status**: `In progress | ~95%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
@@ -218,6 +218,69 @@ Checklist:
       See `crates/core/src/local_store/state_machines.rs`:
       every enum implements `try_transition`, `Display` /
       `FromStr`, and serde with snake_case wire form.)_
+- [x] Transport trait surface (types + `NoopTransportClient`).
+      _(Phase-2/3/4 transport surface landed alongside the
+      narrower Phase-1 `DeliveryClient`. See
+      `crates/core/src/transport/mod.rs`:
+      `TransportClient` defines `fetch_messages`,
+      `init_blob_upload` / `upload_chunk` / `commit_blob` /
+      `fetch_blob_range` (chunked blob I/O),
+      `fetch_archive_manifests` / `fetch_archive_segment`
+      (Personal Archive), and `fetch_index_shards` (encrypted
+      search shards). Supporting types (`FetchMessagesResponse`,
+      `BlobUploadHandle`, `ChunkReceipt`, `CommitBlobResponse`,
+      `EncryptedManifest`, plus the serde-tagged `BlobClass`
+      enum re-used from `crypto::aead`) round-trip through
+      JSON. `NoopTransportClient` returns
+      `Error::NotImplemented("transport")` from every method
+      so `CoreImpl` can be constructed without a real HTTP /
+      gRPC backend until Phase 2 lands.)_
+- [x] Conversation metadata auto-update on message persist.
+      _(`MessagePersister::persist_ingested_message` and
+      `persist_outbox_entry` now call
+      `LocalStoreDb::update_conversation_last_message` from
+      inside the per-message `SAVEPOINT`, and the helper
+      guards against out-of-order arrivals so an older
+      timestamp can never pull `last_activity_ms` /
+      `last_message_id` backwards. `list_conversations`
+      ordering therefore reflects the latest message
+      activity automatically — no extra call from the
+      binding layer.)_
+- [x] Message timeline pagination query.
+      _(`LocalStoreDb::get_timeline(conversation_id, before_ms,
+      limit)` joins `message_skeleton` against `message_body`
+      (LEFT JOIN so a dropped body still surfaces with
+      `text_content == None`), filters by `created_at_ms <
+      before_ms` when supplied, orders newest-first, and
+      caps the page with `LIMIT`. The flat
+      `TimelineRow { message_id, conversation_id, sender_id,
+      created_at_ms, kind, body_state, text_content,
+      reply_to, edited_at_ms, deleted_at_ms }` shape lets a
+      chat-list UI render the full timeline without an extra
+      round-trip per message. Surfaced on `CoreImpl` as
+      `get_timeline(uuid, before_ms, limit)` and re-exported
+      from `crate::TimelineRow`.)_
+- [x] Single-message retrieval on `CoreImpl`.
+      _(`CoreImpl::get_message_with_body(message_id) ->
+      Option<(MessageSkeleton, Option<MessageBody>)>` and
+      `CoreImpl::get_message_body(message_id) ->
+      Option<MessageBody>` wrap the existing
+      `LocalStoreDb::get_message_with_body` /
+      `get_message_body` helpers and convert `DbError` to
+      `Error::Storage`. The pair lets bindings render a
+      tombstone (skeleton + `None` body) after
+      `delete_for_everyone` and lazily hydrate body text on
+      tap.)_
+- [x] Conversation deletion with cascade cleanup.
+      _(`LocalStoreDb::delete_conversation(conversation_id)`
+      drops every dependent row inside a single `SAVEPOINT`:
+      `search_fuzzy` tokens for messages in the conversation,
+      `search_fts` rows, `message_body` rows,
+      `message_skeleton` rows, and finally the
+      `conversation` row. Returns the count of conversation
+      rows deleted; `CoreImpl::delete_conversation(uuid)`
+      maps `0` to `Error::Storage` so callers can
+      distinguish "not found" from "removed".)_
 - [ ] UniFFI bridge for iOS / Swift.
 - [ ] JNI bridge for Android / Kotlin.
 - [x] Core public API surface: `initialize`, `register_device`,
@@ -837,3 +900,35 @@ Notes:
   and `LocalStoreDb`. New combined FTS5 + fuzzy multilingual
   integration suite at
   `crates/core/tests/multilingual_fuzzy_search.rs`.
+- 2026-05-02: Phase 1 closed in to ~95% with five sibling
+  tasks. (1) Transport trait surface: `transport::mod`
+  expanded with `TransportClient` (fetch_messages,
+  init_blob_upload, upload_chunk, commit_blob,
+  fetch_blob_range, fetch_archive_manifests,
+  fetch_archive_segment, fetch_index_shards), supporting
+  types (`FetchMessagesResponse`, `BlobUploadHandle`,
+  `ChunkReceipt`, `CommitBlobResponse`,
+  `EncryptedManifest`), and `NoopTransportClient` that
+  returns `Error::NotImplemented("transport")` from every
+  method. `BlobClass` in `crypto::aead` picked up
+  `Serialize / Deserialize` so the wire-level AAD tag and
+  the transport-level upload argument can never disagree.
+  (2) Conversation metadata auto-update is now hardened
+  against out-of-order arrivals: `update_conversation_last_message`
+  does not regress `last_activity_ms`. (3) Message timeline
+  pagination: `LocalStoreDb::get_timeline` and
+  `CoreImpl::get_timeline` return a newest-first
+  `TimelineRow` page (skeleton + optional body text) cursored
+  on `before_ms`. (4) Single-message retrieval:
+  `CoreImpl::get_message_with_body` and
+  `CoreImpl::get_message_body` wrap the existing DB helpers
+  for the binding layer's hydration display path. (5)
+  Conversation deletion: `LocalStoreDb::delete_conversation`
+  cascades through `search_fuzzy` → `search_fts` →
+  `message_body` → `message_skeleton` → `conversation` in a
+  single `SAVEPOINT`; `CoreImpl::delete_conversation` maps
+  the missing-row case to `Error::Storage`. The five sibling
+  tasks ship with 18 new unit tests across
+  `local_store::db` and `core_impl` plus 12 transport-trait
+  tests (object safety, serde round-trips, every
+  `NoopTransportClient` method).

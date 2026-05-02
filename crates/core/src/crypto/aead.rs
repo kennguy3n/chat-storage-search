@@ -25,13 +25,24 @@ pub const KCHAT_BLOB_CHUNK_AAD_MAGIC: &[u8] = b"KCHAT_BLOB_CHUNK_V1";
 
 /// Object class encoded in [`build_kchat_chunk_aad`]. Numeric values
 /// are the canonical varint payloads from `docs/PROPOSAL.md §8.3`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Re-used by [`crate::transport::TransportClient`] (the upload /
+/// blob-fetch surface uses the same class enum so the wire-level
+/// AAD tag and the transport-level `init_blob_upload` argument
+/// can never disagree).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u32)]
 pub enum BlobClass {
+    /// Media blob (image / video / audio / document).
     Media = 1,
+    /// Archive segment blob (`docs/PROPOSAL.md §6`).
     ArchiveSegment = 2,
+    /// Encrypted search-index shard (`docs/PROPOSAL.md §7.8`).
     SearchIndexShard = 3,
+    /// Backup segment blob (`docs/PROPOSAL.md §9`).
     BackupSegment = 4,
+    /// Backup or archive manifest blob.
     Manifest = 5,
 }
 

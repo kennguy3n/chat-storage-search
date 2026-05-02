@@ -87,7 +87,7 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
-> **Phase 0 closed; Phase 1 in flight (~90%).** Updates vs. the
+> **Phase 0 closed; Phase 1 in flight (~95%).** Updates vs. the
 > original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
@@ -229,33 +229,71 @@ goes through the FFI bridge for the host platform.
 >   Inherent **conversation-management methods**
 >   (`create_conversation`, `list_conversations`,
 >   `get_conversation`, `update_conversation_pin`,
->   `update_conversation_mute`) wrap the matching helpers on
->   `LocalStoreDb` and surface `Error::Storage` when the
->   conversation does not exist so the bridge layer can show
->   the failure to the user. The Phase-2/3/4 trait methods
+>   `update_conversation_mute`, `delete_conversation`) wrap the
+>   matching helpers on `LocalStoreDb` and surface
+>   `Error::Storage` when the conversation does not exist so
+>   the bridge layer can show the failure to the user.
+>   `delete_conversation` cascades through every dependent
+>   row (`media_search_index` → `search_fuzzy` → `search_fts`
+>   → `search_vector` → `media_asset` → `message_body` →
+>   `message_skeleton` → `conversation`) inside a single
+>   `SAVEPOINT`, leaving sibling conversations untouched. The
+>   ordering is dictated by the schema's foreign-key
+>   direction: `media_search_index.asset_id` references
+>   `media_asset(asset_id)` and `media_asset.message_id`
+>   references `message_skeleton(message_id)`, so both must
+>   drain top-down before the skeleton delete runs;
+>   `search_vector` carries no FK but the rows are
+>   message-scoped and never want to outlive the skeleton.
+>   Inherent **timeline + single-message helpers**
+>   (`get_timeline(uuid, before_ms, limit)` for newest-first
+>   `TimelineRow` pages, plus `get_message_with_body(uuid)`
+>   and `get_message_body(uuid)` for the binding hydration
+>   path) wrap the matching DB helpers without re-shaping
+>   through `MessageView`. The Phase-2/3/4 trait methods
 >   `send_media`, `hydrate_message`, `run_incremental_backup`,
 >   `enforce_storage_budget`, and `restore_from_backup`
 >   currently return `Err(Error::NotImplemented(<method>))` —
 >   the surface is locked but the implementation lands with
 >   the relevant later phase.
 > * `crates/core/src/transport/mod.rs` is the **Phase-1
->   transport trait abstraction**. The module now exposes
->   `DeliveryClient` (object-safe, `Send + Sync`),
->   `FetchResult { messages, next_cursor }`,
->   `RawDeliveryMessage` (string-typed wire shape with
->   `message_id`, `conversation_id`, `sender_id`,
->   `created_at_ms`, `text_content`, `media_descriptors`,
->   `reply_to`), and `TransportError { Network, Auth, Server }`
->   with `thiserror`-derived `Display` so upper layers can
->   route on intent without parsing free-form text. A
->   test-only `MockDeliveryClient` lets unit tests stage
->   FIFO `(after_cursor → response)` mappings and asserts —
+>   transport trait abstraction**. The module exposes two
+>   layered traits. The narrower `DeliveryClient` (object-safe,
+>   `Send + Sync`) drives `ingest_remote_messages` today via
+>   `FetchResult { messages, next_cursor }`, the
+>   string-typed `RawDeliveryMessage` wire shape, and
+>   `TransportError { Network, Auth, Server }` with
+>   `thiserror`-derived `Display` so upper layers can route
+>   on intent without parsing free-form text. A test-only
+>   `MockDeliveryClient` stages FIFO
+>   `(after_cursor → response)` mappings and asserts —
 >   inside `fetch_messages` — that the actual `after_cursor`
 >   matches the staged one, which is how the
 >   `core_impl::core_impl_ingest_remote_passes_cursor` test
->   pins the cursor pass-through. The Phase-2+ HTTP / gRPC /
->   MLS-blob transports layer on top of `DeliveryClient` in
->   sibling sub-modules added when those engines arrive.
+>   pins the cursor pass-through. The broader
+>   `TransportClient` is the §10 surface that the
+>   later-phase engines (`media`, `archive`, `backup`,
+>   search-shard fetch) will share: cursor-paginated
+>   `fetch_messages` returning `FetchMessagesResponse`,
+>   chunked blob upload (`init_blob_upload` →
+>   `upload_chunk` → `commit_blob`) with whole-object Merkle
+>   verification through `BlobUploadHandle` / `ChunkReceipt`
+>   / `CommitBlobResponse`, ranged blob download
+>   (`fetch_blob_range`), Personal-Archive manifest +
+>   segment fetch (`fetch_archive_manifests` returning
+>   `EncryptedManifest`, `fetch_archive_segment` returning
+>   ciphertext bytes), and encrypted-search-shard fetch
+>   (`fetch_index_shards`). The `BlobClass` enum
+>   (`Media`, `ArchiveSegment`, `SearchIndexShard`,
+>   `BackupSegment`, `Manifest`) is shared with the AEAD
+>   AAD tag in `crypto::aead`, so the wire-level binding
+>   and the transport-level upload argument can never
+>   disagree. A `NoopTransportClient` returns
+>   `Error::NotImplemented("transport")` from every method
+>   so `CoreImpl` can be constructed without a real backend
+>   until Phase 2 lands. The Phase-2+ HTTP / gRPC / MLS-blob
+>   transports layer on top of these traits in sibling
+>   sub-modules added when those engines arrive.
 > * `crates/core/benches/phase1_benchmarks.rs` is the **Phase-1
 >   performance benchmark suite** (criterion). Five benches
 >   exercise `MessagePersister::persist_ingested_message`
@@ -980,7 +1018,7 @@ sequenceDiagram
 
 > **Phase 1 transport implementation note.** `transport` is now a
 > Phase-1-implemented module (see §2): `core::transport::DeliveryClient`
-> is the trait the upper layer calls into,
+> is the narrower trait the message-ingest path calls into,
 > `RawDeliveryMessage` / `FetchResult` describe the wire shape, and
 > `TransportError` flattens provider-specific failures into
 > `Network` / `Auth` / `Server`. `CoreImpl::ingest_remote_messages`
@@ -994,6 +1032,29 @@ sequenceDiagram
 > `send_text` path. When no client is configured the trait method
 > returns `Err(Error::Transport("no delivery client configured"))`
 > so callers fail fast instead of silently no-oping.
+>
+> The broader **`TransportClient`** trait (also in
+> `core::transport`) carries the full §10 surface that Phases
+> 2–4 will share: `fetch_messages` (cursor-paginated, returning
+> `FetchMessagesResponse`), `init_blob_upload` /
+> `upload_chunk` / `commit_blob` (chunked upload with
+> whole-object Merkle verification through
+> `BlobUploadHandle` / `ChunkReceipt` /
+> `CommitBlobResponse`), `fetch_blob_range` (range
+> download for resumable hydration), `fetch_archive_manifests`
+> (returning `EncryptedManifest` so the manifest chain stays
+> AEAD-sealed end-to-end), `fetch_archive_segment`, and
+> `fetch_index_shards`. The `BlobClass` enum
+> (`Media`, `ArchiveSegment`, `SearchIndexShard`,
+> `BackupSegment`, `Manifest`) is shared between the
+> per-chunk AAD constructed by `crypto::aead` and the
+> `init_blob_upload` argument so the wire-level AAD and the
+> upload-control message cannot disagree about what the blob
+> is. `NoopTransportClient` returns
+> `Error::NotImplemented("transport")` from every method —
+> it is what `CoreImpl` builds against today, and the
+> Phase-2+ HTTP / gRPC implementation drops in by replacing
+> the noop without changing any of the calling code.
 
 > **Conversation-metadata auto-update.** Both message-receive paths
 > (`MessagePersister::persist_ingested_message` for transport-driven
