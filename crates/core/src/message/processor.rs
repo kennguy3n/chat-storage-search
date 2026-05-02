@@ -34,6 +34,13 @@ use crate::ClientMessageId;
 // ---------------------------------------------------------------------------
 
 /// Errors returned by the [`MessageProcessor`].
+///
+/// Deliberately does **not** derive `Clone` / `PartialEq` / `Eq`:
+/// the wrapped `rusqlite::Error` (via [`DbError`]) is not
+/// equality-comparable, and a stringified-on-clone variant would
+/// silently break the reflexivity contract `Eq` requires. Tests use
+/// `matches!` and downstream callers should pattern-match on the
+/// variants directly.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessorError {
     /// The ingested message failed validation (empty id, empty
@@ -46,43 +53,14 @@ pub enum ProcessorError {
     DuplicateMessage,
 
     /// A storage-layer call failed. Phase 1 surfaces specific causes
-    /// (database busy, AEAD open failure, …) through the wrapped
-    /// [`DbError`].
+    /// (database busy, AEAD open failure, …) as a stringified
+    /// description; richer typed surfacing arrives later in Phase 1.
     #[error("storage: {0}")]
     StorageError(String),
 
     /// A `rusqlite` call failed inside [`MessagePersister`].
     #[error("db: {0}")]
     Db(#[from] DbError),
-}
-
-impl PartialEq for ProcessorError {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (
-                ProcessorError::DuplicateMessage,
-                ProcessorError::DuplicateMessage
-            ),
-        ) || match (self, other) {
-            (ProcessorError::InvalidMessage(a), ProcessorError::InvalidMessage(b)) => a == b,
-            (ProcessorError::StorageError(a), ProcessorError::StorageError(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for ProcessorError {}
-
-impl Clone for ProcessorError {
-    fn clone(&self) -> Self {
-        match self {
-            ProcessorError::InvalidMessage(s) => ProcessorError::InvalidMessage(s.clone()),
-            ProcessorError::DuplicateMessage => ProcessorError::DuplicateMessage,
-            ProcessorError::StorageError(s) => ProcessorError::StorageError(s.clone()),
-            ProcessorError::Db(e) => ProcessorError::StorageError(e.to_string()),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +892,10 @@ mod tests {
         };
         p.persist_ingested_message(&msg).unwrap();
         let err = p.persist_ingested_message(&msg).unwrap_err();
-        assert_eq!(err, ProcessorError::DuplicateMessage);
+        assert!(
+            matches!(err, ProcessorError::DuplicateMessage),
+            "expected DuplicateMessage; got {err:?}"
+        );
 
         // FTS / journal must not have been written twice.
         let fts_count: i64 = db

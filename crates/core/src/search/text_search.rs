@@ -173,23 +173,72 @@ pub fn build_fts_query(input: &str) -> String {
     if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         return trimmed.to_string();
     }
-    let mut tokens = Vec::new();
-    for raw in trimmed.split_whitespace() {
-        let token = raw;
-        // Preserve trailing `*` (prefix search). Quote only the
-        // alphabetic stem so `"hello"*` still works.
-        if let Some(stem) = token.strip_suffix('*') {
-            if stem.is_empty() {
-                continue;
+    // First pass: classify each whitespace-separated token as a
+    // (potential) operator vs. a positive term. We hold back the
+    // string form until the second pass so we can demote orphan
+    // operators that aren't flanked by terms.
+    let raw_tokens: Vec<RawFtsToken> = trimmed
+        .split_whitespace()
+        .filter_map(|raw| {
+            if let Some(stem) = raw.strip_suffix('*') {
+                if stem.is_empty() {
+                    None
+                } else {
+                    Some(RawFtsToken::Term(format!(
+                        "\"{}\"*",
+                        escape_fts_quote(stem)
+                    )))
+                }
+            } else if matches!(raw, "AND" | "OR" | "NOT" | "NEAR") {
+                Some(RawFtsToken::Operator(raw.to_string()))
+            } else {
+                Some(RawFtsToken::Term(format!("\"{}\"", escape_fts_quote(raw))))
             }
-            tokens.push(format!("\"{}\"*", escape_fts_quote(stem)));
-        } else if token == "AND" || token == "OR" || token == "NOT" || token == "NEAR" {
-            tokens.push(token.to_string());
-        } else {
-            tokens.push(format!("\"{}\"", escape_fts_quote(token)));
+        })
+        .collect();
+
+    // Second pass: an operator keyword only stays a syntactic
+    // operator when both of its neighbors are positive terms. Bare
+    // `NOT`, leading `AND hello`, trailing `hello AND`, and adjacent
+    // `AND OR` all collapse to literal terms — `"hello AND world"`
+    // still binds via the explicit `AND`. This keeps `sqlite3_prepare`
+    // from bouncing the query on otherwise-reasonable user input.
+    let mut tokens = Vec::with_capacity(raw_tokens.len());
+    for (idx, tok) in raw_tokens.iter().enumerate() {
+        match tok {
+            RawFtsToken::Term(s) => tokens.push(s.clone()),
+            RawFtsToken::Operator(op) => {
+                let prev_is_term = idx
+                    .checked_sub(1)
+                    .and_then(|i| raw_tokens.get(i))
+                    .map(|t| matches!(t, RawFtsToken::Term(_)))
+                    .unwrap_or(false);
+                let next_is_term = raw_tokens
+                    .get(idx + 1)
+                    .map(|t| matches!(t, RawFtsToken::Term(_)))
+                    .unwrap_or(false);
+                if prev_is_term && next_is_term {
+                    tokens.push(op.clone());
+                } else {
+                    tokens.push(format!("\"{}\"", escape_fts_quote(op)));
+                }
+            }
         }
     }
     tokens.join(" ")
+}
+
+/// Internal classification used by [`build_fts_query`] to decide
+/// whether each whitespace-separated input chunk is a positive term
+/// or a (provisional) FTS5 binary operator.
+#[derive(Debug)]
+enum RawFtsToken {
+    /// A token that should always appear as-is in the final
+    /// expression — already quoted / star-suffixed.
+    Term(String),
+    /// One of `AND` / `OR` / `NOT` / `NEAR`. Whether it stays a
+    /// syntactic operator depends on its neighbors.
+    Operator(String),
 }
 
 /// Escape any `"` inside an FTS5 quoted phrase. FTS5 supports doubled
@@ -295,6 +344,54 @@ mod tests {
         let q = build_fts_query("say\"hi");
         // The single embedded quote must be doubled.
         assert!(q.contains("\"\""), "quote must be doubled: {q}");
+    }
+
+    /// Reflects the FTS5 grammar: `AND` / `OR` / `NOT` / `NEAR` are
+    /// only valid as binary infix between two positive terms. When
+    /// the user types one as a free-text token (bare `NOT`, leading
+    /// `AND hello`, trailing `hello AND`, adjacent `AND OR`,
+    /// autocorrected `Not available`, …) it must be demoted to a
+    /// literal term — otherwise `sqlite3_prepare_v2` rejects the
+    /// expression with a syntax error and bubbles a `DbError` up to
+    /// the caller.
+    #[test]
+    fn build_fts_query_demotes_orphan_operators() {
+        assert_eq!(build_fts_query("NOT"), "\"NOT\"");
+        assert_eq!(build_fts_query("AND"), "\"AND\"");
+        assert_eq!(build_fts_query("NEAR"), "\"NEAR\"");
+        assert_eq!(build_fts_query("NOT available"), "\"NOT\" \"available\"");
+        assert_eq!(build_fts_query("hello AND"), "\"hello\" \"AND\"");
+        assert_eq!(build_fts_query("AND hello"), "\"AND\" \"hello\"");
+        assert_eq!(build_fts_query("AND OR"), "\"AND\" \"OR\"");
+        assert_eq!(
+            build_fts_query("hello AND OR world"),
+            "\"hello\" \"AND\" \"OR\" \"world\""
+        );
+        // Sanity: a real binary infix still binds.
+        assert_eq!(
+            build_fts_query("hello AND world"),
+            "\"hello\" AND \"world\""
+        );
+    }
+
+    /// Every input from `build_fts_query_demotes_orphan_operators`
+    /// must round-trip through `sqlite3_prepare_v2` cleanly when
+    /// fed to FTS5 — otherwise we just regressed to the original
+    /// bug. We exercise a few representative cases against a real
+    /// FTS5 table here.
+    #[test]
+    fn search_fts_accepts_demoted_operators_without_error() {
+        let db = test_db();
+        insert_fixture(&db, 1, "available now");
+        insert_fixture(&db, 2, "hello world");
+        let engine = TextSearchEngine::new(&db);
+        for input in ["NOT", "AND", "NEAR", "NOT available", "hello AND", "AND OR"] {
+            let r = engine.search_fts(input, 10);
+            assert!(
+                r.is_ok(),
+                "{input:?} should be a valid FTS expression now: {r:?}"
+            );
+        }
     }
 
     #[test]
