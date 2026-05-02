@@ -460,8 +460,16 @@ impl LocalStoreDb {
     /// inserting a fresh skeleton so the conversation list reflects
     /// the most recent activity.
     ///
-    /// Returns the number of rows updated; `0` when no conversation
-    /// with `conversation_id` exists.
+    /// The update is guarded by `last_activity_ms <= ?2` so that
+    /// out-of-order ingests (e.g. a transport page where messages
+    /// are not sorted by `created_at_ms`, or sender clock skew)
+    /// cannot regress an already-newer activity timestamp or
+    /// downgrade `last_message_id` to an older message.
+    ///
+    /// Returns the number of rows updated. `0` means either the
+    /// conversation does not exist, or the existing
+    /// `last_activity_ms` is already strictly newer than
+    /// `activity_ms` and the call was a no-op.
     pub fn update_conversation_last_message(
         &self,
         conversation_id: &str,
@@ -471,7 +479,8 @@ impl LocalStoreDb {
         let n = self.conn.execute(
             "UPDATE conversation
                 SET last_message_id = ?1, last_activity_ms = ?2
-              WHERE conversation_id = ?3",
+              WHERE conversation_id = ?3
+                AND last_activity_ms <= ?2",
             params![message_id, activity_ms, conversation_id],
         )?;
         Ok(n)
@@ -1278,5 +1287,50 @@ mod tests {
         let db = fresh_db();
         let n = db.update_conversation_last_message("nope", "m", 1).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn update_conversation_last_message_does_not_regress_on_older_message() {
+        // Simulates an out-of-order transport batch: the newer
+        // message (ts = 3_000) is persisted first, then the older
+        // one (ts = 1_000) arrives. The older arrival must not
+        // pull `last_activity_ms` backwards or replace
+        // `last_message_id`, otherwise `list_conversations`
+        // ordering and the conversation preview would regress.
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1, false))
+            .unwrap();
+
+        let n = db
+            .update_conversation_last_message("c-1", "m-newer", 3_000)
+            .unwrap();
+        assert_eq!(n, 1, "first (newer) update should land");
+
+        let n = db
+            .update_conversation_last_message("c-1", "m-older", 1_000)
+            .unwrap();
+        assert_eq!(n, 0, "older update must be a no-op");
+
+        let row = db.get_conversation("c-1").unwrap().expect("conv");
+        assert_eq!(
+            row.last_message_id.as_deref(),
+            Some("m-newer"),
+            "last_message_id must not regress"
+        );
+        assert_eq!(
+            row.last_activity_ms, 3_000,
+            "last_activity_ms must not regress"
+        );
+
+        // An equal-timestamp re-insert (e.g. a duplicate replay
+        // surfacing the same message under a different id) is
+        // still allowed so callers can refresh the pointer.
+        let n = db
+            .update_conversation_last_message("c-1", "m-equal", 3_000)
+            .unwrap();
+        assert_eq!(n, 1, "equal-timestamp update is allowed");
+        let row = db.get_conversation("c-1").unwrap().expect("conv");
+        assert_eq!(row.last_message_id.as_deref(), Some("m-equal"));
+        assert_eq!(row.last_activity_ms, 3_000);
     }
 }
