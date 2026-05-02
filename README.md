@@ -7,10 +7,19 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
-> Status: Phase 0 — Protocol and Test Vectors (in progress). The Rust
-> workspace, crypto module, ZK Object Fabric Pattern C interop, and
-> CI pipeline are landed; the higher-level modules are stubbed. See
-> [docs/PROGRESS.md](docs/PROGRESS.md) for build status.
+> Status: Phase 0 — Protocol and Test Vectors (`In progress | ~90%`).
+> Landed: Rust workspace scaffold, crypto module (BLAKE3, HKDF-SHA256
+> hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD, Pattern C
+> convergent encryption with bit-identical Go SDK interop, AES-256-KW
+> key wrap), CBOR wire formats (`formats::{BackupSegmentFrame,
+> ArchiveSegmentFrame, manifest::{BackupManifest, ArchiveManifest},
+> media_descriptor::MediaDescriptor, search_shard::SearchIndexShard}`),
+> Ed25519 manifest signing with a `previous_manifest_hash` chain, and
+> a CI pipeline. Outstanding: multilingual tokenization spec. The
+> higher-level engines (`message`, `media`, `search`, `archive`,
+> `backup`, `offload`, `restore`) are stubbed and land across
+> Phases 1–7. See [docs/PROGRESS.md](docs/PROGRESS.md) for the full
+> tracker.
 
 ---
 
@@ -27,6 +36,20 @@ cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## How to run tests
+
+```sh
+cargo test --workspace --verbose
+```
+
+The Phase 0 test surface covers the [`crypto`](crates/core/src/crypto/)
+module (content hash, key hierarchy, AEAD, convergent encryption,
+key wrap), the [`formats`](crates/core/src/formats/) module (CBOR
+round-trip, manifest sign / verify / chain, media descriptor,
+search shard), and the integration tests under
+[`crates/core/tests/`](crates/core/tests/) (cross-language Pattern C
+vectors, manifest signing, key-wrap-by-hierarchy-root).
 
 The workspace ships four crates: `kchat-core` (platform-agnostic
 logic), and three thin bridges (`kchat-ios-bridge`,
@@ -278,7 +301,12 @@ chat-storage-search/
           convergent.rs           # Pattern C convergent encryption (BLAKE3 + HKDF + XChaCha20-Poly1305)
           content_hash.rs         # BLAKE3 content hashing
           aead.rs                 # XChaCha20-Poly1305 / AES-256-GCM chunk sealing
-          key_wrap.rs             # key wrapping for media keys, archive keys
+          key_wrap.rs             # AES-256-KW (RFC 3394) for K_asset wrapping
+        formats/                  # CBOR wire-format types (Phase 0 — see ARCHITECTURE.md §2)
+          mod.rs                  # BackupSegmentFrame / ArchiveSegmentFrame / SegmentType
+          manifest.rs             # BackupManifest / ArchiveManifest + Ed25519 sign / verify / chain
+          media_descriptor.rs     # MediaDescriptor (asset_id, blob_id, Merkle root, wrapped K_asset)
+          search_shard.rs         # SearchIndexShard (text / fuzzy / vector / media)
         models/                   # on-device ML model management
           mod.rs
           embeddings.rs           # multilingual text embedding (multilingual-e5-small via ONNX)

@@ -10,9 +10,10 @@
 //! * [`convergent`] — ZK Object Fabric Pattern C convergent
 //!   encryption, byte-identical to the Go SDK at
 //!   `kennguy3n/zk-object-fabric/encryption/client_sdk`.
-//!
-//! [`key_wrap`] is a stub for now; Phase 1 fills it in alongside
-//! `K_local_db` and platform keychain wrappers.
+//! * [`key_wrap`] — AES-256-KW (RFC 3394) for `K_asset` wrapping by
+//!   `K_local_db` / `K_archive_root` / `K_backup_root`. Phase 1
+//!   layers the platform-specific wraps for `K_local_db` itself
+//!   (Keychain / Keystore / DPAPI) on top of the same primitives.
 
 pub mod aead;
 pub mod content_hash;

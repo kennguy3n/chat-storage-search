@@ -3,10 +3,17 @@
 //!
 //! Phase 0 establishes the on-disk and on-wire crypto contract:
 //! BLAKE3 content hashing, the [`crypto::key_hierarchy`] HKDF-SHA256
-//! derivation tree, the AEAD constructions in [`crypto::aead`], and
-//! the Pattern C convergent encryption in [`crypto::convergent`]
+//! derivation tree, the AEAD constructions in [`crypto::aead`], the
+//! Pattern C convergent encryption in [`crypto::convergent`]
 //! (bit-identical to the Go SDK at
-//! `kennguy3n/zk-object-fabric/encryption/client_sdk`).
+//! `kennguy3n/zk-object-fabric/encryption/client_sdk`), and the
+//! AES-256-KW key wrapping in [`crypto::key_wrap`].
+//!
+//! [`formats`] holds the CBOR wire-format types — backup / archive
+//! segment frames, manifest frames (with Ed25519 signatures and the
+//! `previous_manifest_hash` chain), the media descriptor, and the
+//! search index shard — that travel between the device and the
+//! KChat backend / ZK Object Fabric backup sink.
 //!
 //! Higher-level modules (`message`, `media`, `search`, `archive`,
 //! `backup`, `offload`, `restore`, `local_store`, `models`,
@@ -20,6 +27,7 @@ pub mod archive;
 pub mod backup;
 pub mod config;
 pub mod crypto;
+pub mod formats;
 pub mod local_store;
 pub mod media;
 pub mod message;
