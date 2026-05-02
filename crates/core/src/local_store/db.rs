@@ -454,6 +454,126 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Update the conversation row's `last_message_id` and
+    /// `last_activity_ms` columns. Used by
+    /// [`crate::message::processor::MessagePersister`] after
+    /// inserting a fresh skeleton so the conversation list reflects
+    /// the most recent activity.
+    ///
+    /// Returns the number of rows updated; `0` when no conversation
+    /// with `conversation_id` exists.
+    pub fn update_conversation_last_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        activity_ms: i64,
+    ) -> DbResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE conversation
+                SET last_message_id = ?1, last_activity_ms = ?2
+              WHERE conversation_id = ?3",
+            params![message_id, activity_ms, conversation_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Return the messages in `conversation_id`, ordered by
+    /// `created_at_ms DESC`. `before_ms`, when `Some`, restricts the
+    /// page to messages with `created_at_ms < before_ms`. `limit`
+    /// caps the returned page.
+    pub fn get_conversation_messages(
+        &self,
+        conversation_id: &str,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> DbResult<Vec<MessageSkeleton>> {
+        let mut stmt;
+        let rows = if let Some(before) = before_ms {
+            stmt = self.conn.prepare(
+                "SELECT message_id, conversation_id, sender_id,
+                        created_at_ms, received_at_ms, kind,
+                        body_state, media_state, archive_state, backup_state,
+                        reply_to, edited_at_ms, deleted_at_ms
+                   FROM message_skeleton
+                  WHERE conversation_id = ?1 AND created_at_ms < ?2
+                  ORDER BY created_at_ms DESC
+                  LIMIT ?3",
+            )?;
+            stmt.query_map(
+                params![conversation_id, before, limit as i64],
+                decode_skeleton_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt = self.conn.prepare(
+                "SELECT message_id, conversation_id, sender_id,
+                        created_at_ms, received_at_ms, kind,
+                        body_state, media_state, archive_state, backup_state,
+                        reply_to, edited_at_ms, deleted_at_ms
+                   FROM message_skeleton
+                  WHERE conversation_id = ?1
+                  ORDER BY created_at_ms DESC
+                  LIMIT ?2",
+            )?;
+            stmt.query_map(params![conversation_id, limit as i64], decode_skeleton_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for raw in rows {
+            out.push(raw.into_skeleton()?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch a message skeleton plus its (optional) body in one go.
+    /// Returns `Ok(None)` when the skeleton does not exist, or
+    /// `Ok(Some((skel, None)))` when the skeleton exists but the
+    /// body row has been dropped (e.g. `delete_for_everyone`).
+    pub fn get_message_with_body(
+        &self,
+        message_id: &str,
+    ) -> DbResult<Option<(MessageSkeleton, Option<MessageBody>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT s.message_id, s.conversation_id, s.sender_id,
+                        s.created_at_ms, s.received_at_ms, s.kind,
+                        s.body_state, s.media_state, s.archive_state,
+                        s.backup_state, s.reply_to, s.edited_at_ms,
+                        s.deleted_at_ms,
+                        b.text_content, b.detected_language, b.rich_meta
+                   FROM message_skeleton s
+                   LEFT JOIN message_body b ON b.message_id = s.message_id
+                  WHERE s.message_id = ?1",
+                params![message_id],
+                |row| {
+                    let raw = decode_skeleton_row(row)?;
+                    let text_content: Option<String> = row.get(13)?;
+                    let detected_language: Option<String> = row.get(14)?;
+                    let rich_meta: Option<Vec<u8>> = row.get(15)?;
+                    let body_present = text_content.is_some()
+                        || detected_language.is_some()
+                        || rich_meta.is_some();
+                    let body = if body_present {
+                        Some(MessageBody {
+                            message_id: raw.message_id.clone(),
+                            text_content,
+                            detected_language,
+                            rich_meta,
+                        })
+                    } else {
+                        None
+                    };
+                    Ok((raw, body))
+                },
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((raw, body)) => Ok(Some((raw.into_skeleton()?, body))),
+        }
+    }
+
     /// Insert a row into `backup_event_journal`. The `event_seq`
     /// field is `AUTOINCREMENT` in the schema; the value provided
     /// here is honored if non-zero, otherwise the backend assigns
@@ -537,6 +657,28 @@ struct MessageSkeletonRaw {
     reply_to: Option<String>,
     edited_at_ms: Option<i64>,
     deleted_at_ms: Option<i64>,
+}
+
+/// Decode the leading 13 columns of a `message_skeleton` row into a
+/// [`MessageSkeletonRaw`]. Used by row-by-row queries
+/// (`get_message_skeleton`, `get_conversation_messages`,
+/// `get_message_with_body`).
+fn decode_skeleton_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageSkeletonRaw> {
+    Ok(MessageSkeletonRaw {
+        message_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        sender_id: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        received_at_ms: row.get(4)?,
+        kind: row.get(5)?,
+        body_state: row.get(6)?,
+        media_state: row.get(7)?,
+        archive_state: row.get(8)?,
+        backup_state: row.get(9)?,
+        reply_to: row.get(10)?,
+        edited_at_ms: row.get(11)?,
+        deleted_at_ms: row.get(12)?,
+    })
 }
 
 impl MessageSkeletonRaw {
@@ -975,6 +1117,166 @@ mod tests {
     fn update_conversation_mute_returns_zero_for_missing_id() {
         let db = fresh_db();
         let n = db.update_conversation_mute("does-not-exist", true).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Timeline retrieval API
+    // -----------------------------------------------------------------
+
+    /// Insert a skeleton + body, fixing every timestamp / sender so
+    /// the test asserts only the columns it cares about.
+    fn seed_timeline_message(
+        db: &LocalStoreDb,
+        mid: &str,
+        conv: &str,
+        created_at_ms: i64,
+        text: &str,
+    ) {
+        let skel = MessageSkeleton {
+            message_id: mid.into(),
+            conversation_id: conv.into(),
+            sender_id: "user-1".into(),
+            created_at_ms,
+            received_at_ms: created_at_ms,
+            kind: MessageKind::Text,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: None,
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        db.insert_message_skeleton(&skel).unwrap();
+        let body = MessageBody {
+            message_id: mid.into(),
+            text_content: Some(text.into()),
+            detected_language: None,
+            rich_meta: None,
+        };
+        db.insert_message_body(&body).unwrap();
+    }
+
+    #[test]
+    fn get_conversation_messages_returns_newest_first() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        seed_timeline_message(&db, "m-1", "c-1", 100, "first");
+        seed_timeline_message(&db, "m-2", "c-1", 200, "second");
+        seed_timeline_message(&db, "m-3", "c-1", 300, "third");
+
+        let rows = db.get_conversation_messages("c-1", None, 10).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|s| s.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-3", "m-2", "m-1"]);
+    }
+
+    #[test]
+    fn get_conversation_messages_pagination_with_before_ms() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        for (i, ts) in [100, 200, 300, 400, 500].iter().enumerate() {
+            seed_timeline_message(&db, &format!("m-{i}"), "c-1", *ts, "x");
+        }
+
+        // Page 1: newest 2 — m-4 (500) then m-3 (400).
+        let page1 = db.get_conversation_messages("c-1", None, 2).unwrap();
+        let ids: Vec<&str> = page1.iter().map(|s| s.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-4", "m-3"]);
+
+        // Page 2: before 400 — m-2 (300) then m-1 (200).
+        let page2 = db.get_conversation_messages("c-1", Some(400), 2).unwrap();
+        let ids: Vec<&str> = page2.iter().map(|s| s.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-2", "m-1"]);
+
+        // Page 3: before 200 — only m-0 (100).
+        let page3 = db.get_conversation_messages("c-1", Some(200), 2).unwrap();
+        let ids: Vec<&str> = page3.iter().map(|s| s.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-0"]);
+
+        // Page 4: before 100 — empty.
+        assert!(db
+            .get_conversation_messages("c-1", Some(100), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn get_conversation_messages_respects_limit() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        for i in 0..5 {
+            seed_timeline_message(&db, &format!("m-{i}"), "c-1", 100 + i as i64, "x");
+        }
+
+        assert_eq!(
+            db.get_conversation_messages("c-1", None, 0).unwrap().len(),
+            0
+        );
+        assert_eq!(
+            db.get_conversation_messages("c-1", None, 1).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_conversation_messages("c-1", None, 5).unwrap().len(),
+            5
+        );
+        assert_eq!(
+            db.get_conversation_messages("c-1", None, 100)
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn get_message_with_body_returns_both() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        seed_timeline_message(&db, "m-1", "c-1", 100, "hello world");
+
+        let pair = db.get_message_with_body("m-1").unwrap().expect("present");
+        assert_eq!(pair.0.message_id, "m-1");
+        assert_eq!(pair.0.conversation_id, "c-1");
+        let body = pair.1.expect("body present");
+        assert_eq!(body.text_content.as_deref(), Some("hello world"));
+
+        // Missing message round-trips to None.
+        assert!(db.get_message_with_body("m-missing").unwrap().is_none());
+
+        // After dropping the body row the skeleton is still
+        // returned; the body half is None.
+        db.delete_message_body("m-1").unwrap();
+        let pair = db.get_message_with_body("m-1").unwrap().expect("present");
+        assert!(pair.1.is_none(), "body must be None after delete");
+    }
+
+    // -----------------------------------------------------------------
+    // Conversation metadata auto-update
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn update_conversation_last_message_sets_fields() {
+        let db = fresh_db();
+        db.insert_conversation(&build_conv("c-1", 1_000, false))
+            .unwrap();
+        let n = db
+            .update_conversation_last_message("c-1", "m-42", 5_555)
+            .unwrap();
+        assert_eq!(n, 1);
+        let row = db.get_conversation("c-1").unwrap().expect("conv");
+        assert_eq!(row.last_message_id.as_deref(), Some("m-42"));
+        assert_eq!(row.last_activity_ms, 5_555);
+    }
+
+    #[test]
+    fn update_conversation_last_message_returns_zero_for_missing() {
+        let db = fresh_db();
+        let n = db.update_conversation_last_message("nope", "m", 1).unwrap();
         assert_eq!(n, 0);
     }
 }

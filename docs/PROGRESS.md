@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~80%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~90%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -138,7 +138,7 @@ Notes:
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `In progress | ~80%`
+**Status**: `In progress | ~90%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
@@ -221,9 +221,12 @@ Checklist:
 - [ ] UniFFI bridge for iOS / Swift.
 - [ ] JNI bridge for Android / Kotlin.
 - [x] Core public API surface: `initialize`, `register_device`,
-      `send_text`, `ingest_remote_messages`, `search`,
-      `send_media`, `hydrate_message`, `run_incremental_backup`,
-      `enforce_storage_budget`, `restore_from_backup`. _(Types
+      `send_text`, `edit_message`, `delete_for_me`,
+      `delete_for_everyone`, `get_message`,
+      `get_conversation_messages`, `ingest_remote_messages`,
+      `search`, `send_media`, `hydrate_message`,
+      `run_incremental_backup`, `enforce_storage_budget`,
+      `restore_from_backup`. _(Types
       and trait method signatures defined in
       `crates/core/src/lib.rs`: `KChatCore` trait, `SearchQuery`,
       `SearchScope`, `SearchResult`, `HydrationReason` (P0–P5),
@@ -241,13 +244,27 @@ Checklist:
       `CoreImpl::new(config, key)` opens the SQLCipher store,
       the trait `send_text` mints an outbox entry through
       `MessageProcessor` and persists it via `MessagePersister`,
+      `edit_message` / `delete_for_me` /
+      `delete_for_everyone` lock the db mutex and delegate to
+      `MessagePersister`, `get_message` /
+      `get_conversation_messages` delegate to the matching
+      `LocalStoreDb` helpers and re-shape the rows into the
+      public `MessageView` (skeleton + optional body text),
       `search` delegates to `QueryEngine::execute_search`,
       `initialize` re-opens the DB at the new `data_dir` using
       the retained `K_local_db`. The transport-driven
-      `ingest_remote_messages` is a Phase-1 stub returning
-      `IngestResult::default()`; the inherent
-      `CoreImpl::ingest_messages(&[IngestedMessage])` is the
-      batch-ingest entry point tests and bridges currently use.
+      `ingest_remote_messages` now runs against an injected
+      `Box<dyn DeliveryClient>`: `CoreImpl::with_transport` /
+      `set_delivery_client` wire the transport, the trait
+      method calls `fetch_messages(conversation_id,
+      after_cursor)`, converts each `RawDeliveryMessage` to
+      `IngestedMessage`, and forwards into the existing
+      `ingest_messages` pipeline so deduplication and FTS
+      indexing run unchanged. When no delivery client is
+      configured the trait method returns
+      `Err(Error::Transport("no delivery client configured"))`.
+      The inherent `CoreImpl::ingest_messages(&[IngestedMessage])`
+      remains the batch-ingest entry point bridges and tests use.
       The Phase-2/3/4 trait methods (`send_media`,
       `hydrate_message`, `run_incremental_backup`,
       `enforce_storage_budget`, `restore_from_backup`) return
@@ -749,6 +766,65 @@ Notes:
   (`crates/core/src/message/processor.rs`), and the expanded
   `KChatCore` public API in `crates/core/src/lib.rs`.
   Phase 0 ~90%.
+- 2026-05-02: Phase 1 caught up to ~90%. The KChatCore trait
+  now exposes the full Phase-1 message lifecycle and the
+  transport surface is no longer a stub.
+  - `edit_message`, `delete_for_me`, and `delete_for_everyone`
+    on the trait delegate to `MessagePersister` so callers can
+    drive the local lifecycle without reaching into
+    `core::message`. Four new `core_impl` tests pin the
+    body / skeleton / FTS / fuzzy state at every transition
+    plus the missing-id error path.
+  - Timeline retrieval landed: `LocalStoreDb` grew
+    `get_conversation_messages(conversation_id, before_ms,
+    limit)` and `get_message_with_body(message_id)`; the
+    trait surfaces them as `get_message` and
+    `get_conversation_messages` returning the new `MessageView`
+    (skeleton fields plus optional body text) so the public API
+    never leaks the internal schema. Six new tests cover
+    newest-first ordering, `before_ms` pagination, `limit`
+    handling (including `limit == 0`), the joined skeleton +
+    body shape, the missing-body fallback, and the round-trip
+    through `CoreImpl`.
+  - Transport trait abstraction landed at
+    `crates/core/src/transport/mod.rs`: `DeliveryClient`
+    (object-safe, `Send + Sync`),
+    `FetchResult { messages, next_cursor }`,
+    `RawDeliveryMessage` (the wire-shape ingest payload), and
+    `TransportError { Network, Auth, Server }` (with
+    `thiserror`-derived `Display`). A test-only
+    `MockDeliveryClient` lets unit tests stage responses keyed
+    on the expected `after_cursor` and asserts the cursor
+    pass-through inside `fetch_messages`. The trait's
+    object-safety is pinned by an `assert_object_safe` test
+    that constructs a `Box<dyn DeliveryClient>`.
+  - `CoreImpl::ingest_remote_messages` is wired to the
+    transport: the new `delivery_client:
+    Mutex<Option<Box<dyn DeliveryClient>>>` field defaults to
+    `None` (so existing call sites still work), and
+    `with_transport(config, key, client)` /
+    `set_delivery_client(client)` install one. On call the
+    trait method fetches with the caller's cursor, converts
+    each `RawDeliveryMessage` to `IngestedMessage`, and runs
+    the result through the existing batch-ingest pipeline so
+    deduplication / FTS / fuzzy / journal writes are unchanged.
+    Four new tests pin the happy path (3 messages persisted +
+    searchable), the no-transport error
+    (`Error::Transport("no delivery client configured")`),
+    the dedup behavior on retry, and the cursor pass-through.
+  - Conversation metadata auto-update landed in the persistence
+    pipeline. `LocalStoreDb::update_conversation_last_message`
+    bumps `conversation.last_message_id` and
+    `last_activity_ms` in a single statement, and both
+    `MessagePersister::persist_ingested_message` and
+    `persist_outbox_entry` invoke it from inside the existing
+    `SAVEPOINT` so the conversation row stays in lock-step with
+    the message timeline. `list_conversations` therefore
+    reflects the latest activity automatically — no extra call
+    is required from the binding layer. Four new tests cover
+    the SQL helper (sets fields, returns 0 for missing id),
+    the ingested + outbox persistence paths, and the public
+    `list_conversations` re-ordering.
 - 2026-05-02: Phase 1 caught up to ~80%. Fuzzy index is wired
   through `MessagePersister` (ingest / outbox / edit / delete)
   and merged into `QueryEngine::execute_search` with
