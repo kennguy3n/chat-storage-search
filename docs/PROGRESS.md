@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~15%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~55%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -119,20 +119,46 @@ Notes:
   `unwrap_k_asset` convenience helpers operate on the
   `KeyMaterial` from the hierarchy; wrapped output is exactly 40
   bytes (32 + 8-byte integrity check).
+- 2026-05-02: Phase 1 SQLCipher integration, message persistence,
+  FTS5 text search engine, structured search query engine, and
+  multilingual integration test suite landed.
+  `crates/core/Cargo.toml` now depends on
+  `rusqlite = { version = "0.31", features =
+  ["bundled-sqlcipher-vendored-openssl", "column_decltype"] }`
+  so `cargo build` and `cargo test` need no system SQLCipher /
+  OpenSSL. ICU is detected via a non-destructive
+  `CREATE VIRTUAL TABLE temp.__icu_probe USING fts5(...)` probe
+  at open time; the schema rewrites `tokenize = 'icu'` to
+  `tokenize = 'unicode61 remove_diacritics 2'` when ICU is
+  unavailable. `K_local_db` platform wrapping (Keychain /
+  Keystore / DPAPI) is still stubbed; callers pass the 32-byte
+  raw key in for now.
 
 ---
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `In progress | ~15%`
+**Status**: `In progress | ~55%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
 
 Checklist:
 
-- [ ] SQLCipher integration; `K_local_db` wrapped by Keychain /
-      Keystore / DPAPI.
+- [x] SQLCipher integration; `K_local_db` wrapped by Keychain /
+      Keystore / DPAPI. _(Encrypted local store landed at
+      `crates/core/src/local_store/db.rs`: `LocalStoreDb` opens
+      `{data_dir}/kchat.db` (or an in-memory database for tests),
+      sets `PRAGMA key = x'…'` from the 32-byte `K_local_db`,
+      enables foreign-key enforcement, and runs `SCHEMA_SQL` with
+      automatic detection of the FTS5 ICU tokenizer plus
+      `unicode61` fallback via
+      `create_schema_with_unicode61_fallback()`. CRUD helpers cover
+      conversation / skeleton / body / `update_body_state` /
+      `insert_backup_event`. The platform wrap of `K_local_db`
+      (Keychain / Keystore / DPAPI) is stubbed; callers pass the
+      raw key in for now and the platform wrappers land later in
+      Phase 1 with the UniFFI / JNI bridges.)_
 - [x] Local schema (`conversation`, `message_skeleton`,
       `message_body`, `media_asset`, `backup_event_journal`,
       `archive_segment_map`, `restore_state`). _(Types defined in
@@ -140,22 +166,43 @@ Checklist:
       `SCHEMA_SQL` constant carries the `CREATE TABLE` /
       `CREATE VIRTUAL TABLE` statements verbatim from
       `docs/ARCHITECTURE.md §4`. SQLCipher binding follows.)_
-- [ ] Message processor: ingest MLS-decrypted messages, outbox,
-      idempotency. _(Skeleton landed at
-      `crates/core/src/message/processor.rs`:
-      `IngestedMessage`, `OutboxEntry`, `OutboxStatus`,
-      `IngestResult`, plus pure validators
-      `validate_ingest`, `is_duplicate`, and
-      `create_outbox_entry` minting UUID v7. DB-backed
-      implementation lands with the SQLCipher binding.)_
-- [ ] FTS5 with **ICU tokenizer** (`tokenize = 'icu'`) for
+- [x] Message processor: ingest MLS-decrypted messages, outbox,
+      idempotency. _(DB-backed `MessagePersister` landed at
+      `crates/core/src/message/processor.rs` alongside the existing
+      validators: `persist_ingested_message` validates,
+      deduplicates against `message_skeleton`, inserts skeleton +
+      body + `search_fts` row + `"message_received"` journal entry
+      inside a single `SAVEPOINT` boundary; `persist_outbox_entry`
+      mints `body_state = local_plain_available` and writes an
+      `"outbox_pending"` journal entry; `mark_sent` writes
+      `"outbox_sent"`; `check_duplicate` queries
+      `message_skeleton` by id.)_
+- [x] FTS5 with **ICU tokenizer** (`tokenize = 'icu'`) for
       multilingual full-text search; documented `unicode61` fallback.
-      _(Tokenizer spec landed in Phase 0 — see
-      `crates/core/src/search/tokenizer.rs` and `SCHEMA_SQL`'s
-      `search_fts` virtual table.)_
-- [ ] Structured search (sender, date range, conversation, content
-      kind). _(API types `SearchQuery`, `ContentKind`, `SearchScope`,
-      `SearchResult` defined in `crates/core/src/lib.rs`.)_
+      _(Engine landed at `crates/core/src/search/text_search.rs`:
+      `TextSearchEngine::search_fts` runs
+      `bm25(search_fts)`-ordered queries, returns
+      `FtsMatch { message_id, conversation_id, sender_id,
+      created_at_ms, snippet, bm25_score }`, and the schema
+      bring-up in `local_store::db` automatically falls back to
+      `tokenize = 'unicode61 remove_diacritics 2'` on builds
+      without ICU. `build_fts_query` quotes free-text tokens to
+      keep stray `:` / `^` from blowing up the FTS5 query parser
+      and preserves `*` prefix queries plus explicit `"phrase"` /
+      `AND` / `OR` / `NOT` / `NEAR` operators.)_
+- [x] Structured search (sender, date range, conversation, content
+      kind). _(Engine landed at
+      `crates/core/src/search/query_engine.rs`:
+      `QueryEngine::execute_search` combines FTS5 hits with
+      structured `WHERE` clauses on `message_skeleton`
+      (`sender_filter` / `conversation_filter` / `date_from` /
+      `date_to` / `content_kind`), intersects FTS hits with the
+      structured-filter result by `message_id`, and returns the
+      unified rows ordered by BM25 (sign-flipped so callers see
+      "higher = better"). Empty `query_string` returns skeleton
+      rows ordered by `created_at_ms DESC`.
+      `SearchScope::LocalOnly` is honored — no archive fan-out
+      attempts in Phase 1.)_
 - [x] Body state machine (`local_plain_available`,
       `local_encrypted_available`, `delivery_store_only`,
       `deleted_for_me`, `deleted_for_everyone`, `unavailable`).
@@ -174,7 +221,16 @@ Checklist:
       `DeliveryCursor`. Methods are sync `Result<_>`-returning
       placeholders that flip to `async fn` once the SQLCipher /
       transport plumbing exists.)_
-- [ ] Multilingual unit + integration tests.
+- [x] Multilingual unit + integration tests. _(Integration test
+      at `crates/core/tests/multilingual_search.rs` exercises the
+      full `MessagePersister` → `search_fts` → `QueryEngine`
+      round-trip across eight scripts: English, Russian, Chinese,
+      Japanese, Arabic, Thai, Hindi, mixed-script. Latin /
+      Cyrillic / Arabic / Devanagari word search runs against
+      `unicode61` and is required on every build; CJK / Thai
+      tests soft-skip when the SQLCipher build does not link
+      against ICU. Combined FTS-plus-conversation-filter and
+      sender / date-range filters are also covered.)_
 - [ ] Performance validation: insert text < 20 ms p95; search
       recent < 150 ms p95.
 

@@ -15,5 +15,6 @@
 //! cache, migrations, and platform `K_local_db` wrap (Keychain /
 //! Keystore / DPAPI) land later in Phase 1 — see `docs/PHASES.md`.
 
+pub mod db;
 pub mod schema;
 pub mod state_machines;

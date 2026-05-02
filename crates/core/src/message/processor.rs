@@ -17,17 +17,31 @@
 
 use std::collections::HashSet;
 
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::formats::media_descriptor::MediaDescriptor;
+use crate::local_store::db::{DbError, LocalStoreDb};
+use crate::local_store::schema::{
+    BackupEventJournalEntry, MessageBody, MessageKind, MessageSkeleton,
+};
+use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+use crate::ClientMessageId;
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 /// Errors returned by the [`MessageProcessor`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Deliberately does **not** derive `Clone` / `PartialEq` / `Eq`:
+/// the wrapped `rusqlite::Error` (via [`DbError`]) is not
+/// equality-comparable, and a stringified-on-clone variant would
+/// silently break the reflexivity contract `Eq` requires. Tests use
+/// `matches!` and downstream callers should pattern-match on the
+/// variants directly.
+#[derive(Debug, thiserror::Error)]
 pub enum ProcessorError {
     /// The ingested message failed validation (empty id, empty
     /// conversation id, non-positive timestamps, …).
@@ -39,11 +53,14 @@ pub enum ProcessorError {
     DuplicateMessage,
 
     /// A storage-layer call failed. Phase 1 surfaces specific causes
-    /// (database busy, AEAD open failure, …); the variant here is a
-    /// placeholder so trait signatures can use `Result<_, ProcessorError>`
-    /// before that work lands.
+    /// (database busy, AEAD open failure, …) as a stringified
+    /// description; richer typed surfacing arrives later in Phase 1.
     #[error("storage: {0}")]
     StorageError(String),
+
+    /// A `rusqlite` call failed inside [`MessagePersister`].
+    #[error("db: {0}")]
+    Db(#[from] DbError),
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +241,380 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// MessagePersister — DB-backed counterpart to MessageProcessor
+// ---------------------------------------------------------------------------
+
+/// DB-backed persistence helper that wires the pure validators above
+/// to a [`LocalStoreDb`] connection.
+///
+/// The persister is intentionally stateless apart from its borrow on
+/// `LocalStoreDb`: every public method acquires a transaction
+/// internally, performs all writes (skeleton + body + FTS row +
+/// backup-event-journal entry), and commits as a single unit so a
+/// crash mid-ingest cannot leave the FTS index out of sync with the
+/// skeleton table.
+#[derive(Debug)]
+pub struct MessagePersister<'a> {
+    db: &'a LocalStoreDb,
+}
+
+impl<'a> MessagePersister<'a> {
+    /// Construct a new persister against the supplied database
+    /// connection.
+    pub fn new(db: &'a LocalStoreDb) -> Self {
+        Self { db }
+    }
+
+    /// Persist an MLS-decrypted [`IngestedMessage`].
+    ///
+    /// Inside one transaction the persister:
+    ///
+    /// 1. Validates the message via [`MessageProcessor::validate_ingest`].
+    /// 2. Rejects duplicates (existing `message_skeleton` row keyed
+    ///    on `message_id`).
+    /// 3. Inserts the skeleton (`body_state = local_plain_available`)
+    ///    and, when `text_content.is_some()`, a `message_body` row.
+    /// 4. Inserts an FTS5 row into `search_fts` for text messages so
+    ///    the row is searchable as soon as the transaction commits.
+    /// 5. Writes a `"message_received"` entry into
+    ///    `backup_event_journal` (CBOR payload: `[message_id,
+    ///    conversation_id, sender_id, created_at_ms]`).
+    pub fn persist_ingested_message(&self, msg: &IngestedMessage) -> Result<(), ProcessorError> {
+        MessageProcessor::validate_ingest(msg)?;
+        let conn = self.db.connection();
+        // Duplicate check before opening the transaction so the
+        // common "already-ingested" case returns immediately without
+        // taking a write lock.
+        if self.skeleton_exists(&msg.message_id.to_string())? {
+            return Err(ProcessorError::DuplicateMessage);
+        }
+
+        // Transaction boundary: skeleton + body + FTS + journal.
+        // SAVEPOINT is used so this works against connections held
+        // immutably (Connection::transaction wants &mut).
+        conn.execute_batch("SAVEPOINT persist_ingest;")
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        let result = self.persist_ingested_message_inner(msg);
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE persist_ingest;")
+                    .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK TO persist_ingest; RELEASE persist_ingest;");
+            }
+        }
+        result
+    }
+
+    fn persist_ingested_message_inner(&self, msg: &IngestedMessage) -> Result<(), ProcessorError> {
+        let kind = if msg.text_content.is_some() {
+            MessageKind::Text
+        } else if !msg.media_descriptors.is_empty() {
+            MessageKind::Media
+        } else {
+            // validate_ingest already rejects this combination, but
+            // double-check rather than risk a malformed row.
+            return Err(ProcessorError::InvalidMessage(
+                "message has neither text nor media".into(),
+            ));
+        };
+
+        let skel = MessageSkeleton {
+            message_id: msg.message_id.to_string(),
+            conversation_id: msg.conversation_id.to_string(),
+            sender_id: msg.sender_id.clone(),
+            created_at_ms: msg.created_at_ms,
+            received_at_ms: now_ms(),
+            kind,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: None,
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: msg.reply_to.map(|u| u.to_string()),
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        self.db.insert_message_skeleton(&skel)?;
+
+        if let Some(text) = &msg.text_content {
+            let body = MessageBody {
+                message_id: skel.message_id.clone(),
+                text_content: Some(text.clone()),
+                detected_language: None,
+                rich_meta: None,
+            };
+            self.db.insert_message_body(&body)?;
+            self.insert_fts_row(
+                &skel.message_id,
+                &skel.conversation_id,
+                &skel.sender_id,
+                skel.created_at_ms,
+                text,
+            )?;
+        }
+
+        let payload = encode_event_payload(
+            &skel.message_id,
+            &skel.conversation_id,
+            &skel.sender_id,
+            skel.created_at_ms,
+        );
+        let entry = BackupEventJournalEntry {
+            event_seq: 0,
+            event_type: "message_received".into(),
+            payload,
+            created_at_ms: now_ms(),
+        };
+        self.db.insert_backup_event(&entry)?;
+        Ok(())
+    }
+
+    /// Persist a client-originated outbox entry.
+    ///
+    /// The outbox entry's `client_message_id` becomes the skeleton's
+    /// `message_id`. `body_state` is set to
+    /// [`BodyState::LocalPlainAvailable`] because the user's plain
+    /// text is on disk from the moment the entry is created. The
+    /// returned [`ClientMessageId`] is the same UUID v7 already on
+    /// the entry — handing it back is a convenience for callers that
+    /// pipe the outbox creation directly into the persister.
+    pub fn persist_outbox_entry(
+        &self,
+        entry: &OutboxEntry,
+    ) -> Result<ClientMessageId, ProcessorError> {
+        if entry.text_content.is_empty() {
+            return Err(ProcessorError::InvalidMessage(
+                "outbox text_content must not be empty".into(),
+            ));
+        }
+        if entry.client_message_id.get_version_num() != 7 {
+            return Err(ProcessorError::InvalidMessage(
+                "client_message_id must be a UUID v7".into(),
+            ));
+        }
+        let mid = entry.client_message_id.to_string();
+        if self.skeleton_exists(&mid)? {
+            return Err(ProcessorError::DuplicateMessage);
+        }
+
+        let conn = self.db.connection();
+        conn.execute_batch("SAVEPOINT persist_outbox;")
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        let result = self.persist_outbox_entry_inner(entry);
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE persist_outbox;")
+                    .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK TO persist_outbox; RELEASE persist_outbox;");
+            }
+        }
+        result?;
+        Ok(ClientMessageId(entry.client_message_id))
+    }
+
+    fn persist_outbox_entry_inner(&self, entry: &OutboxEntry) -> Result<(), ProcessorError> {
+        let mid = entry.client_message_id.to_string();
+        let conv = entry.conversation_id.to_string();
+        let skel = MessageSkeleton {
+            message_id: mid.clone(),
+            conversation_id: conv.clone(),
+            // Phase 1 outbox sender id is the placeholder "self" —
+            // KChat's identity layer fills the real id in once the
+            // device-side identity wiring lands.
+            sender_id: "self".into(),
+            created_at_ms: entry.created_at_ms,
+            received_at_ms: entry.created_at_ms,
+            kind: MessageKind::Text,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: None,
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: entry.reply_to.map(|u| u.to_string()),
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        self.db.insert_message_skeleton(&skel)?;
+        let body = MessageBody {
+            message_id: mid.clone(),
+            text_content: Some(entry.text_content.clone()),
+            detected_language: None,
+            rich_meta: None,
+        };
+        self.db.insert_message_body(&body)?;
+        self.insert_fts_row(
+            &mid,
+            &conv,
+            "self",
+            entry.created_at_ms,
+            &entry.text_content,
+        )?;
+
+        let payload = encode_event_payload(&mid, &conv, "self", entry.created_at_ms);
+        let journal = BackupEventJournalEntry {
+            event_seq: 0,
+            event_type: "outbox_pending".into(),
+            payload,
+            created_at_ms: now_ms(),
+        };
+        self.db.insert_backup_event(&journal)?;
+        Ok(())
+    }
+
+    /// Whether `client_message_id` (or, equivalently, an
+    /// already-ingested `message_id`) exists in `message_skeleton`.
+    pub fn check_duplicate(&self, client_message_id: &str) -> Result<bool, ProcessorError> {
+        self.skeleton_exists(client_message_id)
+    }
+
+    /// Mark an outbox entry as having been confirmed by the MLS
+    /// delivery layer. Phase 1 records this as an `"outbox_sent"`
+    /// entry in `backup_event_journal`; later phases lift it into a
+    /// dedicated outbox-status column.
+    pub fn mark_sent(&self, client_message_id: &str) -> Result<(), ProcessorError> {
+        // Look up the row to confirm it exists and to populate the
+        // event payload. We do not change body_state — the message
+        // was already local_plain_available at create time.
+        let conn = self.db.connection();
+        let lookup: Option<(String, String, i64)> = conn
+            .query_row(
+                "SELECT conversation_id, sender_id, created_at_ms
+                 FROM message_skeleton WHERE message_id = ?1",
+                params![client_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        let (conv, sender, created_at) = match lookup {
+            Some(v) => v,
+            None => {
+                return Err(ProcessorError::InvalidMessage(format!(
+                    "no outbox entry with client_message_id={client_message_id}"
+                )));
+            }
+        };
+        let payload = encode_event_payload(client_message_id, &conv, &sender, created_at);
+        let entry = BackupEventJournalEntry {
+            event_seq: 0,
+            event_type: "outbox_sent".into(),
+            payload,
+            created_at_ms: now_ms(),
+        };
+        self.db.insert_backup_event(&entry)?;
+        Ok(())
+    }
+
+    fn skeleton_exists(&self, message_id: &str) -> Result<bool, ProcessorError> {
+        let count: i64 = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM message_skeleton WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        Ok(count > 0)
+    }
+
+    fn insert_fts_row(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_id: &str,
+        created_at_ms: i64,
+        text: &str,
+    ) -> Result<(), ProcessorError> {
+        self.db
+            .connection()
+            .execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![message_id, conversation_id, sender_id, created_at_ms, text],
+            )
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Encode a `[message_id, conversation_id, sender_id, created_at_ms]`
+/// CBOR array. Used as the payload for the
+/// `"message_received"` / `"outbox_pending"` / `"outbox_sent"`
+/// event-journal entries.
+fn encode_event_payload(
+    message_id: &str,
+    conversation_id: &str,
+    sender_id: &str,
+    created_at_ms: i64,
+) -> Vec<u8> {
+    // Hand-rolled, dependency-free CBOR encoder for the small fixed
+    // shape used here. Avoids leaning on `serde_cbor` for one writer
+    // path and is exercised by the persister tests below.
+    let mut out = Vec::with_capacity(64);
+    // Array of 4
+    out.push(0x84);
+    push_cbor_text(&mut out, message_id);
+    push_cbor_text(&mut out, conversation_id);
+    push_cbor_text(&mut out, sender_id);
+    push_cbor_int(&mut out, created_at_ms);
+    out
+}
+
+fn push_cbor_text(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if len < 24 {
+        out.push(0x60 | len as u8);
+    } else if len <= u8::MAX as usize {
+        out.push(0x78);
+        out.push(len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0x79);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(0x7a);
+        out.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn push_cbor_int(out: &mut Vec<u8>, v: i64) {
+    if v >= 0 {
+        push_cbor_uint(out, v as u64);
+    } else {
+        let n = (-(v + 1)) as u64;
+        push_cbor_uint_with_major(out, 1, n);
+    }
+}
+
+fn push_cbor_uint(out: &mut Vec<u8>, v: u64) {
+    push_cbor_uint_with_major(out, 0, v)
+}
+
+fn push_cbor_uint_with_major(out: &mut Vec<u8>, major: u8, v: u64) {
+    let m = major << 5;
+    if v < 24 {
+        out.push(m | v as u8);
+    } else if v <= u8::MAX as u64 {
+        out.push(m | 24);
+        out.push(v as u8);
+    } else if v <= u16::MAX as u64 {
+        out.push(m | 25);
+        out.extend_from_slice(&(v as u16).to_be_bytes());
+    } else if v <= u32::MAX as u64 {
+        out.push(m | 26);
+        out.extend_from_slice(&(v as u32).to_be_bytes());
+    } else {
+        out.push(m | 27);
+        out.extend_from_slice(&v.to_be_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,5 +805,243 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: IngestedMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    // -----------------------------------------------------------------
+    // MessagePersister
+    // -----------------------------------------------------------------
+
+    fn fresh_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[0x42; 32]).expect("open in-memory db")
+    }
+
+    fn seed_conversation(db: &LocalStoreDb, conv_id: &Uuid) {
+        let conv = crate::local_store::schema::Conversation {
+            conversation_id: conv_id.to_string(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        db.insert_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn persist_ingested_message_writes_skeleton_body_fts_and_journal() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("hello world".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        let mid = msg.message_id.to_string();
+        let skel = db.get_message_skeleton(&mid).unwrap().expect("skeleton");
+        assert_eq!(skel.message_id, mid);
+        assert_eq!(skel.body_state, BodyState::LocalPlainAvailable);
+        let body = db.get_message_body(&mid).unwrap().expect("body");
+        assert_eq!(body.text_content.as_deref(), Some("hello world"));
+
+        // FTS row.
+        let fts_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1);
+
+        // Backup event journal entry.
+        let event_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM backup_event_journal
+                 WHERE event_type = 'message_received'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn persist_ingested_message_rejects_duplicate() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("first".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).unwrap();
+        let err = p.persist_ingested_message(&msg).unwrap_err();
+        assert!(
+            matches!(err, ProcessorError::DuplicateMessage),
+            "expected DuplicateMessage; got {err:?}"
+        );
+
+        // FTS / journal must not have been written twice.
+        let fts_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                params![msg.message_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1);
+    }
+
+    #[test]
+    fn persist_ingested_message_rejects_invalid() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mut msg = IngestedMessage {
+            message_id: Uuid::nil(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("hello".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        assert!(matches!(
+            p.persist_ingested_message(&msg),
+            Err(ProcessorError::InvalidMessage(_))
+        ));
+        msg.message_id = Uuid::now_v7();
+        msg.text_content = None;
+        assert!(matches!(
+            p.persist_ingested_message(&msg),
+            Err(ProcessorError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn persist_outbox_entry_inserts_skeleton_body_and_returns_uuid() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry = MessageProcessor::create_outbox_entry(conv, "outgoing", None).unwrap();
+        let mid = p.persist_outbox_entry(&entry).expect("persist outbox");
+
+        assert_eq!(mid.0.get_version_num(), 7);
+        assert_eq!(mid.0, entry.client_message_id);
+
+        let skel = db
+            .get_message_skeleton(&entry.client_message_id.to_string())
+            .unwrap()
+            .expect("skeleton");
+        assert_eq!(skel.body_state, BodyState::LocalPlainAvailable);
+        assert_eq!(skel.kind, MessageKind::Text);
+
+        let body = db
+            .get_message_body(&entry.client_message_id.to_string())
+            .unwrap()
+            .expect("body");
+        assert_eq!(body.text_content.as_deref(), Some("outgoing"));
+    }
+
+    #[test]
+    fn persist_outbox_entry_rejects_empty_text_and_non_v7() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry_empty = OutboxEntry {
+            client_message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            text_content: String::new(),
+            reply_to: None,
+            created_at_ms: 100,
+            status: OutboxStatus::Pending,
+        };
+        assert!(matches!(
+            p.persist_outbox_entry(&entry_empty),
+            Err(ProcessorError::InvalidMessage(_))
+        ));
+        let entry_v4 = OutboxEntry {
+            client_message_id: Uuid::nil(),
+            conversation_id: conv,
+            text_content: "hi".into(),
+            reply_to: None,
+            created_at_ms: 100,
+            status: OutboxStatus::Pending,
+        };
+        assert!(matches!(
+            p.persist_outbox_entry(&entry_v4),
+            Err(ProcessorError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn check_duplicate_reflects_persisted_state() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("hi".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        let mid = msg.message_id.to_string();
+        assert!(!p.check_duplicate(&mid).unwrap());
+        p.persist_ingested_message(&msg).unwrap();
+        assert!(p.check_duplicate(&mid).unwrap());
+    }
+
+    #[test]
+    fn mark_sent_writes_journal_entry() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry = MessageProcessor::create_outbox_entry(conv, "ping", None).unwrap();
+        p.persist_outbox_entry(&entry).unwrap();
+        p.mark_sent(&entry.client_message_id.to_string()).unwrap();
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM backup_event_journal WHERE event_type = 'outbox_sent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mark_sent_rejects_unknown_id() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        assert!(matches!(
+            p.mark_sent("does-not-exist"),
+            Err(ProcessorError::InvalidMessage(_))
+        ));
     }
 }

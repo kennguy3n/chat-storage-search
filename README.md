@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~15%`.**
+> Search + MLS Integration — `In progress | ~55%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -25,15 +25,25 @@
 >
 > Landed in Phase 1 so far: typed local-store schema row structs +
 > `SCHEMA_SQL` (`local_store::schema`), per-message state machines
-> with `try_transition` (`local_store::state_machines`), the
-> message-processor skeleton (`message::processor`), and the
-> expanded `KChatCore` public API
-> (`SearchQuery`, `SearchScope`, `SearchResult`, `HydrationReason`,
-> `BackupReason`, `StoragePressureReason`, `ClientMessageId`,
-> `DeliveryCursor`).
+> with `try_transition` (`local_store::state_machines`),
+> SQLCipher-backed local store (`local_store::db::LocalStoreDb` with
+> `PRAGMA key`, foreign-key enforcement, ICU/`unicode61` schema
+> bring-up, conversation/skeleton/body CRUD), the message processor
+> with DB-backed `MessagePersister` (transactional skeleton + body +
+> FTS row + journal entry, idempotent on `message_id`), the FTS5
+> text search engine (`search::text_search::TextSearchEngine` with
+> BM25-ordered queries, snippet highlighting, prefix-search and
+> phrase-quote handling), the unified query engine
+> (`search::query_engine::QueryEngine` combining FTS5 with
+> structured `sender` / `conversation` / `date_from` / `date_to` /
+> `content_kind` filters), and the multilingual integration test
+> at `crates/core/tests/multilingual_search.rs` covering Latin /
+> Cyrillic / CJK / Arabic / Thai / Devanagari / mixed-script
+> messages.
 >
-> Outstanding for Phase 1: SQLCipher integration, FTS5 query
-> engine, UniFFI / JNI bridges, structured-search query parser. The
+> Outstanding for Phase 1: UniFFI / JNI bridges, platform-specific
+> `K_local_db` wrap (Keychain / Keystore / DPAPI), and performance
+> validation against the < 20 ms / < 150 ms p95 targets. The
 > higher-level engines (`media`, `archive`, `backup`, `offload`,
 > `restore`) remain stubbed and land across Phases 2–7. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
@@ -74,16 +84,19 @@ chat-storage-search/
           manifest.rs                       # BackupManifest / ArchiveManifest + Ed25519
           media_descriptor.rs               # MediaDescriptor
           search_shard.rs                   # SearchIndexShard (text/fuzzy/vector/media)
-        local_store/                        # Phase 1: foundation landed
+        local_store/                        # Phase 1: SQLCipher store + schema landed
           mod.rs
+          db.rs                             # SQLCipher-backed LocalStoreDb + CRUD helpers
           schema.rs                         # SCHEMA_SQL + typed row structs
           state_machines.rs                 # body / media / archive / backup / restore
-        message/                            # Phase 1: skeleton landed
+        message/                            # Phase 1: persister landed
           mod.rs
-          processor.rs                      # IngestedMessage / OutboxEntry / validators
-        search/                             # Phase 1: tokenizer landed
+          processor.rs                      # IngestedMessage / OutboxEntry / MessagePersister
+        search/                             # Phase 1: FTS5 + structured search landed
           mod.rs
           tokenizer.rs                      # ICU + ScriptClass + FuzzyGranularity
+          text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
+          query_engine.rs                   # FTS + sender/date/conv/kind structured filters
         archive/                            # placeholder (Phase 3)
         backup/                             # placeholder (Phase 4)
         media/                              # placeholder (Phase 2)
@@ -95,6 +108,7 @@ chat-storage-search/
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
+        multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari round-trip
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
         pattern_c_interop_vectors.json
     ios-bridge/                             # UniFFI → Swift (Phase 1)
@@ -148,15 +162,43 @@ The Phase 0 + Phase 1 test surface covers:
 * [`local_store::state_machines`](crates/core/src/local_store/state_machines.rs) —
   every legal transition succeeds, every illegal transition
   errors, `Display` / `FromStr` round-trip, serde round-trip.
+* [`local_store::db`](crates/core/src/local_store/db.rs) —
+  SQLCipher bring-up (`PRAGMA key`, foreign-key enforcement,
+  ICU→`unicode61` schema fallback), `LocalStoreDb` CRUD round-trip
+  for conversation / skeleton / body / `update_body_state` /
+  `insert_backup_event`, FK-violation enforcement.
 * [`message::processor`](crates/core/src/message/processor.rs) —
-  `validate_ingest`, deduplication, outbox creation with
-  monotonic UUID v7.
+  `validate_ingest`, deduplication, outbox creation with monotonic
+  UUID v7, plus the `MessagePersister` integration tests for
+  transactional skeleton + body + FTS5 + journal writes,
+  duplicate rejection, and `mark_sent` event-journal entries.
+* [`search::text_search`](crates/core/src/search/text_search.rs) —
+  BM25 ordering, snippet highlighting, prefix queries, phrase
+  quoting, special-character escaping in free-text input.
+* [`search::query_engine`](crates/core/src/search/query_engine.rs)
+  — sender / conversation / date / content-kind filters, FTS
+  combined with structured filters by `message_id` intersection,
+  `SearchScope::LocalOnly` invariant.
 * [`lib.rs`](crates/core/src/lib.rs) — public API type
   construction, default `SearchScope::IncludeCold`, P0–P5 ordering
   on `HydrationReason`, `Error` variant `Display` strings.
 * Integration tests under
   [`crates/core/tests/`](crates/core/tests/) — cross-language
-  Pattern C vectors, manifest signing, key-wrap-by-hierarchy-root.
+  Pattern C vectors, manifest signing, key-wrap-by-hierarchy-root,
+  and the [multilingual search
+  round-trip](crates/core/tests/multilingual_search.rs) covering
+  Latin / Cyrillic / Han / Hiragana-Katakana / Arabic / Thai /
+  Devanagari / mixed-script messages. CJK and Thai word-level
+  searches require an ICU-linked SQLCipher build and soft-skip on
+  the bundled `unicode61`-only configuration.
+
+> SQLCipher is bundled by `rusqlite`'s
+> `bundled-sqlcipher-vendored-openssl` feature, so `cargo test` does
+> not need a system SQLCipher / OpenSSL install. The bundled build
+> ships without ICU; the schema bring-up automatically falls back to
+> `tokenize = 'unicode61 remove_diacritics 2'` and the multilingual
+> integration test marks the CJK / Thai cases as soft-skipped
+> instead of failing.
 
 The workspace ships four crates: `kchat-core` (platform-agnostic
 logic), and three thin bridges (`kchat-ios-bridge`,
