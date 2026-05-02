@@ -1735,10 +1735,7 @@ mod tests {
             count_rows(&db, "search_vector", "message_id LIKE 'm-d-%'"),
             0
         );
-        assert_eq!(
-            count_rows(&db, "media_asset", "message_id LIKE 'm-d-%'"),
-            0
-        );
+        assert_eq!(count_rows(&db, "media_asset", "message_id LIKE 'm-d-%'"), 0);
         assert_eq!(
             count_rows(&db, "media_search_index", "asset_id LIKE 'asset-m-d-%'"),
             0
@@ -1757,10 +1754,7 @@ mod tests {
         assert_eq!(count_rows(&db, "search_fts", "message_id = 'm-keep'"), 1);
         assert_eq!(count_rows(&db, "search_fuzzy", "message_id = 'm-keep'"), 1);
         assert_eq!(count_rows(&db, "search_vector", "message_id = 'm-keep'"), 1);
-        assert_eq!(
-            count_rows(&db, "media_asset", "message_id = 'm-keep'"),
-            1
-        );
+        assert_eq!(count_rows(&db, "media_asset", "message_id = 'm-keep'"), 1);
         assert_eq!(
             count_rows(&db, "media_search_index", "asset_id = 'asset-m-keep'"),
             1
