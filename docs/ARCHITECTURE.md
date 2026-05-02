@@ -111,16 +111,51 @@ goes through the FFI bridge for the host platform.
 >   foundation** for the SQLCipher schema: typed Rust row structs
 >   for every table in §4 plus the `SCHEMA_SQL` constant carrying
 >   the `CREATE TABLE` / `CREATE VIRTUAL TABLE` statements.
+> * `crates/core/src/local_store/db.rs` is the **Phase-1 SQLCipher
+>   binding**: `LocalStoreDb` opens / creates `{data_dir}/kchat.db`
+>   (or an `:memory:` database for tests), sets `PRAGMA key` from
+>   the 32-byte `K_local_db`, enables foreign-key enforcement, and
+>   runs `SCHEMA_SQL` with automatic detection of the FTS5 ICU
+>   tokenizer plus `unicode61` fallback via
+>   `create_schema_with_unicode61_fallback()`. CRUD helpers cover
+>   conversation / skeleton / body / `update_body_state` /
+>   `insert_backup_event`. SQLCipher itself is bundled by
+>   `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature so
+>   the workspace builds and tests without a system SQLCipher /
+>   OpenSSL install. Platform-specific wrapping of `K_local_db`
+>   (Keychain / Keystore / DPAPI) is still stubbed and lands later
+>   in Phase 1 with the UniFFI / JNI bridges.
 > * `crates/core/src/local_store/state_machines.rs` defines the
 >   `body_state`, `media_state`, `archive_state`, `backup_state`,
 >   and `restore_state` enums with `try_transition`, `Display` /
 >   `FromStr`, and serde support — every transition not in the
 >   diagrams in §5 is rejected.
-> * `crates/core/src/message/processor.rs` is the **Phase-1 message
->   processor skeleton**: `IngestedMessage`, `OutboxEntry`,
->   `OutboxStatus`, `IngestResult`, and the static
->   `validate_ingest` / `is_duplicate` / `create_outbox_entry`
->   helpers.
+> * `crates/core/src/message/processor.rs` carries the **Phase-1
+>   message processor**: `IngestedMessage`, `OutboxEntry`,
+>   `OutboxStatus`, `IngestResult`, the pure validators
+>   (`validate_ingest`, `is_duplicate`, `create_outbox_entry`),
+>   and the DB-backed `MessagePersister` that wraps skeleton +
+>   body + FTS row + `"message_received"` /
+>   `"outbox_pending"` / `"outbox_sent"` journal writes inside one
+>   `SAVEPOINT` so a crash mid-ingest cannot leave the FTS index
+>   out of sync with the skeleton table.
+> * `crates/core/src/search/text_search.rs` is the **Phase-1 FTS5
+>   text search engine**: `TextSearchEngine::search_fts` runs
+>   `bm25(search_fts)`-ordered queries returning
+>   `FtsMatch { message_id, conversation_id, sender_id,
+>   created_at_ms, snippet, bm25_score }`. `build_fts_query`
+>   quotes free-text tokens token-by-token while preserving
+>   `"phrase"` and trailing-`*` prefix queries plus the explicit
+>   `AND` / `OR` / `NOT` / `NEAR` operators.
+> * `crates/core/src/search/query_engine.rs` is the **Phase-1
+>   unified search engine**: `QueryEngine::execute_search`
+>   intersects FTS hits with structured `WHERE` clauses on
+>   `message_skeleton` (`sender_filter`, `conversation_filter`,
+>   `date_from` / `date_to`, `content_kind`) by `message_id`,
+>   maps the rows to `SearchResult { snippet, rank_score,
+>   is_cold }`, and short-circuits to a recency-ordered skeleton
+>   scan when the query string is empty. `SearchScope::LocalOnly`
+>   is honored — no archive fan-out attempts in Phase 1.
 
 The workspace ships four crates: a core that knows nothing about
 platforms, and three thin bridges.
@@ -206,14 +241,18 @@ the standard library and chosen primitives.
 > the same `wrap_key` / `unwrap_key` primitives.
 >
 > Phase 1 has additionally landed the `local_store::schema`,
-> `local_store::state_machines`, `message::processor`, and
-> `search::tokenizer` modules, plus the expanded `KChatCore`
-> public-API trait in `lib.rs` (`SearchQuery`, `SearchScope`,
-> `SearchResult`, `HydrationReason`, `BackupReason`,
-> `StoragePressureReason`, `ClientMessageId`, `DeliveryCursor`).
-> The remaining higher-level modules (`media`, `archive`, `backup`,
-> `offload`, `restore`, `models`, `transport`, `scheduler`) are
-> Phase-0 placeholders and are filled in across Phases 1 – 7.
+> `local_store::db` (SQLCipher binding + CRUD helpers),
+> `local_store::state_machines`, `message::processor` (validators
+> *and* DB-backed `MessagePersister`), `search::tokenizer`,
+> `search::text_search` (FTS5 BM25 engine), and
+> `search::query_engine` (unified FTS + structured search) modules,
+> plus the expanded `KChatCore` public-API trait in `lib.rs`
+> (`SearchQuery`, `SearchScope`, `SearchResult`, `HydrationReason`,
+> `BackupReason`, `StoragePressureReason`, `ClientMessageId`,
+> `DeliveryCursor`). The remaining higher-level modules (`media`,
+> `archive`, `backup`, `offload`, `restore`, `models`, `transport`,
+> `scheduler`) are Phase-0 placeholders and are filled in across
+> Phases 1 – 7.
 
 ---
 
