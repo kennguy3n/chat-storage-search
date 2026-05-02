@@ -263,14 +263,17 @@ Checklist:
 
 - [ ] ONNX Runtime integration via the
       [`ort`](https://crates.io/crates/ort) crate.
-- [ ] Multilingual text embedding model (`multilingual-e5-small`,
-      INT8 ONNX) wired through the search pipeline. English-only
-      MiniLM-L6 is **rejected**.
+- [ ] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
+      ONNX) wired through the search pipeline. Same encoder as
+      `kennguy3n/slm-guardrail`, unifying the text encoder across
+      the platform. English-only MiniLM-L6 is **rejected**.
 - [ ] HNSW vector index for semantic text search.
-- [ ] CLIP integration for image search (multilingual text→image).
-- [ ] Video keyframe sampling and CLIP embeddings.
+- [ ] `MobileCLIP-S2` integration for image search (multilingual
+      text→image, ~80 MB INT8 ONNX).
+- [ ] Video keyframe sampling and `MobileCLIP-S2` embeddings.
 - [ ] Whisper multilingual integration for voice-message transcription
-      (`whisper-small` default; `whisper-tiny` on low-end Android).
+      (`whisper-base` default, ~140 MB; `whisper-tiny` on low-end
+      Android, ~75 MB).
 - [ ] Platform OCR bridge: Vision (`VNRecognizeTextRequest`) on
       iOS / macOS; ML Kit Text Recognition v2 on Android;
       `Windows.Media.Ocr` / Tesseract on Windows.
