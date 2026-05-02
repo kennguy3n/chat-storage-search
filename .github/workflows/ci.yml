@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: Check + Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace --verbose
+
+  # Phase 0+ : cross-language interop check via the Go vector
+  # generator. Uses a local replace to the zk-object-fabric SDK on
+  # CI nodes that have the sibling repo available; on a fresh
+  # GitHub Actions runner the generator falls back to the public
+  # module path. Disabled by default until both repos are CI-linked.
+  # interop-vectors:
+  #   name: Pattern C Interop Vectors
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version: "1.22"
+  #     - name: Generate Go vectors
+  #       run: |
+  #         cd tests/generate_vectors
+  #         go run . > ../../crates/core/tests/pattern_c_interop_vectors.json
+  #     - name: Run Rust interop tests
+  #       run: cargo test -p kchat-core --test pattern_c_interop_vectors

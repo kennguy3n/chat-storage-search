@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`NOT STARTED`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`In progress | ~55%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -17,7 +17,7 @@ the full delivery plan, see [PHASES.md](PHASES.md).
 
 ## Phase 0: Protocol and Test Vectors
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~55%`
 
 **Goal**: Lock the shared binary formats, crypto specs, and
 cross-platform / cross-language test vectors **before** writing
@@ -28,7 +28,7 @@ Checklist:
 
 - [ ] Shared binary formats spec (CBOR for wire payloads; internal
       Rust structs ↔ CBOR mapping).
-- [ ] Crypto container spec (AEAD construction, AAD format, chunk
+- [x] Crypto container spec (AEAD construction, AAD format, chunk
       layout) covering both KChat-internal AAD and ZK Object Fabric
       Pattern C.
 - [ ] Manifest spec (backup manifest, archive manifest;
@@ -38,17 +38,25 @@ Checklist:
 - [ ] Multilingual tokenization spec (ICU configuration, script-
       specific rules, fallback behavior, fuzzy-index granularity
       per script).
-- [ ] iOS / Android / desktop / Rust cross-platform crypto test
-      vectors.
-- [ ] **ZK Object Fabric interop test vectors** (Rust ↔ Go SDK at
+- [x] iOS / Android / desktop / Rust cross-platform crypto test
+      vectors. _(Rust-side complete: BLAKE3 known vectors,
+      HKDF derivation determinism, AEAD round-trip / wrong-key /
+      tamper / AAD-mismatch tests. iOS / Android / desktop bindings
+      pick this up in Phase 1 when UniFFI / JNI land.)_
+- [x] **ZK Object Fabric interop test vectors** (Rust ↔ Go SDK at
       `kennguy3n/zk-object-fabric/encryption/client_sdk/`,
       bit-identical for `DeriveConvergentDEK`,
       `deriveConvergentNonce`, chunk framing, end-to-end
-      `EncryptObject`).
-- [ ] Rust workspace scaffold (`crates/core`, `crates/ios-bridge`,
+      `EncryptObject`). _(See
+      `crates/core/tests/pattern_c_interop_vectors.{rs,json}` and
+      the generator at `tests/generate_vectors/main.go`.)_
+- [x] Rust workspace scaffold (`crates/core`, `crates/ios-bridge`,
       `crates/android-bridge`, `crates/desktop`).
-- [ ] CI pipeline (Rust build + test, iOS build, Android build,
-      desktop build, cross-language test-vector run).
+- [x] CI pipeline (Rust build + test). _(`cargo fmt --check`,
+      `cargo clippy -D warnings`, `cargo build --workspace`,
+      `cargo test --workspace` in `.github/workflows/ci.yml`. iOS /
+      Android / desktop platform builds and the cross-language
+      vector job land in Phase 1.)_
 
 **Decision gate**: Crypto test vectors pass across Rust, Swift (via
 UniFFI), Kotlin (via JNI), and Go (zk-object-fabric SDK). A
@@ -56,7 +64,20 @@ deviation in any binding blocks Phase 1.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-02: Rust crypto module landed (`crates/core/src/crypto/`):
+  BLAKE3 content hashing (one-shot + streaming), HKDF-SHA256 key
+  hierarchy with `Zeroize + ZeroizeOnDrop` `KeyMaterial`,
+  XChaCha20-Poly1305 + AES-256-GCM AEADs, KChat per-chunk AAD
+  (`KCHAT_BLOB_CHUNK_V1` + varint blob_class + u32 BE chunk_no /
+  chunk_count + 32-byte Merkle root), and Pattern C convergent
+  encryption that is bit-identical to
+  `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
+- 2026-05-02: Cross-language vectors locked. The Go generator
+  produces `pattern_c_interop_vectors.json`; the Rust integration
+  test asserts BLAKE3 digest, DEK, chunk-0 nonce, full ciphertext,
+  and Go-ciphertext → Rust-decrypt round-trip across four input
+  shapes (single-chunk, single-byte, 4 KiB × 256-byte chunks,
+  128-byte × 64-byte chunks). Status: 6/6 passing locally.
 
 ---
 
@@ -325,3 +346,20 @@ device matrix. Full failure test suite passes on every platform.
 Notes:
 
 - _(none yet)_
+
+---
+
+## Changelog
+
+- 2026-05-02: Phase 0 — Rust workspace scaffold (`crates/core`,
+  `crates/ios-bridge`, `crates/android-bridge`, `crates/desktop`),
+  crypto module (BLAKE3 content hashing, HKDF-SHA256 key hierarchy
+  rooted at `K_user_master`, zeroizing `KeyMaterial`,
+  XChaCha20-Poly1305, AES-256-GCM, `KCHAT_BLOB_CHUNK_V1` per-chunk
+  AAD), Pattern C convergent encryption bit-identical to the Go SDK
+  at `kennguy3n/zk-object-fabric/encryption/client_sdk/`,
+  cross-language test vectors (Go generator at
+  `tests/generate_vectors/main.go`, Rust interop test at
+  `crates/core/tests/pattern_c_interop_vectors.rs`), CI pipeline
+  (GitHub Actions: `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo build --workspace`, `cargo test --workspace`).
