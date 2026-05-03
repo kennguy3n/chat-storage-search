@@ -300,7 +300,7 @@ mod tests {
             *self.upload_calls.lock().unwrap() += 1;
             Ok(MediaBlobReference {
                 blob_id: format!("sink-blob-{asset_id}"),
-                storage_sink: "i_cloud".to_string(),
+                storage_sink: "icloud".to_string(),
                 sink_metadata: Some(b"icloud-meta".to_vec()),
             })
         }
@@ -421,7 +421,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(r.storage_sink, "i_cloud");
+        assert_eq!(r.storage_sink, "icloud");
         assert_eq!(r.blob_id, "sink-blob-asset-2");
         assert_eq!(sink.upload_calls(), 1);
         assert_eq!(transport.upload_calls(), 0);
@@ -504,10 +504,10 @@ mod tests {
         let transport = StubTransport::new();
         let blob_ref = MediaBlobReference {
             blob_id: "i-blob-1".to_string(),
-            storage_sink: "i_cloud".to_string(),
+            storage_sink: "icloud".to_string(),
             sink_metadata: None,
         };
-        let got = route_media_download("i_cloud", &transport, Some(&sink), &blob_ref, 2).unwrap();
+        let got = route_media_download("icloud", &transport, Some(&sink), &blob_ref, 2).unwrap();
         assert_eq!(got, payload);
         assert_eq!(sink.fetch_calls(), 1);
         assert_eq!(transport.fetch_calls(), 0);
@@ -535,7 +535,7 @@ mod tests {
         let sink = StubSink::new();
         let blob_ref = MediaBlobReference {
             blob_id: "blob-x".to_string(),
-            storage_sink: "i_cloud".to_string(),
+            storage_sink: "icloud".to_string(),
             sink_metadata: None,
         };
         let err = route_media_download(KCHAT_BACKEND_SINK, &transport, Some(&sink), &blob_ref, 0)

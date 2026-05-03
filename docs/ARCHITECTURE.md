@@ -505,19 +505,62 @@ the standard library and chosen primitives.
 > `persist_segment_map_row` records the resulting blob in
 > `archive_segment_map`), `archive::prefetch::batch_prefetch_bucket`
 > (one transport hop per `(conversation_id, time_bucket)` per
-> PROPOSAL §5.6), `local_store::db::update_archive_state` (atomic
-> batch UPDATE gated by `ArchiveState::try_transition`), and
-> `offload::{budget, scoring, eviction, hydration}` (storage
-> budget enforcer, eviction scoring per PROPOSAL §5.4 with a
-> `pinned`-row guard returning `f64::MIN`, eviction planner /
-> executor, P0..P5 hydration priority queue). All of this is
-> wired into `CoreImpl`: `enforce_storage_budget` now harvests
-> candidate rows via `collect_eviction_candidates` (no more
-> `Vec::new()` placeholder), and `hydrate_message` enqueues every
-> request into a `Mutex<HydrationQueue>` with the priority mapped
-> from the reason string by `parse_hydration_reason`. The
-> remote archive fetch path (manifest reader / segment download
-> / replay) is queued for the next Phase 3 milestone.
+> PROPOSAL §5.6), `archive::prefetch::batch_prefetch_bucket_with_padding`
+> (the privacy-aware variant — interleaves UUIDv4 dummy
+> segment-ids with the real UUIDv7 ones when
+> `KChatCoreConfig::privacy_level == High`),
+> `archive::epoch_keys::EpochKeyManager` (current epoch key in
+> `Zeroizing<[u8; 32]>` plus a registry of prior epoch keys
+> wrapped via AES-256-KW under `K_archive_root` for cross-epoch
+> segment decrypt; `rotate(new_epoch_id)` /
+> `unwrap_prior_epoch_key` / `delete_epoch_key(epoch_id)` cover
+> the lifecycle including forward-secrecy deletion),
+> `archive::routing::{route_archive_upload, route_archive_download,
+> route_manifest_upload}` (dispatches archive operations to
+> either the `TransportClient` or a `ZkofArchiveAdapter` based
+> on `KChatCoreConfig::archive_backend`; the ZKOF adapter is
+> backed by an `S3Client` trait with a `NoopS3Client` stub),
+> `archive::privacy::{should_pad, compute_padding_count,
+> generate_dummy_segment_id, pad_with_dummy_requests}`
+> (privacy-padding helpers consumed by the prefetch path),
+> `local_store::db::update_archive_state` (atomic batch UPDATE
+> gated by `ArchiveState::try_transition`),
+> `local_store::db::rehydrate_message_body` (in-place body update
+> + `body_state` transition + FTS / fuzzy re-indexing inside one
+> SAVEPOINT, no `created_at_ms` / `received_at_ms` mutation, so
+> the timeline never scroll-jumps when a cold body lands),
+> `media::download::rehydrate_media_asset` (reads
+> `media_asset.{blob_id, storage_sink, chunk_count, merkle_root,
+> wrapped_k_asset}`, unwraps `K_asset` via `K_local_db`, drives
+> the chunked download through `TransportClient` or the
+> configured `MediaBlobSink` based on `storage_sink`, and flips
+> `media_state` to `original_local`), `media::sinks::zk_fabric`
+> (`ZkObjectFabricSink` mapping
+> `upload_media_chunks` / `fetch_media_chunk` /
+> `delete_media_blob` to per-chunk S3 keys
+> `media/{asset_id}/chunk-{idx:08}` against a configured bucket;
+> `MediaBlobReference::metadata` carries
+> `[chunk_count:u32_be][merkle_root:32b][asset_id:utf8]` so the
+> rehydration path can re-derive every chunk key without a
+> second DB round-trip), and `offload::{budget, scoring, eviction,
+> hydration}` (storage budget enforcer, eviction scoring per
+> PROPOSAL §5.4 with a `pinned`-row guard returning `f64::MIN`,
+> pressure-tier-aware eviction planner / executor including the
+> tiered policy `plan_tiered_eviction` (cloud-offload pool first
+> → KChat-backend pool only on shortfall), P0..P5 hydration
+> priority queue). All of this is wired into `CoreImpl`:
+> `enforce_storage_budget` now harvests candidate rows via
+> `collect_eviction_candidates` and runs the tiered eviction
+> planner / executor in two passes (cloud, then full) with the
+> combined `freed_bytes` / `evicted_count` reported back to the
+> caller, and `hydrate_message` enqueues every request into a
+> `Mutex<HydrationQueue>` with the priority mapped from the
+> reason string by `parse_hydration_reason`, calling
+> `LocalStoreDb::rehydrate_message_body` for cold text bodies
+> and `media::download::rehydrate_media_asset` for evicted /
+> remote-only media on the same path. The remote archive fetch
+> path (manifest reader / segment download / replay) is queued
+> for the next Phase 3 milestone.
 
 ---
 
@@ -960,18 +1003,41 @@ sequenceDiagram
 >   (`ContentKind::weight`, 30-day half-life recency decay,
 >   16 MiB-normalised size bonus, `compute_eviction_score`).
 >   Pinned candidates short-circuit to `f64::NEG_INFINITY`.
-> * Plan / execute live in `offload::eviction` (`plan_eviction`
+> * Plan / execute live in `offload::eviction`. `plan_eviction`
 >   filters pinned + not-archived candidates, sorts by score
->   descending, accumulates until `target_bytes`;
+>   descending, accumulates until `target_bytes`.
+>   `plan_eviction_with_pressure` is the pressure-aware variant:
+>   originals (video / documents / images / voice) are eligible at
+>   `Warning+`, thumbnails at `Critical+`, cold text bodies at
+>   `Extreme` only.
 >   `execute_eviction` issues the state-machine demotion against
->   `media_asset`).
+>   `media_asset`.
+> * **Tiered eviction policy** (PROPOSAL §5.4 / §5.7): media
+>   originals on a user-cloud sink (`storage_sink != "kchat_backend"`)
+>   are evicted first because the original is still recoverable
+>   from the configured `MediaBlobSink` (cheap rehydration), and
+>   only if that pool underruns the byte target does the planner
+>   fall through to a second pass over assets whose only remote
+>   copy is in the KChat archive.
+>   `EvictionTier::{CloudOffload, FullEviction}` classifies each
+>   `EvictionCandidate` by its `storage_sink`;
+>   `plan_tiered_eviction` partitions the candidate pool, runs
+>   `plan_eviction_with_pressure` once per pool, and combines the
+>   two `EvictionPlan`s into a `TieredEvictionPlan` with
+>   `target_bytes` / `total_bytes` accounting.
 > * `offload::hydration::HydrationQueue` drives the rehydration
 >   side: a deduplicating priority queue ordered by
 >   `HydrationReason` (P0..P5) with FIFO tiebreaker, plus
 >   `enqueue_prefetch_window` for viewport adjacency.
 > * `CoreImpl::enforce_storage_budget` wires the budget enforcer
->   in. The candidate-collection query that drives a non-trivial
->   plan is queued for the next milestone.
+>   in: it harvests rows via `collect_eviction_candidates`,
+>   runs `plan_tiered_eviction`, and executes the cloud-offload
+>   plan and the full-eviction plan in order. The combined
+>   `freed_bytes` / `evicted_count` is reported to the caller via
+>   `BudgetEnforcementReport`. The end-to-end pipeline is
+>   exercised by
+>   [`crates/core/tests/storage_budget_enforcement.rs`](../crates/core/tests/storage_budget_enforcement.rs)
+>   across every `PressureLevel` and both `EvictionTier` branches.
 
 ### 8.3 Rehydration
 
@@ -1009,7 +1075,7 @@ sequenceDiagram
             Core->>Tr: "GET /v1/blobs/{blob_id}?range=..."
             Tr->>BE: "encrypted media chunks"
             BE-->>Tr: "ciphertext"
-        else "storage_sink = i_cloud / google_drive / zk_object_fabric"
+        else "storage_sink = icloud / google_drive / zk_object_fabric"
             Core->>Sink: "MediaBlobSink::fetch_media_chunk(blob_ref, idx)"
             Sink-->>Core: "ciphertext (CloudKit / Drive API / S3 GetObject)"
         end

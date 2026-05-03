@@ -52,7 +52,9 @@ use crate::message::processor::{
     ProcessorError,
 };
 use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
-use crate::offload::eviction::{collect_eviction_candidates, execute_eviction, plan_eviction};
+use crate::offload::eviction::{
+    collect_eviction_candidates, execute_eviction, plan_tiered_eviction,
+};
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
 use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::query_engine::QueryEngine;
@@ -127,8 +129,12 @@ impl CoreImpl {
         })
     }
 
-    /// Construct a new core backed by an in-memory database. Test-only.
-    #[cfg(test)]
+    /// Construct a new core backed by an in-memory database.
+    ///
+    /// Intended for unit / integration tests — the in-memory
+    /// SQLCipher handle does not persist anywhere on disk and is
+    /// not appropriate for production callers.
+    #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string()))?;
         Ok(Self {
@@ -234,10 +240,12 @@ impl CoreImpl {
         Ok(result)
     }
 
-    /// Borrow the local store for read-only inspection. Test-only.
-    /// Production callers should go through the public API.
-    #[cfg(test)]
-    fn with_db<F, T>(&self, f: F) -> T
+    /// Borrow the local store for read-only inspection.
+    ///
+    /// Intended for unit / integration tests. Production callers
+    /// should go through the public API.
+    #[doc(hidden)]
+    pub fn with_db<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&LocalStoreDb) -> T,
     {
@@ -376,6 +384,41 @@ impl CoreImpl {
         let db = self.db.lock().map_err(poisoned)?;
         db.get_message_body(&message_id.to_string())
             .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// Rehydrate a cold message body in place using
+    /// already-decrypted plaintext. The orchestration layer calls
+    /// this once it has fetched and AEAD-unsealed an archive
+    /// segment for `message_id`.
+    ///
+    /// Wraps
+    /// [`LocalStoreDb::rehydrate_message_body`] (UPSERT + body-state
+    /// transition + `search_fts` refresh in one SAVEPOINT) and
+    /// re-indexes the message into `search_fuzzy` so a follow-up
+    /// fuzzy query reflects the rehydrated content.
+    /// `created_at_ms` is **never** touched, so the timeline order
+    /// remains stable and the renderer does not scroll-jump.
+    pub fn rehydrate_message_body_locally(
+        &self,
+        message_id: Uuid,
+        text_content: &str,
+        new_body_state: BodyState,
+    ) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        db.rehydrate_message_body(&message_id.to_string(), text_content, new_body_state)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // Refresh fuzzy tokens — the engine's index_message is
+        // idempotent thanks to the (token, script, message_id)
+        // primary key but stale tokens from a previous body are
+        // dropped first so search_fuzzy stays in sync.
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        engine
+            .remove_message(&message_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        engine
+            .index_message(&message_id.to_string(), text_content)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -801,11 +844,20 @@ impl KChatCore for CoreImpl {
         // this into a per-tenant configurable knob.
         const MIN_OFFLOAD_AGE_MS: i64 = 24 * 60 * 60 * 1000;
         let candidates = collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms)?;
-        let plan = plan_eviction(candidates, target_bytes, now_ms);
-        let result = execute_eviction(db.connection(), &plan)?;
+        // Tiered eviction (`docs/PROPOSAL.md §5.4`): exhaust the
+        // cloud-offload pool first; only fall through to the
+        // KChat-backend pool if the cloud pass underran the budget.
+        let tiered =
+            plan_tiered_eviction(candidates, target_bytes, now_ms, assessment.pressure_level);
+        let cloud_result = execute_eviction(db.connection(), &tiered.cloud_offload)?;
+        let full_result = execute_eviction(db.connection(), &tiered.full_eviction)?;
         Ok(OffloadResult {
-            freed_bytes: result.freed_bytes,
-            evicted_count: result.evicted_count,
+            freed_bytes: cloud_result
+                .freed_bytes
+                .saturating_add(full_result.freed_bytes),
+            evicted_count: cloud_result
+                .evicted_count
+                .saturating_add(full_result.evicted_count),
         })
     }
 
@@ -2360,5 +2412,63 @@ mod tests {
             assert_eq!(r.reason, HydrationReason::AdjacentPrefetch);
             assert_eq!(r.conversation_id, conv);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-3: timeline-skeleton rehydration on CoreImpl.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rehydrate_message_body_locally_refreshes_fuzzy_index() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core
+            .send_text(conv, "salt sodium chloride", None)
+            .expect("send_text");
+        // Sanity: a fuzzy query for "sodium" hits before
+        // rehydration.
+        {
+            let db = core.db.lock().unwrap();
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            assert!(
+                !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
+                "pre-rehydrate fuzzy search must find original body"
+            );
+        }
+
+        core.rehydrate_message_body_locally(
+            mid.0,
+            "completely different content about dogs",
+            BodyState::LocalPlainAvailable,
+        )
+        .expect("rehydrate");
+
+        // Old fuzzy tokens are gone …
+        let db = core.db.lock().unwrap();
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        assert!(
+            engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
+            "post-rehydrate fuzzy index must drop stale tokens"
+        );
+        // … and new ones match.
+        assert!(
+            !engine.search_fuzzy("dogs", 5).unwrap().is_empty(),
+            "post-rehydrate fuzzy index must contain new tokens"
+        );
+    }
+
+    #[test]
+    fn rehydrate_message_body_locally_round_trips_text() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "before", None).unwrap();
+
+        core.rehydrate_message_body_locally(mid.0, "after", BodyState::LocalPlainAvailable)
+            .expect("rehydrate");
+
+        let body = core.get_message_body(mid.0).unwrap().expect("body present");
+        assert_eq!(body.text_content.as_deref(), Some("after"));
     }
 }

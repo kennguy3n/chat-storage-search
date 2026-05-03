@@ -11,8 +11,11 @@
 //! and `docs/PROPOSAL.md §6` for the wire-format / key-hierarchy
 //! specification.
 
+pub mod epoch_keys;
 pub mod event_journal;
 pub mod manifest_builder;
 pub mod prefetch;
+pub mod privacy;
+pub mod routing;
 pub mod segment_builder;
 pub mod upload;

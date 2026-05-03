@@ -40,10 +40,16 @@
 use std::ops::Range;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::crypto::aead::{build_kchat_chunk_aad, xchacha20_poly1305, BlobClass};
 use crate::crypto::content_hash;
+use crate::crypto::key_hierarchy::KEY_LEN;
+use crate::crypto::key_wrap::unwrap_key;
+use crate::local_store::db::LocalStoreDb;
+use crate::local_store::state_machines::MediaState;
 use crate::media::chunker::DEFAULT_CHUNK_SIZE;
+use crate::media::processor::transition_media_state;
 use crate::transport::TransportClient;
 use crate::Error;
 
@@ -236,6 +242,130 @@ pub fn download_single_chunk(
     );
     let nonce = chunk_nonce(chunk_idx);
     xchacha20_poly1305::open(k_asset, &nonce, &ciphertext, &aad).map_err(crate::Error::from)
+}
+
+/// Rehydrate a previously evicted media asset from cold storage,
+/// driven by the row in `media_asset` for `asset_id`.
+///
+/// Implements the Phase-3 lazy-rehydrate flow from
+/// `docs/PROPOSAL.md §5.5`:
+///
+/// 1. Look up the `media_asset` row for `asset_id`. The row carries
+///    `wrapped_k_asset`, `chunk_count`, `merkle_root`, `blob_id`,
+///    and `storage_sink`.
+/// 2. Unwrap `K_asset` under the wrapping key passed in by the
+///    caller (typically `K_local_db` / `K_archive_root`). The raw
+///    key is held in [`Zeroizing`] so a panic mid-way still scrubs
+///    it.
+/// 3. Drive [`download_chunked_media`] (KChat backend sink) — the
+///    routing knob `storage_sink` is checked so the (future)
+///    `MediaBlobSink` path can be wired in once the iCloud / Drive /
+///    ZKOF adapters land. Today only `kchat_backend` round-trips
+///    end-to-end; other sinks return [`Error::NotImplemented`].
+/// 4. Transition `media_state` through
+///    `Evicted → DownloadInProgress → OriginalLocal` (or
+///    `RemoteOriginal → DownloadInProgress → OriginalLocal`) using
+///    [`transition_media_state`] so the state machine matrix
+///    (`docs/PROPOSAL.md §3.2`) is enforced.
+///
+/// Returns the **plaintext** bytes of the asset.
+///
+/// `wrapping_key` must match the key the upload pipeline used to
+/// wrap `K_asset` (see [`crate::media::processor::process_media`]).
+pub fn rehydrate_media_asset(
+    db: &LocalStoreDb,
+    asset_id: &str,
+    transport: &dyn TransportClient,
+    wrapping_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>, Error> {
+    // 1) Look up the row.
+    let row = db
+        .get_media_asset(asset_id)
+        .map_err(|e| Error::Storage(e.to_string()))?
+        .ok_or_else(|| {
+            Error::Storage(format!(
+                "rehydrate_media_asset: no media_asset row for {asset_id}"
+            ))
+        })?;
+
+    // The state machine only exits to `download_in_progress` from
+    // `Evicted` or `RemoteOriginal` — anything else is either
+    // already-local or a terminal state, and we surface the legality
+    // check early so we don't issue a download for an
+    // already-resident asset.
+    let from_state = match row.media_state {
+        MediaState::Evicted | MediaState::RemoteOriginal => row.media_state,
+        MediaState::OriginalLocal => {
+            return Err(Error::Storage(format!(
+                "rehydrate_media_asset: asset {asset_id} is already original_local"
+            )));
+        }
+        other => {
+            return Err(Error::Storage(format!(
+                "rehydrate_media_asset: asset {asset_id} in state {other:?} cannot rehydrate"
+            )));
+        }
+    };
+
+    // 2) Unwrap K_asset under the caller-supplied wrapping key. The
+    //    cleartext key is held in `Zeroizing` so an early-return
+    //    error still scrubs it before unwinding.
+    let raw = unwrap_key(wrapping_key, &row.wrapped_k_asset).map_err(Error::from)?;
+    let k_asset: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(raw);
+
+    // Convert merkle_root to fixed array.
+    if row.merkle_root.len() != 32 {
+        return Err(Error::Storage(format!(
+            "rehydrate_media_asset: merkle_root for {asset_id} is {} bytes (expected 32)",
+            row.merkle_root.len()
+        )));
+    }
+    let mut merkle_root = [0u8; 32];
+    merkle_root.copy_from_slice(&row.merkle_root);
+
+    // 3) Route by `storage_sink`. Only `kchat_backend` round-trips
+    //    end-to-end today; the iCloud / Drive / ZKOF sink
+    //    implementations land in their own subtasks.
+    let plaintext = match row.storage_sink.as_str() {
+        "kchat_backend" => {
+            let chunk_count: u32 = u32::try_from(row.chunk_count.max(0)).map_err(|_| {
+                Error::Storage(format!(
+                    "rehydrate_media_asset: chunk_count {} out of range",
+                    row.chunk_count
+                ))
+            })?;
+            download_chunked_media(
+                transport,
+                &row.blob_id,
+                chunk_count,
+                merkle_root,
+                &k_asset,
+                BlobClass::Media,
+            )?
+        }
+        "icloud" | "google_drive" | "zk_object_fabric" => {
+            return Err(Error::NotImplemented(
+                "rehydrate_media_asset: MediaBlobSink rehydration",
+            ));
+        }
+        other => {
+            return Err(Error::Storage(format!(
+                "rehydrate_media_asset: unknown storage_sink {other:?}"
+            )));
+        }
+    };
+
+    // 4) Drive the media-state machine all the way through:
+    //    `Evicted | RemoteOriginal → DownloadInProgress → OriginalLocal`.
+    transition_media_state(db, asset_id, from_state, MediaState::DownloadInProgress)?;
+    transition_media_state(
+        db,
+        asset_id,
+        MediaState::DownloadInProgress,
+        MediaState::OriginalLocal,
+    )?;
+
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -652,5 +782,225 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // rehydrate_media_asset — Phase-3 lazy media rehydration on tap.
+    // -----------------------------------------------------------------
+
+    use crate::crypto::key_wrap::wrap_key;
+    use crate::local_store::schema::{Conversation, MediaAsset, MessageKind, MessageSkeleton};
+    use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+
+    #[allow(clippy::too_many_arguments)]
+    fn fresh_db_with_asset(
+        asset_id: &str,
+        blob_id: &str,
+        wrapping_key: &[u8; 32],
+        k_asset: &[u8; 32],
+        merkle_root: [u8; 32],
+        chunk_count: u32,
+        media_state: MediaState,
+        storage_sink: &str,
+    ) -> LocalStoreDb {
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        db.insert_conversation(&Conversation {
+            conversation_id: "c-rehy".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        })
+        .unwrap();
+        db.insert_message_skeleton(&MessageSkeleton {
+            message_id: "m-rehy".into(),
+            conversation_id: "c-rehy".into(),
+            sender_id: "u-1".into(),
+            created_at_ms: 100,
+            received_at_ms: 110,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(media_state),
+            archive_state: ArchiveState::ArchiveVerified,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        })
+        .unwrap();
+        let wrapped = wrap_key(wrapping_key, k_asset).unwrap();
+        db.insert_media_asset(&MediaAsset {
+            asset_id: asset_id.into(),
+            message_id: "m-rehy".into(),
+            mime_type: "image/png".into(),
+            bytes_total: 0,
+            bytes_local: 0,
+            media_state,
+            wrapped_k_asset: wrapped,
+            chunk_count: chunk_count as i32,
+            merkle_root: merkle_root.to_vec(),
+            blob_id: blob_id.into(),
+            storage_sink: storage_sink.into(),
+        })
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn rehydrate_evicted_asset_round_trips_plaintext() {
+        let wrapping = fixed_k_asset();
+        // Use a different k_asset so the unwrap step is meaningful.
+        let mut k_asset = wrapping;
+        k_asset[0] ^= 0x42;
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size * 2 + 7).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-1",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::Evicted,
+            "kchat_backend",
+        );
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let got = rehydrate_media_asset(&db, "a-1", &transport, &wrapping).unwrap();
+        assert_eq!(got, pt);
+
+        // The asset is now original_local in the DB.
+        let row = db.get_media_asset("a-1").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::OriginalLocal);
+    }
+
+    #[test]
+    fn rehydrate_remote_original_asset_round_trips_plaintext() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[1] ^= 0x10;
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-2",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::RemoteOriginal,
+            "kchat_backend",
+        );
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let got = rehydrate_media_asset(&db, "a-2", &transport, &wrapping).unwrap();
+        assert_eq!(got, pt);
+        let row = db.get_media_asset("a-2").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::OriginalLocal);
+    }
+
+    #[test]
+    fn rehydrate_already_local_errors_without_download() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[2] ^= 0x33;
+        let chunk_size = small_chunk_size();
+        let pt = vec![0u8; chunk_size];
+        let (blob_id, _sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-3",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::OriginalLocal,
+            "kchat_backend",
+        );
+        // Empty transport — if we attempted a download it would
+        // surface "unknown blob_id".
+        let transport = InMemoryBlobTransport::new();
+
+        let err = rehydrate_media_asset(&db, "a-3", &transport, &wrapping).unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("already original_local"), "got {msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehydrate_with_wrong_wrapping_key_fails() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[3] ^= 0x55;
+        let chunk_size = small_chunk_size();
+        let pt = vec![0u8; chunk_size];
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-4",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::Evicted,
+            "kchat_backend",
+        );
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let mut wrong = wrapping;
+        wrong[0] ^= 0xFF;
+        let err = rehydrate_media_asset(&db, "a-4", &transport, &wrong).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+        // State must be unchanged since the key unwrap failed
+        // before we kicked off the state-machine transition.
+        let row = db.get_media_asset("a-4").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::Evicted);
+    }
+
+    #[test]
+    fn rehydrate_routes_zk_object_fabric_to_not_implemented() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[4] ^= 0x66;
+        let chunk_size = small_chunk_size();
+        let pt = vec![0u8; chunk_size];
+        let (blob_id, _sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-5",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::Evicted,
+            "zk_object_fabric",
+        );
+        let transport = InMemoryBlobTransport::new();
+        let err = rehydrate_media_asset(&db, "a-5", &transport, &wrapping).unwrap_err();
+        assert!(matches!(err, Error::NotImplemented(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rehydrate_unknown_asset_id_errors() {
+        let wrapping = fixed_k_asset();
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let transport = InMemoryBlobTransport::new();
+        let err = rehydrate_media_asset(&db, "nope", &transport, &wrapping).unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("no media_asset row"), "got {msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
     }
 }

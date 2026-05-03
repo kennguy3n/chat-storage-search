@@ -45,7 +45,7 @@ pub enum ArchiveBackend {
 /// superset: `KChatBackend` is the Phase-1 default, the user-cloud
 /// variants land in Phase 3 and may grow inner fields then.
 ///
-/// The serialized variant tags (`"kchat_backend"`, `"i_cloud"`,
+/// The serialized variant tags (`"kchat_backend"`, `"icloud"`,
 /// `"google_drive"`, `"zk_object_fabric"`) are pinned via explicit
 /// `#[serde(rename = "...")]` attributes so they always match the
 /// `media_asset.storage_sink` SQL column default and the
@@ -62,7 +62,7 @@ pub enum StorageSink {
     #[serde(rename = "kchat_backend")]
     KChatBackend,
     /// iCloud (CloudKit file storage). Implementation lands in Phase 3.
-    #[serde(rename = "i_cloud")]
+    #[serde(rename = "icloud")]
     ICloud {
         /// CloudKit container path (or platform-specific equivalent)
         /// where media blobs are stored.
@@ -81,6 +81,34 @@ pub enum StorageSink {
         /// S3 bucket name media blobs are uploaded to.
         bucket: String,
     },
+}
+
+/// Privacy posture toggle for the archive prefetch / orchestration
+/// pipeline.
+///
+/// `docs/PROPOSAL.md §5.6` proposes optional **dummy request
+/// padding** to break the per-bucket access-pattern fingerprint:
+/// when [`PrivacyLevel::High`] is configured, the orchestration
+/// layer mixes dummy segment-id fetches in with the real ones so an
+/// observer at the transport / backend layer cannot distinguish
+/// "user is reading bucket X" from "user is paginating bucket Y".
+/// The default ([`PrivacyLevel::Standard`]) keeps the prefetch path
+/// cost-optimal and is what every Phase-1 / Phase-2 deployment
+/// already runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PrivacyLevel {
+    /// Phase-1 default. The prefetch issues exactly one fetch per
+    /// real segment id.
+    #[default]
+    #[serde(rename = "standard")]
+    Standard,
+    /// Phase-3 optional. The prefetch interleaves randomly
+    /// generated dummy segment ids with the real ones; the dummy
+    /// fetches return empty / 404 from the backend and are
+    /// dropped on the receiving side. Trades transport bandwidth
+    /// for traffic-analysis resistance.
+    #[serde(rename = "high")]
+    High,
 }
 
 /// Configuration for a [`crate::KChatCore`] instance.
@@ -103,6 +131,11 @@ pub struct KChatCoreConfig {
     /// and archive segments still go to Tier 0. See
     /// `docs/PROPOSAL.md §5.7`.
     pub media_blob_sink: Option<StorageSink>,
+    /// Privacy posture for archive prefetch / orchestration. The
+    /// default is [`PrivacyLevel::Standard`]; bumping it to
+    /// [`PrivacyLevel::High`] enables dummy-request padding per
+    /// `docs/PROPOSAL.md §5.6`.
+    pub privacy_level: PrivacyLevel,
 }
 
 impl KChatCoreConfig {
@@ -120,6 +153,7 @@ impl KChatCoreConfig {
             tenant_id: tenant_id.into(),
             archive_backend: ArchiveBackend::default(),
             media_blob_sink: None,
+            privacy_level: PrivacyLevel::default(),
         }
     }
 
@@ -134,6 +168,13 @@ impl KChatCoreConfig {
     #[must_use]
     pub fn with_media_blob_sink(mut self, sink: Option<StorageSink>) -> Self {
         self.media_blob_sink = sink;
+        self
+    }
+
+    /// Builder-style override for [`Self::privacy_level`].
+    #[must_use]
+    pub fn with_privacy_level(mut self, level: PrivacyLevel) -> Self {
+        self.privacy_level = level;
         self
     }
 }
@@ -174,7 +215,7 @@ mod tests {
         // The `storage_sink` tag has to match the `media_asset.storage_sink`
         // SQL default (`'kchat_backend'`) and the canonical values listed
         // in the `MediaBlobReference::storage_sink` doc — `kchat_backend`,
-        // `i_cloud`, `google_drive`, `zk_object_fabric`. Pin all four so a
+        // `icloud`, `google_drive`, `zk_object_fabric`. Pin all four so a
         // future re-introduction of `rename_all = "snake_case"` (which
         // would split `KChatBackend` at the K/C boundary and emit
         // `"k_chat_backend"`) is caught by CI.
@@ -184,7 +225,7 @@ mod tests {
                 StorageSink::ICloud {
                     container_path: "iCloud.com.kchat.media".to_string(),
                 },
-                "i_cloud",
+                "icloud",
             ),
             (
                 StorageSink::GoogleDrive {

@@ -24,6 +24,8 @@
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+use crate::archive::privacy::{compute_padding_count, pad_with_dummy_requests, should_pad};
+use crate::config::KChatCoreConfig;
 use crate::transport::TransportClient;
 use crate::Error;
 
@@ -100,6 +102,85 @@ pub fn batch_prefetch_bucket(
             storage_backend,
             ciphertext,
         });
+    }
+    Ok(out)
+}
+
+/// Padding-aware variant of [`batch_prefetch_bucket`].
+///
+/// `docs/PROPOSAL.md §5.6` — when
+/// [`crate::config::PrivacyLevel::High`] is configured the
+/// orchestration layer mixes dummy segment-id fetches in with the
+/// real ones. The dummy ids are freshly-generated UUIDv4s; the
+/// transport returns an empty payload (or a 404 the call-site
+/// silently swallows). Real segments are returned in the same
+/// shape as [`batch_prefetch_bucket`]; dummy fetches are dropped
+/// after the round-trip lands.
+///
+/// When [`crate::config::PrivacyLevel::Standard`] is configured
+/// this delegates straight to [`batch_prefetch_bucket`].
+pub fn batch_prefetch_bucket_with_padding(
+    config: &KChatCoreConfig,
+    conn: &Connection,
+    transport: &dyn TransportClient,
+    conversation_id: Uuid,
+    time_bucket: &str,
+) -> Result<Vec<PrefetchedSegment>, Error> {
+    if !should_pad(config) {
+        return batch_prefetch_bucket(conn, transport, conversation_id, time_bucket);
+    }
+
+    // 1) Pull every real segment-id row up front so we know how
+    //    many dummies to mint.
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, blob_id, storage_backend
+               FROM archive_segment_map
+              WHERE conversation_id = ?1 AND time_bucket = ?2",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(params![conversation_id.to_string(), time_bucket], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let mut real_rows: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (segment_id, blob_id, storage_backend) =
+            row.map_err(|e| Error::Storage(e.to_string()))?;
+        real_rows.insert(segment_id, (blob_id, storage_backend));
+    }
+
+    // 2) Compute how many dummies to mint and shuffle them in
+    //    with the real ids.
+    let real_ids: Vec<String> = real_rows.keys().cloned().collect();
+    let padding_count = compute_padding_count(real_ids.len());
+    let padded = pad_with_dummy_requests(&real_ids, padding_count);
+
+    // 3) Issue one fetch per id in the padded order. Dummy
+    //    fetches that error out are silently dropped — the
+    //    backend will 404 on every dummy id and we don't want a
+    //    single 404 to fail the whole batch.
+    let mut out = Vec::with_capacity(real_rows.len());
+    for id in padded {
+        if let Some((blob_id, storage_backend)) = real_rows.get(&id).cloned() {
+            let ciphertext = transport.fetch_archive_segment(&id)?;
+            out.push(PrefetchedSegment {
+                segment_id: id,
+                blob_id,
+                storage_backend,
+                ciphertext,
+            });
+        } else {
+            // Dummy fetch — discard the result (and any error).
+            let _ = transport.fetch_archive_segment(&id);
+        }
     }
     Ok(out)
 }
@@ -269,6 +350,112 @@ mod tests {
             batch_prefetch_bucket(db.connection(), &transport, Uuid::now_v7(), "2030-01")
                 .expect("prefetch");
         assert!(segments.is_empty());
+        assert!(transport.calls().is_empty());
+    }
+
+    fn fresh_config(privacy: crate::config::PrivacyLevel) -> crate::config::KChatCoreConfig {
+        crate::config::KChatCoreConfig::new(
+            std::path::PathBuf::from("/tmp/dummy"),
+            crate::config::Platform::MacOs,
+            "tenant",
+        )
+        .with_privacy_level(privacy)
+    }
+
+    /// Transport that records every fetch and serves canned
+    /// payloads for known ids. Unknown ids surface as
+    /// `Storage(...)` errors so the padded path's silent-drop
+    /// behaviour is exercised.
+    impl FixtureTransport {
+        fn with_calls(&self, expected_real: usize) {
+            let calls = self.calls();
+            assert!(
+                calls.len() >= expected_real,
+                "transport must see at least the real ids ({} >= {})",
+                calls.len(),
+                expected_real,
+            );
+        }
+    }
+
+    #[test]
+    fn padded_variant_with_standard_privacy_matches_unpadded() {
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2026-04";
+        seed_segment_map_row(&db, "seg-1", &conv.to_string(), bucket, "blob-1");
+        seed_segment_map_row(&db, "seg-2", &conv.to_string(), bucket, "blob-2");
+
+        let transport = FixtureTransport::default();
+        transport.install("seg-1", vec![0xAA; 8]);
+        transport.install("seg-2", vec![0xBB; 8]);
+
+        let config = fresh_config(crate::config::PrivacyLevel::Standard);
+        let segments =
+            batch_prefetch_bucket_with_padding(&config, db.connection(), &transport, conv, bucket)
+                .expect("prefetch");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(transport.calls().len(), 2, "no padding under Standard");
+    }
+
+    #[test]
+    fn padded_variant_with_high_privacy_emits_extra_fetches() {
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2026-04";
+        for i in 1..=3 {
+            seed_segment_map_row(
+                &db,
+                &format!("seg-{i}"),
+                &conv.to_string(),
+                bucket,
+                &format!("blob-{i}"),
+            );
+        }
+
+        let transport = FixtureTransport::default();
+        for i in 1..=3 {
+            transport.install(&format!("seg-{i}"), vec![i as u8; 8]);
+        }
+
+        let config = fresh_config(crate::config::PrivacyLevel::High);
+        let segments =
+            batch_prefetch_bucket_with_padding(&config, db.connection(), &transport, conv, bucket)
+                .expect("prefetch");
+
+        // All three real segments must have been returned.
+        assert_eq!(segments.len(), 3);
+        let mut ids: Vec<&str> = segments.iter().map(|s| s.segment_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["seg-1", "seg-2", "seg-3"]);
+
+        // Padding count is 2 * 3 = 6, so the transport must have
+        // been called 9 times total (3 real + 6 dummy). The
+        // dummies error out (no canned response) but the padded
+        // variant silently drops those errors.
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 9, "padded variant must issue real + dummy");
+        transport.with_calls(3);
+
+        // Every real id must appear at least once in the call log
+        // (the dummies don't, by definition).
+        for real in &["seg-1", "seg-2", "seg-3"] {
+            assert!(calls.iter().any(|c| c == real), "missing {real}");
+        }
+    }
+
+    #[test]
+    fn padded_variant_with_high_privacy_and_no_real_segments_only_emits_real_calls() {
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2030-01";
+        let transport = FixtureTransport::default();
+        let config = fresh_config(crate::config::PrivacyLevel::High);
+        let segments =
+            batch_prefetch_bucket_with_padding(&config, db.connection(), &transport, conv, bucket)
+                .expect("prefetch");
+        assert!(segments.is_empty());
+        // compute_padding_count(0) == 0 → no dummies either.
         assert!(transport.calls().is_empty());
     }
 }

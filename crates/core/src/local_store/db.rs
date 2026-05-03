@@ -395,6 +395,130 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Rehydrate a cold message body in place, without touching the
+    /// timeline ordering columns (`created_at_ms`, the row's
+    /// position in `message_skeleton`).
+    ///
+    /// `docs/PROPOSAL.md §5.5` calls out that a cold message must be
+    /// "filled in" without a scroll-jump on the renderer — the row
+    /// is already drawn as a skeleton and the body arrives later
+    /// from the archive. The full sequence runs inside a single
+    /// `SAVEPOINT rehydrate_body` so a partial failure (e.g. the
+    /// FTS upsert errors out) rolls back to the pre-call state and
+    /// the caller can retry without observing a half-applied row:
+    ///
+    /// 1. UPSERT `message_body` keyed on `message_id`. Missing rows
+    ///    (the body was previously evicted) get an INSERT;
+    ///    existing rows have their `text_content` updated and
+    ///    `detected_language` / `rich_meta` left untouched.
+    /// 2. `UPDATE message_skeleton.body_state` to `new_body_state`.
+    ///    The state is **not** validated against the body-state
+    ///    transition matrix here because rehydration after an
+    ///    archive fetch is the canonical exit from
+    ///    `RemoteArchiveOnly` and does not have a pure-state
+    ///    predecessor.
+    /// 3. Refresh the `search_fts` row. The previous row (if any) is
+    ///    dropped first so we never accumulate stale duplicates.
+    ///
+    /// `created_at_ms` is **never** touched by this method —
+    /// `INSERT OR REPLACE` would reset the column on the FTS side,
+    /// so the implementation deliberately reads the existing
+    /// timestamp out of `message_skeleton` and re-inserts it
+    /// verbatim. The caller is responsible for re-indexing
+    /// `search_fuzzy` separately (the fuzzy tokenizer lives at
+    /// [`crate::search::fuzzy_search::FuzzySearchEngine`] which
+    /// already knows how to upsert idempotently).
+    pub fn rehydrate_message_body(
+        &self,
+        message_id: &str,
+        text_content: &str,
+        new_body_state: BodyState,
+    ) -> DbResult<()> {
+        // 0) Pre-fetch the skeleton row so we have the
+        //    conversation_id / sender_id / created_at_ms triple
+        //    needed by the `search_fts` upsert. A missing skeleton
+        //    is an error — rehydration of an unknown message would
+        //    silently succeed otherwise.
+        let row = self.conn.query_row(
+            "SELECT conversation_id, sender_id, created_at_ms
+               FROM message_skeleton
+              WHERE message_id = ?1",
+            params![message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        );
+        let (conversation_id, sender_id, created_at_ms) = match row {
+            Ok(t) => t,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(DbError::InvalidState(format!(
+                    "rehydrate_message_body: no message_skeleton row for {message_id}"
+                )));
+            }
+            Err(e) => return Err(DbError::from(e)),
+        };
+
+        self.conn
+            .execute_batch("SAVEPOINT rehydrate_body;")
+            .map_err(DbError::from)?;
+        let result: DbResult<()> = (|| {
+            // 1) UPSERT message_body. We can't use
+            //    `INSERT OR REPLACE` because that would clear
+            //    `detected_language` / `rich_meta` on rows that
+            //    already have them set. The `ON CONFLICT DO UPDATE`
+            //    form preserves those columns.
+            self.conn.execute(
+                "INSERT INTO message_body
+                     (message_id, text_content, detected_language, rich_meta)
+                 VALUES (?1, ?2, NULL, NULL)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                     text_content = excluded.text_content",
+                params![message_id, text_content],
+            )?;
+            // 2) Body-state transition.
+            self.conn.execute(
+                "UPDATE message_skeleton SET body_state = ?1 WHERE message_id = ?2",
+                params![new_body_state.to_string(), message_id],
+            )?;
+            // 3) Refresh search_fts.
+            self.conn.execute(
+                "DELETE FROM search_fts WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            self.conn.execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message_id,
+                    conversation_id,
+                    sender_id,
+                    created_at_ms,
+                    text_content
+                ],
+            )?;
+            Ok(())
+        })();
+        match &result {
+            Ok(_) => self
+                .conn
+                .execute_batch("RELEASE SAVEPOINT rehydrate_body;")
+                .map_err(DbError::from)?,
+            Err(_) => self
+                .conn
+                .execute_batch(
+                    "ROLLBACK TO SAVEPOINT rehydrate_body;\nRELEASE SAVEPOINT rehydrate_body;",
+                )
+                .map_err(DbError::from)?,
+        }
+        result
+    }
+
     /// Transition the `archive_state` of every message in
     /// `message_ids` to `new_state`.
     ///
@@ -1496,6 +1620,176 @@ mod tests {
         assert_eq!(count, 0);
         // Second delete on a missing row is still Ok.
         db.delete_fts_row("m").unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-3: rehydrate_message_body — `docs/PROPOSAL.md §5.5`.
+    // -----------------------------------------------------------------
+
+    fn fts_row_text(db: &LocalStoreDb, message_id: &str) -> Option<String> {
+        db.connection()
+            .query_row(
+                "SELECT text_content FROM search_fts WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn rehydrate_updates_existing_body_in_place() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m1", "c", "old text");
+        // Seed an FTS row to mirror the in-prod state.
+        db.connection()
+            .execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["m1", "c", "user-1", 100i64, "old text"],
+            )
+            .unwrap();
+        let before_skel = db.get_message_skeleton("m1").unwrap().unwrap();
+
+        db.rehydrate_message_body("m1", "rehydrated body", BodyState::LocalPlainAvailable)
+            .unwrap();
+
+        let after_body = db.get_message_body("m1").unwrap().unwrap();
+        assert_eq!(after_body.text_content.as_deref(), Some("rehydrated body"));
+        let after_skel = db.get_message_skeleton("m1").unwrap().unwrap();
+        // body_state advanced to local_plain_available …
+        assert_eq!(after_skel.body_state, BodyState::LocalPlainAvailable);
+        // … but the timeline-ordering columns are untouched.
+        assert_eq!(after_skel.created_at_ms, before_skel.created_at_ms);
+        assert_eq!(after_skel.received_at_ms, before_skel.received_at_ms);
+        // search_fts row was refreshed to match.
+        assert_eq!(fts_row_text(&db, "m1").as_deref(), Some("rehydrated body"));
+    }
+
+    #[test]
+    fn rehydrate_inserts_body_for_evicted_message() {
+        let db = fresh_db();
+        // Seed a skeleton without a body row, mimicking a row that
+        // has been evicted to the archive.
+        let conversation = Conversation {
+            conversation_id: "c".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        db.insert_conversation(&conversation).unwrap();
+        let skel = MessageSkeleton {
+            message_id: "m2".into(),
+            conversation_id: "c".into(),
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700,
+            received_at_ms: 1_710,
+            kind: MessageKind::Text,
+            body_state: BodyState::RemoteArchiveOnly,
+            media_state: None,
+            archive_state: ArchiveState::ArchiveVerified,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        db.insert_message_skeleton(&skel).unwrap();
+
+        db.rehydrate_message_body("m2", "from archive", BodyState::LocalPlainAvailable)
+            .unwrap();
+
+        let body = db.get_message_body("m2").unwrap().expect("body inserted");
+        assert_eq!(body.text_content.as_deref(), Some("from archive"));
+        let after = db.get_message_skeleton("m2").unwrap().unwrap();
+        assert_eq!(after.body_state, BodyState::LocalPlainAvailable);
+        assert_eq!(after.created_at_ms, 1_700);
+        // search_fts row created.
+        assert_eq!(fts_row_text(&db, "m2").as_deref(), Some("from archive"));
+    }
+
+    #[test]
+    fn rehydrate_preserves_detected_language_and_rich_meta() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m3", "c", "x");
+        db.connection()
+            .execute(
+                "UPDATE message_body SET detected_language = ?1, rich_meta = ?2
+                  WHERE message_id = ?3",
+                params!["es", vec![1u8, 2, 3], "m3"],
+            )
+            .unwrap();
+
+        db.rehydrate_message_body("m3", "rehydrated", BodyState::LocalPlainAvailable)
+            .unwrap();
+
+        let body = db.get_message_body("m3").unwrap().unwrap();
+        assert_eq!(body.text_content.as_deref(), Some("rehydrated"));
+        // Existing detected_language / rich_meta survive the upsert
+        // — the rehydration path only refreshes text_content.
+        assert_eq!(body.detected_language.as_deref(), Some("es"));
+        assert_eq!(body.rich_meta, Some(vec![1u8, 2, 3]));
+    }
+
+    #[test]
+    fn rehydrate_missing_skeleton_errors_without_writing_anything() {
+        let db = fresh_db();
+        // No skeleton row for "ghost".
+        let err = db
+            .rehydrate_message_body("ghost", "text", BodyState::LocalPlainAvailable)
+            .expect_err("unknown message_id must error");
+        match err {
+            DbError::InvalidState(msg) => assert!(msg.contains("ghost"), "got {msg}"),
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+        assert!(db.get_message_body("ghost").unwrap().is_none());
+        assert!(fts_row_text(&db, "ghost").is_none());
+    }
+
+    #[test]
+    fn rehydrate_does_not_change_timeline_order() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m4", "c", "old");
+        // Use a fresh conversation so list_timeline only sees
+        // these two rows.
+        db.connection()
+            .execute(
+                "INSERT INTO message_skeleton(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, received_at_ms, kind, body_state,
+                    media_state, archive_state, backup_state, reply_to,
+                    edited_at_ms, deleted_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'text',
+                           'remote_archive_only', NULL, 'archive_verified',
+                           'not_backed_up', NULL, NULL, NULL)",
+                params!["m5", "c", "user-1", 200i64, 210i64],
+            )
+            .unwrap();
+        let before: Vec<i64> = db
+            .connection()
+            .prepare("SELECT created_at_ms FROM message_skeleton ORDER BY created_at_ms ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        db.rehydrate_message_body("m5", "filled in", BodyState::LocalPlainAvailable)
+            .unwrap();
+
+        let after: Vec<i64> = db
+            .connection()
+            .prepare("SELECT created_at_ms FROM message_skeleton ORDER BY created_at_ms ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(before, after, "rehydration must not reorder timeline");
     }
 
     // -----------------------------------------------------------------

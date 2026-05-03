@@ -33,6 +33,7 @@ use crate::formats::media_descriptor::MediaDescriptor;
 use crate::local_store::db::LocalStoreDb;
 use crate::local_store::state_machines::MediaState;
 use crate::media::chunker::{chunk_and_encrypt, SealedChunk, DEFAULT_CHUNK_SIZE};
+use crate::media::thumbnail::{ThumbnailGenerator, DEFAULT_MAX_DIMENSION};
 use crate::Error;
 
 /// Output of [`process_media`]: everything the local store and the
@@ -64,6 +65,21 @@ pub struct MediaProcessResult {
     /// the legal-transitions matrix in
     /// [`MediaState::try_transition`].
     pub initial_media_state: MediaState,
+    /// Optional **plaintext** thumbnail bytes (PNG) generated from
+    /// `plaintext` for image MIME types (`image/png`, `image/jpeg`).
+    ///
+    /// `Some(_)` for supported image inputs that decode + downscale
+    /// successfully via [`ThumbnailGenerator::generate_thumbnail`].
+    /// `None` when the MIME type is not a supported image type
+    /// (e.g. `video/mp4`, `application/pdf`) or when thumbnail
+    /// generation fails — thumbnail failures are deliberately
+    /// non-fatal so the original media still uploads even if the
+    /// preview is unavailable. The caller is responsible for
+    /// chunking + AEAD-sealing the thumbnail bytes through
+    /// [`crate::media::chunker::chunk_and_encrypt`] (or a second
+    /// `process_media` call) before persisting them — the bytes
+    /// here are the *plaintext* PNG that fits in a single chunk.
+    pub thumbnail_bytes: Option<Vec<u8>>,
 }
 
 /// Run the full chunk-encrypt + key-wrap + descriptor pipeline for a
@@ -117,11 +133,22 @@ pub fn process_media(
         storage_sink: None,
     };
 
+    // 6) Optional thumbnail. Errors are non-fatal — the original
+    //    media still uploads cleanly without a preview, and
+    //    non-image MIME types (`video/*`, `application/*`, `audio/*`)
+    //    deliberately collapse to `None` so the caller can branch on
+    //    the optional without inspecting the error variant.
+    let thumbnail_bytes = ThumbnailGenerator::new()
+        .generate_thumbnail(plaintext, mime_type, DEFAULT_MAX_DIMENSION)
+        .ok()
+        .map(|t| t.thumbnail_bytes);
+
     Ok(MediaProcessResult {
         descriptor,
         sealed_chunks: chunked.sealed_chunks,
         k_asset_raw: k_asset_buf,
         initial_media_state: MediaState::ThumbnailOnly,
+        thumbnail_bytes,
     })
 }
 
@@ -465,5 +492,133 @@ mod tests {
         mark_deleted(&db, "a-8").unwrap();
         let row = db.get_media_asset("a-8").unwrap().unwrap();
         assert_eq!(row.media_state, MediaState::Deleted);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-2 finishing pass: thumbnail wiring on `process_media`.
+    // -----------------------------------------------------------------
+    use image::{ImageBuffer, ImageFormat as TestImageFormat, Rgb, Rgba};
+    use std::io::Cursor as TestCursor;
+
+    fn make_png(w: u32, h: u32) -> Vec<u8> {
+        let img = ImageBuffer::from_fn(w, h, |x, y| {
+            Rgba([
+                ((x * 255) / w.max(1)) as u8,
+                ((y * 255) / h.max(1)) as u8,
+                ((x ^ y) & 0xFF) as u8,
+                0xFF,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut TestCursor::new(&mut out), TestImageFormat::Png)
+            .expect("encode png");
+        out
+    }
+
+    fn make_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = ImageBuffer::from_fn(w, h, |x, y| {
+            Rgb([
+                ((x * 255) / w.max(1)) as u8,
+                ((y * 255) / h.max(1)) as u8,
+                ((x ^ y) & 0xFF) as u8,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut TestCursor::new(&mut out), TestImageFormat::Jpeg)
+            .expect("encode jpeg");
+        out
+    }
+
+    #[test]
+    fn process_media_emits_thumbnail_for_png() {
+        let wrapping = fixed_wrapping_key();
+        let pt = make_png(640, 480);
+        let res = process_media(&pt, "image/png", &wrapping, BlobClass::Media, false).unwrap();
+        let thumb = res
+            .thumbnail_bytes
+            .as_ref()
+            .expect("png input must yield a thumbnail");
+        // PNG magic bytes — every thumbnail re-encodes as PNG
+        // regardless of input MIME.
+        assert_eq!(&thumb[..8], b"\x89PNG\r\n\x1A\n");
+        // Thumbnail is bounded by `DEFAULT_MAX_DIMENSION` so it fits
+        // inside a single AEAD chunk; for a 640×480 source it lands
+        // well under the source size.
+        assert!(
+            thumb.len() < pt.len(),
+            "thumb {} >= src {}",
+            thumb.len(),
+            pt.len()
+        );
+    }
+
+    #[test]
+    fn process_media_emits_thumbnail_for_jpeg() {
+        let wrapping = fixed_wrapping_key();
+        let pt = make_jpeg(800, 600);
+        let res = process_media(&pt, "image/jpeg", &wrapping, BlobClass::Media, false).unwrap();
+        let thumb = res
+            .thumbnail_bytes
+            .as_ref()
+            .expect("jpeg input must yield a thumbnail");
+        assert_eq!(&thumb[..8], b"\x89PNG\r\n\x1A\n");
+    }
+
+    #[test]
+    fn process_media_thumbnail_respects_max_dimension() {
+        let wrapping = fixed_wrapping_key();
+        let pt = make_png(1024, 1024);
+        let res = process_media(&pt, "image/png", &wrapping, BlobClass::Media, false).unwrap();
+        let thumb = res.thumbnail_bytes.as_ref().expect("thumbnail");
+        // Decode the thumbnail and verify both dimensions fit inside
+        // the bound the processor wires in
+        // (`media::thumbnail::DEFAULT_MAX_DIMENSION`).
+        let decoded = image::ImageReader::new(TestCursor::new(thumb))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .expect("decode thumbnail");
+        let (w, h) = (decoded.width(), decoded.height());
+        let bound = crate::media::thumbnail::DEFAULT_MAX_DIMENSION;
+        assert!(w <= bound, "thumbnail width {w} > bound {bound}");
+        assert!(h <= bound, "thumbnail height {h} > bound {bound}");
+    }
+
+    #[test]
+    fn process_media_no_thumbnail_for_video_mime() {
+        let wrapping = fixed_wrapping_key();
+        // Non-image MIME types — and inputs that don't decode as the
+        // declared image format — collapse to `None` rather than
+        // erroring out, so the original media still uploads cleanly.
+        let pt = vec![0xAB; 4096];
+        let res = process_media(&pt, "video/mp4", &wrapping, BlobClass::Media, false).unwrap();
+        assert!(
+            res.thumbnail_bytes.is_none(),
+            "video/mp4 must not yield a thumbnail"
+        );
+    }
+
+    #[test]
+    fn process_media_no_thumbnail_for_document_mime() {
+        let wrapping = fixed_wrapping_key();
+        let pt = vec![0xCD; 8192];
+        let res =
+            process_media(&pt, "application/pdf", &wrapping, BlobClass::Media, false).unwrap();
+        assert!(res.thumbnail_bytes.is_none());
+    }
+
+    #[test]
+    fn process_media_no_thumbnail_when_image_corrupt() {
+        let wrapping = fixed_wrapping_key();
+        // PNG MIME but garbage payload — thumbnail generation fails
+        // and `process_media` swallows it, returning `None` so the
+        // sealed-original path is unaffected.
+        let res =
+            process_media(&[0u8; 16], "image/png", &wrapping, BlobClass::Media, false).unwrap();
+        assert!(res.thumbnail_bytes.is_none());
+        // The original chunks + descriptor are still produced.
+        assert_eq!(res.descriptor.bytes_total, 16);
     }
 }
