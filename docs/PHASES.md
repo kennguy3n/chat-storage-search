@@ -137,6 +137,24 @@ Checklist:
       PROPOSAL §8.3).
 - [ ] Multilingual filename / caption handling (UTF-8 canonicalization;
       no English-only assumptions).
+- [ ] `StorageSink` enum and `ArchiveBackend` enum in config
+      (`crates/core/src/config.rs`). See PROPOSAL.md §5.7.
+- [ ] `storage_sink` field on `MediaDescriptor` (CBOR,
+      `#[serde(default)]` for backward compat).
+- [ ] `storage_sink` column on `media_asset` table (schema
+      migration with `DEFAULT 'kchat_backend'`).
+- [ ] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
+      `upload_media_chunks` / `fetch_media_chunk` /
+      `delete_media_blob`. See PROPOSAL.md §5.7 and §10.2.
+- [ ] `NoopMediaBlobSink` placeholder returning
+      `Error::NotImplemented("media_blob_sink")` from every method.
+- [ ] Media upload routing: thumbnails always go to the
+      `TransportClient` (KChat backend); originals route to the
+      configured `MediaBlobSink` (default: `TransportClient`
+      fallback when `media_blob_sink = None`).
+- [ ] Media rehydration routing: `media_asset.storage_sink`
+      determines which `MediaBlobSink` implementation to fetch
+      from on tap / scroll-back.
 
 **Decision gate**: Media can be encrypted, chunked, uploaded,
 downloaded, range-fetched, verified, and displayed (thumbnail +
@@ -201,6 +219,19 @@ Checklist:
 - [ ] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.
+- [ ] iCloud `MediaBlobSink` implementation (CloudKit file
+      storage). See PROPOSAL.md §10.2.
+- [ ] Google Drive `MediaBlobSink` implementation (Drive API via
+      the Android / desktop platform bridge). See PROPOSAL.md
+      §10.2.
+- [ ] ZK Object Fabric `MediaBlobSink` implementation (S3
+      `PutObject` / `GetObject`). See PROPOSAL.md §10.2.
+- [ ] Tiered eviction policy: media originals offload to the
+      configured user cloud sink before archive segments offload
+      to the KChat backend.
+- [ ] `storage_backend` column on `archive_segment_map` for
+      tracking which backend each segment lives on (`kchat_backend`
+      or `zk_object_fabric`).
 
 **Decision gate**: Messages and media can be offloaded to the
 archive, rehydrated transparently on scroll-back and search-result
@@ -210,7 +241,10 @@ remain resident across all eviction strata. Epoch key rotation is
 exercised end-to-end (build segments across two epochs, rotate,
 verify both epochs decrypt). ZKOF archive backend passes the same
 segment upload / download / rehydration tests as the KChat backend.
-Batch-by-bucket prefetch is the default rehydration mode.
+Batch-by-bucket prefetch is the default rehydration mode. Media
+originals can be uploaded to and fetched from at least one
+user-cloud sink (iCloud or ZKOF) in addition to the KChat backend,
+with `media_asset.storage_sink` round-tripped correctly.
 
 ---
 
@@ -369,6 +403,14 @@ Checklist:
       conversation + bucket: collect old deltas → apply tombstones →
       rebuild compact segment → upload → new manifest → mark old
       expired).
+- [ ] Cross-platform media migration: iOS → Android migrates
+      iCloud-resident media blobs to Google Drive (or ZKOF as
+      platform-neutral fallback) in the background, rewriting
+      `media_asset.storage_sink` and the related `MediaDescriptor`
+      field as it goes. See PROPOSAL.md §5.7.
+- [ ] Media blob sink stress test: 10K+ media files across mixed
+      sinks (KChat backend + iCloud + Google Drive + ZKOF in the
+      same account); verify rehydration from each.
 - [ ] **Failure test suite**, all passing:
   - chunk upload interrupted mid-stream
   - manifest upload interrupted mid-write

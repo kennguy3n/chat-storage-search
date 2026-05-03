@@ -46,7 +46,7 @@ flowchart TD
     subgraph External["External Services"]
         BE["KChat Backend<br/>(PostgreSQL, MLS distribution)"]
         ZKOF["ZK Object Fabric<br/>(S3 API, optional backup + archive)"]
-        Platform["Platform Services<br/>(Keychain / Keystore,<br/>BGTaskScheduler / WorkManager,<br/>Vision / ML Kit, iCloud,<br/>Auto Backup / SAF)"]
+        Platform["Platform Services<br/>(Keychain / Keystore,<br/>BGTaskScheduler / WorkManager,<br/>Vision / ML Kit, iCloud / Google Drive,<br/>Auto Backup / SAF)"]
     end
 
     UI --> Swift
@@ -479,6 +479,14 @@ Backup never feeds the archive directly, and the archive never
 feeds the backup directly. They are independent pipelines reading
 from their own event journals on the local store.
 
+> **Tiered media storage (PROPOSAL.md §5.7).** Media originals may
+> route to user cloud storage (iCloud / Google Drive / ZK Object
+> Fabric) via the `MediaBlobSink` trait instead of the Personal
+> Archive backend. The archive stores only `media_key_delta`
+> segments (the `K_asset` wraps) and thumbnails; the originals are
+> fetched from the user's configured media sink on tap. Thumbnails
+> and archive segments stay on Tier 0; only originals are routed.
+
 ---
 
 ## 4. Local Store Schema
@@ -531,7 +539,8 @@ CREATE TABLE media_asset (
     wrapped_k_asset   BLOB NOT NULL,
     chunk_count       INTEGER NOT NULL,
     merkle_root       BLOB NOT NULL,
-    blob_id           TEXT NOT NULL
+    blob_id           TEXT NOT NULL,
+    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- PROPOSAL.md §5.7
 );
 
 -- Multilingual full-text search
@@ -582,6 +591,7 @@ CREATE TABLE archive_segment_map (
     time_bucket          TEXT NOT NULL,     -- e.g. '2026-04'
     segment_type         TEXT NOT NULL,
     blob_id              TEXT NOT NULL,
+    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- PROPOSAL.md §10.1
     merkle_root          BLOB NOT NULL,
     state                TEXT NOT NULL      -- not_archived..archive_compacted
 );
@@ -855,10 +865,11 @@ sequenceDiagram
     participant Core as "Rust core"
     participant DB as "local_store"
     participant Tr as "transport"
+    participant Sink as "MediaBlobSink<br/>(iCloud / Drive / ZKOF)"
     participant BE as "KChat backend"
 
     UI->>Core: "scrolled to / tapped message_id"
-    Core->>DB: "read skeleton + body_state"
+    Core->>DB: "read skeleton + body_state + media_state"
     alt "body local"
         Core-->>UI: "render plaintext"
     else "body cold"
@@ -876,6 +887,20 @@ sequenceDiagram
         Core->>Core: "AEAD decrypt with K_archive_segment<br/>(derived from K_archive_epoch)"
         Core->>DB: "update body in place"
         Core-->>UI: "render plaintext (no scroll jump)"
+    else "media original cold"
+        Core->>DB: "read media_asset.storage_sink + blob_id"
+        alt "storage_sink = kchat_backend"
+            Core->>Tr: "GET /v1/blobs/{blob_id}?range=..."
+            Tr->>BE: "encrypted media chunks"
+            BE-->>Tr: "ciphertext"
+        else "storage_sink = i_cloud / google_drive / zk_object_fabric"
+            Core->>Sink: "MediaBlobSink::fetch_media_chunk(blob_ref, idx)"
+            Sink-->>Core: "ciphertext (CloudKit / Drive API / S3 GetObject)"
+        end
+        Core->>Core: "verify per-chunk SHA-256 + whole-object Merkle root"
+        Core->>Core: "AEAD open with K_asset (unwrapped from media_key_delta)"
+        Core->>DB: "advance media_state to original_local"
+        Core-->>UI: "render media (no scroll jump)"
     end
 ```
 

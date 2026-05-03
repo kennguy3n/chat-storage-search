@@ -968,6 +968,7 @@ mod tests {
             merkle_root: [0u8; 32],
             blob_id: Uuid::now_v7(),
             wrapped_k_asset: vec![0u8; 40],
+            storage_sink: None,
         }];
         MessageProcessor::validate_ingest(&msg).expect("valid media-only");
     }

@@ -37,6 +37,11 @@ KChat.
   (S3 API). Both backends are untrusted; segments are AEAD-sealed
   on-device. The archive backend is selected per-deployment via
   `archive_backend` configuration.
+- **Tiered media storage**: media originals route to user-configured
+  cloud storage (iCloud, Google Drive, ZK Object Fabric) when
+  available; thumbnails and archive segments stay on the KChat
+  backend or ZKOF. The `MediaBlobSink` trait abstracts the storage
+  backend for media blobs. See §5.7.
 - **Incremental backup** to platform sinks: iCloud, Android Auto
   Backup, Android Large Backup, Storage Access Framework, and ZK
   Object Fabric (S3 API, Pattern C convergent encryption).
@@ -520,6 +525,90 @@ sophisticated adversary. Dummy padding is off by default
 (`privacy_level = "standard"`) because it increases bandwidth
 consumption.
 
+### 5.7 Tiered media storage
+
+Media originals dominate per-user archive storage at scale. A
+realistic active user generates 1–3 GB of photos, 5–20 GB of
+videos, and < 100 MB of text per year. Routing those originals
+through the same KChat backend that holds text deltas pushes
+backend storage 1–2 orders of magnitude higher than the data the
+backend actually needs to fan out (text, skeletons, indexes, key
+wraps, thumbnails). The fix is a three-tier storage model that
+keeps the user-paid cloud (iCloud, Google Drive, ZKOF) on the
+critical path for media originals.
+
+**Tier 0 — KChat backend (always)**: text deltas, message
+skeletons, manifests, media `K_asset` wraps, thumbnails, search
+index shards (recent). Small, latency-sensitive, ciphertext-only.
+
+**Tier 1 — KChat backend, movable**: older search index shards.
+Stored on the KChat backend by default, can age to user cloud
+under storage pressure (Phase 7). Shards remain encrypted; the
+shard fetch path on a search hit is the only consumer.
+
+**Tier 2 — User cloud (media originals)**: photos, videos,
+documents, voice messages, large attachments. Routed to iCloud,
+Google Drive, or ZK Object Fabric via the configured
+`media_blob_sink`. Tap-to-download latency is acceptable for this
+class. Ciphertext-only — the user-cloud provider sees opaque
+encrypted blobs.
+
+| Tier | Contents                                       | Backend            | Latency budget     |
+| ---- | ---------------------------------------------- | ------------------ | ------------------ |
+| 0    | text, skeletons, manifests, key wraps, thumbnails, recent search shards | KChat backend / ZKOF | Interactive (< 100 ms p95) |
+| 1    | older search index shards                      | KChat backend / ZKOF (movable) | Interactive (< 250 ms p95) |
+| 2    | media originals                                | iCloud / Google Drive / ZKOF | Tap-to-download (< 2 s p95) |
+
+**Routing surface.** [`MediaDescriptor::storage_sink`] (CBOR
+field, `#[serde(default)]` for backward compat) and
+`media_asset.storage_sink` (SQL column, default
+`'kchat_backend'`) record where each blob actually lives. The
+[`MediaBlobSink`] trait at `crates/core/src/media/sinks/mod.rs`
+is the routing seam — analogous to `backup/sinks/` for the backup
+vault — that the media engine calls into when uploading or
+fetching an original. Thumbnails always go through the KChat
+[`TransportClient`] (Tier 0); only originals are routed.
+
+**Default policy.** `media_blob_sink = None` means originals flow
+through the default `TransportClient` to the KChat backend (the
+Phase 1 / Phase 2 default). Setting `media_blob_sink` to one of
+the user-cloud variants in `KChatCoreConfig` redirects originals
+to that sink without touching the thumbnail or archive path.
+
+**Rehydration path.** On a tap or scroll-back hit, the media
+engine reads `media_asset.storage_sink` for the asset and
+dispatches to the matching `MediaBlobSink` implementation:
+`"kchat_backend"` → `TransportClient`, `"i_cloud"` → iCloud sink,
+`"google_drive"` → Drive sink, `"zk_object_fabric"` → ZKOF sink.
+The chunk verification (per-chunk SHA-256 + whole-object Merkle
+root) and AEAD open with `K_asset` are unchanged — only the
+*source of bytes* differs.
+
+**Cross-platform migration.** Switching from iOS to Android
+requires migrating iCloud-resident originals to Google Drive (or
+ZKOF as a platform-neutral fallback). Phase 7 carries a
+background migration job that re-uploads originals from the old
+sink to the new one and rewrites `media_asset.storage_sink` and
+the related `MediaDescriptor` field. ZKOF is the recommended
+neutral target for households that span platforms because it
+removes the per-vendor dependency entirely.
+
+**Storage projection (per active user, per year).**
+
+| Component                          | Approx. size | Tier   |
+| ---------------------------------- | ------------ | ------ |
+| Text deltas + skeletons + manifests | 50–100 MB   | 0      |
+| Search index shards (recent + old)  | 50–200 MB   | 0 / 1  |
+| Media `K_asset` wraps + thumbnails  | 100–300 MB  | 0      |
+| **Media originals**                 | **6–25 GB** | **2**  |
+| Total                               | ≈ 6–25 GB    |        |
+
+Routing originals to Tier 2 cuts KChat-side per-user storage from
+≈ 6–25 GB to ≈ 200–600 MB — a 95%+ reduction at scale. The
+remaining KChat-resident bytes are the parts that *only* the
+KChat backend can serve: MLS fanout, search shards, manifests.
+The user-paid cloud absorbs the rest.
+
 ---
 
 ## 6. Backup Specification
@@ -977,6 +1066,41 @@ The transport client selects the backend at initialization based on
 configuration. Both backends receive identical ciphertext; the
 crypto layer is unaware of the routing decision.
 
+Media blob routing is **independent** of archive backend routing.
+A deployment can run with `archive_backend = "kchat"` for archive
+segments while routing media originals to user cloud via
+`media_blob_sink` (§5.7). The two configurations live on
+[`crate::config::KChatCoreConfig`] as separate fields and the
+transport / sink dispatch paths do not share state. ZKOF can play
+either role (or both) without coupling them.
+
+### 10.2 Media blob sink routing
+
+When `media_blob_sink` is set on `KChatCoreConfig`, media-original
+upload, download, and delete route to the configured sink instead
+of the KChat backend's `/v1/blobs/*` endpoints. Each
+`MediaBlobSink` variant maps to a concrete transport mechanism:
+
+| `StorageSink` variant   | Upload                                          | Download                                    | Delete                                    |
+| ----------------------- | ----------------------------------------------- | ------------------------------------------- | ----------------------------------------- |
+| `KChatBackend` (default)| `TransportClient` `POST /v1/blobs/init` + chunks + commit | `TransportClient` `GET /v1/blobs/{id}?range=` | `TransportClient` blob delete             |
+| `ICloud { … }`          | CloudKit file storage in the configured container | CloudKit fetch by record name               | CloudKit record delete                    |
+| `GoogleDrive { … }`     | Drive API `files.create` (resumable upload) in the configured folder | Drive API `files.get?alt=media` (range)     | Drive API `files.delete`                  |
+| `ZkObjectFabric { … }`  | S3 `PutObject` (multipart for large originals) in the configured bucket | S3 `GetObject` (range)                      | S3 `DeleteObject`                         |
+
+All variants receive identical AEAD-sealed ciphertext (per
+`docs/PROPOSAL.md §8`). The sink is a byte mover — it never
+inspects, compresses, or re-keys the chunks. Thumbnails and
+archive segments do not flow through `MediaBlobSink`; they keep
+the existing routing (Tier 0).
+
+The `MediaBlobReference` returned from `upload_media_chunks`
+carries the sink-specific identifier (`blob_id`) plus an opaque
+metadata blob for things like CloudKit zone names, Drive
+revisions, and S3 version-ids. The local store persists the
+identifier to `media_asset.blob_id` and the variant tag to
+`media_asset.storage_sink`; rehydration reverses the flow.
+
 ---
 
 ## 11. Background Processing
@@ -1096,4 +1220,6 @@ is *include cold*, with a small ranking penalty per §7.5.
 | ZK Object Fabric Pattern C interop drift                          | Cross-language test vectors locked in Phase 0; Rust implementation diff-tested against the Go SDK on every release.                                                                     |
 | Access-pattern metadata leakage on rehydration                    | Batch-by-bucket prefetch coarsens the signal to per-bucket granularity; optional dummy request padding (`privacy_level = "high"`) further obscures access patterns. See §5.6.          |
 | Archive key compromise exposes full history                       | Epoch-rotated archive keys (`K_archive_epoch`) limit the blast radius to the current epoch + any prior epochs whose wrapped keys the attacker can unwrap. Optional epoch-key deletion provides forward secrecy at the cost of scroll-back depth. See §2.1. |
+| Backend storage cost at scale (media originals)                   | Tiered media storage routes originals to user-paid cloud (iCloud / Google Drive / ZK Object Fabric); KChat backend holds only text, indexes, thumbnails, and manifests. See §5.7.       |
+| User cloud storage quota exhaustion                               | Graceful fallback: if user cloud is full, queue uploads and notify; fall back to KChat backend or ZKOF. Settings surface "KChat is using X GB of your iCloud / Google storage". See §5.7. |
 | FFI panic propagation                                             | Rust core never `panic!`s across the boundary; all errors surface as typed `Result` variants; UniFFI / JNI wrappers translate to platform exceptions / `Error` enums.                   |

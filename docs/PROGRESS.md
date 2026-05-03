@@ -628,6 +628,22 @@ Checklist:
 - [ ] Size-class padding for metadata privacy.
 - [ ] Per-chunk AEAD AAD construction.
 - [ ] Multilingual filename / caption handling.
+- [ ] `StorageSink` enum and `ArchiveBackend` enum in config
+      (`crates/core/src/config.rs`). See PROPOSAL.md §5.7.
+- [ ] `storage_sink` field on `MediaDescriptor` (CBOR,
+      `#[serde(default)]` for backward compat).
+- [ ] `storage_sink` column on `media_asset` table (schema
+      migration with `DEFAULT 'kchat_backend'`).
+- [ ] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
+      `upload_media_chunks` / `fetch_media_chunk` /
+      `delete_media_blob`.
+- [ ] `NoopMediaBlobSink` placeholder.
+- [ ] Media upload routing: thumbnails always go to
+      `TransportClient` (KChat backend); originals route to the
+      configured `MediaBlobSink` (default: `TransportClient`
+      fallback).
+- [ ] Media rehydration routing: `media_asset.storage_sink`
+      determines which sink to fetch from.
 
 **Decision gate**: Media can be encrypted, chunked, uploaded,
 downloaded, range-fetched, verified, and displayed on iOS, Android,
@@ -636,7 +652,8 @@ chunks.
 
 Notes:
 
-- _(none yet)_
+- Tiered media storage spec and trait surface land here; sink
+  implementations land in Phase 3. See PROPOSAL.md §5.7 and §10.2.
 
 ---
 
@@ -692,11 +709,23 @@ Checklist:
 - [ ] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.
+- [ ] iCloud `MediaBlobSink` implementation (CloudKit file
+      storage). See PROPOSAL.md §10.2.
+- [ ] Google Drive `MediaBlobSink` implementation (Drive API via
+      platform bridge).
+- [ ] ZK Object Fabric `MediaBlobSink` implementation (S3
+      `PutObject` / `GetObject`).
+- [ ] Tiered eviction policy: media originals offload to user
+      cloud before archive segments offload to KChat backend.
+- [ ] `storage_backend` column on `archive_segment_map` for
+      tracking where each segment lives.
 
 **Decision gate**: Messages and media offload + rehydrate
 transparently; storage budget is enforced; timeline renders
 skeletons immediately with lazy fill; indexes remain resident
-across all eviction strata.
+across all eviction strata. Media originals can be uploaded to
+and fetched from at least one user-cloud sink (iCloud or ZKOF) in
+addition to the KChat backend.
 
 Notes:
 
@@ -845,6 +874,11 @@ Checklist:
 - [ ] Edge-case handling (offline, interrupted, partial, corrupted,
       missing).
 - [ ] Production-scale archive compaction.
+- [ ] Cross-platform media migration: iOS → Android migrates
+      iCloud media blobs to Google Drive (or ZKOF fallback) in the
+      background.
+- [ ] Media blob sink stress test: 10K+ media files across mixed
+      sinks, verify rehydration from each.
 - [ ] **Failure test suite**, all passing:
       - chunk upload interrupted
       - manifest upload interrupted
