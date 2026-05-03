@@ -47,6 +47,10 @@ pub mod info {
     pub const TEXT_INDEX_SHARD: &[u8] = b"kchat-text-index-shard-v1";
     pub const VECTOR_INDEX_SHARD: &[u8] = b"kchat-vector-index-shard-v1";
     pub const MEDIA_INDEX_SHARD: &[u8] = b"kchat-media-index-shard-v1";
+
+    /// Phase-3 epoch-rotated archive key. `info` =
+    /// `b"kchat-archive-epoch-v1" || epoch_id`.
+    pub const ARCHIVE_EPOCH: &[u8] = b"kchat-archive-epoch-v1";
 }
 
 /// Owned, zeroizing 32-byte key material. Dropping a [`KeyMaterial`]
@@ -204,6 +208,73 @@ pub fn derive_media_index_shard(
     derive_with_id(search_root.as_bytes(), info::MEDIA_INDEX_SHARD, shard_id)
 }
 
+// ---------------------------------------------------------------------------
+// Phase-3: epoch-rotated archive keys
+// ---------------------------------------------------------------------------
+
+/// Derive `K_archive_epoch(epoch_id)` from `K_archive_root`.
+///
+/// `docs/PHASES.md` Phase 3 calls for an extra epoch indirection
+/// between `K_archive_root` and the per-segment / per-manifest
+/// keys: each "epoch" gets its own subkey so the orchestration
+/// layer can rotate without re-deriving every leaf key.
+///
+/// HKDF info = [`info::ARCHIVE_EPOCH`] concatenated with
+/// `epoch_id.as_bytes()`.
+pub fn derive_archive_epoch_key(
+    k_archive_root: &KeyMaterial,
+    epoch_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_id(
+        k_archive_root.as_bytes(),
+        info::ARCHIVE_EPOCH,
+        epoch_id.as_bytes(),
+    )
+}
+
+/// Derive `K_archive_segment(segment_id)` from a (possibly rotated)
+/// epoch key. Versioned under [`info::ARCHIVE_SEGMENT`] so the
+/// segment-level info string matches the non-epoch derivation.
+pub fn derive_archive_segment_key(
+    k_archive_epoch: &KeyMaterial,
+    segment_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_id(
+        k_archive_epoch.as_bytes(),
+        info::ARCHIVE_SEGMENT,
+        segment_id.as_bytes(),
+    )
+}
+
+/// Derive `K_archive_manifest(manifest_id)` from an epoch key.
+pub fn derive_archive_manifest_key(
+    k_archive_epoch: &KeyMaterial,
+    manifest_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_id(
+        k_archive_epoch.as_bytes(),
+        info::ARCHIVE_MANIFEST,
+        manifest_id.as_bytes(),
+    )
+}
+
+/// AES-256-KW wrap an epoch key under `K_archive_root` so the
+/// orchestration layer can persist prior-epoch keys in the
+/// manifest chain (and unwrap them again on hydration).
+pub fn wrap_epoch_key(
+    k_archive_root: &KeyMaterial,
+    k_archive_epoch: &KeyMaterial,
+) -> CryptoResult<Vec<u8>> {
+    super::key_wrap::wrap_key(k_archive_root.as_bytes(), k_archive_epoch.as_bytes())
+}
+
+/// AES-256-KW unwrap a wrapped epoch key produced by
+/// [`wrap_epoch_key`].
+pub fn unwrap_epoch_key(k_archive_root: &KeyMaterial, wrapped: &[u8]) -> CryptoResult<KeyMaterial> {
+    let raw = super::key_wrap::unwrap_key(k_archive_root.as_bytes(), wrapped)?;
+    Ok(KeyMaterial::from_bytes(raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +361,77 @@ mod tests {
         assert!(KeyMaterial::from_slice(&[0u8; 31]).is_err());
         assert!(KeyMaterial::from_slice(&[0u8; 33]).is_err());
         assert!(KeyMaterial::from_slice(&[0u8; 32]).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // Phase-3: epoch-rotated archive keys
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn epoch_key_derivation_is_deterministic() {
+        let root = derive_archive_root(&master()).unwrap();
+        let a = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let b = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn different_epoch_ids_produce_different_keys() {
+        let root = derive_archive_root(&master()).unwrap();
+        let april = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let may = derive_archive_epoch_key(&root, "2026-05").unwrap();
+        assert_ne!(april.as_bytes(), may.as_bytes());
+    }
+
+    #[test]
+    fn epoch_key_wrap_unwrap_round_trip() {
+        let root = derive_archive_root(&master()).unwrap();
+        let epoch = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let wrapped = wrap_epoch_key(&root, &epoch).unwrap();
+        let unwrapped = unwrap_epoch_key(&root, &wrapped).unwrap();
+        assert_eq!(unwrapped.as_bytes(), epoch.as_bytes());
+    }
+
+    #[test]
+    fn segment_key_from_epoch_is_deterministic() {
+        let root = derive_archive_root(&master()).unwrap();
+        let epoch = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let s1 = derive_archive_segment_key(&epoch, "seg-1").unwrap();
+        let s2 = derive_archive_segment_key(&epoch, "seg-1").unwrap();
+        assert_eq!(s1.as_bytes(), s2.as_bytes());
+        let s_other = derive_archive_segment_key(&epoch, "seg-2").unwrap();
+        assert_ne!(s_other.as_bytes(), s1.as_bytes());
+    }
+
+    #[test]
+    fn cross_epoch_segment_decrypt() {
+        // Encrypt under epoch A's segment key, persist the wrapped
+        // epoch-A key, unwrap, re-derive the segment key, and
+        // confirm decryption succeeds.
+        use crate::crypto::aead::xchacha20_poly1305::{open, seal, NONCE_LEN};
+        let root = derive_archive_root(&master()).unwrap();
+        let epoch_a = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let seg_key = derive_archive_segment_key(&epoch_a, "seg-A").unwrap();
+        let plaintext = b"archive segment payload from epoch A";
+        let nonce = [0x11u8; NONCE_LEN];
+        let ciphertext = seal(seg_key.as_bytes(), &nonce, plaintext, b"aad").unwrap();
+
+        // Persist the wrapped epoch key, then drop the in-memory
+        // copy and rebuild it from the wrapped form.
+        let wrapped = wrap_epoch_key(&root, &epoch_a).unwrap();
+        drop(epoch_a);
+        let recovered_epoch = unwrap_epoch_key(&root, &wrapped).unwrap();
+        let recovered_seg = derive_archive_segment_key(&recovered_epoch, "seg-A").unwrap();
+        let pt = open(recovered_seg.as_bytes(), &nonce, &ciphertext, b"aad").unwrap();
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn epoch_segment_and_manifest_keys_differ() {
+        let root = derive_archive_root(&master()).unwrap();
+        let epoch = derive_archive_epoch_key(&root, "2026-04").unwrap();
+        let seg = derive_archive_segment_key(&epoch, "id-1").unwrap();
+        let man = derive_archive_manifest_key(&epoch, "id-1").unwrap();
+        assert_ne!(seg.as_bytes(), man.as_bytes());
     }
 }

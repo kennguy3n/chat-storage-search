@@ -36,6 +36,16 @@ zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "column_decltype"] }
 unicode-normalization = "0.1"
+# Image decoding + resizing for Phase 2 thumbnail generation
+# (`crates/core/src/media/thumbnail.rs`). `default-features = false`
+# keeps the dep tree lean — we only need PNG and JPEG codecs at this
+# phase. No dynamic library lookup is required.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# zstd compression for Phase 3 archive segments
+# (`crates/core/src/archive/segment_builder.rs`). The bundled C
+# library is statically linked so callers don't need a system
+# `libzstd`.
+zstd = { version = "0.13", default-features = false }
 ort = { workspace = true, optional = true }
 
 # On Windows builds, additionally enable the `directml` feature on the

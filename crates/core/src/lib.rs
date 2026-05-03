@@ -56,13 +56,12 @@ pub mod transport;
 
 pub use config::KChatCoreConfig;
 pub use core_impl::CoreImpl;
+pub use formats::media_descriptor::MediaDescriptor;
 pub use local_store::schema::TimelineRow;
 pub use transport::{
     BlobUploadHandle, ChunkReceipt, CommitBlobResponse, EncryptedManifest, FetchMessagesResponse,
     NoopTransportClient, TransportClient,
 };
-
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -284,12 +283,45 @@ pub struct DeliveryCursor(pub String);
 
 /// Result of [`KChatCore::hydrate_message`].
 ///
-/// Phase-1 placeholder. The full hydration contract
-/// (decrypted body, decrypted media descriptors, hydration
-/// provenance) lands when the rehydration / restore engines arrive
-/// in Phase 2 / Phase 4.
+/// Phase 3 widens the placeholder to carry the rehydrated body
+/// (when one exists), the originating skeleton metadata, and a
+/// `is_cold` flag the renderer can use to decide whether to wait
+/// on a background fetch. Subsequent phases (3+ / Phase 4) will
+/// extend this with decrypted media descriptors and hydration
+/// provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydratedMessage {}
+pub struct HydratedMessage {
+    /// Stable message identifier the request was for.
+    pub message_id: Option<Uuid>,
+    /// Owning conversation, when the skeleton is locally known.
+    pub conversation_id: Option<Uuid>,
+    /// Plaintext body when the message body is locally available.
+    /// `None` for messages whose body is offloaded, deleted, or
+    /// otherwise unavailable.
+    pub text_content: Option<String>,
+    /// `true` when the message body is not local (offloaded /
+    /// remote-archive-only). The hydration request has been
+    /// queued; the renderer should display the skeleton in a cold
+    /// state until the archive fetch lands.
+    pub is_cold: bool,
+}
+
+/// Result of [`KChatCore::send_media`].
+///
+/// Phase 2 carries the freshly-minted [`ClientMessageId`], the
+/// [`MediaDescriptor`] the rest of the system round-trips through
+/// CBOR, and the `asset_id` (UUID v7) that the local-store
+/// `media_asset` row keys on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMediaResult {
+    /// Identifier of the freshly-minted outbox / message row.
+    pub client_message_id: ClientMessageId,
+    /// `media_asset.asset_id` for the persisted asset.
+    pub asset_id: Uuid,
+    /// Asset descriptor ready to ship through MLS to the rest of
+    /// the conversation.
+    pub descriptor: MediaDescriptor,
+}
 
 /// Result of [`KChatCore::run_incremental_backup`].
 ///
@@ -301,11 +333,19 @@ pub struct BackupResult {}
 
 /// Result of [`KChatCore::enforce_storage_budget`].
 ///
-/// Phase-1 placeholder. The full offload contract (rows demoted,
-/// bytes freed, archive segment refs created, …) lands with the
-/// offload engine in Phase 3.
+/// Phase 3 carries the byte / row counts the eviction planner
+/// produced. The full offload contract (archive segment refs
+/// created, manifest deltas, …) lands as the archive upload path
+/// fills in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OffloadResult {}
+pub struct OffloadResult {
+    /// Total plaintext bytes the eviction sweep freed from the
+    /// local store.
+    pub freed_bytes: u64,
+    /// Number of `media_asset` / `message_body` rows the eviction
+    /// sweep demoted.
+    pub evicted_count: u32,
+}
 
 /// Result of [`KChatCore::restore_from_backup`].
 ///
@@ -471,21 +511,32 @@ pub trait KChatCore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MessageView>>;
 
-    /// Send an outbound media message: copy / encrypt the file at
-    /// `local_file`, persist a media descriptor + body row, and
-    /// queue the resulting outbox entry. Returns the new message's
-    /// [`ClientMessageId`].
+    /// Send an outbound media message: chunk + AEAD-seal the
+    /// in-memory `plaintext`, persist a `media_asset` row + media
+    /// skeleton, and stage the descriptor for MLS distribution.
     ///
-    /// **Phase-1 stub.** The media-send pipeline (chunking, MLS
-    /// encryption, descriptor signing) lands in Phase 2. Until then
-    /// this method returns
-    /// `Err(Error::NotImplemented("send_media"))`.
+    /// `message_id` is the caller-minted UUID v7 the new
+    /// [`ClientMessageId`] is built around — bridge layers that
+    /// need to pre-allocate the id (so the UI can render a pending
+    /// bubble before the encrypt step finishes) supply it directly;
+    /// the in-process [`CoreImpl`] still mints fresh ids when the
+    /// caller doesn't care.
+    ///
+    /// Phase 2 wires this to
+    /// [`crate::media::processor::process_media`] and the
+    /// [`crate::media::thumbnail::ThumbnailGenerator`]. The actual
+    /// upload to the configured [`TransportClient`] /
+    /// [`crate::media::sinks::MediaBlobSink`] is deferred —
+    /// [`SendMediaResult::descriptor`] is the wire form callers ship
+    /// through MLS.
     fn send_media(
         &self,
         conversation_id: Uuid,
-        local_file: &Path,
+        message_id: Uuid,
+        plaintext: Vec<u8>,
+        mime_type: &str,
         caption: Option<&str>,
-    ) -> Result<ClientMessageId>;
+    ) -> Result<SendMediaResult>;
 
     /// Hydrate a previously offloaded message back into the local
     /// store. `reason` is recorded in the rehydration journal so

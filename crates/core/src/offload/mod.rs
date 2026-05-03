@@ -1,4 +1,21 @@
-//! `offload` module — Phase 0 stub.
+//! `offload` module — Phase 3 storage-pressure enforcement.
 //!
-//! Implementation lands in a later phase. See `docs/PHASES.md` for
-//! the schedule.
+//! Phase 3 of `docs/PHASES.md` and `docs/PROPOSAL.md §5.4` lay out
+//! how the local store keeps itself within its storage budget:
+//!
+//! * [`budget`] — observe storage usage, compare against a
+//!   declared budget, surface the resulting [`PressureLevel`].
+//! * [`scoring`] — score individual eviction candidates per the
+//!   PROPOSAL §5.4 formula.
+//! * [`eviction`] — turn a sorted list of candidates into an
+//!   [`EvictionPlan`] and execute it via state-machine
+//!   transitions on the local store.
+//! * [`hydration`] — priority queue (P0..P5) that drives
+//!   restoration of cold messages back into local storage.
+
+pub mod budget;
+pub mod eviction;
+pub mod hydration;
+pub mod scoring;
+
+pub use budget::PressureLevel;
