@@ -447,10 +447,29 @@ the standard library and chosen primitives.
 > criterion benchmark suite at
 > `crates/core/benches/phase1_benchmarks.rs` enforces the
 > < 20 ms / < 150 ms p95 budgets from §13 of
-> `docs/PROPOSAL.md`. The remaining higher-level modules
-> (`media`, `archive`, `backup`, `offload`, `restore`, `models`,
+> `docs/PROPOSAL.md`.
+>
+> Phase 2 has now started filling `crates/core/src/media/`. It
+> is no longer a pure placeholder: in addition to the
+> tiered-media routing seam under `media/sinks/`
+> (`MediaBlobSink` trait + `NoopMediaBlobSink`, see PROPOSAL.md
+> §5.7) the module now carries the chunked-media pipeline at
+> `media/chunker.rs` (`chunk_and_encrypt`, `verify_and_decrypt`,
+> `pad_to_size_class` / `unpad_from_size_class`, the
+> `SealedChunk` / `ChunkedMedia` pair, `DEFAULT_CHUNK_SIZE`),
+> `media/processor.rs` (`process_media` →
+> `MediaProcessResult { descriptor, sealed_chunks,
+> k_asset_raw }` with random `K_asset` generation, AES-256-KW
+> wrap, and `MediaDescriptor` assembly), and `media/upload.rs`
+> (`upload_chunked_media` / `resume_upload` over
+> `TransportClient` with server-side BLAKE3 verification).
+>
+> The remaining higher-level modules
+> (`archive`, `backup`, `offload`, `restore`, `models`,
 > `transport`, `scheduler`) are Phase-0 placeholders and are
-> filled in across Phases 1 – 7.
+> filled in across Phases 3 – 7. `transport` is partially
+> populated by Phase 1 (`DeliveryClient` / `TransportClient`
+> traits, `NoopTransportClient`, `MockDeliveryClient`).
 
 ---
 

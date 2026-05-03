@@ -8,7 +8,8 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~96%`.**
+> Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
+> Media Encryption and Blob Service — `In progress | ~30%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -121,9 +122,37 @@
 > (`get_message_with_body`, `get_message_body`), and
 > conversation-deletion cascade (`delete_conversation`) used
 > by the rendering and storage-management paths in the
-> bindings. The higher-level engines
-> (`media`, `archive`, `backup`, `offload`, `restore`) remain
-> stubbed and land across Phases 2–7. See
+> bindings.
+>
+> Landed in Phase 2 so far: the chunked-media pipeline
+> (`media::chunker`, `media::processor`, `media::upload`) and the
+> tiered-media routing surface (`media::sinks::MediaBlobSink`,
+> `NoopMediaBlobSink`, `StorageSink` / `ArchiveBackend` enums on
+> `KChatCoreConfig`, `storage_sink` field on `MediaDescriptor`,
+> `storage_sink` column on `media_asset`).
+> `media::chunker::chunk_and_encrypt` splits a plaintext blob into
+> XChaCha20-Poly1305-sealed `SealedChunk`s under a per-chunk
+> `KCHAT_BLOB_CHUNK_V1` AAD (PROPOSAL.md §8.3) bound to the
+> whole-object BLAKE3 root, records per-chunk SHA-256 over the
+> ciphertext for fast-fail integrity, and supports opt-in
+> size-class padding via `pad_to_size_class` /
+> `unpad_from_size_class` (PROPOSAL.md §8.2). The matching
+> `verify_and_decrypt` rebuilds the AAD per chunk, AEAD-opens,
+> and verifies the BLAKE3 root over the recovered plaintext.
+> `media::processor::process_media` generates a fresh-random
+> `K_asset` (zeroized on drop), runs the chunker, wraps `K_asset`
+> under `K_local_db` / `K_archive_root` / `K_backup_root` with
+> AES-256-KW, and assembles the `MediaDescriptor` the local store
+> persists. `media::upload::upload_chunked_media` /
+> `resume_upload` drive `TransportClient::init_blob_upload` →
+> `upload_chunk` → `commit_blob` and verify the server-side
+> BLAKE3 root on commit, with `UploadState::completed_chunks`
+> bookkeeping so resumed uploads never duplicate completed
+> chunks.
+>
+> The remaining higher-level engines
+> (`archive`, `backup`, `offload`, `restore`) remain
+> stubbed and land across Phases 3–7. See
 > [docs/PROGRESS.md](docs/PROGRESS.md) for the full tracker.
 
 ---
@@ -179,7 +208,13 @@ chat-storage-search/
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
         archive/                            # placeholder (Phase 3)
         backup/                             # placeholder (Phase 4)
-        media/                              # placeholder (Phase 2)
+        media/                              # Phase 2: chunker + processor + upload + sinks landed
+          mod.rs
+          chunker.rs                        # chunk + AEAD-seal, size-class padding, verify_and_decrypt
+          processor.rs                      # process_media: random K_asset + chunk + wrap + descriptor
+          upload.rs                         # upload_chunked_media + resume_upload over TransportClient
+          sinks/                            # MediaBlobSink trait + NoopMediaBlobSink (PROPOSAL.md §5.7)
+            mod.rs
         models/                             # placeholder (Phase 6)
         offload/                            # placeholder (Phase 3)
         restore/                            # placeholder (Phase 4)

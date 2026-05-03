@@ -2,8 +2,8 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`).
-- **Last updated**: 2026-05-02
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~30%`).
+- **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -607,37 +607,44 @@ Notes:
 
 ## Phase 2: Media Encryption and Blob Service
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~30%`
 
 **Goal**: Chunked encrypted media upload / download, thumbnailing,
 local media cache.
 
 Checklist:
 
-- [ ] Media processor: thumbnail generation, chunk encryption with
-      random `K_asset`.
-- [ ] Chunked encrypted blob upload / download (transport client).
+- [~] Media processor: thumbnail generation, chunk encryption with
+      random `K_asset`. (Chunk encryption + `K_asset` random gen +
+      AES-256-KW wrap landed in `media::processor::process_media`;
+      thumbnail generation still pending.)
+- [~] Chunked encrypted blob upload / download (transport client).
+      (`media::upload::upload_chunked_media` /
+      `media::upload::resume_upload` drive `init → chunk(s) →
+      commit` against `TransportClient`; the production HTTP /
+      gRPC implementation of `TransportClient` itself is still
+      stubbed by `NoopTransportClient`.)
 - [ ] Media descriptor distribution through MLS.
 - [ ] Local media cache with LRU eviction.
-- [ ] Resume-upload (no duplicate completed chunks).
-- [ ] Chunk integrity verification (per-chunk SHA-256, BLAKE3
+- [x] Resume-upload (no duplicate completed chunks).
+- [x] Chunk integrity verification (per-chunk SHA-256, BLAKE3
       Merkle root, AEAD tag).
 - [ ] Media state machine (`thumbnail_only`, `original_local`,
       `remote_original`, `download_in_progress`, `evicted`,
       `deleted`).
-- [ ] Size-class padding for metadata privacy.
-- [ ] Per-chunk AEAD AAD construction.
+- [x] Size-class padding for metadata privacy.
+- [x] Per-chunk AEAD AAD construction.
 - [ ] Multilingual filename / caption handling.
-- [ ] `StorageSink` enum and `ArchiveBackend` enum in config
+- [x] `StorageSink` enum and `ArchiveBackend` enum in config
       (`crates/core/src/config.rs`). See PROPOSAL.md §5.7.
-- [ ] `storage_sink` field on `MediaDescriptor` (CBOR,
+- [x] `storage_sink` field on `MediaDescriptor` (CBOR,
       `#[serde(default)]` for backward compat).
-- [ ] `storage_sink` column on `media_asset` table (schema
+- [x] `storage_sink` column on `media_asset` table (schema
       migration with `DEFAULT 'kchat_backend'`).
-- [ ] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
+- [x] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
       `upload_media_chunks` / `fetch_media_chunk` /
       `delete_media_blob`.
-- [ ] `NoopMediaBlobSink` placeholder.
+- [x] `NoopMediaBlobSink` placeholder.
 - [ ] Media upload routing: thumbnails always go to
       `TransportClient` (KChat backend); originals route to the
       configured `MediaBlobSink` (default: `TransportClient`
@@ -654,6 +661,23 @@ Notes:
 
 - Tiered media storage spec and trait surface land here; sink
   implementations land in Phase 3. See PROPOSAL.md §5.7 and §10.2.
+- Phase-2 chunked-media pipeline scaffolding landed at
+  `crates/core/src/media/{chunker,processor,upload}.rs`. The
+  chunker carries `chunk_and_encrypt` /
+  `verify_and_decrypt` (per-chunk `KCHAT_BLOB_CHUNK_V1` AAD,
+  XChaCha20-Poly1305, deterministic per-chunk nonces, SHA-256
+  fast-fail before AEAD-open, BLAKE3 whole-object root) and the
+  size-class padding (`pad_to_size_class` /
+  `unpad_from_size_class`). The processor wires everything
+  through random `K_asset` generation + AES-256-KW wrap +
+  `MediaDescriptor` assembly. The upload pipeline drives
+  `TransportClient` through `init → chunk(s) → commit` with
+  server-side BLAKE3 verification, and `resume_upload` skips
+  completed chunks for resumable transfers.
+- The `K_asset` raw bytes returned by `process_media` live in a
+  `Zeroizing<[u8; 32]>` so a panic mid-upload still scrubs the
+  asset key before unwinding (matches the `core_impl::CoreImpl`
+  pattern for `K_local_db`).
 
 ---
 
@@ -899,6 +923,101 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase 2 chunked-media pipeline (chunker / processor / upload)
+
+- Media chunker landed at `crates/core/src/media/chunker.rs`:
+  `DEFAULT_CHUNK_SIZE = 16 MiB` (matches Pattern C), the
+  `SealedChunk { ciphertext, chunk_sha256 }` /
+  `ChunkedMedia { sealed_chunks, merkle_root, chunk_count }`
+  pair, and `chunk_and_encrypt(plaintext, k_asset, blob_id,
+  blob_class, chunk_size, pad)` driving XChaCha20-Poly1305 over
+  every `chunk_size`-byte slice with a per-chunk
+  `KCHAT_BLOB_CHUNK_V1` AAD (PROPOSAL.md §8.3) and a
+  deterministic 24-byte nonce derived from the chunk index.
+  Per-chunk SHA-256 is recorded over the **ciphertext** so the
+  rehydration path can fast-fail on torn / re-ordered uploads
+  before doing any AEAD work. The whole-object BLAKE3 root is
+  computed over the (padded) plaintext and bound into every
+  per-chunk AAD. Empty plaintext still produces one zero-length
+  chunk so `chunk_count >= 1` holds.
+- Size-class padding (PROPOSAL.md §8.2) landed in the same
+  module: `pad_to_size_class(plaintext)` rounds
+  `plaintext.len() + 8` up to the next class from
+  `[1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB,
+  16 MiB, 64 MiB, 256 MiB, 1 GiB]` (extending the §8.2 ladder
+  by 1 KiB at the low end and 1 GiB at the high end so sub-4 KiB
+  voice notes and long-form video both have a class) and writes
+  an 8-byte big-endian length prefix so
+  `unpad_from_size_class(padded)` can recover the original slice.
+  Inputs larger than 1 GiB round up to the next power of two.
+  `chunk_and_encrypt` wires it through an opt-in `pad: bool`
+  parameter; the merkle root is computed *after* padding so the
+  rehydration path doesn't have to re-run padding logic.
+- Chunk-integrity verifier (`media::chunker::verify_and_decrypt`)
+  closes the rehydration loop: SHA-256 fast-fail across every
+  chunk, then per-chunk AEAD-open with the same §8.3 AAD, then
+  whole-object BLAKE3 verification against the descriptor's
+  `merkle_root`. Error messages distinguish each stage so the UI
+  layer can surface a useful diagnostic.
+- Media processor landed at `crates/core/src/media/processor.rs`:
+  `process_media(plaintext, mime_type, wrapping_key, blob_class,
+  pad)` generates a fresh-random 256-bit `K_asset` (held in a
+  `Zeroizing<[u8; 32]>` for panic-safe scrubbing), runs the
+  chunker, AES-256-KW-wraps `K_asset` under the caller's
+  wrapping key (`K_local_db` / `K_archive_root` /
+  `K_backup_root`), and assembles a CBOR-ready
+  `MediaDescriptor` (`asset_id` / `blob_id` from `Uuid::now_v7`,
+  `bytes_total`, `chunk_count`, `merkle_root`,
+  `wrapped_k_asset`, `storage_sink: None`).
+  `MediaProcessResult { descriptor, sealed_chunks, k_asset_raw }`
+  bundles everything the local store and the upload pipeline
+  need.
+- Chunked-blob upload pipeline landed at
+  `crates/core/src/media/upload.rs`:
+  `upload_chunked_media(transport, sealed_chunks, merkle_root,
+  blob_class)` drives `TransportClient::init_blob_upload` →
+  `upload_chunk` (echoing per-chunk SHA-256 in the receipt) →
+  `commit_blob`, then verifies
+  `commit_response.merkle_root == merkle_root`.
+  `resume_upload(transport, state, sealed_chunks, blob_class)`
+  consumes an `UploadState { blob_id, completed_chunks,
+  merkle_root }`, skips chunks already marked completed, pushes
+  the remainder, and re-runs commit. Both functions return an
+  `UploadResult { blob_id, merkle_root, server_merkle_root }`
+  for observability of any client/server disagreement on
+  whole-object integrity.
+- Test coverage: the lib test count is up by **24** to **395**
+  total. The new tests cover the prompt's full matrix —
+  `single_chunk_round_trip`, `multi_chunk_splits_correctly`,
+  `empty_plaintext`, `chunk_sha256_is_over_ciphertext`,
+  `different_k_asset_produces_different_ciphertext`,
+  `aad_mismatch_prevents_decrypt`, `pad_round_trip`,
+  `padding_reaches_next_class`, `unpad_rejects_corrupted_length`,
+  `zero_length_input_pads_correctly`,
+  `padding_in_chunk_and_encrypt_round_trips_through_verify`,
+  `verify_and_decrypt_round_trip`,
+  `tampered_ciphertext_fails_sha256`,
+  `tampered_chunk_order_fails`, `wrong_merkle_root_fails`,
+  `wrong_key_fails`, `empty_sealed_chunks_rejected`,
+  `process_media_round_trip`, `process_media_descriptor_fields`,
+  `process_media_with_padding`,
+  `different_calls_produce_different_k_asset`,
+  `upload_all_chunks_happy_path`,
+  `resume_skips_completed_chunks`,
+  `merkle_root_mismatch_on_commit_fails`,
+  `empty_chunks_list_errors`,
+  `resume_with_all_chunks_complete_only_commits`, and
+  `resume_length_mismatch_errors` (the upload tests use a
+  test-only `MockTransportClient` modeled on the existing
+  `MockDeliveryClient` pattern).
+- Phase 2 status flipped from `NOT STARTED` to
+  `In progress | ~30%`. The PR #14 items it inherits
+  (`StorageSink` / `ArchiveBackend` enums, `storage_sink` on
+  `MediaDescriptor` and `media_asset`, `MediaBlobSink` trait,
+  `NoopMediaBlobSink` placeholder) are now ticked alongside the
+  new per-chunk AAD, size-class padding, and chunk-integrity
+  verification items.
 
 ### 2026-05-02 — Phase 1 bridges + trait surface cleanup
 
