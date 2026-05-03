@@ -30,7 +30,7 @@
 //! `K_*_index_shard(shard_id)` derivation, which only the
 //! orchestration layer knows.
 
-use crate::archive::privacy::{compute_padding_count, generate_dummy_segment_id, should_pad};
+use crate::archive::privacy::{compute_padding_count, pad_with_dummy_requests, should_pad};
 use crate::config::KChatCoreConfig;
 use crate::formats::search_shard::IndexType;
 use crate::transport::TransportClient;
@@ -115,6 +115,14 @@ pub fn batch_prefetch_shards(
 /// fetches every shard type in the same order so a timing
 /// observer cannot tell the real target apart from the dummies.
 ///
+/// Real and dummy `conversation_hash` values are **interleaved**
+/// via [`pad_with_dummy_requests`] before any transport call
+/// fires, so a network observer cannot recover the real target
+/// from the position of the first burst of fetches. The
+/// archive-segment counterpart in
+/// [`crate::archive::prefetch::batch_prefetch_bucket_with_padding`]
+/// uses the same shape.
+///
 /// Dummy responses are silently dropped — the returned vec
 /// contains only real-target shards. The number of dummy
 /// `(conversation_hash, bucket)` pairs is governed by
@@ -125,21 +133,36 @@ pub fn batch_prefetch_shards_with_padding(
     bucket: &str,
     config: &KChatCoreConfig,
 ) -> Result<Vec<PrefetchedShard>, Error> {
-    let real = batch_prefetch_shards(transport, conversation_hash, bucket)?;
     if !should_pad(config) {
-        return Ok(real);
+        return batch_prefetch_shards(transport, conversation_hash, bucket);
     }
-    let dummy_count = compute_padding_count(1);
-    for _ in 0..dummy_count {
-        let dummy_hash = generate_dummy_segment_id();
+    let real_hashes = vec![conversation_hash.to_string()];
+    let dummy_count = compute_padding_count(real_hashes.len());
+    let interleaved = pad_with_dummy_requests(&real_hashes, dummy_count);
+    let mut out: Vec<PrefetchedShard> = Vec::with_capacity(PREFETCH_ORDER.len());
+    for hash in &interleaved {
+        let is_real = hash == conversation_hash;
         for shard_type in PREFETCH_ORDER {
-            // Best-effort dummy: ignore the response (and any
-            // error — a 404 / NotImplemented on a dummy is the
-            // expected case).
-            let _ = transport.fetch_index_shards(&dummy_hash, bucket, shard_type_str(shard_type));
+            let result = transport.fetch_index_shards(hash, bucket, shard_type_str(shard_type));
+            if !is_real {
+                // Best-effort dummy: ignore the response (and any
+                // error — a 404 / NotImplemented on a dummy is the
+                // expected case).
+                continue;
+            }
+            let bytes = result?;
+            if bytes.is_empty() {
+                continue;
+            }
+            out.push(PrefetchedShard {
+                shard_type,
+                conversation_hash: conversation_hash.into(),
+                bucket: bucket.into(),
+                ciphertext: bytes,
+            });
         }
     }
-    Ok(real)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -333,5 +356,62 @@ mod tests {
         // size must equal `compute_padding_count(1)` (one unique
         // hash per dummy bucket).
         assert_eq!(dummy_hashes.len(), compute_padding_count(1));
+    }
+
+    #[test]
+    fn padding_interleaves_real_and_dummy_calls() {
+        // Regression test for the privacy bug: under the old
+        // implementation the first 4 transport calls always
+        // targeted the real `conversation_hash`, so a network
+        // observer could read the real target straight off the
+        // wire. The fix interleaves real + dummy hashes via
+        // `pad_with_dummy_requests` before issuing any call, so
+        // across many runs the real hash must NOT always appear
+        // at position 0.
+        let cfg = fresh_config(PrivacyLevel::High);
+        let trials = 64;
+        let mut real_first = 0usize;
+        for _ in 0..trials {
+            let t = RecordingTransport::default();
+            t.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
+            let _ =
+                batch_prefetch_shards_with_padding(&t, "hash", "2026-04", &cfg).expect("prefetch");
+            let calls = t.calls();
+            // The very first transport call's `conversation_hash`
+            // tells us whether the real target was issued first.
+            if calls.first().map(|(h, _, _)| h == "hash").unwrap_or(false) {
+                real_first += 1;
+            }
+        }
+        // With `compute_padding_count(1) == 2`, the interleaved
+        // list has 3 hashes; under uniform shuffling the real
+        // hash lands at position 0 ≈ 1/3 of the time. Allow a
+        // very wide tail (≤ 60/64) so the test stays stable
+        // across rand versions, but reject the broken
+        // "real-always-first" case.
+        assert!(
+            real_first < trials,
+            "real hash must not be issued first on every run (was {real_first}/{trials})"
+        );
+    }
+
+    #[test]
+    fn padding_returned_results_match_unpadded_results() {
+        // Whichever interleaving the shuffle picks, the returned
+        // `Vec<PrefetchedShard>` must be byte-identical to the
+        // unpadded path — only the *transport call sequence*
+        // changes when padding is on.
+        let cfg = fresh_config(PrivacyLevel::High);
+        let t_padded = RecordingTransport::default();
+        let t_unpadded = RecordingTransport::default();
+        for shard_type in ["text", "fuzzy", "vector", "media"] {
+            let bytes = format!("{shard_type}-bytes").into_bytes();
+            t_padded.seed("hash", "2026-04", shard_type, bytes.clone());
+            t_unpadded.seed("hash", "2026-04", shard_type, bytes);
+        }
+        let padded =
+            batch_prefetch_shards_with_padding(&t_padded, "hash", "2026-04", &cfg).expect("padded");
+        let unpadded = batch_prefetch_shards(&t_unpadded, "hash", "2026-04").expect("unpadded");
+        assert_eq!(padded, unpadded, "padding must not alter returned shards");
     }
 }

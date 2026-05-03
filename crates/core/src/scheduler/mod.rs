@@ -109,13 +109,20 @@ pub struct ScheduledTask {
 
 impl ScheduledTask {
     /// Build a task descriptor with `next_run_ms = now + interval`.
+    ///
+    /// `interval_ms` is the public `u64` cadence; we saturate
+    /// the cast so an out-of-range value (anything `> i64::MAX`)
+    /// pins `next_run_ms` to the i64 ceiling instead of silently
+    /// wrapping to a negative — i.e. a past-dated `next_run_ms`
+    /// that the scheduler would treat as immediately due.
     pub fn new(task_type: TaskType, interval_ms: u64, now_ms: i64) -> Self {
+        let interval_i64 = i64::try_from(interval_ms).unwrap_or(i64::MAX);
         Self {
             task_id: task_type.default_task_id().into(),
             task_type,
             interval_ms,
             last_run_ms: None,
-            next_run_ms: now_ms.saturating_add(interval_ms as i64),
+            next_run_ms: now_ms.saturating_add(interval_i64),
         }
     }
 }
@@ -388,6 +395,62 @@ mod tests {
             assert!(
                 id.starts_with("kchat.scheduler."),
                 "namespaced task_id required, got {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_task_new_saturates_overflow_intervals() {
+        // Regression: `interval_ms as i64` would silently wrap on
+        // any value `> i64::MAX`, producing a *negative* delta
+        // and a `next_run_ms` in the past. The fix uses
+        // `i64::try_from(interval_ms).unwrap_or(i64::MAX)` so the
+        // out-of-range case pins to the i64 ceiling instead.
+        for interval_ms in [
+            (i64::MAX as u64) + 1,
+            (i64::MAX as u64) + 1_000,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let t = ScheduledTask::new(TaskType::IncrementalBackup, interval_ms, 0);
+            assert_eq!(
+                t.next_run_ms,
+                i64::MAX,
+                "overflow interval {interval_ms} must pin next_run_ms to i64::MAX, got {}",
+                t.next_run_ms
+            );
+            assert_eq!(t.interval_ms, interval_ms);
+            assert!(
+                t.next_run_ms >= 0,
+                "next_run_ms must never be negative for any input interval"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_task_new_handles_i64_max_interval_exactly() {
+        // Boundary: `interval_ms == i64::MAX as u64` is the
+        // largest value that fits without saturation, so adding
+        // it to `now_ms = 0` yields exactly `i64::MAX`.
+        let t = ScheduledTask::new(TaskType::IncrementalBackup, i64::MAX as u64, 0);
+        assert_eq!(t.next_run_ms, i64::MAX);
+    }
+
+    #[test]
+    fn scheduled_task_new_never_yields_past_next_run() {
+        // The contract: `next_run_ms >= now_ms` for every
+        // representable `(interval_ms, now_ms)` pair, because a
+        // brand-new task has not run yet and `next_run_ms` is the
+        // first scheduled execution.
+        let now_ms = 1_700_000_000_000_i64; // ~ 2023-11-14 UTC
+        for interval_ms in [0u64, 1, 60_000, 86_400_000, i64::MAX as u64, u64::MAX] {
+            let t = ScheduledTask::new(TaskType::IndexMaintenance, interval_ms, now_ms);
+            assert!(
+                t.next_run_ms >= now_ms,
+                "next_run_ms ({}) must be >= now_ms ({}) for interval {}",
+                t.next_run_ms,
+                now_ms,
+                interval_ms
             );
         }
     }
