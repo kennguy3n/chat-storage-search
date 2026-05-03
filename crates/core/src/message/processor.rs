@@ -810,20 +810,21 @@ impl<'a> MessagePersister<'a> {
         };
         self.db.insert_backup_event(&entry)?;
 
-        // If the deleted message had attached media, also emit an
-        // explicit `media_deleted` backup event. The compaction
-        // planner already drops orphan `MediaReceived` rows under a
-        // `MessageDeleted` tombstone, but writing the explicit
-        // `MediaDeleted` tombstone keeps the backup taxonomy aligned
-        // with `BackupEventType::MediaDeleted` and lets downstream
-        // consumers (restore, compaction across non-adjacent
-        // segments) reason about media without having to walk the
-        // skeleton table.
-        if let Some(asset) = self
+        // For each media asset attached to the deleted message,
+        // emit an explicit `media_deleted` backup event. The
+        // compaction planner already drops orphan `MediaReceived`
+        // rows under a `MessageDeleted` tombstone, but writing one
+        // explicit `MediaDeleted` per asset keeps the backup
+        // taxonomy aligned with `BackupEventType::MediaDeleted` and
+        // lets downstream consumers (restore, compaction across
+        // non-adjacent segments) reason about media without having
+        // to walk the skeleton table. Multi-asset messages emit one
+        // event per asset.
+        let attached_assets = self
             .db
-            .get_media_asset_by_message(&skel.message_id)
-            .map_err(|e| ProcessorError::StorageError(e.to_string()))?
-        {
+            .list_media_assets_by_message(&skel.message_id)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        for asset in &attached_assets {
             let media_payload =
                 encode_media_delete_event_payload(&asset.asset_id, &skel.message_id);
             let media_entry = BackupEventJournalEntry {
@@ -1811,6 +1812,58 @@ mod tests {
 
         assert_eq!(journal_count(&db, "message_deleted"), 2);
         assert_eq!(journal_count(&db, "media_deleted"), 1);
+    }
+
+    #[test]
+    fn delete_with_multi_asset_message_emits_one_media_deleted_per_asset() {
+        // Multi-asset messages must emit one `media_deleted` backup
+        // event per attached asset (not just one for the first
+        // asset). `LocalStoreDb::list_media_assets_by_message`
+        // returns every row deterministically ordered by `asset_id`.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+
+        let mid = Uuid::now_v7();
+        let asset_a = Uuid::now_v7();
+        let asset_b = Uuid::now_v7();
+        let asset_c = Uuid::now_v7();
+        let make_desc = |asset_id: Uuid| MediaDescriptor {
+            asset_id,
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1024,
+            chunk_count: 1,
+            merkle_root: [0u8; 32],
+            blob_id: Uuid::now_v7(),
+            wrapped_k_asset: vec![0u8; 40],
+            storage_sink: None,
+        };
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("with three media".into()),
+            media_descriptors: vec![make_desc(asset_a), make_desc(asset_b), make_desc(asset_c)],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        // Sanity-check the helper that drives the iteration.
+        let attached = db
+            .list_media_assets_by_message(&mid.to_string())
+            .expect("list");
+        assert_eq!(attached.len(), 3);
+
+        p.delete_for_everyone(&mid.to_string()).unwrap();
+
+        assert_eq!(journal_count(&db, "message_deleted"), 1);
+        assert_eq!(
+            journal_count(&db, "media_deleted"),
+            3,
+            "one media_deleted event per attached asset",
+        );
     }
 
     #[test]

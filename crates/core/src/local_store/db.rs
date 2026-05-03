@@ -749,6 +749,61 @@ impl LocalStoreDb {
             .map_err(DbError::from)
     }
 
+    /// List every `media_asset` row attached to `message_id`,
+    /// ordered by `asset_id` for deterministic iteration.
+    ///
+    /// Companion to [`Self::get_media_asset_by_message`], which
+    /// returns at most one row. The delete path
+    /// (`MessagePersister::delete_inner_tx`) calls this to emit one
+    /// `BackupEventType::MediaDeleted` event per attached asset on
+    /// multi-asset messages — `MessageDeleted` already covers the
+    /// compaction-side filter, but explicit per-asset tombstones
+    /// keep the backup taxonomy aligned with
+    /// [`crate::backup::event_journal::BackupEventType::MediaDeleted`].
+    pub fn list_media_assets_by_message(&self, message_id: &str) -> DbResult<Vec<MediaAsset>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                        storage_sink
+                   FROM media_asset
+                  WHERE message_id = ?1
+                  ORDER BY asset_id",
+            )
+            .map_err(DbError::from)?;
+        let rows = stmt
+            .query_map(params![message_id], |row| {
+                let media_state: String = row.get(5)?;
+                let media_state = media_state.parse::<MediaState>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                })?;
+                Ok(MediaAsset {
+                    asset_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    mime_type: row.get(2)?,
+                    bytes_total: row.get(3)?,
+                    bytes_local: row.get(4)?,
+                    media_state,
+                    wrapped_k_asset: row.get(6)?,
+                    chunk_count: row.get(7)?,
+                    merkle_root: row.get(8)?,
+                    blob_id: row.get(9)?,
+                    storage_sink: row.get(10)?,
+                })
+            })
+            .map_err(DbError::from)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(DbError::from)?);
+        }
+        Ok(out)
+    }
+
     /// Update `media_asset.media_state` for `asset_id`. Returns the
     /// number of rows updated (0 when no asset matches).
     ///
@@ -2747,5 +2802,56 @@ mod tests {
             .get_media_asset_by_message("m-does-not-exist")
             .unwrap()
             .is_none());
+    }
+
+    // ----------------------------------------------------------------
+    // list_media_assets_by_message — multi-asset media support for
+    // `MessagePersister::delete_inner_tx` (Phase 4 backup taxonomy).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn list_media_assets_by_message_returns_every_asset_for_message() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m-multi", "c-multi", "caption");
+        let make_asset = |asset_id: &str, blob_id: &str| MediaAsset {
+            asset_id: asset_id.into(),
+            message_id: "m-multi".into(),
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1024,
+            bytes_local: 512,
+            media_state: MediaState::ThumbnailOnly,
+            wrapped_k_asset: vec![0xFE; 40],
+            chunk_count: 4,
+            merkle_root: vec![0xAB; 32],
+            blob_id: blob_id.into(),
+            storage_sink: "kchat_backend".into(),
+        };
+        db.insert_media_asset(&make_asset("asset-c", "blob-c"))
+            .unwrap();
+        db.insert_media_asset(&make_asset("asset-a", "blob-a"))
+            .unwrap();
+        db.insert_media_asset(&make_asset("asset-b", "blob-b"))
+            .unwrap();
+
+        let assets = db.list_media_assets_by_message("m-multi").unwrap();
+        assert_eq!(assets.len(), 3);
+        // Deterministic ORDER BY asset_id.
+        assert_eq!(assets[0].asset_id, "asset-a");
+        assert_eq!(assets[1].asset_id, "asset-b");
+        assert_eq!(assets[2].asset_id, "asset-c");
+    }
+
+    #[test]
+    fn list_media_assets_by_message_returns_empty_when_no_attachment() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m-text", "c-text", "no media");
+        assert!(db
+            .list_media_assets_by_message("m-text")
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_media_assets_by_message("m-does-not-exist")
+            .unwrap()
+            .is_empty());
     }
 }
