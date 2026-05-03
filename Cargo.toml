@@ -11,3 +11,21 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Proprietary"
+
+[workspace.dependencies]
+# ONNX Runtime — optional, off by default. Phase 6 wires this into
+# `crates/core/src/models/{embeddings_onnx,clip}.rs`. We pin to a
+# version with a stable v2 API surface (`ort::ep::DirectML`,
+# `Session::builder()`, etc.). Default features are explicitly
+# listed (rather than relying on `default-features = true`) so
+# the dep tree is auditable — `download-binaries` makes the
+# `ort-sys` build script fetch a prebuilt ORT shared library at
+# compile time (CI hosts have outbound network), avoiding the
+# need for callers to set `ORT_LIB_LOCATION`. The Windows target
+# adds the `directml` feature in `crates/core/Cargo.toml`.
+#
+# Note: `load-dynamic` is intentionally NOT enabled — that path
+# exposes a `SessionOptionsAppendExecutionProvider_VitisAI` binding
+# bug in ort 2.0.0-rc.12 (`ort/src/ep/vitis.rs` references a field
+# that is not in `ort-sys` 2.0.0-rc.12's `OrtApi`).
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }

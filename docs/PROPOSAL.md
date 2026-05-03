@@ -925,7 +925,7 @@ database is open).
 | iOS      | Core ML (preferred) or ONNX Runtime CoreML EP  | `VNRecognizeTextRequest` (Vision)  | Background inference under BGTaskScheduler. INT4 supported via ONNX Runtime CoreML EP for embedding models on devices with tight storage. |
 | Android  | ONNX Runtime NNAPI EP, fallback to CPU EP      | ML Kit Text Recognition v2         | WorkManager job constrained on battery + thermal + network. INT4 default for embeddings on low-end Android (tight storage budget); INT8 on flagship. |
 | macOS    | Core ML or ONNX Runtime CoreML EP              | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
-| Windows  | ONNX Runtime CPU EP                            | Multilingual OCR via Tesseract / Windows.Media.Ocr | **Must run CPU-only**; INT8 quantized models essential. INT4 (`MatMulNBits`) supported and is the default on Windows tablets / low-storage SKUs. |
+| Windows  | ONNX Runtime DirectML EP (preferred) or CPU EP (fallback) | Multilingual OCR via Tesseract / Windows.Media.Ocr | DirectML EP for GPU-equipped machines; CPU EP fallback for CPU-only laptops; INT8/INT4 (`MatMulNBits`) quantized models essential. INT4 is the default on Windows tablets / low-storage SKUs. |
 
 ### 7.8 Search index shard format
 

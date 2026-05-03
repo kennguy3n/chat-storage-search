@@ -5,6 +5,20 @@ edition.workspace = true
 license.workspace = true
 description = "KChat Storage & Search — platform-agnostic core (E2EE local store, archive, backup, search)."
 
+[features]
+default = []
+# Enables the Phase 6 ONNX Runtime scaffold for XLM-R + MobileCLIP-S2.
+# Off by default so the standard `cargo build --workspace` and
+# `cargo test --workspace` do not pull the `ort` crate. The
+# EP-selection state machine in `models::embeddings_onnx` and
+# `models::clip` is ALWAYS compiled (no feature gate) so unit tests
+# can exercise it on any host; only the actual `ort::Session`
+# creation is gated behind this feature plus
+# `cfg(target_os = "windows")` (DirectML attempt) or
+# `cfg(not(target_os = "windows"))` (CPU EP only). See
+# `docs/ARCHITECTURE.md §11.4`.
+onnx-runtime = ["dep:ort"]
+
 [dependencies]
 blake3 = "1"
 hkdf = "0.12"
@@ -22,6 +36,19 @@ zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "column_decltype"] }
 unicode-normalization = "0.1"
+ort = { workspace = true, optional = true }
+
+# On Windows builds, additionally enable the `directml` feature on the
+# `ort` crate so `ort::ep::DirectML` is available for the preferred-EP
+# attempt in `models::embeddings_onnx::create_xlmr_session` and
+# `models::clip::create_mobileclip_session`. Cargo unifies features
+# across `[dependencies]` and `[target.*.dependencies]`, so the
+# resulting `ort` build on Windows is `[..., directml]` while the
+# Linux / macOS build (used by CI lint and by the `--all-features`
+# clippy pass) does NOT enable `directml` and therefore does not
+# require any DirectML SDK to be present.
+[target.'cfg(windows)'.dependencies]
+ort = { workspace = true, optional = true, features = ["directml"] }
 
 [dev-dependencies]
 hex = "0.4"

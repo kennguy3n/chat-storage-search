@@ -862,7 +862,8 @@ Checklist:
 - [ ] Model manager (lazy download, versioning, INT8 quantization).
 - [ ] Encrypted vector / media shard archive.
 - [ ] On-device reranking with semantic scores.
-- [ ] Desktop support: macOS (Core ML), Windows (CPU-only ONNX RT).
+- [ ] Desktop support: macOS (Core ML), Windows (DirectML EP
+      preferred, CPU EP fallback).
 - [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
       `kennguy3n/slm-guardrail` in the search pipeline
       (`(message_id, model_version)` keyed `search_vector` row;

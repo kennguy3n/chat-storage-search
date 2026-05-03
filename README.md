@@ -589,7 +589,10 @@ content from day one.
   embeddings (~40 MB INT4 / ~80 MB INT8), `Whisper-base` (~140 MB)
   / `Whisper-tiny` (~75 MB) audio transcription. INT4 quantization
   uses ONNX Runtime's `MatMulNBits` and is supported on the
-  embedding models only — Whisper stays at INT8.
+  embedding models only — Whisper stays at INT8. On Windows, ONNX
+  Runtime uses the DirectML EP when a compatible GPU is available
+  and falls back to the CPU EP otherwise (best-effort session
+  creation; see `docs/ARCHITECTURE.md §11.4`).
 - **BLAKE3** for content hashing (matches `kennguy3n/zk-object-fabric`'s
   Pattern C convergent dedup so backup interop is bit-identical).
 - **XChaCha20-Poly1305** as the default AEAD; **AES-256-GCM** as
