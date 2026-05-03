@@ -354,6 +354,34 @@ mod jni_bindings {
         }
     }
 
+    /// Encode `value` as a `jstring`, throwing a
+    /// `KChatException` on JNI allocation failure. Returns
+    /// `null_ret` after the throw so the JVM unwinds back to the
+    /// caller; the unwind ensures the null is interpreted as a
+    /// pending exception, never as a successful "no value" result.
+    /// Callers that distinguish "not found" from a JNI failure
+    /// (notably `getMessage`) must use this helper rather than
+    /// `unwrap_or(null_ret)` so the two paths stay
+    /// distinguishable on the Kotlin side.
+    fn new_string_or_throw<'a>(
+        env: &mut JNIEnv<'a>,
+        value: &str,
+        null_ret: JString<'a>,
+    ) -> JString<'a> {
+        match env.new_string(value) {
+            Ok(js) => js,
+            Err(e) => {
+                throw_kchat(
+                    env,
+                    &BridgeError::Jni {
+                        message: e.to_string(),
+                    },
+                );
+                null_ret
+            }
+        }
+    }
+
     fn handle_from_ptr<'a>(env: &mut JNIEnv, ptr: jlong) -> Option<&'a KChatBridgeHandle> {
         if ptr == 0 {
             throw_kchat(
@@ -514,7 +542,7 @@ mod jni_bindings {
             None => return null_ret,
         };
         match handle.search(&q, &scope) {
-            Ok(s) => env.new_string(s).unwrap_or(null_ret),
+            Ok(s) => new_string_or_throw(&mut env, &s, null_ret),
             Err(err) => {
                 throw_kchat(&mut env, &err);
                 null_ret
@@ -625,7 +653,7 @@ mod jni_bindings {
         };
         match handle.get_message(&mid) {
             Ok(None) => null_ret,
-            Ok(Some(s)) => env.new_string(s).unwrap_or(null_ret),
+            Ok(Some(s)) => new_string_or_throw(&mut env, &s, null_ret),
             Err(err) => {
                 throw_kchat(&mut env, &err);
                 null_ret
@@ -658,7 +686,7 @@ mod jni_bindings {
         // arg.
         let before = if before_ms < 0 { None } else { Some(before_ms) };
         match handle.get_conversation_messages(&conv, before, limit.max(0) as u32) {
-            Ok(s) => env.new_string(s).unwrap_or(null_ret),
+            Ok(s) => new_string_or_throw(&mut env, &s, null_ret),
             Err(err) => {
                 throw_kchat(&mut env, &err);
                 null_ret
