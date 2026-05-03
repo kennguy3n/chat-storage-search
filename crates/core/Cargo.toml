@@ -21,6 +21,7 @@ thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "column_decltype"] }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 hex = "0.4"

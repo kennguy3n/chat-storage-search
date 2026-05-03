@@ -458,11 +458,29 @@ the standard library and chosen primitives.
 > `pad_to_size_class` / `unpad_from_size_class`, the
 > `SealedChunk` / `ChunkedMedia` pair, `DEFAULT_CHUNK_SIZE`),
 > `media/processor.rs` (`process_media` →
-> `MediaProcessResult { descriptor, sealed_chunks,
-> k_asset_raw }` with random `K_asset` generation, AES-256-KW
-> wrap, and `MediaDescriptor` assembly), and `media/upload.rs`
-> (`upload_chunked_media` / `resume_upload` over
-> `TransportClient` with server-side BLAKE3 verification).
+> `MediaProcessResult { descriptor, sealed_chunks, k_asset_raw,
+> initial_media_state }` with random `K_asset` generation,
+> AES-256-KW wrap, `MediaDescriptor` assembly, and the
+> `transition_media_state` / `mark_downloaded` /
+> `mark_evicted` / `mark_deleted` helpers that drive the
+> `MediaState` machine through `LocalStoreDb::update_media_state`),
+> `media/upload.rs` (`upload_chunked_media` / `resume_upload`
+> over `TransportClient` with server-side BLAKE3 verification),
+> `media/download.rs` (`download_chunked_media` /
+> `download_single_chunk` fetching encrypted chunks via
+> `TransportClient::fetch_blob_range`, per-chunk SHA-256
+> fast-fail, AEAD-open with per-chunk AAD, BLAKE3 root
+> verification), `media/cache.rs` (`MediaCache` with O(1)
+> insert / `touch` / `remove` and LRU eviction to a
+> configurable byte budget), `media/caption.rs`
+> (`normalize_caption`, `sanitize_filename`, `validate_mime_type`
+> with Unicode NFC normalization, filesystem-illegal-char
+> stripping, byte-budget truncation that preserves character
+> boundaries, and full multilingual coverage), and
+> `media/routing.rs` (`route_media_upload` /
+> `route_media_download` dispatching between the KChat backend
+> via `TransportClient` and the configured `MediaBlobSink`
+> based on `is_thumbnail` and `MediaBlobReference::storage_sink`).
 >
 > The remaining higher-level modules
 > (`archive`, `backup`, `offload`, `restore`, `models`,
