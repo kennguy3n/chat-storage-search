@@ -364,10 +364,7 @@ mod tests {
             ArchiveEventType::ConversationCreated,
             ArchiveEventType::ConversationDeleted,
         ] {
-            assert_eq!(
-                ArchiveEventType::parse_snake_case(ty.as_str()).unwrap(),
-                ty
-            );
+            assert_eq!(ArchiveEventType::parse_snake_case(ty.as_str()).unwrap(), ty);
             // serde round-trip too.
             let json = serde_json::to_string(&ty).unwrap();
             let back: ArchiveEventType = serde_json::from_str(&json).unwrap();
