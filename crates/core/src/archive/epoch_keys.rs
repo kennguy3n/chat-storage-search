@@ -195,6 +195,29 @@ impl EpochKeyManager {
     pub fn retired_epoch_ids(&self) -> Vec<String> {
         self.prior_epoch_keys.keys().cloned().collect()
     }
+
+    /// Snapshot of every retired epoch id paired with its wrapped
+    /// key bytes — the canonical input to
+    /// [`crate::archive::manifest_builder::ManifestBuildRequest::wrapped_prior_epoch_keys`].
+    ///
+    /// The pairs are returned in lexicographic epoch-id order so the
+    /// resulting manifest is deterministic across rebuilds. The
+    /// returned `Vec<u8>` is a fresh clone of the wrapped bytes — the
+    /// manager keeps the canonical copy until
+    /// [`Self::delete_epoch_key`] retires it for forward secrecy.
+    pub fn wrapped_prior_epoch_keys_for_manifest(
+        &self,
+    ) -> Vec<crate::formats::manifest::WrappedEpochKeyRef> {
+        self.prior_epoch_keys
+            .iter()
+            .map(
+                |(id, wrapped)| crate::formats::manifest::WrappedEpochKeyRef {
+                    epoch_id: id.clone(),
+                    wrapped_key: wrapped.clone(),
+                },
+            )
+            .collect()
+    }
 }
 
 #[cfg(test)]

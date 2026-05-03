@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
     BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
-    TimelineRow, SCHEMA_SQL,
+    StorageBackend, TimelineRow, SCHEMA_SQL,
 };
 use super::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 
@@ -537,6 +537,100 @@ impl LocalStoreDb {
         update_archive_state(&self.conn, message_ids, new_state)
     }
 
+    /// Read the typed `storage_backend` column for an
+    /// `archive_segment_map` row.
+    ///
+    /// Returns `Ok(None)` when the segment id is unknown. The text
+    /// stored on disk is normalized through
+    /// [`StorageBackend::from_str`] so callers never have to
+    /// re-validate the column's free-form `TEXT` value;
+    /// non-canonical values surface as
+    /// [`DbError::InvalidState`].
+    pub fn get_segment_storage_backend(
+        &self,
+        segment_id: &str,
+    ) -> DbResult<Option<StorageBackend>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT storage_backend FROM archive_segment_map WHERE segment_id = ?1",
+                params![segment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match raw {
+            None => Ok(None),
+            Some(s) => s
+                .parse::<StorageBackend>()
+                .map(Some)
+                .map_err(|e| DbError::InvalidState(e.to_string())),
+        }
+    }
+
+    /// Update the `storage_backend` column for an
+    /// `archive_segment_map` row. Returns the number of rows
+    /// actually updated (0 when no segment matches).
+    ///
+    /// `docs/PROPOSAL.md §10.1` calls this out as the single point
+    /// the orchestration layer flips a segment from the KChat
+    /// backend to ZK Object Fabric — the manifest builder records
+    /// the change in the next manifest, and the prefetch path
+    /// dispatches by `storage_backend` on every read.
+    pub fn update_segment_storage_backend(
+        &self,
+        segment_id: &str,
+        new_backend: StorageBackend,
+    ) -> DbResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE archive_segment_map SET storage_backend = ?1 WHERE segment_id = ?2",
+            params![new_backend.as_str(), segment_id],
+        )?;
+        Ok(rows)
+    }
+
+    /// Insert a skeleton row pulled from a remote archive segment,
+    /// **without overwriting** any pre-existing local skeleton for
+    /// `message_id`.
+    ///
+    /// `docs/PROPOSAL.md §5.1` (skeleton-first rendering) — when
+    /// the orchestration layer rehydrates a scroll-back bucket it
+    /// merges the skeletons it pulls from the archive into the
+    /// local store. Existing local rows always win because they
+    /// carry richer state (e.g. a freshly-cached body, or media
+    /// progress) than the archive-only stub.
+    ///
+    /// Returns `true` when a brand-new row was actually inserted,
+    /// `false` when the `message_id` was already present and the
+    /// archive copy was discarded.
+    pub fn upsert_skeleton_from_archive(&self, skel: &MessageSkeleton) -> DbResult<bool> {
+        let rows = self.conn.execute(
+            "INSERT OR IGNORE INTO message_skeleton (
+                message_id, conversation_id, sender_id,
+                created_at_ms, received_at_ms, kind,
+                body_state, media_state, archive_state, backup_state,
+                reply_to, edited_at_ms, deleted_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+             )",
+            params![
+                skel.message_id,
+                skel.conversation_id,
+                skel.sender_id,
+                skel.created_at_ms,
+                skel.received_at_ms,
+                skel.kind.as_str(),
+                skel.body_state.to_string(),
+                skel.media_state.map(|s| s.to_string()),
+                skel.archive_state.to_string(),
+                skel.backup_state.to_string(),
+                skel.reply_to,
+                skel.edited_at_ms,
+                skel.deleted_at_ms,
+            ],
+        )?;
+        Ok(rows == 1)
+    }
+
     /// Insert a row into `media_asset`.
     ///
     /// `docs/PROPOSAL.md §3.2` (`media_asset` columns) and §5.7
@@ -580,6 +674,53 @@ impl LocalStoreDb {
                    FROM media_asset
                   WHERE asset_id = ?1",
                 params![asset_id],
+                |row| {
+                    let media_state: String = row.get(5)?;
+                    let media_state = media_state.parse::<MediaState>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                        )
+                    })?;
+                    Ok(MediaAsset {
+                        asset_id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        bytes_total: row.get(3)?,
+                        bytes_local: row.get(4)?,
+                        media_state,
+                        wrapped_k_asset: row.get(6)?,
+                        chunk_count: row.get(7)?,
+                        merkle_root: row.get(8)?,
+                        blob_id: row.get(9)?,
+                        storage_sink: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    /// Lookup the `media_asset` row attached to `message_id`, if
+    /// any.
+    ///
+    /// Mirrors [`Self::get_media_asset`] but keys on the owning
+    /// `message_id` rather than the `asset_id`. The hydration path
+    /// (`docs/PROPOSAL.md §5.2` — lazy media rehydration on tap)
+    /// pulls the asset row through this helper so the caller can
+    /// inspect [`MediaState`] before deciding whether to fetch the
+    /// blob.
+    pub fn get_media_asset_by_message(&self, message_id: &str) -> DbResult<Option<MediaAsset>> {
+        self.conn
+            .query_row(
+                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                        storage_sink
+                   FROM media_asset
+                  WHERE message_id = ?1
+                  LIMIT 1",
+                params![message_id],
                 |row| {
                     let media_state: String = row.get(5)?;
                     let media_state = media_state.parse::<MediaState>().map_err(|e| {
@@ -2389,5 +2530,210 @@ mod tests {
         for mid in ["m1", "m2", "m3"] {
             assert_eq!(read_archive_state(&db, mid), ArchiveState::ArchivePending);
         }
+    }
+
+    fn seed_segment_row(db: &LocalStoreDb, segment_id: &str, storage_backend: &str) {
+        db.connection()
+            .execute(
+                "INSERT INTO archive_segment_map(
+                    segment_id, conversation_id, time_bucket, segment_type,
+                    blob_id, storage_backend, merkle_root, state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    segment_id,
+                    "c-seg",
+                    "2026-05",
+                    "message_delta",
+                    format!("blob-{segment_id}"),
+                    storage_backend,
+                    vec![0u8; 32],
+                    "archive_uploaded",
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn get_segment_storage_backend_round_trip() {
+        let db = fresh_db();
+        seed_segment_row(&db, "seg-kchat", "kchat_backend");
+        seed_segment_row(&db, "seg-zkof", "zk_object_fabric");
+        assert_eq!(
+            db.get_segment_storage_backend("seg-kchat").unwrap(),
+            Some(StorageBackend::KChatBackend)
+        );
+        assert_eq!(
+            db.get_segment_storage_backend("seg-zkof").unwrap(),
+            Some(StorageBackend::ZkObjectFabric)
+        );
+    }
+
+    #[test]
+    fn get_segment_storage_backend_missing_returns_none() {
+        let db = fresh_db();
+        assert!(db
+            .get_segment_storage_backend("never-seen")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn get_segment_storage_backend_default_is_kchat_backend() {
+        let db = fresh_db();
+        // Insert a row without specifying storage_backend so the
+        // schema default kicks in.
+        db.connection()
+            .execute(
+                "INSERT INTO archive_segment_map(
+                    segment_id, conversation_id, time_bucket, segment_type,
+                    blob_id, merkle_root, state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "seg-default",
+                    "c-seg",
+                    "2026-05",
+                    "message_delta",
+                    "blob-default",
+                    vec![0u8; 32],
+                    "archive_uploaded",
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_segment_storage_backend("seg-default").unwrap(),
+            Some(StorageBackend::KChatBackend)
+        );
+    }
+
+    #[test]
+    fn update_segment_storage_backend_returns_rows_affected() {
+        let db = fresh_db();
+        seed_segment_row(&db, "seg-flip", "kchat_backend");
+        let n = db
+            .update_segment_storage_backend("seg-flip", StorageBackend::ZkObjectFabric)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            db.get_segment_storage_backend("seg-flip").unwrap(),
+            Some(StorageBackend::ZkObjectFabric)
+        );
+        let n = db
+            .update_segment_storage_backend("never-seen", StorageBackend::ZkObjectFabric)
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn get_segment_storage_backend_rejects_unknown_value() {
+        let db = fresh_db();
+        seed_segment_row(&db, "seg-bad", "frobnicator_v2");
+        let err = db.get_segment_storage_backend("seg-bad").unwrap_err();
+        assert!(matches!(err, DbError::InvalidState(_)), "got {err:?}");
+    }
+
+    // ----------------------------------------------------------------
+    // upsert_skeleton_from_archive (Task 4 — `docs/PROPOSAL.md §5.1`)
+    // ----------------------------------------------------------------
+
+    fn archive_skeleton(mid: &str, conv: &str) -> MessageSkeleton {
+        MessageSkeleton {
+            message_id: mid.into(),
+            conversation_id: conv.into(),
+            sender_id: "remote-sender".into(),
+            created_at_ms: 1_700_000_000_000,
+            received_at_ms: 1_700_000_000_500,
+            kind: MessageKind::Text,
+            body_state: BodyState::RemoteArchiveOnly,
+            media_state: None,
+            archive_state: ArchiveState::ArchiveUploaded,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn upsert_skeleton_from_archive_inserts_new_row() {
+        let db = fresh_db();
+        let conv = Conversation {
+            conversation_id: "c-arch".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 0,
+        };
+        db.insert_conversation(&conv).unwrap();
+        let skel = archive_skeleton("m-arch", "c-arch");
+
+        assert!(
+            db.upsert_skeleton_from_archive(&skel).unwrap(),
+            "first insert returns true"
+        );
+        let stored = db.get_message_skeleton("m-arch").unwrap().unwrap();
+        assert_eq!(stored.body_state, BodyState::RemoteArchiveOnly);
+        assert_eq!(stored.sender_id, "remote-sender");
+    }
+
+    #[test]
+    fn upsert_skeleton_from_archive_does_not_overwrite_existing_row() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m1", "c-keep", "local body");
+
+        let mut archive_view = archive_skeleton("m1", "c-keep");
+        archive_view.sender_id = "should-not-replace".into();
+        let inserted = db.upsert_skeleton_from_archive(&archive_view).unwrap();
+        assert!(!inserted, "INSERT OR IGNORE must skip existing rows");
+
+        let stored = db.get_message_skeleton("m1").unwrap().unwrap();
+        assert_eq!(
+            stored.body_state,
+            BodyState::LocalPlainAvailable,
+            "local skeleton wins"
+        );
+        assert_eq!(stored.sender_id, "user-1");
+    }
+
+    // ----------------------------------------------------------------
+    // get_media_asset_by_message (Task 5 — `docs/PROPOSAL.md §5.2`)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn get_media_asset_by_message_returns_attached_asset() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m-media", "c-media", "caption");
+        let asset = MediaAsset {
+            asset_id: "asset-1".into(),
+            message_id: "m-media".into(),
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1024,
+            bytes_local: 512,
+            media_state: MediaState::ThumbnailOnly,
+            wrapped_k_asset: vec![0xFE; 40],
+            chunk_count: 4,
+            merkle_root: vec![0xAB; 32],
+            blob_id: "blob-1".into(),
+            storage_sink: "kchat_backend".into(),
+        };
+        db.insert_media_asset(&asset).unwrap();
+
+        let got = db
+            .get_media_asset_by_message("m-media")
+            .unwrap()
+            .expect("asset row");
+        assert_eq!(got.asset_id, "asset-1");
+        assert_eq!(got.media_state, MediaState::ThumbnailOnly);
+    }
+
+    #[test]
+    fn get_media_asset_by_message_returns_none_when_no_attachment() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m-text", "c-text", "no media");
+        assert!(db.get_media_asset_by_message("m-text").unwrap().is_none());
+        assert!(db
+            .get_media_asset_by_message("m-does-not-exist")
+            .unwrap()
+            .is_none());
     }
 }

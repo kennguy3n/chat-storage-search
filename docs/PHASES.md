@@ -265,14 +265,27 @@ Checklist:
       `INSERT OR REPLACE` on `message_body` plus a `body_state`
       UPDATE in one SAVEPOINT without touching `created_at_ms` /
       `received_at_ms`, then re-indexes into `search_fts` and
-      `search_fuzzy_words`. Wired into `CoreImpl::hydrate_message`.)_
+      `search_fuzzy_words`. Wired into `CoreImpl::hydrate_message`.
+      The bucket-level scroll-back rehydration sits on
+      `CoreImpl::rehydrate_timeline_skeletons` —
+      `batch_prefetch_bucket` → `archive::download::decrypt_archive_segment`
+      → `LocalStoreDb::upsert_skeleton_from_archive` (`INSERT OR
+      IGNORE` so existing local rows always win), landing
+      archive-only stub skeletons at
+      `BodyState::RemoteArchiveOnly`.)_
 - [x] Lazy media rehydration on tap. _(`media::download::rehydrate_media_asset`
       reads `media_asset.{blob_id, storage_sink, chunk_count,
       merkle_root, wrapped_k_asset}`, unwraps `K_asset` via
       `K_local_db`, drives the chunked download through
       `TransportClient` or the configured `MediaBlobSink` based
       on `storage_sink`, verifies the BLAKE3 root, and flips
-      `media_state` to `original_local`.)_
+      `media_state` to `original_local`. The on-tap UI flow
+      surfaces through `CoreImpl::rehydrate_media_for_message` —
+      resolves the asset by `message_id` via
+      `LocalStoreDb::get_media_asset_by_message`, and
+      `hydrate_message` escalates the queued
+      `HydrationReason` to `MediaFullScreen` whenever the
+      attached asset is `MediaState::Evicted`.)_
 - [~] Prefetch window management (viewport ± 100–150 messages).
       _(`HydrationQueue::enqueue_prefetch_window` plus
       `CoreImpl::enqueue_prefetch_window` widen a viewport into

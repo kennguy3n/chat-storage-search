@@ -211,6 +211,87 @@ impl MessageKind {
     }
 }
 
+/// Typed value of `archive_segment_map.storage_backend`
+/// (`docs/PROPOSAL.md §10.1`).
+///
+/// The SQL column is a free-form `TEXT NOT NULL DEFAULT
+/// 'kchat_backend'`, but every row should be a member of this enum.
+/// Use [`Self::as_str`] to round-trip into the column and
+/// [`std::str::FromStr`] / [`Self::parse`] to round-trip back.
+///
+/// Compared to [`crate::config::ArchiveBackend`] (which uses the
+/// short `"kchat"` / `"zkof"` tags for the public configuration
+/// surface), this enum carries the *full* backend identifier
+/// persisted to disk — `"kchat_backend"` and `"zk_object_fabric"`.
+/// The two are deliberately disjoint so the configuration JSON and
+/// the SQL column never alias on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackend {
+    /// Default for legacy rows. Segments live in the KChat
+    /// PostgreSQL blob service and are addressed via
+    /// [`crate::transport::TransportClient`].
+    #[default]
+    #[serde(rename = "kchat_backend")]
+    KChatBackend,
+    /// ZK Object Fabric (S3 API). Segments live in the configured
+    /// ZKOF tenant bucket.
+    #[serde(rename = "zk_object_fabric")]
+    ZkObjectFabric,
+}
+
+impl StorageBackend {
+    /// Canonical snake_case representation persisted to the SQL
+    /// column. The values are pinned by `docs/PROPOSAL.md §10.1`
+    /// and the schema column default in [`SCHEMA_SQL`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageBackend::KChatBackend => "kchat_backend",
+            StorageBackend::ZkObjectFabric => "zk_object_fabric",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned by `StorageBackend::from_str` when the input is
+/// not one of the canonical values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBackendParseError(pub String);
+
+impl std::fmt::Display for StorageBackendParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid storage_backend value: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for StorageBackendParseError {}
+
+impl std::str::FromStr for StorageBackend {
+    type Err = StorageBackendParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "kchat_backend" => Ok(StorageBackend::KChatBackend),
+            "zk_object_fabric" => Ok(StorageBackend::ZkObjectFabric),
+            other => Err(StorageBackendParseError(other.to_string())),
+        }
+    }
+}
+
+impl From<crate::config::ArchiveBackend> for StorageBackend {
+    fn from(backend: crate::config::ArchiveBackend) -> Self {
+        match backend {
+            crate::config::ArchiveBackend::KChat => StorageBackend::KChatBackend,
+            crate::config::ArchiveBackend::Zkof => StorageBackend::ZkObjectFabric,
+        }
+    }
+}
+
 /// `conversation` row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
@@ -633,5 +714,60 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), TABLES.len(), "TABLES has duplicates");
+    }
+
+    #[test]
+    fn storage_backend_canonical_strings() {
+        assert_eq!(StorageBackend::KChatBackend.as_str(), "kchat_backend");
+        assert_eq!(StorageBackend::ZkObjectFabric.as_str(), "zk_object_fabric");
+        assert_eq!(StorageBackend::default(), StorageBackend::KChatBackend);
+        assert_eq!(StorageBackend::KChatBackend.to_string(), "kchat_backend");
+    }
+
+    #[test]
+    fn storage_backend_round_trips_through_serde() {
+        for b in [StorageBackend::KChatBackend, StorageBackend::ZkObjectFabric] {
+            let json = serde_json::to_string(&b).unwrap();
+            let back: StorageBackend = serde_json::from_str(&json).unwrap();
+            assert_eq!(b, back);
+        }
+    }
+
+    #[test]
+    fn storage_backend_parses_canonical_strings() {
+        use std::str::FromStr;
+        assert_eq!(
+            StorageBackend::from_str("kchat_backend").unwrap(),
+            StorageBackend::KChatBackend
+        );
+        assert_eq!(
+            StorageBackend::from_str("zk_object_fabric").unwrap(),
+            StorageBackend::ZkObjectFabric
+        );
+        let err = StorageBackend::from_str("not_a_backend").unwrap_err();
+        assert_eq!(err.0, "not_a_backend");
+        assert!(err.to_string().contains("not_a_backend"));
+    }
+
+    #[test]
+    fn storage_backend_from_archive_backend() {
+        use crate::config::ArchiveBackend;
+        assert_eq!(
+            StorageBackend::from(ArchiveBackend::KChat),
+            StorageBackend::KChatBackend
+        );
+        assert_eq!(
+            StorageBackend::from(ArchiveBackend::Zkof),
+            StorageBackend::ZkObjectFabric
+        );
+    }
+
+    #[test]
+    fn storage_backend_schema_default_matches_kchat_backend() {
+        // The SQL `DEFAULT 'kchat_backend'` literal in
+        // `archive_segment_map` must agree with the `Default` impl
+        // for [`StorageBackend`].
+        assert!(SCHEMA_SQL.contains("storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend'"));
+        assert_eq!(StorageBackend::default().as_str(), "kchat_backend");
     }
 }
