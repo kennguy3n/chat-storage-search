@@ -927,6 +927,18 @@ database is open).
 | macOS    | Core ML or ONNX Runtime CoreML EP              | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
 | Windows  | ONNX Runtime DirectML EP (preferred) or CPU EP (fallback) | Multilingual OCR via Tesseract / Windows.Media.Ocr | DirectML EP for GPU-equipped machines; CPU EP fallback for CPU-only laptops; INT8/INT4 (`MatMulNBits`) quantized models essential. INT4 is the default on Windows tablets / low-storage SKUs. |
 
+#### 7.7.1 Model warm-up strategy
+
+XLM-R is pre-loaded during app startup on all platforms because it
+serves both the guardrail pipeline and semantic search. The ONNX
+session is created eagerly and kept resident on desktop; on mobile
+it is loaded during the first idle period after launch (via
+`BGTaskScheduler` on iOS, `WorkManager` on Android).
+
+MobileCLIP-S2 and Whisper remain lazy-loaded on first use, since
+they are only needed for image search and audio transcription
+respectively.
+
 ### 7.8 Search index shard format
 
 Index shards are encrypted on the backend and decrypted on-device

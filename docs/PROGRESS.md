@@ -859,7 +859,10 @@ Checklist:
 - [ ] Document text extraction (PDF, DOCX) with page-level indexing.
 - [ ] Resource-gated background processing (battery, thermal,
       charging, network).
-- [ ] Model manager (lazy download, versioning, INT8 quantization).
+- [ ] Model manager: lazy download on first semantic-search use
+      (MobileCLIP-S2, Whisper) or eager pre-load (XLM-R),
+      versioning, INT8/INT4 quantization, integrity-checked
+      artifacts, warm-up strategy.
 - [ ] Encrypted vector / media shard archive.
 - [ ] On-device reranking with semantic scores.
 - [ ] Desktop support: macOS (Core ML), Windows (DirectML EP

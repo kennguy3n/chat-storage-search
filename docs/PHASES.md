@@ -362,8 +362,10 @@ Checklist:
       handling and page-level indexing.
 - [ ] Resource-gated background processing: battery level, thermal
       state, charging, network type.
-- [ ] Model manager: lazy download on first semantic-search use,
-      versioning, INT8 quantization, integrity-checked artifacts.
+- [ ] Model manager: lazy download on first semantic-search use
+      (MobileCLIP-S2, Whisper) or eager pre-load (XLM-R),
+      versioning, INT8/INT4 quantization, integrity-checked
+      artifacts, warm-up strategy.
 - [ ] Encrypted vector / media index shard archive.
 - [ ] On-device reranking with semantic similarity scores.
 - [ ] Desktop support: macOS (Core ML), Windows (DirectML EP

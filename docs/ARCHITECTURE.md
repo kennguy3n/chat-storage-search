@@ -1213,6 +1213,7 @@ sequenceDiagram
 | Background work            | `BGTaskScheduler` (`BGProcessingTask` for backup / archive / index maintenance)                              |
 | OCR                        | `VNRecognizeTextRequest` (multilingual; 18+ languages supported in current iOS)                              |
 | ML inference               | Core ML (preferred) or ONNX Runtime CoreML EP                                                                |
+| Model warm-up              | XLM-R session created in `BGProcessingTask` during first idle after launch                                   |
 | iCloud backup              | App's iCloud container file storage for encrypted backup files                                               |
 | Audio session              | Foreground for live recording; background-friendly transcription via Whisper-tiny / Whisper-base             |
 
@@ -1225,6 +1226,7 @@ sequenceDiagram
 | Background work            | `WorkManager` (constraints: charging, unmetered network, thermal-headroom)                                   |
 | OCR                        | ML Kit Text Recognition v2 (multilingual; 50+ languages including CJK)                                       |
 | ML inference               | ONNX Runtime NNAPI EP, fallback to CPU EP                                                                    |
+| Model warm-up              | XLM-R session created in `WorkManager` job during first idle                                                 |
 | Auto Backup                | `BackupAgent` storing recovery envelopes + manifest pointers under the 25 MB cap                             |
 | Large Backup               | Large Backups API where available                                                                            |
 | Storage Access Framework   | User-selected cloud / document provider for large encrypted backup files                                     |
@@ -1238,6 +1240,7 @@ sequenceDiagram
 | Background work            | `NSBackgroundActivityScheduler` + cooperative scheduler                                                      |
 | OCR                        | `VNRecognizeTextRequest` (Vision)                                                                            |
 | ML inference               | Core ML or ONNX Runtime CoreML EP                                                                            |
+| Model warm-up              | XLM-R session created eagerly at startup; kept resident                                                      |
 | Search integration         | Optional Spotlight integration for app-internal search anchors                                               |
 
 ### 11.4 Windows
@@ -1249,6 +1252,7 @@ sequenceDiagram
 | Background work            | Background Tasks / Task Scheduler integration                                                                |
 | OCR                        | `Windows.Media.Ocr` (multilingual where the Language Pack is installed); Tesseract fallback                  |
 | ML inference               | ONNX Runtime DirectML EP (preferred, when GPU available) or CPU EP (fallback); INT8/INT4 quantized models essential |
+| Model warm-up              | XLM-R session created eagerly at startup; kept resident                                                      |
 | Search integration         | Optional Windows Search integration for app-internal anchors                                                 |
 
 > The DirectML EP is best-effort: session creation attempts
