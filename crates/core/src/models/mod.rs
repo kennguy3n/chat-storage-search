@@ -17,7 +17,20 @@
 //!   guardrail (`kennguy3n/slm-guardrail`) and search pipelines
 //!   can start sharing one XLM-R inference per message ahead of
 //!   the Phase 6 ONNX integration.
+//! * [`embeddings_onnx`] — Phase 6 scaffold: the XLM-R
+//!   `ort::Session` creator with the best-effort DirectML → CPU
+//!   execution-provider state machine for Windows
+//!   (`docs/ARCHITECTURE.md §11.4`). The EP-selection function is
+//!   pure Rust so it is unit-tested on any host; the actual
+//!   `ort::Session` glue is gated behind the `onnx-runtime` cargo
+//!   feature.
+//! * [`clip`] — Phase 6 scaffold: the MobileCLIP-S2
+//!   `ort::Session` creator. Re-uses the EP-selection state
+//!   machine from [`embeddings_onnx`] for the same DirectML → CPU
+//!   pattern.
 //!
 //! See `docs/PHASES.md` Phase 6 for the schedule.
 
+pub mod clip;
 pub mod embeddings;
+pub mod embeddings_onnx;

@@ -1248,8 +1248,21 @@ sequenceDiagram
 | Keys                       | DPAPI (`CryptProtectData`) bound to the user profile; TPM-backed via `NCryptCreatePersistedKey` if available |
 | Background work            | Background Tasks / Task Scheduler integration                                                                |
 | OCR                        | `Windows.Media.Ocr` (multilingual where the Language Pack is installed); Tesseract fallback                  |
-| ML inference               | ONNX Runtime CPU EP; **no GPU assumption**; INT8 quantized models essential                                  |
+| ML inference               | ONNX Runtime DirectML EP (preferred, when GPU available) or CPU EP (fallback); INT8/INT4 quantized models essential |
 | Search integration         | Optional Windows Search integration for app-internal anchors                                                 |
+
+> The DirectML EP is best-effort: session creation attempts
+> DirectML first, and falls back to CPU EP if DirectML
+> initialization fails (e.g., no compatible GPU, driver issues).
+> This mirrors the cv-guard `OnnxInferenceBridge` pattern
+> (`kennguy3n/cv-guard`,
+> `desktop/native/windows/Sources/CVGuardAddon/OnnxInferenceBridge.cpp`).
+> The Rust scaffold lives in
+> `crates/core/src/models/embeddings_onnx.rs` (XLM-R) and
+> `crates/core/src/models/clip.rs` (MobileCLIP-S2). The
+> EP-selection state machine is factored as a pure function over
+> a `DirectMlProbe` trait so it can be exhaustively unit-tested
+> on non-Windows hosts.
 
 ---
 

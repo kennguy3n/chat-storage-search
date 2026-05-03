@@ -366,8 +366,8 @@ Checklist:
       versioning, INT8 quantization, integrity-checked artifacts.
 - [ ] Encrypted vector / media index shard archive.
 - [ ] On-device reranking with semantic similarity scores.
-- [ ] Desktop support: macOS (Core ML), Windows (CPU-only ONNX
-      Runtime).
+- [ ] Desktop support: macOS (Core ML), Windows (DirectML EP
+      preferred, CPU EP fallback).
 - [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
       `kennguy3n/slm-guardrail` in the search pipeline. Cache key
       `(message_id, model_version = 'xlmr@v1')`; backed by the
