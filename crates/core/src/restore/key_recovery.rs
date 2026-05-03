@@ -408,7 +408,7 @@ pub fn derive_passphrase_key_with_params(
     salt: &[u8; PASSPHRASE_SALT_LEN],
     params: Argon2Params,
 ) -> Result<[u8; KEY_LEN], Error> {
-    let trimmed = passphrase;
+    let trimmed = passphrase.trim();
     if trimmed.is_empty() {
         return Err(Error::Crypto(CryptoError::InvalidInput(
             "passphrase: must not be empty",
@@ -687,6 +687,66 @@ mod tests {
     fn passphrase_empty_rejected() {
         let salt = fresh_salt();
         assert!(derive_passphrase_key_with_params("", &salt, test_params()).is_err());
+    }
+
+    #[test]
+    fn passphrase_whitespace_only_rejected() {
+        // Passphrases that are only whitespace must fail the same
+        // way as the empty string — otherwise a paste-induced "  "
+        // would silently derive a valid key under any salt.
+        let salt = fresh_salt();
+        for whitespace in ["   ", "\t", "\n", " \t\n "] {
+            let err = derive_passphrase_key_with_params(whitespace, &salt, test_params())
+                .expect_err("whitespace-only passphrase must be rejected");
+            assert!(
+                matches!(err, Error::Crypto(CryptoError::InvalidInput(_))),
+                "expected InvalidInput, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passphrase_leading_trailing_whitespace_trimmed() {
+        // The trim contract: leading / trailing whitespace must
+        // collapse so a clipboard paste landing on a different
+        // device does not lock the user out of K_user_master.
+        let salt = fresh_salt();
+        let canonical = derive_passphrase_key_with_params("hunter2", &salt, test_params()).unwrap();
+        for variant in ["  hunter2", "hunter2  ", "  hunter2  ", "\thunter2\n"] {
+            let derived = derive_passphrase_key_with_params(variant, &salt, test_params()).unwrap();
+            assert_eq!(
+                derived, canonical,
+                "variant {variant:?} must derive the same key as canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn passphrase_internal_whitespace_preserved() {
+        // The trim contract is leading / trailing only — a passphrase
+        // like "hunter two" must NOT collapse to "huntertwo".
+        let salt = fresh_salt();
+        let with_space =
+            derive_passphrase_key_with_params("hunter two", &salt, test_params()).unwrap();
+        let without_space =
+            derive_passphrase_key_with_params("huntertwo", &salt, test_params()).unwrap();
+        assert_ne!(
+            with_space, without_space,
+            "internal whitespace must be preserved"
+        );
+    }
+
+    #[test]
+    fn passphrase_round_trip_survives_clipboard_padding() {
+        // End-to-end version of the trim contract: wrap on device A
+        // with a clean passphrase, unwrap on device B with a
+        // whitespace-padded passphrase, master must round-trip.
+        let mut master = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut master);
+        let envelope = wrap_master_key_with_passphrase(&master, "hunter2").expect("wrap");
+        let recovered =
+            unwrap_master_key_with_passphrase(&envelope, "  hunter2\n").expect("unwrap");
+        assert_eq!(*recovered, master);
     }
 
     #[test]
