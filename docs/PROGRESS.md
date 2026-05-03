@@ -852,8 +852,13 @@ Checklist:
 - [ ] HNSW vector index for semantic text search.
 - [ ] `MobileCLIP-S2` image / video embeddings (~80 MB INT8 ONNX).
 - [ ] Video keyframe sampling.
-- [ ] Whisper multilingual transcription (`whisper-base` default,
-      ~140 MB; `whisper-tiny` on low-end Android, ~75 MB).
+- [ ] Whisper multilingual transcription: Apple MLX
+      (`mlx-community/whisper-base-mlx`) on Apple Silicon
+      (preferred — Neural Engine, lower latency / battery cost);
+      ONNX Runtime (`whisper-base` ~140 MB INT8) on all other
+      platforms (Intel macOS, Windows, Android, Linux);
+      `whisper-tiny` (~75 MB) on low-end Android. See PROPOSAL
+      §7.6 / §7.7.
 - [ ] Platform OCR bridge (Vision on iOS / macOS; ML Kit on
       Android; `Windows.Media.Ocr` / Tesseract on Windows).
 - [ ] Document text extraction (PDF, DOCX) with page-level indexing.
@@ -934,6 +939,36 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase 6 scaffold: Apple MLX Whisper backend (Apple Silicon) → ONNX Runtime fallback
+
+- Added `crates/core/src/models/whisper.rs`: pure
+  `select_whisper_backend(&AppleSiliconProbe)` state machine
+  that returns `WhisperBackend::Mlx` on Apple Silicon
+  (`aarch64` `macOS` / `iOS`) when the probe reports MLX
+  available, and `WhisperBackend::Onnx` everywhere else.
+  Mirrors the DirectML → CPU pattern in
+  `crates/core/src/models/embeddings_onnx.rs` /
+  `crates/core/src/models/clip.rs` but pivots on
+  `cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))`
+  instead of `cfg(target_os = "windows")`.
+- Canonical artifact identifiers exposed for the model
+  manager: `WHISPER_BASE_MLX_MODEL_REPO =
+  "mlx-community/whisper-base-mlx"` and
+  `WHISPER_BASE_ONNX_ARTIFACT = "whisper-base.int8.onnx"`.
+  `WHISPER_BASE_MLX_MODEL_VERSION` / `WHISPER_BASE_ONNX_MODEL_VERSION`
+  are versioned independently so transcripts cannot leak
+  across decoder families.
+- Documentation alignment: PROPOSAL §7.6 model table gains
+  an "Apple MLX" column; PROPOSAL §7.7 platform table marks
+  iOS / macOS as `MLX (preferred for Whisper) or Core ML or
+  ONNX Runtime CoreML EP`. README, ARCHITECTURE §11.1 / §11.3,
+  PHASES Phase 6, and PROGRESS Phase 6 follow the same split.
+  Whisper joins the same MLX-on-Apple-Silicon track already
+  established in
+  [`kennguy3n/slm-chat-demo`](https://github.com/kennguy3n/slm-chat-demo)
+  and [`kennguy3n/cv-guard`](https://github.com/kennguy3n/cv-guard)
+  for the SLM stack.
 
 ### 2026-05-03 — Phase 2 media download + cache + state machine + caption + routing
 

@@ -568,7 +568,7 @@ content from day one.
 | Fuzzy matching           | Trigrams for Latin / Cyrillic / Greek; bigrams for CJK (Chinese, Japanese, Korean); script-aware Levenshtein.                       |
 | Text embeddings          | `XLM-R` (100+ languages, ~40–50 MB INT4 / ~80–100 MB INT8 ONNX) — same encoder used by `kennguy3n/slm-guardrail`, unifying the text encoder across the platform. INT4 default on tight-storage devices (low-end Android, Windows tablets); INT8 default on desktop and flagship. English-only MiniLM-L6 is **rejected**. |
 | OCR                      | Apple Vision (18+ languages) on iOS / macOS; ML Kit Text Recognition v2 (50+ languages) on Android; multilingual fallback on desktop. |
-| Audio transcription      | `Whisper-base` (~140 MB) / `Whisper-tiny` (~75 MB) multilingual INT8 ONNX, gated on battery and thermal state.                       |
+| Audio transcription      | `Whisper-base` via Apple MLX on Apple Silicon (`mlx-community/whisper-base-mlx`, preferred — Neural Engine) or ~140 MB INT8 ONNX on other platforms; `Whisper-tiny` (~75 MB) on low-end Android. Gated on battery and thermal state. |
 | Mixed-script messages    | A single message may interleave scripts (e.g. `Meeting at 3pm 会議室で`). ICU and the ML stack handle this natively per run.        |
 
 ## Tech stack
@@ -758,7 +758,7 @@ chat-storage-search/
           mod.rs
           embeddings.rs           # multilingual text embedding (XLM-R via ONNX)
           clip.rs                 # MobileCLIP-S2 image/video embeddings (ONNX)
-          whisper.rs              # Whisper-base / Whisper-tiny audio transcription (ONNX, multilingual)
+          whisper.rs              # Whisper-base / Whisper-tiny audio transcription. MLX (mlx-community/whisper-base-mlx) preferred on Apple Silicon; ONNX (multilingual) fallback on other platforms.
           ocr.rs                  # platform OCR bridge (Vision on iOS, ML Kit on Android)
           model_manager.rs        # model download, versioning, quantization
         transport/                # backend API client for blob/archive/delivery
