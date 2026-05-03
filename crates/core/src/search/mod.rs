@@ -13,5 +13,6 @@
 pub mod fuzzy_search;
 pub mod query_engine;
 pub mod shard_builder;
+pub mod shard_prefetch;
 pub mod text_search;
 pub mod tokenizer;

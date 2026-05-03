@@ -141,6 +141,25 @@ pub struct CoreImpl {
     /// the compacted entries replacing the superseded ones. Phase
     /// 5 will persist this in a `backup_segment_map` table.
     tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
+    /// Phase-3 ZKOF archive backend configuration. `None` until
+    /// [`CoreImpl::install_zkof_archive_backend`] is called. When
+    /// set together with [`Self::zkof_archive_s3`], the
+    /// archive-segment router routes
+    /// `archive_segment_map.storage_backend = zk_object_fabric`
+    /// rows through ZKOF instead of the legacy KChat transport.
+    zkof_archive_config: Mutex<Option<crate::media::sinks::zk_fabric::ZkFabricSinkConfig>>,
+    /// Shared `Arc<dyn S3Client>` used by the ZKOF archive router.
+    /// `None` until [`CoreImpl::install_zkof_archive_backend`] is
+    /// called. Wrapped in a `Mutex<Option<_>>` (rather than
+    /// `OnceCell`) so tests can install / re-install in the same
+    /// process without spinning up a fresh core.
+    zkof_archive_s3: Mutex<Option<std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>>>,
+    /// Phase-5 background scheduler bridge. `None` until
+    /// [`CoreImpl::install_scheduler`] is called by the platform
+    /// glue (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
+    /// orchestration layer treats `None` as "no scheduler
+    /// available — run maintenance loops on demand only".
+    scheduler: Mutex<Option<Box<dyn crate::scheduler::BackgroundScheduler>>>,
 }
 
 /// One row of [`CoreImpl::tracked_backup_segments`].
@@ -200,6 +219,9 @@ impl CoreImpl {
             backup_device_id: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
+            zkof_archive_config: Mutex::new(None),
+            zkof_archive_s3: Mutex::new(None),
+            scheduler: Mutex::new(None),
         })
     }
 
@@ -223,6 +245,9 @@ impl CoreImpl {
             backup_device_id: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
+            zkof_archive_config: Mutex::new(None),
+            zkof_archive_s3: Mutex::new(None),
+            scheduler: Mutex::new(None),
         })
     }
 
@@ -399,6 +424,54 @@ impl CoreImpl {
         Ok(mgr.wrapped_prior_epoch_keys_for_manifest())
     }
 
+    /// Push every cold-flagged [`SearchResult`] into the
+    /// hydration queue at priority
+    /// [`HydrationReason::SearchResultTap`]. Used by
+    /// [`Self::search`] when `scope == IncludeCold`. Best-effort
+    /// — a poisoned queue mutex is logged-and-skipped (the
+    /// search results still flow back to the caller).
+    fn enqueue_cold_results_for_hydration(&self, results: &[SearchResult]) {
+        let cold_iter = results.iter().filter(|r| r.is_cold);
+        let now = now_ms_for_send_media();
+        let mut queue = match self.hydration_queue.lock() {
+            Ok(q) => q,
+            Err(_) => return,
+        };
+        for r in cold_iter {
+            queue.enqueue(crate::offload::hydration::HydrationRequest {
+                message_id: r.message_id,
+                conversation_id: r.conversation_id,
+                reason: HydrationReason::SearchResultTap,
+                requested_at_ms: now,
+            });
+        }
+    }
+
+    /// Run a unified search and immediately enqueue every
+    /// cold-flagged result into the hydration queue at priority
+    /// `SearchResultTap`. Equivalent to
+    /// [`KChatCore::search`] today (since `search` already
+    /// enqueues cold results when `scope == IncludeCold`) but
+    /// returns a count of newly-enqueued cold rows alongside the
+    /// results so the orchestration layer can update UI badges.
+    pub fn search_and_prefetch_cold(
+        &self,
+        query: SearchQuery,
+        scope: SearchScope,
+    ) -> Result<(Vec<SearchResult>, usize)> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let engine = QueryEngine::new(&db);
+        let results = engine
+            .execute_search(&query, &scope)
+            .map_err(|e| Error::Search(e.to_string()))?;
+        drop(db);
+        let cold_count = results.iter().filter(|r| r.is_cold).count();
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.enqueue_cold_results_for_hydration(&results);
+        }
+        Ok((results, cold_count))
+    }
+
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
     /// adjacent-window. The window size is the slice the caller
     /// already widened — typical UI values are 5..50. See
@@ -460,13 +533,148 @@ impl CoreImpl {
     where
         F: FnMut(&str) -> Result<[u8; 32]>,
     {
-        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(transport);
+        // Pick the ZKOF-aware router whenever the caller has
+        // installed a ZKOF backend AND the config opts into the
+        // ZKOF archive backend. Otherwise fall back to the legacy
+        // KChat-only router. This keeps the public method
+        // signature stable while routing
+        // `storage_backend = zk_object_fabric` rows through S3
+        // automatically when the wiring is present.
+        let router = self.build_archive_router(transport)?;
         self.rehydrate_timeline_skeletons_with_router(
             &router,
             conversation_id,
             time_bucket,
             key_for_segment,
         )
+    }
+
+    /// Build an [`ArchiveSegmentRouter`] honouring
+    /// [`KChatCoreConfig::archive_backend`]. When the backend is
+    /// [`crate::config::ArchiveBackend::Zkof`] AND
+    /// [`Self::install_zkof_archive_backend`] has been called, the
+    /// router knows how to route segment rows tagged
+    /// `storage_backend = zk_object_fabric` through ZKOF /
+    /// S3 instead of the KChat transport.
+    fn build_archive_router<'a>(
+        &self,
+        transport: &'a dyn TransportClient,
+    ) -> Result<crate::archive::download::ArchiveSegmentRouter<'a>> {
+        match self.config.archive_backend {
+            crate::config::ArchiveBackend::Zkof => {
+                let s3 = self
+                    .zkof_archive_s3
+                    .lock()
+                    .map_err(poisoned)?
+                    .as_ref()
+                    .cloned();
+                let cfg = self
+                    .zkof_archive_config
+                    .lock()
+                    .map_err(poisoned)?
+                    .as_ref()
+                    .cloned();
+                match (s3, cfg) {
+                    (Some(s3), Some(cfg)) => {
+                        Ok(crate::archive::download::ArchiveSegmentRouter::with_zkof(
+                            transport, s3, cfg,
+                        ))
+                    }
+                    // ZKOF is the configured backend but the
+                    // wiring is missing — surface a structured
+                    // error rather than silently falling through
+                    // to KChat-only.
+                    _ => Err(Error::Storage(
+                        "archive_backend = zkof but no ZKOF backend installed; \
+                         call CoreImpl::install_zkof_archive_backend before \
+                         calling rehydrate_timeline_skeletons"
+                            .into(),
+                    )),
+                }
+            }
+            crate::config::ArchiveBackend::KChat => Ok(
+                crate::archive::download::ArchiveSegmentRouter::kchat_only(transport),
+            ),
+        }
+    }
+
+    /// Install the Phase-3 ZKOF archive backend (S3 client +
+    /// gateway config). Required before
+    /// [`Self::rehydrate_timeline_skeletons`] can route any
+    /// `storage_backend = zk_object_fabric` rows; the call is a
+    /// no-op for installs against a `KChatCoreConfig` whose
+    /// `archive_backend` is [`crate::config::ArchiveBackend::KChat`]
+    /// but the slots stay populated so a runtime
+    /// reconfiguration to ZKOF picks up the wiring without
+    /// re-installing.
+    pub fn install_zkof_archive_backend(
+        &self,
+        s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
+        config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
+    ) -> Result<()> {
+        config.validate()?;
+        *self.zkof_archive_s3.lock().map_err(poisoned)? = Some(s3);
+        *self.zkof_archive_config.lock().map_err(poisoned)? = Some(config);
+        Ok(())
+    }
+
+    /// Install a Phase-5 background scheduler bridge. The bridge
+    /// is platform glue (Swift `BGTaskScheduler` on iOS, Kotlin
+    /// `WorkManager` on Android) that fills in the
+    /// [`crate::scheduler::BackgroundScheduler`] trait.
+    ///
+    /// Re-installing replaces the previous bridge — the
+    /// orchestration layer is responsible for cancelling any
+    /// outstanding tasks on the old bridge first via
+    /// [`crate::scheduler::BackgroundScheduler::cancel_all`].
+    pub fn install_scheduler(
+        &self,
+        scheduler: Box<dyn crate::scheduler::BackgroundScheduler>,
+    ) -> Result<()> {
+        *self.scheduler.lock().map_err(poisoned)? = Some(scheduler);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_scheduler`] has been called with a
+    /// real bridge.
+    pub fn has_scheduler(&self) -> bool {
+        self.scheduler
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Replay the supplied search-index shards into the local
+    /// `search_fts` / `search_fuzzy` tables (Phase 4, Task 6).
+    ///
+    /// Wires
+    /// [`crate::restore::pipeline::RestorePipeline::restore_search_index_shards_with_replay`]
+    /// to the `CoreImpl` so the orchestration layer can drive a
+    /// shard restore without owning a `RestorePipeline` instance.
+    /// The transport-side contract on `BackupSource` does not yet
+    /// carry shard segments; once it does, this entry point is the
+    /// natural binding glue.
+    pub fn restore_search_shards(
+        &self,
+        shards: &[crate::restore::pipeline::SealedSearchShardEntry<'_>],
+    ) -> Result<Vec<crate::restore::pipeline::RestoredShardSummary>> {
+        let mut db = self.db.lock().map_err(poisoned)?;
+        crate::restore::pipeline::RestorePipeline::new()
+            .restore_search_index_shards_with_replay(db.connection_mut(), shards)
+    }
+
+    /// Whether [`Self::install_zkof_archive_backend`] has been
+    /// called.
+    pub fn has_zkof_archive_backend(&self) -> bool {
+        self.zkof_archive_s3
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+            && self
+                .zkof_archive_config
+                .lock()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false)
     }
 
     /// Backend-aware variant of [`Self::rehydrate_timeline_skeletons`].
@@ -1520,9 +1728,21 @@ impl KChatCore for CoreImpl {
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
         let db = self.db.lock().map_err(poisoned)?;
         let engine = QueryEngine::new(&db);
-        engine
+        let results = engine
             .execute_search(&query, &scope)
-            .map_err(|e| Error::Search(e.to_string()))
+            .map_err(|e| Error::Search(e.to_string()))?;
+        drop(db);
+        // When the caller requested the personal archive, enqueue
+        // every cold-flagged result for hydration at priority
+        // `SearchResultTap` (`docs/PROPOSAL.md §5.5`). The enqueue
+        // is best-effort: if the queue mutex is poisoned we
+        // surface the search results regardless so the UI can
+        // render — the orchestrator will retry the enqueue on the
+        // next search.
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.enqueue_cold_results_for_hydration(&results);
+        }
+        Ok(results)
     }
 
     fn edit_message(&self, message_id: Uuid, new_text: &str) -> Result<()> {
@@ -1912,11 +2132,13 @@ impl KChatCore for CoreImpl {
         // Phase-4 wiring: drive the restore state machine end-to-end
         // through the skeleton-first pipeline. The transport-side
         // contract on `BackupSource` (manifest chain handle, segment
-        // download channel, …) is still a placeholder, so the
-        // pipeline currently runs with empty inputs and demonstrates
-        // the orchestration is in place. Once
-        // `BackupSource` is fleshed out, the segments + manifests
-        // flow through here unchanged.
+        // download channel, search-shard segments, …) is still a
+        // placeholder, so the pipeline currently runs with empty
+        // inputs and demonstrates the orchestration is in place.
+        // Search-index shards land via
+        // [`CoreImpl::restore_search_shards`] today; once
+        // `BackupSource` is fleshed out, the segments, manifests,
+        // and shard list flow through here unchanged.
         let db = self.db.lock().map_err(poisoned)?;
         let conn = db.connection();
         crate::restore::state_machine::reset(conn)?;
@@ -4078,6 +4300,103 @@ mod tests {
         assert!(
             matches!(err, Error::Crypto(_) | Error::Storage(_)),
             "expected crypto/storage failure, got {err:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // ZKOF archive backend installation (Phase-3 Task 2).
+    // ----------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct InMemoryS3 {
+        objects: std::sync::Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
+    }
+
+    impl crate::media::sinks::zk_fabric::S3Client for InMemoryS3 {
+        fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            bytes: &[u8],
+        ) -> std::result::Result<(), Error> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert((bucket.into(), key.into()), bytes.to_vec());
+            Ok(())
+        }
+        fn get_object_range(
+            &self,
+            bucket: &str,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> std::result::Result<Vec<u8>, Error> {
+            let objects = self.objects.lock().unwrap();
+            let bytes = objects
+                .get(&(bucket.into(), key.into()))
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+            let start = range.start.min(bytes.len() as u64) as usize;
+            let end = range.end.min(bytes.len() as u64) as usize;
+            Ok(bytes[start..end].to_vec())
+        }
+        fn delete_object(&self, _bucket: &str, _key: &str) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+        fn list_objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+        ) -> std::result::Result<Vec<String>, Error> {
+            let objects = self.objects.lock().unwrap();
+            Ok(objects
+                .keys()
+                .filter(|(b, k)| b == bucket && k.starts_with(prefix))
+                .map(|(_, k)| k.clone())
+                .collect())
+        }
+    }
+
+    fn fresh_zkof_config() -> crate::media::sinks::zk_fabric::ZkFabricSinkConfig {
+        crate::media::sinks::zk_fabric::ZkFabricSinkConfig {
+            endpoint_url: "https://zkof.example.com".into(),
+            access_key: "AKIA-TEST".into(),
+            secret_key: "secret".into(),
+            bucket: "kchat-archive".into(),
+        }
+    }
+
+    #[test]
+    fn install_zkof_archive_backend_round_trip() {
+        let core = fresh_core();
+        assert!(!core.has_zkof_archive_backend());
+        let s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client> =
+            std::sync::Arc::new(InMemoryS3::default());
+        core.install_zkof_archive_backend(s3, fresh_zkof_config())
+            .expect("install");
+        assert!(core.has_zkof_archive_backend());
+    }
+
+    #[test]
+    fn install_zkof_archive_backend_rejects_invalid_config() {
+        let core = fresh_core();
+        let mut bad = fresh_zkof_config();
+        bad.endpoint_url.clear();
+        let s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client> =
+            std::sync::Arc::new(InMemoryS3::default());
+        let err = core.install_zkof_archive_backend(s3, bad).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        assert!(!core.has_zkof_archive_backend());
+    }
+
+    #[test]
+    fn build_archive_router_zkof_without_install_returns_error() {
+        let cfg = test_config().with_archive_backend(crate::config::ArchiveBackend::Zkof);
+        let core = CoreImpl::new_in_memory(cfg, TEST_KEY).unwrap();
+        let transport = FixtureTransport::default();
+        let err = core.build_archive_router(&transport).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(msg) if msg.contains("ZKOF backend installed")),
+            "expected install-missing storage error"
         );
     }
 

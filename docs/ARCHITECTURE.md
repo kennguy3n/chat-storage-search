@@ -925,6 +925,60 @@ instead of running its own ONNX inference. See
 [`crate::models::embeddings::EmbeddingCache`] for the trait that
 binds the seam.
 
+### 6.1 Encrypted shard prefetch
+
+When a query needs a shard that is not in the on-device cache, the
+core fetches it from the backend through the
+[`search::shard_prefetch`](../crates/core/src/search/shard_prefetch.rs)
+module. A naive per-shard `GET /v1/archive/index-shards?...&type=`
+leaks `(conversation_hash, bucket, shard_type)` tuples to the
+backend. The prefetch module collapses that signal to
+`(conversation_hash, bucket)` granularity: every miss issues one
+batch call that pulls all four `IndexType` variants
+(`Text`, `Fuzzy`, `Vector`, `Media`) for the same time bucket.
+
+```mermaid
+flowchart LR
+    Hit["Search miss on<br/>(conversation_hash, bucket)"]
+    Batch["batch_prefetch_shards<br/>(transport, hash, bucket)"]
+    T["fetch_index_shards<br/>type = Text"]
+    F["fetch_index_shards<br/>type = Fuzzy"]
+    V["fetch_index_shards<br/>type = Vector"]
+    M["fetch_index_shards<br/>type = Media"]
+    Out["Vec&lt;PrefetchedShard&gt;<br/>(non-empty rows only)"]
+
+    Hit --> Batch
+    Batch --> T --> Out
+    Batch --> F --> Out
+    Batch --> V --> Out
+    Batch --> M --> Out
+```
+
+The four type calls run in a deterministic
+`[Text, Fuzzy, Vector, Media]` order so the on-the-wire request
+sequence does not depend on which shard the local query missed
+on. Empty responses are dropped before returning so callers do
+not have to deal with sparse vectors.
+
+`batch_prefetch_shards_with_padding` adds a privacy hop on top:
+when `KChatCoreConfig::privacy_level` is `High`, it interleaves
+real `(conversation_hash, bucket)` requests with dummy
+`(conversation_hash, bucket)` pairs minted by
+`archive::privacy::generate_dummy_segment_id`. The dummies are
+indistinguishable from real shard requests on the wire (same
+endpoint, same shape) and silently drop on error, so a network
+observer sees a blurred per-bucket access pattern instead of a
+sharp per-shard one. Dummy frequency is governed by the same
+privacy helpers used for archive-segment prefetch (see §8.4).
+
+The prefetch module is independent of the local query engine: it
+returns sealed bytes plus the `IndexType` tag, and it is the
+caller's job to decrypt under the appropriate
+`K_text_index_shard` / `K_fuzzy_index_shard` /
+`K_vector_index_shard` / `K_media_index_shard` derived from
+`K_search_root`. This keeps the transport layer ignorant of the
+shard payload format.
+
 ---
 
 ## 7. Crypto Architecture
@@ -1320,6 +1374,54 @@ The Rust modules implementing the diagrams above:
   `crypto::convergent::derive_convergent_dek` keeps the
   ciphertext bit-identical to the Go SDK at
   `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
+* `crates/core/src/backup/sinks/icloud.rs` — `ICloudBackupSink`
+  wraps an `Arc<dyn ICloudBackupBridge>` exposing
+  `upload_file` / `download_file` / `list_files` /
+  `delete_file`; the iOS / macOS bridge implements the actual
+  CloudKit calls. Manifests map to record name
+  `backups/{manifest_id}` and segments to
+  `backups/segments/{segment_id}`. `NoopICloudBackupBridge`
+  returns `Error::NotImplemented("icloud_backup_bridge")` for
+  tests.
+* `crates/core/src/backup/sinks/android.rs` — `AndroidBackupSink`
+  splits storage by record size: manifest envelopes (under
+  Android Auto Backup's 25 MiB cap per record) flow through
+  `AndroidBackupBridge::write_auto_backup` /
+  `read_auto_backup`; full-size segments flow through
+  `write_saf` / `read_saf` (Storage Access Framework, no size
+  cap). `list_backup_manifests` filters Auto Backup entries to
+  manifests-only so a stale segment URI never surfaces as a
+  manifest candidate. `NoopAndroidBackupBridge` stub for tests.
+
+#### 9.5.1 Backup sink architecture
+
+All four backup sinks (`ZkofBackupSink`, `ICloudBackupSink`,
+`AndroidBackupSink`, plus the `NoopBackupSink` test stub) share
+the same `BackupSink` trait surface so the upper layers
+(`run_incremental_backup`, `RestorePipeline`,
+`compact_backup`) treat sinks uniformly. The differences between
+sinks are confined to two dimensions:
+
+| Sink             | Authentication path                                     | Record / object naming                                    |
+| ---------------- | ------------------------------------------------------- | --------------------------------------------------------- |
+| `ZkofBackupSink` | ZKOF tenant credentials via `Arc<dyn S3Client>`         | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
+| `ICloudBackupSink` | Per-user CloudKit container via `ICloudBackupBridge`   | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
+| `AndroidBackupSink` | `BackupAgent` (Auto Backup) + SAF tree URI             | Manifest = Auto Backup entry; segment = SAF blob          |
+| `NoopBackupSink` | n/a                                                     | n/a — every method returns `Error::NotImplemented`        |
+
+The naming convention is identical wherever it can be (every
+sink that addresses by free-form key uses `backups/...`); the
+Android sink is the only one that splits storage by record
+size, because that is forced by the platform's 25 MiB Auto
+Backup cap.
+
+`CoreImpl` only ever holds a single `Box<dyn BackupSink>` at a
+time, but the platform layer can swap sinks at runtime (e.g. a
+desktop client first restoring from iCloud, then continuing
+with ZKOF). All sinks operate on already-sealed segments and
+manifests — they do not see plaintext bytes — so a malicious or
+compromised sink cannot leak user content beyond the metadata
+already exposed by `(manifest_id, segment_id, byte length)`.
 
 `CoreImpl::run_incremental_backup` is the orchestrator: read
 `BackupEventJournal::read_unsegmented` → derive
@@ -1347,13 +1449,43 @@ sign manifest → advance cursor.
   → search shards → recent bodies → enable lazy media) and
   persists every `RestoreState` transition between steps.
 * `crates/core/src/restore/key_recovery.rs` — Phase-4 key
-  recovery foundation: `RecoveryKey` is a 256-bit secret that
-  AES-256-KW-wraps `K_user_master` (hex-encoded for display);
-  `DeviceTransferPayload` is an XChaCha20-Poly1305-sealed
-  bundle of `(K_user_master, K_archive_root, K_backup_root,
-  K_search_root)` under a key derived from a numeric / QR
-  transfer code via HKDF-SHA-256. Server escrow remains OFF by
-  default per `docs/PHASES.md §Phase 4`.
+  recovery foundation. Three independent paths share a single
+  module so the secret-handling guarantees stay uniform:
+  * **Recovery key** — `RecoveryKey` is a 256-bit secret that
+    AES-256-KW-wraps `K_user_master` and is rendered as a
+    64-character lowercase-hex string for write-down during
+    setup. `generate_recovery_key` / `recover_from_key`
+    round-trip; wrong / tampered keys fail the AES-KW
+    integrity-check value before any further work runs.
+  * **Device transfer** — `DeviceTransferEnvelope` is an
+    XChaCha20-Poly1305-sealed bundle of
+    `(K_user_master, K_archive_root, K_backup_root,
+    K_search_root)` under a transfer key derived from a numeric /
+    QR transfer code via HKDF-SHA-256.
+    `prepare_device_transfer` / `accept_device_transfer`
+    round-trip the envelope and validate code length. The
+    envelope itself derives `Zeroize` + `ZeroizeOnDrop`, and
+    every CBOR / AEAD-opened plaintext flows through
+    `Zeroizing<Vec<u8>>` so transfer-time secret material never
+    lingers on the heap.
+  * **Passphrase** — `PassphraseRecoveryEnvelope { salt,
+    wrapped_key, argon2_params }` AES-256-KW-wraps
+    `K_user_master` under a 32-byte KEK derived via Argon2id from
+    the user's passphrase + a random 16-byte salt.
+    `wrap_master_key_with_passphrase` /
+    `unwrap_master_key_with_passphrase` use the OWASP-mobile
+    parameter triple (`m_cost = 65536`, `t_cost = 3`,
+    `p_cost = 1`) by default; the parameters are stored on the
+    envelope so a future bump can re-derive against older
+    blobs. The unwrap path returns `Zeroizing<[u8; 32]>` and
+    surfaces wrong-passphrase / tampered-envelope failures via
+    the AES-KW integrity-check value (no oracle on the Argon2
+    output itself).
+  Server escrow remains OFF by default per
+  `docs/PHASES.md §Phase 4`. The three recovery paths are
+  designed to be combined: a user can publish a recovery key
+  and a passphrase envelope simultaneously, so device loss
+  plus passphrase loss does not strand them.
 
 ### 9.7 Search-shard sub-module layout
 

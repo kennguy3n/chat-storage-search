@@ -46,6 +46,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # library is statically linked so callers don't need a system
 # `libzstd`.
 zstd = { version = "0.13", default-features = false }
+# Argon2id KDF for passphrase-based key recovery
+# (`crates/core/src/restore/key_recovery.rs`). The `alloc` feature
+# enables the heap-allocating helpers we need; we deliberately
+# pin OWASP-recommended mobile parameters (m_cost = 65 536 KiB,
+# t_cost = 3, p_cost = 1) inside the wrapper so callers cannot
+# accidentally weaken them.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 ort = { workspace = true, optional = true }
 
 # On Windows builds, additionally enable the `directml` feature on the

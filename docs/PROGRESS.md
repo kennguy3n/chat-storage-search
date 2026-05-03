@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~85%`). Phase 4 — Backup and Restore (`In progress | ~75%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~95%`). Phase 4 — Backup and Restore (`In progress | ~85%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~15%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -684,7 +684,7 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~85%`
+**Status**: `In progress | ~95%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
@@ -831,10 +831,22 @@ Checklist:
       `epoch_key_wrap_unwrap_round_trip`,
       `cross_epoch_segment_decrypt`,
       `epoch_key_info_string_matches_spec`.)
-- [ ] ZK Object Fabric as optional archive backend: S3-compatible
+- [x] ZK Object Fabric as optional archive backend: S3-compatible
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
       + ZKOF tenant credentials.
+      (`crates/core/src/archive/routing.rs::ZkofArchiveAdapter`
+      now wires a real `S3Client`-backed adapter — segment
+      uploads land at `archive/segments/{segment_id}` and
+      manifest uploads at `archive/manifests/{manifest_id}`,
+      matching `backup/sinks/zk_fabric.rs`.
+      `CoreImpl::install_zkof_archive_backend(s3, config)` wires
+      it in alongside `zkof_archive_config` /
+      `zkof_archive_s3` slots; `rehydrate_timeline_skeletons`
+      dispatches via the ZKOF router when
+      `archive_backend == Zkof`. Integration tests use
+      `InMemoryS3` and round-trip a sealed segment through
+      upload → fetch → decrypt.)
 - [x] Archive backend routing: transport client routes archive
       operations to KChat backend or ZKOF based on configuration.
       Manifest index stored as a well-known S3 key when using ZKOF.
@@ -1012,7 +1024,7 @@ Notes:
 
 ## Phase 4: Backup and Restore
 
-**Status**: `In progress | ~75%`
+**Status**: `In progress | ~85%`
 
 **Goal**: Incremental backup to platform sinks and skeleton-first
 restore.
@@ -1048,9 +1060,29 @@ Checklist:
       Ed25519 over canonical CBOR, AEAD-sealed under
       `K_backup_manifest` with `device_id` mixed into the AAD for
       device attribution.)
-- [ ] iOS iCloud backup sink.
-- [ ] Android backup sink strategy (Auto Backup for envelopes;
+- [x] iOS iCloud backup sink.
+      (`crates/core/src/backup/sinks/icloud.rs::ICloudBackupSink`:
+      `ICloudBackupBridge` trait (`upload_file` / `download_file`
+      / `list_files` / `delete_file`) wraps the iOS / macOS side;
+      `ICloudBackupSink` maps `segment_id` →
+      `backups/segments/{segment_id}` and `manifest_id` →
+      `backups/{manifest_id}` records and implements
+      `BackupSink::{upload_backup_segment,
+      upload_backup_manifest, fetch_backup_manifest,
+      fetch_backup_segment, list_backup_manifests}`.
+      `NoopICloudBackupBridge` returns
+      `Error::NotImplemented("icloud_backup_bridge")`.)
+- [x] Android backup sink strategy (Auto Backup for envelopes;
       Large Backup / SAF for full data).
+      (`crates/core/src/backup/sinks/android.rs::AndroidBackupSink`:
+      `AndroidBackupBridge` trait splits manifest envelopes
+      (`write_auto_backup` / `read_auto_backup` — Auto Backup
+      ≤ 25 MiB record cap) from full segment data
+      (`write_saf` / `read_saf` / `list_saf` —
+      Storage Access Framework, no size cap).
+      `AndroidBackupSink::list_backup_manifests` filters Auto
+      Backup entries to manifests-only.
+      `NoopAndroidBackupBridge` stub for tests.)
 - [x] **ZK Object Fabric backup sink** (S3 API; Pattern C convergent
       encryption; bit-identical interop with the Go SDK).
       (`crates/core/src/backup/sinks/zk_fabric.rs::ZkofBackupSink`:
@@ -1114,7 +1146,7 @@ Checklist:
       forward-only `try_transition`. Snake-case `Display` /
       `FromStr` round-trip; serde wire form matches the SQL
       column.)
-- [~] Key recovery (device-to-device, recovery key, passphrase;
+- [x] Key recovery (device-to-device, recovery key, passphrase;
       server escrow off by default).
       (`crates/core/src/restore/key_recovery.rs`: `RecoveryKey`
       wraps `K_user_master` via AES-256-KW (RFC 3394) with a
@@ -1125,9 +1157,19 @@ Checklist:
       AEAD-seal `K_user_master` + the three derived roots
       (`K_archive_root`, `K_backup_root`, `K_search_root`)
       under a transfer key derived from a numeric / QR code via
-      HKDF-SHA-256. Server escrow remains OFF by default per
-      `docs/PHASES.md §Phase 4`. Passphrase flow is the next
-      milestone.)
+      HKDF-SHA-256; the envelope itself now derives
+      `Zeroize` + `ZeroizeOnDrop` and every CBOR /
+      AEAD-opened plaintext flows through `Zeroizing<Vec<u8>>`.
+      Passphrase recovery (`PassphraseRecoveryEnvelope`,
+      `wrap_master_key_with_passphrase`,
+      `unwrap_master_key_with_passphrase`) uses Argon2id with
+      OWASP-mobile parameters (`m_cost = 65536`, `t_cost = 3`,
+      `p_cost = 1`, output 32 bytes) feeding AES-256-KW;
+      different salts produce different keys, the same
+      (passphrase, salt) is deterministic, and a wrong
+      passphrase fails the wrap integrity check value. Server
+      escrow remains OFF by default per
+      `docs/PHASES.md §Phase 4`.)
 - [x] Search index backup and restore (encrypted shards).
       (`crates/core/src/search/shard_builder.rs`:
       `build_text_search_shard` / `build_fuzzy_search_shard`
@@ -1350,7 +1392,7 @@ Notes:
 
 ## Phase 5: Search — Fuzzy + Encrypted Shards
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~15%`
 
 **Goal**: Fuzzy matching across scripts, plus encrypted search
 shards on the backend so cold buckets remain searchable.
@@ -1364,16 +1406,34 @@ Checklist:
       (`K_text_index_shard`).
 - [ ] Search shard fetch
       (`GET /v1/archive/index-shards?conversation_hash=&bucket=&type=`).
-- [ ] Cold-result hydration on tap.
+- [~] Cold-result hydration on tap.
+      (`crates/core/src/search/query_engine.rs::mark_cold_results`
+      flags every hit on a `body_state = remote_archive_only`
+      row with `is_cold = true` when the caller passes
+      `SearchScope::IncludeCold`. `CoreImpl::search` enqueues
+      cold results into the `HydrationQueue` at
+      `HydrationReason::SearchResultTap` (P0) priority, and
+      `CoreImpl::search_and_prefetch_cold` returns
+      `(results, cold_count)` so the platform layer can render
+      a "hydrating…" badge.)
 - [ ] Unified query engine (parse → fan-out → merge → rerank).
 - [ ] Ranking formula implementation.
 - [ ] Mixed-language query handling.
 - [ ] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
-- [ ] Batch shard prefetch by time bucket: when fetching encrypted
+- [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
       metadata signal on the shard-listing endpoint.
+      (`crates/core/src/search/shard_prefetch.rs::batch_prefetch_shards`
+      fans out a single call per `IndexType` variant in
+      deterministic `[Text, Fuzzy, Vector, Media]` order and
+      returns `Vec<PrefetchedShard>` with non-empty rows only.
+      `batch_prefetch_shards_with_padding` mixes in dummy
+      `(conversation_hash, bucket)` requests when
+      `KChatCoreConfig::privacy_level == High`, reusing the
+      `archive::privacy` helpers so dummy ids do not collide
+      with real UUIDv7 segments.)
 
 **Decision gate**: Fuzzy search returns relevant hits across all
 target scripts, including mixed-script queries. Cold (offloaded)
@@ -1491,7 +1551,200 @@ Notes:
 
 ## Changelog
 
-### 2026-05-03 — Phase-3 / Phase-4 batch of 10 (this PR)
+### 2026-05-03 — Phase 3 / 4 / 5 / 7 batch of 10 (this PR)
+
+Lands the next 10-task batch on top of PR #29 (`ba706825`). Closes
+the remaining Phase-3 ZKOF archive plumbing, finishes the Phase-4
+backup sinks (iCloud, Android), introduces passphrase-based key
+recovery, wires the Phase-4 search-index shard restore path, and
+opens Phase 5 (cold-result hydration, batch shard prefetch) plus
+the Phase-5/7 scheduler foundation and the first 4 of the 8
+Phase-7 failure scenarios. All ten tasks ship with unit +
+integration tests; `cargo test --workspace` passes (981 tests
+total), `cargo fmt --all -- --check` is clean, and
+`cargo clippy --all-targets --all-features -- -D warnings` is
+clean.
+
+1. **DeviceTransferEnvelope zeroize fix**
+   (`crates/core/src/restore/key_recovery.rs`):
+   `DeviceTransferEnvelope` now derives
+   `#[derive(Zeroize, ZeroizeOnDrop)]`. `prepare_device_transfer`
+   wraps the CBOR plaintext in `Zeroizing::new(...)` and
+   `accept_device_transfer` wraps the AEAD-opened plaintext in
+   `Zeroizing::new(aead_open(...)?)`. New compile-time test
+   `device_transfer_envelope_implements_zeroize_on_drop` asserts
+   the trait bound. Closes the Devin Review finding on PR #29.
+
+2. **ZKOF S3 archive transport adapter**
+   (`crates/core/src/archive/routing.rs`,
+   `crates/core/src/core_impl.rs`): the `ZkofArchiveAdapter`
+   stops returning `NotImplemented` and instead drives a real
+   `Arc<dyn S3Client>`. Segment uploads land at
+   `archive/segments/{segment_id}` and manifest uploads at
+   `archive/manifests/{manifest_id}`, matching the layout of
+   `backup/sinks/zk_fabric.rs`. `CoreImpl` carries
+   `zkof_archive_config` / `zkof_archive_s3` slots and exposes
+   `install_zkof_archive_backend(s3, config)`;
+   `rehydrate_timeline_skeletons_with_router` dispatches on
+   `KChatCoreConfig::archive_backend == Zkof`. New integration
+   tests upload → fetch → decrypt round-trip a sealed segment
+   through `InMemoryS3`.
+
+3. **iCloud backup sink**
+   (`crates/core/src/backup/sinks/icloud.rs`): mirrors
+   `media::sinks::icloud`. `ICloudBackupBridge` (object-safe,
+   `Send + Sync`) exposes `upload_file` / `download_file` /
+   `list_files` / `delete_file`. `ICloudBackupSink` maps
+   `segment_id` → `backups/segments/{segment_id}` and
+   `manifest_id` → `backups/{manifest_id}` records and
+   implements `BackupSink::{upload_backup_segment,
+   upload_backup_manifest, fetch_backup_manifest,
+   fetch_backup_segment, list_backup_manifests}`.
+   `NoopICloudBackupBridge` returns
+   `Error::NotImplemented("icloud_backup_bridge")`. 5 unit tests
+   (object safety, round-trip, list filtering, error
+   propagation, delete idempotency).
+
+4. **Android backup sink**
+   (`crates/core/src/backup/sinks/android.rs`):
+   `AndroidBackupBridge` splits manifest envelopes
+   (`write_auto_backup` / `read_auto_backup` — Auto Backup
+   ≤ 25 MiB record cap) from full segment data
+   (`write_saf` / `read_saf` / `list_saf` — Storage Access
+   Framework, no size cap). `AndroidBackupSink::list_backup_manifests`
+   filters Auto Backup entries to manifests-only.
+   `NoopAndroidBackupBridge` stub. 5 unit tests matching the
+   iCloud sink coverage.
+
+5. **Passphrase-based key recovery**
+   (`crates/core/src/restore/key_recovery.rs`,
+   `crates/core/Cargo.toml`): adds the `argon2 = "0.5"`
+   dependency with the `alloc` feature. New
+   `derive_passphrase_key(passphrase, salt)` runs Argon2id with
+   OWASP mobile parameters (`m_cost = 65536`, `t_cost = 3`,
+   `p_cost = 1`, output 32 bytes). `wrap_master_key_with_passphrase`
+   generates a 16-byte salt, derives the wrapping key, and
+   AES-256-KW wraps `K_user_master` into a
+   `PassphraseRecoveryEnvelope { salt, wrapped_key,
+   argon2_params }` (serde + zeroize aware).
+   `unwrap_master_key_with_passphrase` returns
+   `Zeroizing<[u8; 32]>` and surfaces wrong-passphrase /
+   tampered-envelope failures via the AES-KW integrity check.
+   6 tests cover round-trip, wrong-passphrase, deterministic
+   derivation for the same `(passphrase, salt)`, different
+   salts → different keys, empty-passphrase rejection, and
+   serde round-trip of the envelope.
+
+6. **Search shard restore wired into RestorePipeline**
+   (`crates/core/src/restore/pipeline.rs`,
+   `crates/core/tests/backup_pipeline.rs`):
+   `restore_search_index_shards_with_replay` accepts
+   `SealedSearchShardEntry<'_>` (sealed shard ⊕ per-shard key)
+   and dispatches to `restore_text_search_shard` /
+   `restore_fuzzy_search_shard` based on the shard's
+   `IndexType`, replaying every entry into local `search_fts`
+   and `search_fuzzy` while the state machine advances through
+   `RestoreState::SearchIndexShardsRestored`. Returns
+   `RestoredShardSummary { shards, fts_rows, fuzzy_rows }` for
+   progress reporting. New integration test
+   `search_shards_round_trip_through_pipeline` builds text +
+   fuzzy shards, replays them, and asserts FTS / fuzzy queries
+   return the restored content.
+
+7. **Cold-result hydration in search query engine**
+   (`crates/core/src/search/query_engine.rs`,
+   `crates/core/src/core_impl.rs`): when the caller passes
+   `SearchScope::IncludeCold`, `mark_cold_results` joins
+   `message_skeleton.body_state` and flips `is_cold = true` on
+   any hit whose body lives in the archive
+   (`body_state = 'remote_archive_only'`). `CoreImpl::search`
+   enqueues every cold result into the `HydrationQueue` at
+   `HydrationReason::SearchResultTap` (P0) priority, and a new
+   `CoreImpl::search_and_prefetch_cold` returns
+   `(results, cold_count)` so the platform layer can render a
+   "hydrating…" badge. 3 query-engine tests cover the offloaded
+   → cold marking, `LocalOnly` never marks cold, and structured
+   filters ⊕ cold marking.
+
+8. **Batch shard prefetch by time bucket**
+   (`crates/core/src/search/shard_prefetch.rs`,
+   `crates/core/src/search/mod.rs`):
+   `batch_prefetch_shards(transport, conversation_hash,
+   bucket)` fans out a single transport call per `IndexType`
+   variant in the deterministic
+   `[Text, Fuzzy, Vector, Media]` order and returns
+   `Vec<PrefetchedShard>` with non-empty rows only.
+   `batch_prefetch_shards_with_padding` mixes in dummy
+   `(conversation_hash, bucket)` requests when
+   `KChatCoreConfig::privacy_level == High`, reusing
+   `archive::privacy::generate_dummy_segment_id` so dummy
+   conversation hashes never collide with real ones. 6 unit
+   tests with a `RecordingTransport` mock cover seeded shards,
+   skipped empty responses, empty buckets, padding-disabled
+   call ordering, padding-enabled dummy interleave, and dummy
+   call distinctness.
+
+9. **Scheduler module foundation**
+   (`crates/core/src/scheduler/mod.rs`,
+   `crates/core/src/core_impl.rs`): replaces the 4-line
+   placeholder with a full Phase-5/7 scheduler surface.
+   `BackgroundScheduler` (object-safe, `Send + Sync`) declares
+   `schedule_backup` / `schedule_archive_compaction` /
+   `schedule_index_maintenance` / `cancel_all` /
+   `is_task_pending`. `ScheduledTask { task_id, task_type,
+   interval_ms, last_run_ms, next_run_ms }` describes one
+   task; `TaskType` enumerates `IncrementalBackup`,
+   `ArchiveCompaction`, `IndexMaintenance`,
+   `MediaCacheEviction`, `ModelWarmup` (snake-case serde).
+   `NoopScheduler` returns `Error::NotImplemented("scheduler")`
+   for every method. Platform bridges
+   (`IosBgTaskBridge` for `BGTaskScheduler`,
+   `AndroidWorkManagerBridge` for `WorkManager`) and matching
+   `Noop*` stubs sit alongside.
+   `CoreImpl::install_scheduler` / `has_scheduler` install /
+   probe the bridge. 10 unit tests cover trait object safety,
+   `Noop*` returns, `TaskType` and `ScheduledTask` serde
+   round-trip, default `task_id` namespace, and
+   `next_run_ms = now + interval`.
+
+10. **Phase-7 failure-scenario suite (4 of 8)**
+    (`crates/core/tests/failure_scenarios.rs`): each test is
+    self-contained, uses an in-memory store / mock transport,
+    and asserts a specific error variant.
+    • `chunk_upload_interrupted_then_resumed_succeeds` drives a
+      `MockTransportClient` that returns
+      `Error::Transport("connection reset")` after 2 of 5
+      chunks, asserts `upload_chunked_media` surfaces the
+      transport error, then resumes via `resume_upload` with a
+      seeded `UploadState` and asserts only chunks 2/3/4 are
+      pushed and the post-commit BLAKE3 root matches.
+    • `corrupted_chunk_ciphertext_fails_sha256_fast_fail` flips
+      one byte of `sealed_chunks[1].ciphertext`, asserts
+      `verify_and_decrypt` fails with the SHA-256 fast-fail
+      message naming chunk 1 (no AEAD work runs);
+      `tampered_merkle_root_in_descriptor_fails_blake3_root_check`
+      tampers with the descriptor's `merkle_root` and asserts
+      the AEAD AAD binding rejects it.
+    • `wrong_backup_segment_key_fails_aead_open` builds a
+      sealed segment, decrypts with the right key (sanity), and
+      asserts a bit-flipped `K_backup_segment` produces
+      `Error::Crypto`. `wrong_signing_key_on_manifest_chain_fails_signature_invalid`
+      verifies a chain under an imposter Ed25519 key and asserts
+      `VerificationError::SignatureInvalid { generation: 0 }`.
+    • `manifest_chain_break_returns_chain_break_with_expected_and_actual`
+      builds a 3-generation chain, replaces gen-1's
+      `previous_manifest_hash` with garbage, re-signs gen-1 and
+      gen-2 (so signatures are valid — only the chain link
+      breaks), and asserts `verify_manifest_chain` returns
+      `VerificationError::ChainBreak { generation: 1, expected,
+      actual }` with `expected == compute_manifest_hash(gen0)`
+      and `actual == [0x42; 32]`.
+
+Status moves: Phase 3 → `In progress | ~95%`; Phase 4 →
+`In progress | ~85%`; Phase 5 → `In progress | ~15%` (was
+`NOT STARTED`).
+
+### 2026-05-03 — Phase-3 / Phase-4 batch of 10 (PR #29)
 
 Lands the next batch on top of PRs #27 and #28. Closes the Phase-3
 `storage_backend` plumbing, finishes the Phase-4 backup pipeline
