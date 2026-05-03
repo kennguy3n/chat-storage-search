@@ -716,6 +716,7 @@ flowchart TD
         FTS["FTS5<br/>(exact + prefix + BM25,<br/>tokenize = 'icu')"]
         FZ["Fuzzy index<br/>(trigram for Latn / Cyrl,<br/>bigram for CJK)"]
         STRUCT["Structured index<br/>(sender, date, conversation)"]
+        ECACHE["Embedding cache check<br/>(search_vector,<br/>(message_id, model_version))"]
         EMB["Multilingual embedding<br/>(XLM-R)"]
         HNSW["HNSW vector index"]
     end
@@ -730,7 +731,10 @@ flowchart TD
     TOK --> FTS
     TOK --> FZ
     Q --> STRUCT
-    Q --> EMB --> HNSW
+    Q --> ECACHE
+    ECACHE -->|"hit"| HNSW
+    ECACHE -->|"miss"| EMB
+    EMB --> HNSW
     FTS -->|"index missing locally"| Cold
     FZ -->|"index missing locally"| Cold
     HNSW -->|"index missing locally"| Cold
@@ -742,6 +746,18 @@ flowchart TD
     HNSW --> Merge
     Merge --> Rerank --> Out
 ```
+
+The embedding cache is populated by both the guardrail pipeline
+(`kennguy3n/slm-guardrail`) and the search pipeline. A message's
+`XLM-R` embedding is computed at most once: whichever pipeline
+first observes the message writes the 384-dim vector into the
+`search_vector` row keyed by `(message_id, model_version =
+'xlmr@v1')`, and the other pipeline reads it back from that row
+instead of running its own ONNX inference. See
+[`docs/PROPOSAL.md` §7.6.1](./PROPOSAL.md) for the full contract
+(version-mismatch handling, locality / non-replication rules) and
+[`crate::models::embeddings::EmbeddingCache`] for the trait that
+binds the seam.
 
 ---
 

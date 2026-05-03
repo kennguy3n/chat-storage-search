@@ -825,12 +825,12 @@ older or larger conversations from search, which contradicts the
 
 ### 7.6 On-device ML models (multilingual)
 
-| Model                          | Purpose                     | Size (INT8 ONNX) | Languages            | Platform                        |
-| ------------------------------ | --------------------------- | ---------------- | -------------------- | ------------------------------- |
-| `XLM-R`                        | Text embeddings             | ~80–100 MB       | 100+                 | All (CPU)                       |
-| `MobileCLIP-S2`                | Image / video embeddings    | ~80 MB           | language-agnostic    | All (CPU)                       |
-| `Whisper-base` (multilingual)  | Audio transcription         | ~140 MB          | 99                   | All (CPU)                       |
-| `Whisper-tiny` (multilingual)  | Low-end audio transcription | ~75 MB           | 99                   | All (CPU); low-end Android default |
+| Model                          | Purpose                     | Size (INT8 ONNX) | Size (INT4 ONNX) | Languages            | Platform                        |
+| ------------------------------ | --------------------------- | ---------------- | ---------------- | -------------------- | ------------------------------- |
+| `XLM-R`                        | Text embeddings             | ~80–100 MB       | ~40–50 MB        | 100+                 | All (CPU)                       |
+| `MobileCLIP-S2`                | Image / video embeddings    | ~80 MB           | ~40 MB           | language-agnostic    | All (CPU)                       |
+| `Whisper-base` (multilingual)  | Audio transcription         | ~140 MB          | n/a              | 99                   | All (CPU)                       |
+| `Whisper-tiny` (multilingual)  | Low-end audio transcription | ~75 MB           | n/a              | 99                   | All (CPU); low-end Android default |
 
 `XLM-R` is the same encoder used by the guardrail system
 (`kennguy3n/slm-guardrail`). Standardizing on it here unifies the
@@ -849,14 +849,83 @@ coverage and is paid by:
 - Per-device opt-out for users on extremely tight storage budgets
   (search degrades gracefully to FTS + fuzzy without semantic).
 
+INT4 quantization via ONNX Runtime
+[`MatMulNBits`](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html)
+is supported for the embedding models (`XLM-R` and `MobileCLIP-S2`).
+INT4 halves the on-disk size with minimal accuracy loss for
+embedding tasks (cosine-similarity correlation against the INT8
+baseline is verified by the multilingual relevance regression
+suite — see PHASES Phase 6). INT4 is the default on devices with
+tight storage budgets (low-end Android, Windows tablets); INT8
+remains the default on desktop and recent flagship mobile hardware
+where the slightly higher accuracy is preferred and the storage
+delta is not material. Whisper is **not** quantized to INT4 — the
+audio transcription quality regression at INT4 is too large; INT8
+remains the floor for `Whisper-base` and `Whisper-tiny`.
+
+#### 7.6.1 Cross-pipeline embedding cache
+
+When the guardrail pipeline (`kennguy3n/slm-guardrail`) computes an
+`XLM-R` embedding for a message, the raw 384-dim vector is
+returned alongside the classification result. The chat-storage-search
+`MessagePersister` checks the `search_vector` table for a cached
+embedding before invoking the ONNX session. This eliminates one
+full `XLM-R` inference per message on the hot path — every
+ingested message would otherwise pay an embedding cost twice
+(guardrail then search) for the same `(message_id, model_version)`
+pair.
+
+The cache key is `(message_id, model_version)` where `model_version`
+is `xlmr@v1`. If the guardrail and search pipelines use different
+`XLM-R` checkpoints the cache is invalidated by version mismatch:
+the search pipeline will not consume a guardrail-written entry
+tagged with a stale `model_version`, and instead recomputes and
+overwrites the row with its own version tag. The reverse is also
+true — the guardrail will not consume a search-written entry under
+a different version. This makes the cache a forward-compatible
+seam across rolling encoder upgrades on either side.
+
+The cache is local-only: it lives in the same SQLCipher database
+as the rest of the local store and is sealed by `K_local_db`. It
+is **not** uploaded to the search-shard archive (vector index
+shards are computed from the same embeddings but encrypted under
+`K_vector_index_shard` with their own segmentation). The cache is
+treated as a hot-path optimization, not as durable state — losing
+it only causes a recomputation on the next message ingestion or
+semantic search, not data loss.
+
+The trait that defines this seam is
+[`crate::models::embeddings::EmbeddingCache`]:
+
+```rust
+pub trait EmbeddingCache {
+    fn get(
+        &self,
+        message_id: &str,
+        model_version: &str,
+    ) -> crate::Result<Option<Vec<f32>>>;
+    fn put(
+        &self,
+        message_id: &str,
+        model_version: &str,
+        embedding: &[f32],
+    ) -> crate::Result<()>;
+}
+```
+
+The default implementation reads / writes the `search_vector`
+table; a `Noop` placeholder is provided for callers that do not
+have a local store handy (e.g. very early bring-up before the
+database is open).
+
 ### 7.7 Platform ML execution
 
 | Platform | Inference                                      | OCR                                | Notes                                                          |
 | -------- | ---------------------------------------------- | ---------------------------------- | -------------------------------------------------------------- |
-| iOS      | Core ML (preferred) or ONNX Runtime CoreML EP  | `VNRecognizeTextRequest` (Vision)  | Background inference under BGTaskScheduler.                    |
-| Android  | ONNX Runtime NNAPI EP, fallback to CPU EP      | ML Kit Text Recognition v2         | WorkManager job constrained on battery + thermal + network.    |
-| macOS    | Core ML or ONNX Runtime CoreML EP              | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident.             |
-| Windows  | ONNX Runtime CPU EP                            | Multilingual OCR via Tesseract / Windows.Media.Ocr | **Must run CPU-only**; INT8 quantized models essential. |
+| iOS      | Core ML (preferred) or ONNX Runtime CoreML EP  | `VNRecognizeTextRequest` (Vision)  | Background inference under BGTaskScheduler. INT4 supported via ONNX Runtime CoreML EP for embedding models on devices with tight storage. |
+| Android  | ONNX Runtime NNAPI EP, fallback to CPU EP      | ML Kit Text Recognition v2         | WorkManager job constrained on battery + thermal + network. INT4 default for embeddings on low-end Android (tight storage budget); INT8 on flagship. |
+| macOS    | Core ML or ONNX Runtime CoreML EP              | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
+| Windows  | ONNX Runtime CPU EP                            | Multilingual OCR via Tesseract / Windows.Media.Ocr | **Must run CPU-only**; INT8 quantized models essential. INT4 (`MatMulNBits`) supported and is the default on Windows tablets / low-storage SKUs. |
 
 ### 7.8 Search index shard format
 

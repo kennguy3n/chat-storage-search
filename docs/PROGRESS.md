@@ -863,6 +863,13 @@ Checklist:
 - [ ] Encrypted vector / media shard archive.
 - [ ] On-device reranking with semantic scores.
 - [ ] Desktop support: macOS (Core ML), Windows (CPU-only ONNX RT).
+- [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
+      `kennguy3n/slm-guardrail` in the search pipeline
+      (`(message_id, model_version)` keyed `search_vector` row;
+      version-mismatch invalidates). See PROPOSAL §7.6.1.
+- [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
+      Runtime `MatMulNBits`; benchmark accuracy vs INT8 with the
+      multilingual relevance regression suite.
 
 **Decision gate**: Semantic search returns relevant multilingual
 results across text, images, video, and audio on iOS, Android,

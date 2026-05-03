@@ -368,6 +368,17 @@ Checklist:
 - [ ] On-device reranking with semantic similarity scores.
 - [ ] Desktop support: macOS (Core ML), Windows (CPU-only ONNX
       Runtime).
+- [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
+      `kennguy3n/slm-guardrail` in the search pipeline. Cache key
+      `(message_id, model_version = 'xlmr@v1')`; backed by the
+      `search_vector` table; version-mismatch invalidates. Trait:
+      `crate::models::embeddings::EmbeddingCache`. See PROPOSAL §7.6.1.
+- [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
+      Runtime `MatMulNBits`. Benchmark cosine-similarity correlation
+      against the INT8 baseline using the multilingual relevance
+      regression suite. INT4 ships as the default on devices with
+      tight storage budgets (low-end Android, Windows tablets);
+      INT8 remains the default on desktop and flagship mobile.
 
 **Decision gate**: Semantic search returns relevant multilingual
 results across text, images, video, and audio on iOS, Android,

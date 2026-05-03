@@ -566,7 +566,7 @@ content from day one.
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Tokenization (FTS5)      | SQLite FTS5 with **ICU tokenizer** (`tokenize = 'icu'`); falls back to `unicode61` only if ICU is unavailable on the platform.      |
 | Fuzzy matching           | Trigrams for Latin / Cyrillic / Greek; bigrams for CJK (Chinese, Japanese, Korean); script-aware Levenshtein.                       |
-| Text embeddings          | `XLM-R` (100+ languages, ~80–100 MB INT8 ONNX) — same encoder used by `kennguy3n/slm-guardrail`, unifying the text encoder across the platform. English-only MiniLM-L6 is **rejected**. |
+| Text embeddings          | `XLM-R` (100+ languages, ~40–50 MB INT4 / ~80–100 MB INT8 ONNX) — same encoder used by `kennguy3n/slm-guardrail`, unifying the text encoder across the platform. INT4 default on tight-storage devices (low-end Android, Windows tablets); INT8 default on desktop and flagship. English-only MiniLM-L6 is **rejected**. |
 | OCR                      | Apple Vision (18+ languages) on iOS / macOS; ML Kit Text Recognition v2 (50+ languages) on Android; multilingual fallback on desktop. |
 | Audio transcription      | `Whisper-base` (~140 MB) / `Whisper-tiny` (~75 MB) multilingual INT8 ONNX, gated on battery and thermal state.                       |
 | Mixed-script messages    | A single message may interleave scripts (e.g. `Meeting at 3pm 会議室で`). ICU and the ML stack handle this natively per run.        |
@@ -585,9 +585,11 @@ content from day one.
   approximate vector search.
 - **ONNX Runtime** via the [`ort`](https://crates.io/crates/ort)
   crate for on-device ML inference: `XLM-R` text embeddings
-  (~80–100 MB INT8), `MobileCLIP-S2` image / video embeddings
-  (~80 MB INT8), `Whisper-base` (~140 MB) / `Whisper-tiny`
-  (~75 MB) audio transcription.
+  (~40–50 MB INT4 / ~80–100 MB INT8), `MobileCLIP-S2` image / video
+  embeddings (~40 MB INT4 / ~80 MB INT8), `Whisper-base` (~140 MB)
+  / `Whisper-tiny` (~75 MB) audio transcription. INT4 quantization
+  uses ONNX Runtime's `MatMulNBits` and is supported on the
+  embedding models only — Whisper stays at INT8.
 - **BLAKE3** for content hashing (matches `kennguy3n/zk-object-fabric`'s
   Pattern C convergent dedup so backup interop is bit-identical).
 - **XChaCha20-Poly1305** as the default AEAD; **AES-256-GCM** as
