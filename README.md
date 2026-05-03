@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
+> Search + MLS Integration — `In progress | ~95%`.** **Phase 2 —
 > Media Encryption and Blob Service — `In progress | ~95%` (chunked
 > media pipeline + thumbnailing landed; tiered media-storage routing
 > wired through `MediaBlobSink`).**
