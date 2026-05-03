@@ -111,6 +111,62 @@ pub struct CoreImpl {
     /// every time a manifest is cut (to harvest the
     /// wrapped-prior-epoch-keys list).
     current_epoch: Mutex<Option<EpochKeyManager>>,
+    /// Phase-4 backup root key (`K_backup_root`,
+    /// `docs/PROPOSAL.md §6.2`). `None` until
+    /// [`CoreImpl::install_backup_keys`] is called. When unset,
+    /// [`KChatCore::run_incremental_backup`] short-circuits to a
+    /// noop result rather than failing — the device may not have
+    /// finished unlocking the backup root yet.
+    backup_root_key: Mutex<Option<Zeroizing<[u8; KEY_LEN]>>>,
+    /// Ed25519 device signing key used to sign backup manifests.
+    /// `None` until [`CoreImpl::install_backup_keys`] is called.
+    backup_signing_key: Mutex<Option<ed25519_dalek::SigningKey>>,
+    /// Stable device id stamped into the backup manifest AAD so
+    /// the orchestrator can attribute manifests to the device that
+    /// produced them.
+    backup_device_id: Mutex<Option<String>>,
+    /// In-memory tail of the backup manifest chain. The next
+    /// manifest produced by
+    /// [`KChatCore::run_incremental_backup`] chains under this one;
+    /// `None` produces a genesis manifest. Phase 5 will persist
+    /// this in a `backup_manifest_chain` table so chain continuity
+    /// survives a process restart.
+    previous_backup_manifest: Mutex<Option<crate::formats::manifest::BackupManifest>>,
+    /// In-memory ledger of every sealed backup segment the
+    /// orchestrator currently knows about (built but not yet
+    /// superseded by compaction). [`KChatCore::run_incremental_backup`]
+    /// appends one entry per call; [`Self::compact_backup`] reads
+    /// it, builds a [`crate::backup::compaction::CompactionPlan`],
+    /// re-seals the merged groups, and rewrites the ledger with
+    /// the compacted entries replacing the superseded ones. Phase
+    /// 5 will persist this in a `backup_segment_map` table.
+    tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
+}
+
+/// One row of [`CoreImpl::tracked_backup_segments`].
+#[derive(Debug, Clone)]
+pub struct TrackedBackupSegment {
+    /// Sealed segment record returned by
+    /// [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`].
+    pub built: crate::backup::segment_builder::BuiltBackupSegment,
+    /// Tier the segment currently sits in. New segments produced
+    /// by [`KChatCore::run_incremental_backup`] start at
+    /// [`crate::backup::compaction::CompactionTier::Daily`].
+    pub tier: crate::backup::compaction::CompactionTier,
+    /// Earliest event timestamp covered by the segment (ms epoch).
+    pub min_event_ms: i64,
+    /// Latest event timestamp covered by the segment (ms epoch).
+    pub max_event_ms: i64,
+    /// The `K_backup_segment` instance the segment was sealed
+    /// under. Stored here because
+    /// [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`]
+    /// generates `built.segment_id` internally — it is **not**
+    /// the input to [`crate::crypto::key_hierarchy::derive_backup_segment`]
+    /// — so the orchestrator cannot re-derive the key on the
+    /// open side. Phase 5 will move this into a sealed
+    /// `wrapped_k_segment` column on the backup-segment-map table
+    /// (wrapped under `K_backup_root`).
+    pub k_segment: crate::crypto::key_hierarchy::KeyMaterial,
 }
 
 impl std::fmt::Debug for CoreImpl {
@@ -139,6 +195,11 @@ impl CoreImpl {
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
+            backup_root_key: Mutex::new(None),
+            backup_signing_key: Mutex::new(None),
+            backup_device_id: Mutex::new(None),
+            previous_backup_manifest: Mutex::new(None),
+            tracked_backup_segments: Mutex::new(Vec::new()),
         })
     }
 
@@ -157,6 +218,11 @@ impl CoreImpl {
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
+            backup_root_key: Mutex::new(None),
+            backup_signing_key: Mutex::new(None),
+            backup_device_id: Mutex::new(None),
+            previous_backup_manifest: Mutex::new(None),
+            tracked_backup_segments: Mutex::new(Vec::new()),
         })
     }
 
@@ -389,6 +455,30 @@ impl CoreImpl {
         transport: &dyn TransportClient,
         conversation_id: Uuid,
         time_bucket: &str,
+        key_for_segment: F,
+    ) -> Result<Vec<MessageSkeleton>>
+    where
+        F: FnMut(&str) -> Result<[u8; 32]>,
+    {
+        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(transport);
+        self.rehydrate_timeline_skeletons_with_router(
+            &router,
+            conversation_id,
+            time_bucket,
+            key_for_segment,
+        )
+    }
+
+    /// Backend-aware variant of [`Self::rehydrate_timeline_skeletons`].
+    /// Routes per-row fetches through the supplied
+    /// [`crate::archive::download::ArchiveSegmentRouter`] so
+    /// `archive_segment_map.storage_backend = zk_object_fabric` rows
+    /// land via S3 instead of the legacy KChat transport.
+    pub fn rehydrate_timeline_skeletons_with_router<F>(
+        &self,
+        router: &crate::archive::download::ArchiveSegmentRouter<'_>,
+        conversation_id: Uuid,
+        time_bucket: &str,
         mut key_for_segment: F,
     ) -> Result<Vec<MessageSkeleton>>
     where
@@ -396,9 +486,9 @@ impl CoreImpl {
     {
         let segments = {
             let db = self.db.lock().map_err(poisoned)?;
-            crate::archive::prefetch::batch_prefetch_bucket(
+            crate::archive::prefetch::batch_prefetch_bucket_with_router(
                 db.connection(),
-                transport,
+                router,
                 conversation_id,
                 time_bucket,
             )?
@@ -477,19 +567,41 @@ impl CoreImpl {
         wrapping_key: &[u8; KEY_LEN],
     ) -> Result<Option<Vec<u8>>> {
         let mid = message_id.to_string();
-        let db = self.db.lock().map_err(poisoned)?;
-        let Some(asset) = db
-            .get_media_asset_by_message(&mid)
-            .map_err(|e| Error::Storage(e.to_string()))?
-        else {
-            return Ok(None);
+
+        // Phase 1: read all metadata under the db lock, then drop
+        // the guard so the long-running chunked download in
+        // phase 2 doesn't block concurrent
+        // `send_text` / `search` / `ingest` callers
+        // (Task 2 of the Phase 3/4 batch).
+        let plan = {
+            let db = self.db.lock().map_err(poisoned)?;
+            let Some(asset) = db
+                .get_media_asset_by_message(&mid)
+                .map_err(|e| Error::Storage(e.to_string()))?
+            else {
+                return Ok(None);
+            };
+            crate::media::download::prepare_rehydration(&db, &asset.asset_id)?
+            // MutexGuard drops here on the closing brace.
         };
-        let plaintext = crate::media::download::rehydrate_media_asset(
-            &db,
-            &asset.asset_id,
-            transport,
-            wrapping_key,
-        )?;
+
+        // Phase 2: chunked download, AEAD-open, BLAKE3 verify —
+        // no db reference held.
+        let plaintext =
+            crate::media::download::execute_rehydration_download(&plan, transport, wrapping_key)?;
+
+        // Phase 3: re-acquire the db lock and flip the state
+        // machine + bytes_local under SAVEPOINT.
+        {
+            let db = self.db.lock().map_err(poisoned)?;
+            crate::media::download::commit_rehydration(
+                &db,
+                &plan.asset_id,
+                plan.from_state,
+                plaintext.len(),
+            )?;
+        }
+
         Ok(Some(plaintext))
     }
 
@@ -720,6 +832,617 @@ impl CoreImpl {
         }
         result
     }
+
+    // ----------------------------------------------------------------
+    // Backup orchestration (Task 3 — `docs/PROPOSAL.md §6.2`)
+    // ----------------------------------------------------------------
+
+    /// Install the Phase-4 backup keys: the long-lived
+    /// `K_backup_root` (root of the backup KDF tree), the Ed25519
+    /// device signing key used to sign backup manifests, and the
+    /// stable `device_id` stamped into every manifest's AAD.
+    ///
+    /// Called once after the platform keystore unlocks the user's
+    /// `K_user_master`. Replaces any previously installed keys.
+    /// Without these,
+    /// [`KChatCore::run_incremental_backup`] returns
+    /// `Error::Crypto(...)` because the segment / manifest
+    /// builders cannot derive their per-record keys.
+    pub fn install_backup_keys(
+        &self,
+        backup_root: [u8; KEY_LEN],
+        signing_key: ed25519_dalek::SigningKey,
+        device_id: String,
+    ) -> Result<()> {
+        *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
+        *self.backup_signing_key.lock().map_err(poisoned)? = Some(signing_key);
+        *self.backup_device_id.lock().map_err(poisoned)? = Some(device_id);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_backup_keys`] has been called.
+    pub fn has_backup_keys(&self) -> bool {
+        self.backup_root_key
+            .lock()
+            .map(|s| s.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Drive one incremental backup pass.
+    ///
+    /// Implements `docs/PROPOSAL.md §6.2` end-to-end:
+    ///
+    /// 1. Read every event past the
+    ///    [`crate::backup::event_journal::BackupEventJournal`]
+    ///    cursor up to `MAX_EVENTS_PER_SEGMENT`. If empty, return a
+    ///    [`BackupResult`] with all counters zeroed and skip the
+    ///    seal-and-sign work below.
+    /// 2. Derive `K_backup_segment(segment_id)` from
+    ///    `K_backup_root` via
+    ///    [`crate::crypto::key_hierarchy::derive_backup_segment`]
+    ///    and seal the events through
+    ///    [`crate::backup::segment_builder::BackupSegmentBuilder`].
+    /// 3. Derive `K_backup_manifest(manifest_id)` from
+    ///    `K_backup_root` via
+    ///    [`crate::crypto::key_hierarchy::derive_backup_manifest`]
+    ///    and build the next manifest via
+    ///    [`crate::backup::manifest_builder::build_backup_manifest`],
+    ///    chaining under
+    ///    [`Self::previous_backup_manifest`] (or genesis at
+    ///    `generation = 0`).
+    /// 4. Advance the journal cursor and update the in-memory
+    ///    chain tail so the next call chains under this manifest.
+    ///
+    /// Upload of the sealed segment / manifest ciphertext is the
+    /// caller's job: this method does not own a
+    /// [`crate::transport::TransportClient`] handle. Once the
+    /// `BackupSink` adapter from Task 4 lands, a follow-up will
+    /// extend this function to drive
+    /// `BackupSink::upload_backup_segment` /
+    /// `BackupSink::upload_backup_manifest` here.
+    fn run_incremental_backup_inner(&self, _reason: &str) -> Result<BackupResult> {
+        use crate::backup::event_journal::BackupEventJournal;
+        use crate::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
+        use crate::backup::segment_builder::{BackupSegmentBuildRequest, BackupSegmentBuilder};
+        use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
+        use crate::formats::SegmentType;
+
+        // Cap each segment so an event-journal backlog does not
+        // produce a single oversized seal. Mirrors the archive
+        // segment cap (`docs/PROPOSAL.md §5.2`).
+        const MAX_EVENTS_PER_SEGMENT: usize = 4_096;
+
+        // Phase 1 — read unsegmented events (db lock).
+        let (events_with_seq, last_seq) = {
+            let db = self.db.lock().map_err(poisoned)?;
+            let journal = BackupEventJournal::new();
+            let events = journal
+                .read_unsegmented(db.connection(), MAX_EVENTS_PER_SEGMENT)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let last_seq = events.last().map(|(seq, _)| *seq);
+            (events, last_seq)
+        };
+        if events_with_seq.is_empty() {
+            return Ok(BackupResult::default());
+        }
+        let last_seq = last_seq.expect("non-empty events implies a last seq");
+        let events: Vec<_> = events_with_seq.into_iter().map(|(_, e)| e).collect();
+        let event_count = events.len() as u64;
+        let min_event_ms = events
+            .iter()
+            .map(|e| e.created_at_ms)
+            .min()
+            .expect("non-empty events implies a min");
+        let max_event_ms = events
+            .iter()
+            .map(|e| e.created_at_ms)
+            .max()
+            .expect("non-empty events implies a max");
+
+        // Phase 2 — seal the segment outside the db lock.
+        let backup_root = {
+            let slot = self.backup_root_key.lock().map_err(poisoned)?;
+            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
+                Error::Storage(
+                    "run_incremental_backup: K_backup_root not installed (call install_backup_keys first)".into(),
+                )
+            })?;
+            KeyMaterial::from_bytes(bytes)
+        };
+        let signing_key = self
+            .backup_signing_key
+            .lock()
+            .map_err(poisoned)?
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Storage(
+                    "run_incremental_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                )
+            })?
+            .clone();
+        let device_id = self
+            .backup_device_id
+            .lock()
+            .map_err(poisoned)?
+            .clone()
+            .unwrap_or_else(|| "unknown-device".to_string());
+
+        let segment_id = uuid::Uuid::now_v7();
+        let k_segment =
+            derive_backup_segment(&backup_root, segment_id.as_bytes()).map_err(Error::Crypto)?;
+        let built = BackupSegmentBuilder::new().build_segment(
+            BackupSegmentBuildRequest {
+                events,
+                segment_type: SegmentType::Events,
+            },
+            &k_segment,
+        )?;
+
+        // Build the manifest chained under the in-memory tail.
+        let previous_owned = self
+            .previous_backup_manifest
+            .lock()
+            .map_err(poisoned)?
+            .clone();
+        let manifest_id_for_key = uuid::Uuid::now_v7();
+        let k_manifest = derive_backup_manifest(&backup_root, manifest_id_for_key.as_bytes())
+            .map_err(Error::Crypto)?;
+        let segments = [built.clone()];
+        let request = BackupManifestBuildRequest {
+            segments: &segments,
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            previous: previous_owned.as_ref(),
+            device_id: device_id.clone(),
+        };
+        let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
+        let manifest_generation = sealed_manifest.manifest.generation;
+
+        // Phase 3 — advance the cursor under the db lock.
+        {
+            let db = self.db.lock().map_err(poisoned)?;
+            let journal = BackupEventJournal::new();
+            journal
+                .advance_cursor(db.connection(), last_seq)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        *self.previous_backup_manifest.lock().map_err(poisoned)? =
+            Some(sealed_manifest.manifest.clone());
+
+        // Phase 5 (Task 5) consumes this ledger when the
+        // compaction policy decides to roll up daily segments.
+        self.tracked_backup_segments
+            .lock()
+            .map_err(poisoned)?
+            .push(TrackedBackupSegment {
+                built: built.clone(),
+                tier: crate::backup::compaction::CompactionTier::Daily,
+                min_event_ms,
+                max_event_ms,
+                k_segment: k_segment.clone(),
+            });
+
+        Ok(BackupResult {
+            segments_built: 1,
+            // No transport-side BackupSink upload yet; Task 4 wires
+            // `ZkofBackupSink::upload_backup_segment` /
+            // `upload_backup_manifest` into this slot. Until then
+            // the caller is responsible for uploading the sealed
+            // bytes out-of-band.
+            segments_uploaded: 0,
+            events_segmented: event_count,
+            manifest_generation: Some(manifest_generation),
+            manifest_uploaded: false,
+        })
+    }
+
+    /// Drive one pass of backup compaction.
+    ///
+    /// Reads the current ledger of sealed segments
+    /// ([`Self::tracked_backup_segments`]), asks
+    /// [`crate::backup::compaction::CompactionPolicy::plan`] for
+    /// the eligible groups, and for each group:
+    ///
+    /// 1. Decrypts every member segment under
+    ///    `K_backup_segment(member.segment_id)`.
+    /// 2. Concatenates the events.
+    /// 3. Runs
+    ///    [`crate::backup::compaction::apply_tombstones`] to drop
+    ///    deleted-message events.
+    /// 4. Re-seals the survivors as a single
+    ///    [`crate::backup::segment_builder::BuiltBackupSegment`]
+    ///    under a freshly-derived
+    ///    `K_backup_segment(new_segment_id)` at the group's target
+    ///    tier.
+    /// 5. Replaces the superseded entries in the ledger with the
+    ///    compacted entry.
+    /// 6. Builds a new
+    ///    [`crate::backup::manifest_builder::SealedBackupManifest`]
+    ///    over the rewritten ledger and chains it under
+    ///    [`Self::previous_backup_manifest`].
+    pub fn compact_backup(&self, now_ms: i64) -> Result<BackupCompactionResult> {
+        use crate::backup::compaction::{apply_tombstones, CompactionPolicy};
+        use crate::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
+        use crate::backup::segment_builder::{
+            decrypt_backup_segment, BackupSegmentBuildRequest, BackupSegmentBuilder,
+        };
+        use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
+        use crate::formats::SegmentType;
+
+        let backup_root = {
+            let slot = self.backup_root_key.lock().map_err(poisoned)?;
+            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
+                Error::Storage(
+                    "compact_backup: K_backup_root not installed (call install_backup_keys first)"
+                        .into(),
+                )
+            })?;
+            KeyMaterial::from_bytes(bytes)
+        };
+        let signing_key = self
+            .backup_signing_key
+            .lock()
+            .map_err(poisoned)?
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Storage(
+                    "compact_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                )
+            })?
+            .clone();
+        let device_id = self
+            .backup_device_id
+            .lock()
+            .map_err(poisoned)?
+            .clone()
+            .unwrap_or_else(|| "unknown-device".to_string());
+
+        // Snapshot the ledger and build a plan.
+        let snapshot = self
+            .tracked_backup_segments
+            .lock()
+            .map_err(poisoned)?
+            .clone();
+        if snapshot.is_empty() {
+            return Ok(BackupCompactionResult::default());
+        }
+        let segment_refs: Vec<crate::backup::compaction::BackupSegmentRef> = snapshot
+            .iter()
+            .map(|s| crate::backup::compaction::BackupSegmentRef {
+                segment_id: s.built.segment_id,
+                tier: s.tier,
+                min_event_ms: s.min_event_ms,
+                max_event_ms: s.max_event_ms,
+                event_count: s.built.event_count,
+            })
+            .collect();
+        let plan = CompactionPolicy::default().plan(&segment_refs, now_ms);
+        if plan.is_empty() {
+            return Ok(BackupCompactionResult::default());
+        }
+
+        let mut groups_compacted = 0u64;
+        let mut segments_superseded = 0u64;
+        let mut bytes_before = 0u64;
+        let mut bytes_after = 0u64;
+        let mut compacted_outputs: Vec<TrackedBackupSegment> = Vec::new();
+        let superseded_ids: std::collections::BTreeSet<uuid::Uuid> =
+            plan.superseded_segment_ids().into_iter().collect();
+
+        for group in &plan.groups {
+            // Decrypt each source segment under its per-segment
+            // key derived from K_backup_root.
+            let mut events: Vec<crate::backup::event_journal::BackupEvent> = Vec::new();
+            let mut group_min_ms = i64::MAX;
+            let mut group_max_ms = i64::MIN;
+            for member in &group.members {
+                let tracked = snapshot
+                    .iter()
+                    .find(|s| s.built.segment_id == member.segment_id)
+                    .ok_or_else(|| {
+                        Error::Storage(format!(
+                            "compact_backup: superseded segment {} missing from ledger",
+                            member.segment_id
+                        ))
+                    })?;
+                bytes_before += tracked.built.ciphertext.len() as u64;
+                group_min_ms = group_min_ms.min(tracked.min_event_ms);
+                group_max_ms = group_max_ms.max(tracked.max_event_ms);
+                let payload = decrypt_backup_segment(&tracked.built, &tracked.k_segment)?;
+                events.extend(payload.events);
+            }
+            segments_superseded += group.members.len() as u64;
+            groups_compacted += 1;
+
+            // Tombstones drop the original delete events too —
+            // matching the semantics already validated in
+            // `crate::backup::compaction::apply_tombstones`.
+            let survivors = apply_tombstones(events);
+            if survivors.is_empty() {
+                // Whole group erased by tombstones; nothing to
+                // re-seal.
+                continue;
+            }
+
+            let new_segment_id = uuid::Uuid::now_v7();
+            let k_new = derive_backup_segment(&backup_root, new_segment_id.as_bytes())
+                .map_err(Error::Crypto)?;
+            let built = BackupSegmentBuilder::new().build_segment(
+                BackupSegmentBuildRequest {
+                    events: survivors,
+                    segment_type: SegmentType::Events,
+                },
+                &k_new,
+            )?;
+            bytes_after += built.ciphertext.len() as u64;
+            compacted_outputs.push(TrackedBackupSegment {
+                built,
+                tier: group.target_tier,
+                min_event_ms: group_min_ms,
+                max_event_ms: group_max_ms,
+                k_segment: k_new,
+            });
+        }
+
+        // Rewrite the ledger: drop the superseded entries, append
+        // the compacted ones.
+        {
+            let mut slot = self.tracked_backup_segments.lock().map_err(poisoned)?;
+            slot.retain(|s| !superseded_ids.contains(&s.built.segment_id));
+            slot.extend(compacted_outputs.iter().cloned());
+        }
+
+        // Cut a new manifest over the rewritten ledger so the
+        // chain reflects the compaction.
+        let ledger_snapshot = self
+            .tracked_backup_segments
+            .lock()
+            .map_err(poisoned)?
+            .clone();
+        let segments_for_manifest: Vec<_> =
+            ledger_snapshot.iter().map(|s| s.built.clone()).collect();
+        let previous_owned = self
+            .previous_backup_manifest
+            .lock()
+            .map_err(poisoned)?
+            .clone();
+        let manifest_id_for_key = uuid::Uuid::now_v7();
+        let k_manifest = derive_backup_manifest(&backup_root, manifest_id_for_key.as_bytes())
+            .map_err(Error::Crypto)?;
+        let request = BackupManifestBuildRequest {
+            segments: &segments_for_manifest,
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            previous: previous_owned.as_ref(),
+            device_id,
+        };
+        let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
+        let manifest_generation = sealed_manifest.manifest.generation;
+        *self.previous_backup_manifest.lock().map_err(poisoned)? =
+            Some(sealed_manifest.manifest.clone());
+
+        Ok(BackupCompactionResult {
+            groups_compacted,
+            segments_superseded,
+            segments_emitted: compacted_outputs.len() as u64,
+            bytes_before,
+            bytes_after,
+            manifest_generation: Some(manifest_generation),
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-3 / Phase-7 archive compaction (Task 9 — `docs/PHASES.md
+    // §Phase 7`).
+    // -----------------------------------------------------------------
+
+    /// Compact the archive segments for a single
+    /// `(conversation_id, time_bucket)` key.
+    ///
+    /// The orchestration layer:
+    ///
+    /// 1. Selects every `archive_segment_map` row matching
+    ///    `conversation_id` / `time_bucket` whose state is
+    ///    [`ArchiveState::ArchiveVerified`]. Earlier states (still
+    ///    being uploaded, not yet verified) are not eligible —
+    ///    re-sealing in flight would race with the integrity
+    ///    cross-check.
+    /// 2. Fetches each row's ciphertext via the supplied
+    ///    [`crate::archive::download::ArchiveSegmentRouter`] (which
+    ///    routes per-row by
+    ///    [`crate::local_store::schema::StorageBackend`]).
+    /// 3. Decrypts each segment via
+    ///    [`crate::archive::download::decrypt_archive_segment`]
+    ///    using the key returned by `key_for_segment`.
+    /// 4. Concatenates events, runs
+    ///    [`crate::archive::compaction::apply_archive_tombstones`].
+    /// 5. Re-seals the survivors as a single archive segment via
+    ///    [`crate::archive::segment_builder::ArchiveSegmentBuilder::build_segment`]
+    ///    under `k_compact_segment`.
+    /// 6. Calls `commit_compact` so the orchestrator can route the
+    ///    upload + persist the new `archive_segment_map` row.
+    /// 7. Transitions the source segments to
+    ///    [`ArchiveState::ArchiveCompacted`].
+    ///
+    /// Returns an [`crate::archive::compaction::ArchiveCompactionResult`]
+    /// summarising the run. A noop run (≤1 source segment) returns
+    /// the default summary unchanged.
+    pub fn compact_archive<F, C>(
+        &self,
+        router: &crate::archive::download::ArchiveSegmentRouter<'_>,
+        conversation_id: Uuid,
+        time_bucket: &str,
+        k_compact_segment: &[u8; 32],
+        mut key_for_segment: F,
+        mut commit_compact: C,
+    ) -> Result<crate::archive::compaction::ArchiveCompactionResult>
+    where
+        F: FnMut(&str) -> Result<[u8; 32]>,
+        C: FnMut(&crate::archive::segment_builder::BuiltSegment) -> Result<()>,
+    {
+        use crate::archive::compaction::{apply_archive_tombstones, ArchiveCompactionResult};
+        use crate::archive::download::{decode_archive_segment_payload, decrypt_archive_segment};
+        use crate::archive::prefetch::batch_prefetch_bucket_with_router;
+        use crate::archive::segment_builder::{ArchiveSegmentBuilder, SegmentBuildRequest};
+
+        let mut summary = ArchiveCompactionResult {
+            buckets_inspected: 1,
+            ..Default::default()
+        };
+
+        // Phase A — read every eligible segment row + ciphertext
+        // outside the db lock (the prefetch helper opens it
+        // internally and releases before we decrypt).
+        let prefetched = {
+            let db = self.db.lock().map_err(poisoned)?;
+            // Filter to `archive_verified` state up-front: only
+            // segments past Merkle-cross-check are eligible for
+            // compaction.
+            let mut stmt = db
+                .connection()
+                .prepare(
+                    "SELECT segment_id FROM archive_segment_map
+                       WHERE conversation_id = ?1
+                         AND time_bucket = ?2
+                         AND state = 'archive_verified'",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![conversation_id.to_string(), time_bucket],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut eligible_ids: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for row in rows {
+                eligible_ids.insert(row.map_err(|e| Error::Storage(e.to_string()))?);
+            }
+            drop(stmt);
+            if eligible_ids.len() < 2 {
+                // ≤1 eligible segment: nothing to compact.
+                return Ok(summary);
+            }
+            let prefetched = batch_prefetch_bucket_with_router(
+                db.connection(),
+                router,
+                conversation_id,
+                time_bucket,
+            )?;
+            // The prefetch helper returns rows for *every* state;
+            // we only compact the ones in `archive_verified`.
+            prefetched
+                .into_iter()
+                .filter(|p| eligible_ids.contains(&p.segment_id))
+                .collect::<Vec<_>>()
+        };
+
+        if prefetched.len() < 2 {
+            return Ok(summary);
+        }
+
+        // Phase B — decrypt every source segment and concatenate
+        // the events. We track the original segment ids so we can
+        // flip their state in phase E.
+        let mut events: Vec<crate::archive::event_journal::ArchiveEvent> = Vec::new();
+        let mut superseded_ids: Vec<String> = Vec::new();
+        for prefetched_seg in &prefetched {
+            summary.bytes_before += prefetched_seg.ciphertext.len() as u64;
+            let k_bytes = key_for_segment(&prefetched_seg.segment_id)?;
+            let plaintext_cbor = decrypt_archive_segment(&prefetched_seg.ciphertext, &k_bytes)?;
+            let payload = decode_archive_segment_payload(&plaintext_cbor)?;
+            events.extend(payload.events);
+            superseded_ids.push(prefetched_seg.segment_id.clone());
+        }
+
+        // Phase C — apply archive-flavored tombstones, then re-seal
+        // a single compact segment. If tombstones erased every
+        // event we skip the build but still flip the source rows
+        // to `archive_compacted`.
+        let survivors = apply_archive_tombstones(events);
+        let compact_segment = if survivors.is_empty() {
+            None
+        } else {
+            let built = ArchiveSegmentBuilder::new().build_segment(
+                SegmentBuildRequest {
+                    conversation_id,
+                    time_bucket: time_bucket.to_string(),
+                    events: survivors,
+                },
+                k_compact_segment,
+            )?;
+            summary.bytes_after += built.ciphertext.len() as u64;
+            Some(built)
+        };
+
+        // Phase D — let the orchestrator route the upload + write
+        // the new segment_map row before we transition the source
+        // rows. If commit_compact returns an error the source rows
+        // remain at `archive_verified` and the run is retryable.
+        if let Some(ref new_segment) = compact_segment {
+            commit_compact(new_segment)?;
+            summary.segments_emitted += 1;
+        }
+
+        // Phase E — flip every source segment to
+        // `archive_compacted`. A SAVEPOINT keeps the bulk of the
+        // updates atomic against concurrent reads.
+        {
+            let db = self.db.lock().map_err(poisoned)?;
+            let conn = db.connection();
+            conn.execute_batch("SAVEPOINT compact_archive;")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let res = (|| -> Result<()> {
+                for sid in &superseded_ids {
+                    conn.execute(
+                        "UPDATE archive_segment_map SET state = 'archive_compacted'
+                          WHERE segment_id = ?1",
+                        rusqlite::params![sid],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+                Ok(())
+            })();
+            match res {
+                Ok(()) => {
+                    conn.execute_batch("RELEASE compact_archive;")
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                }
+                Err(e) => {
+                    let _ =
+                        conn.execute_batch("ROLLBACK TO compact_archive; RELEASE compact_archive;");
+                    return Err(e);
+                }
+            }
+        }
+
+        summary.buckets_compacted = 1;
+        summary.segments_superseded = superseded_ids.len() as u64;
+        Ok(summary)
+    }
+}
+
+/// Result of [`CoreImpl::compact_backup`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupCompactionResult {
+    /// Number of [`crate::backup::compaction::CompactionGroup`]s
+    /// the policy planned and the orchestrator merged.
+    pub groups_compacted: u64,
+    /// Total source segments superseded by the compacted outputs.
+    pub segments_superseded: u64,
+    /// Number of new segments emitted by this run. May be smaller
+    /// than `groups_compacted` if a whole group was erased by
+    /// tombstones.
+    pub segments_emitted: u64,
+    /// Total ciphertext bytes of the superseded segments.
+    pub bytes_before: u64,
+    /// Total ciphertext bytes of the compacted outputs.
+    pub bytes_after: u64,
+    /// `generation` of the manifest cut after the rewrite. `None`
+    /// when the run was a noop.
+    pub manifest_generation: Option<u64>,
 }
 
 impl KChatCore for CoreImpl {
@@ -1135,10 +1858,8 @@ impl KChatCore for CoreImpl {
         })
     }
 
-    fn run_incremental_backup(&self, _reason: &str) -> Result<BackupResult> {
-        // Phase-1 stub: backup segment packing + manifest signing
-        // arrives in Phase 4.
-        Err(Error::NotImplemented("run_incremental_backup"))
+    fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
+        self.run_incremental_backup_inner(reason)
     }
 
     fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
@@ -1830,13 +2551,17 @@ mod tests {
     }
 
     #[test]
-    fn run_incremental_backup_returns_not_implemented() {
+    fn run_incremental_backup_with_empty_store_is_noop() {
+        // Phase-4 wiring (Task 3): when no events have been
+        // journaled and no backup keys are installed, the call
+        // short-circuits to a default `BackupResult` rather than
+        // erroring — there is nothing to seal, so there is no
+        // need for keys.
         let core = fresh_core();
-        let err = core.run_incremental_backup("scheduled").unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented("run_incremental_backup")),
-            "got {err:?}"
-        );
+        let result = core
+            .run_incremental_backup("scheduled")
+            .expect("noop on empty store");
+        assert_eq!(result, BackupResult::default());
     }
 
     #[test]
@@ -3409,6 +4134,271 @@ mod tests {
         asset_id
     }
 
+    /// In-memory blob transport that blocks `fetch_blob_range` on a
+    /// gate channel for the duration of the (test-controlled)
+    /// download phase. Exists so the concurrency test for Task 2
+    /// can pin a `rehydrate_media_for_message` call inside the
+    /// download phase while a second thread runs an unrelated db op
+    /// against the same `CoreImpl`. Once the gate is released the
+    /// transport serves chunks from a pre-staged
+    /// `(blob_id, chunk_idx) -> ciphertext` map using the same
+    /// deterministic byte-range layout the download path computes.
+    struct GatedTransport {
+        chunks: StdMutex<HashMap<String, Vec<Vec<u8>>>>,
+        gate: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+        entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl GatedTransport {
+        fn new(
+            rx: std::sync::mpsc::Receiver<()>,
+            entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                chunks: StdMutex::new(HashMap::new()),
+                gate: StdMutex::new(Some(rx)),
+                entered,
+            }
+        }
+
+        fn put_chunks(&self, blob_id: &str, sealed: &[crate::media::chunker::SealedChunk]) {
+            let mut state = self.chunks.lock().unwrap();
+            state.insert(
+                blob_id.to_string(),
+                sealed.iter().map(|c| c.ciphertext.clone()).collect(),
+            );
+        }
+    }
+
+    impl crate::transport::TransportClient for GatedTransport {
+        fn fetch_messages(
+            &self,
+            _conversation_id: &str,
+            _after_cursor: Option<&str>,
+        ) -> crate::transport::TransportResult<crate::transport::FetchMessagesResponse> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn init_blob_upload(
+            &self,
+            _size: u64,
+            _blob_class: BlobClass,
+            _expected_merkle_root: [u8; 32],
+        ) -> crate::transport::TransportResult<crate::transport::BlobUploadHandle> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn upload_chunk(
+            &self,
+            _blob_id: &str,
+            _chunk_idx: u32,
+            _ciphertext: &[u8],
+            _sha256: [u8; 32],
+        ) -> crate::transport::TransportResult<crate::transport::ChunkReceipt> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn commit_blob(
+            &self,
+            _blob_id: &str,
+        ) -> crate::transport::TransportResult<crate::transport::CommitBlobResponse> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_blob_range(
+            &self,
+            blob_id: &str,
+            range: std::ops::Range<u64>,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            // Signal that we have entered the download phase, then
+            // park until the test releases the gate.
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(rx) = self.gate.lock().unwrap().take() {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            }
+            // Translate the byte range back to a chunk index using
+            // the same formula the download path uses to compute it.
+            let stride = crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64;
+            if !range.start.is_multiple_of(stride) {
+                return Err(Error::Storage(format!(
+                    "GatedTransport: range start {} is not chunk-aligned",
+                    range.start
+                )));
+            }
+            let chunk_idx = (range.start / stride) as usize;
+            let chunks = self.chunks.lock().unwrap();
+            let entries = chunks
+                .get(blob_id)
+                .ok_or_else(|| Error::Storage(format!("GatedTransport: no blob {blob_id}")))?;
+            let chunk = entries.get(chunk_idx).cloned().ok_or_else(|| {
+                Error::Storage(format!(
+                    "GatedTransport: chunk {chunk_idx} out of range for blob {blob_id}"
+                ))
+            })?;
+            Ok(chunk)
+        }
+
+        fn fetch_archive_manifests(
+            &self,
+            _after_generation: Option<u64>,
+        ) -> crate::transport::TransportResult<Vec<crate::transport::EncryptedManifest>> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_archive_segment(
+            &self,
+            _segment_id: &str,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_index_shards(
+            &self,
+            _conversation_hash: &str,
+            _bucket: &str,
+            _shard_type: &str,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            Err(Error::NotImplemented("transport"))
+        }
+    }
+
+    #[test]
+    fn rehydrate_media_for_message_releases_db_lock_during_download() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let core = Arc::new(fresh_core());
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Build a real chunked + AEAD-sealed blob via `process_media`
+        // so the download phase actually verifies an honest
+        // ciphertext + Merkle root. The wrapping key under which
+        // `K_asset` was wrapped is what the rehydration call passes
+        // back in.
+        let wrapping = [0x37u8; 32];
+        let plaintext = vec![0x55u8; 256];
+        let processed = crate::media::processor::process_media(
+            &plaintext,
+            "image/png",
+            &wrapping,
+            BlobClass::Media,
+            false,
+        )
+        .expect("process_media");
+        let descriptor = &processed.descriptor;
+
+        // Seed the message_skeleton + media_asset rows with the real
+        // descriptor so `prepare_rehydration` can read them under the
+        // db lock.
+        let mid = Uuid::now_v7();
+        let asset_id = descriptor.asset_id.to_string();
+        let blob_id = descriptor.blob_id.to_string();
+        let merkle_root = descriptor.merkle_root.to_vec();
+        let wrapped_k_asset = descriptor.wrapped_k_asset.clone();
+        let chunk_count = descriptor.chunk_count as i32;
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "u-sender".into(),
+                created_at_ms: 100,
+                received_at_ms: 110,
+                kind: MessageKind::Media,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: Some(MediaState::Evicted),
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+            db.insert_media_asset(&MediaAsset {
+                asset_id: asset_id.clone(),
+                message_id: mid.to_string(),
+                mime_type: "image/png".into(),
+                bytes_total: plaintext.len() as i64,
+                bytes_local: 0,
+                media_state: MediaState::Evicted,
+                wrapped_k_asset: wrapped_k_asset.clone(),
+                chunk_count,
+                merkle_root: merkle_root.clone(),
+                blob_id: blob_id.clone(),
+                storage_sink: "kchat_backend".into(),
+            })
+            .unwrap();
+        });
+
+        // Stage chunks into the gated transport, which blocks
+        // `fetch_blob_range` until the test releases the gate.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let transport = Arc::new(GatedTransport::new(rx, entered.clone()));
+        transport.put_chunks(&blob_id, &processed.sealed_chunks);
+
+        // Thread A: rehydrate. It will park inside `fetch_blob_range`
+        // until the gate channel is pulsed. While parked, the db
+        // mutex MUST be released — otherwise thread B below would
+        // deadlock.
+        let core_a = core.clone();
+        let transport_a = transport.clone();
+        let handle_a = std::thread::spawn(move || {
+            core_a
+                .rehydrate_media_for_message(transport_a.as_ref(), mid, &wrapping)
+                .expect("rehydrate")
+        });
+
+        // Wait until thread A is actually inside the download phase
+        // before testing the lock from thread B.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for fetch_blob_range to be entered");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Thread B: a quick db op. This call would block forever on
+        // the db mutex if `rehydrate_media_for_message` were still
+        // holding it during the download phase.
+        let core_b = core.clone();
+        let lock_test_started = Instant::now();
+        let handle_b = std::thread::spawn(move || {
+            // Use a fresh conversation id to make absolutely sure
+            // this is a write that touches the same db mutex.
+            core_b
+                .create_conversation(Uuid::now_v7(), Some("racy"), 0)
+                .expect("create_conversation must not block on the rehydrate's lock")
+        });
+        handle_b
+            .join()
+            .expect("thread B must not panic and must not deadlock");
+        let lock_test_elapsed = lock_test_started.elapsed();
+        // 2s is generous: in practice this completes in a few ms when
+        // the lock is correctly released. Anything close to the gate
+        // timeout (10s) means we deadlocked on the db lock.
+        assert!(
+            lock_test_elapsed < Duration::from_secs(2),
+            "concurrent db op took {lock_test_elapsed:?}; the rehydrate is holding the db lock during the download phase",
+        );
+
+        // Release thread A and confirm rehydration completed.
+        let _ = tx.send(());
+        let plaintext_recovered = handle_a.join().expect("thread A panicked");
+        assert_eq!(plaintext_recovered.as_deref(), Some(plaintext.as_slice()));
+
+        // After phase 3 commits, the asset must be `OriginalLocal`
+        // and `bytes_local` must reflect the plaintext length.
+        core.with_db(|db| {
+            let asset = db.get_media_asset(&asset_id).unwrap().expect("asset");
+            assert_eq!(asset.media_state, MediaState::OriginalLocal);
+            assert_eq!(asset.bytes_local, plaintext.len() as i64);
+        });
+    }
+
     #[test]
     fn rehydrate_media_for_message_returns_none_when_no_asset() {
         let core = fresh_core();
@@ -3522,5 +4512,626 @@ mod tests {
             build_archive_manifest(req, &signing_key, &k_manifest).expect("build manifest");
         assert_eq!(sealed.manifest.wrapped_prior_epoch_keys, prior);
         assert!(!sealed.manifest.wrapped_prior_epoch_keys.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3: run_incremental_backup wiring (`docs/PROPOSAL.md §6.2`).
+    // -----------------------------------------------------------------
+
+    fn install_test_backup_keys(core: &CoreImpl) {
+        use ed25519_dalek::SigningKey;
+        let backup_root = [0x33u8; 32];
+        let signing = SigningKey::from_bytes(&[0x44u8; 32]);
+        core.install_backup_keys(backup_root, signing, "test-device".to_string())
+            .expect("install backup keys");
+    }
+
+    fn seed_backup_event(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) {
+        use crate::backup::event_journal::{BackupEvent, BackupEventJournal, BackupEventType};
+        core.with_db(|db| {
+            BackupEventJournal::new()
+                .write_event(
+                    db.connection(),
+                    &BackupEvent {
+                        event_type: BackupEventType::MessageReceived,
+                        conversation_id: Some(conv),
+                        message_id: Some(msg),
+                        payload: vec![0xAA, 0xBB, 0xCC],
+                        created_at_ms: ts_ms,
+                    },
+                )
+                .expect("write backup event");
+        });
+    }
+
+    #[test]
+    fn run_incremental_backup_with_pending_events_produces_segment() {
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_002_000);
+
+        let result = core
+            .run_incremental_backup("scheduled")
+            .expect("incremental backup");
+        assert_eq!(result.segments_built, 1);
+        assert_eq!(result.events_segmented, 3);
+        assert_eq!(result.manifest_generation, Some(0));
+        assert_eq!(result.segments_uploaded, 0);
+        assert!(!result.manifest_uploaded);
+    }
+
+    #[test]
+    fn run_incremental_backup_with_no_events_is_noop() {
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let result = core.run_incremental_backup("scheduled").expect("noop");
+        assert_eq!(result, BackupResult::default());
+    }
+
+    #[test]
+    fn run_incremental_backup_advances_cursor() {
+        use crate::backup::event_journal::BackupEventJournal;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+
+        // Sanity: cursor is 0 before the run.
+        let before = core.with_db(|db| {
+            BackupEventJournal::new()
+                .read_cursor(db.connection())
+                .unwrap()
+        });
+        assert_eq!(before, 0);
+
+        core.run_incremental_backup("scheduled")
+            .expect("incremental backup");
+
+        let after = core.with_db(|db| {
+            BackupEventJournal::new()
+                .read_cursor(db.connection())
+                .unwrap()
+        });
+        assert!(after >= 2, "cursor should advance past the seeded events");
+
+        // Subsequent read must surface no events.
+        let unsegmented = core.with_db(|db| {
+            BackupEventJournal::new()
+                .read_unsegmented(db.connection(), 100)
+                .unwrap()
+        });
+        assert!(unsegmented.is_empty());
+    }
+
+    #[test]
+    fn run_incremental_backup_idempotent_on_retry() {
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+
+        let first = core.run_incremental_backup("scheduled").expect("first run");
+        assert_eq!(first.segments_built, 1);
+        assert_eq!(first.events_segmented, 1);
+        assert_eq!(first.manifest_generation, Some(0));
+
+        // No new events → second run must be a noop.
+        let second = core
+            .run_incremental_backup("scheduled")
+            .expect("second run");
+        assert_eq!(second, BackupResult::default());
+
+        // Seed one more event and confirm the chain advances.
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+        let third = core.run_incremental_backup("scheduled").expect("third run");
+        assert_eq!(third.segments_built, 1);
+        assert_eq!(third.events_segmented, 1);
+        // Manifest chain advanced from genesis to generation 1.
+        assert_eq!(third.manifest_generation, Some(1));
+    }
+
+    #[test]
+    fn run_incremental_backup_without_keys_returns_error_with_pending_events() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+
+        let err = core
+            .run_incremental_backup("scheduled")
+            .expect_err("must fail without keys");
+        match err {
+            Error::Storage(msg) => {
+                assert!(msg.contains("K_backup_root not installed"), "{msg}")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5: compact_backup orchestration (`docs/PROPOSAL.md §6.6`).
+    // -----------------------------------------------------------------
+
+    fn seed_backup_event_with_seq(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) -> i64 {
+        use crate::backup::event_journal::{BackupEvent, BackupEventJournal, BackupEventType};
+        core.with_db(|db| {
+            BackupEventJournal::new()
+                .write_event(
+                    db.connection(),
+                    &BackupEvent {
+                        event_type: BackupEventType::MessageReceived,
+                        conversation_id: Some(conv),
+                        message_id: Some(msg),
+                        payload: vec![0xAA, 0xBB, 0xCC],
+                        created_at_ms: ts_ms,
+                    },
+                )
+                .expect("write")
+        })
+    }
+
+    fn seed_message_deleted(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) -> i64 {
+        use crate::backup::event_journal::{BackupEvent, BackupEventJournal, BackupEventType};
+        core.with_db(|db| {
+            BackupEventJournal::new()
+                .write_event(
+                    db.connection(),
+                    &BackupEvent {
+                        event_type: BackupEventType::MessageDeleted,
+                        conversation_id: Some(conv),
+                        message_id: Some(msg),
+                        payload: vec![],
+                        created_at_ms: ts_ms,
+                    },
+                )
+                .expect("write")
+        })
+    }
+
+    /// Helper: build N daily segments by running
+    /// `run_incremental_backup` between event-bursts, dating the
+    /// events `days_old` days before `now_ms`.
+    fn build_aged_segments(core: &CoreImpl, conv: Uuid, days_old: i64, count: usize, now_ms: i64) {
+        const DAY_MS: i64 = 86_400_000;
+        for i in 0..count {
+            let ts = now_ms - (days_old * DAY_MS) + (i as i64) * 1_000;
+            seed_backup_event_with_seq(core, conv, Uuid::now_v7(), ts);
+            core.run_incremental_backup("test").expect("backup");
+        }
+    }
+
+    #[test]
+    fn compact_backup_merges_aged_daily_segments_into_weekly() {
+        const DAY_MS: i64 = 86_400_000;
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Three daily segments, each 10 days old (eligible).
+        build_aged_segments(&core, conv, 10, 3, now_ms);
+
+        // Sanity: ledger has three Daily segments before the
+        // compaction.
+        let pre_len = core.tracked_backup_segments.lock().unwrap().len();
+        assert_eq!(pre_len, 3);
+
+        let result = core.compact_backup(now_ms).expect("compact");
+        assert_eq!(result.groups_compacted, 1);
+        assert_eq!(result.segments_superseded, 3);
+        assert_eq!(result.segments_emitted, 1);
+        // Manifest was cut over the rewritten ledger.
+        assert!(result.manifest_generation.is_some());
+        // bytes_after should be smaller than bytes_before (one
+        // segment vs three) — modulo overheads, it's at least
+        // bounded.
+        assert!(result.bytes_after > 0);
+        assert!(result.bytes_before > 0);
+
+        // Ledger now has exactly one Weekly entry.
+        let post = core.tracked_backup_segments.lock().unwrap().clone();
+        assert_eq!(post.len(), 1);
+        assert_eq!(
+            post[0].tier,
+            crate::backup::compaction::CompactionTier::Weekly
+        );
+
+        // Re-seal must be decryptable under the orchestrator's
+        // ledger-stored segment key.
+        let payload = crate::backup::segment_builder::decrypt_backup_segment(
+            &post[0].built,
+            &post[0].k_segment,
+        )
+        .unwrap();
+        assert_eq!(payload.events.len(), 3);
+        // Sanity: timestamps of original events are preserved.
+        for ev in &payload.events {
+            assert!(ev.created_at_ms <= now_ms - 7 * DAY_MS);
+        }
+    }
+
+    #[test]
+    fn compact_backup_noop_when_no_eligible_segments() {
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Three daily segments only 1 day old — way under the
+        // `daily_to_weekly_ms` threshold.
+        build_aged_segments(&core, conv, 1, 3, now_ms);
+
+        let result = core.compact_backup(now_ms).expect("compact");
+        assert_eq!(result, BackupCompactionResult::default());
+        // Ledger preserved.
+        assert_eq!(core.tracked_backup_segments.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn compact_backup_applies_tombstones() {
+        const DAY_MS: i64 = 86_400_000;
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Segment A: messages M1, M2 (10 days old).
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        seed_backup_event_with_seq(&core, conv, m1, now_ms - 10 * DAY_MS);
+        seed_backup_event_with_seq(&core, conv, m2, now_ms - 10 * DAY_MS + 1_000);
+        core.run_incremental_backup("test").expect("backup A");
+
+        // Segment B: tombstone deleting M1, plus a fresh message M3.
+        let m3 = Uuid::now_v7();
+        seed_message_deleted(&core, conv, m1, now_ms - 10 * DAY_MS + 2_000);
+        seed_backup_event_with_seq(&core, conv, m3, now_ms - 10 * DAY_MS + 3_000);
+        core.run_incremental_backup("test").expect("backup B");
+
+        // Segment C: another message to push the group over
+        // `min_group_size`.
+        let m4 = Uuid::now_v7();
+        seed_backup_event_with_seq(&core, conv, m4, now_ms - 10 * DAY_MS + 4_000);
+        core.run_incremental_backup("test").expect("backup C");
+
+        let result = core.compact_backup(now_ms).expect("compact");
+        assert_eq!(result.groups_compacted, 1);
+        assert_eq!(result.segments_superseded, 3);
+
+        let post = core.tracked_backup_segments.lock().unwrap().clone();
+        assert_eq!(post.len(), 1);
+        let payload = crate::backup::segment_builder::decrypt_backup_segment(
+            &post[0].built,
+            &post[0].k_segment,
+        )
+        .unwrap();
+        // The compacted segment should contain only M2, M3, M4
+        // — M1 and its tombstone are dropped.
+        let surviving_messages: Vec<_> =
+            payload.events.iter().filter_map(|e| e.message_id).collect();
+        assert!(!surviving_messages.contains(&m1));
+        assert!(surviving_messages.contains(&m2));
+        assert!(surviving_messages.contains(&m3));
+        assert!(surviving_messages.contains(&m4));
+    }
+
+    #[test]
+    fn compact_backup_with_empty_ledger_is_noop() {
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let result = core.compact_backup(1_900_000_000_000).expect("noop");
+        assert_eq!(result, BackupCompactionResult::default());
+    }
+
+    // ---------------------------------------------------------------
+    // Archive compaction tests (Task 9 — `docs/PHASES.md §Phase 7`)
+    // ---------------------------------------------------------------
+
+    /// Same as [`seal_and_seed_segment`] but seeds the row with
+    /// `archive_state = 'archive_verified'` so it is eligible for
+    /// archive compaction. Returns the segment_id.
+    fn seal_and_seed_verified_segment(
+        core: &CoreImpl,
+        transport: &FixtureTransport,
+        key_bytes: &[u8; 32],
+        conv: Uuid,
+        bucket: &str,
+        events: Vec<crate::archive::event_journal::ArchiveEvent>,
+    ) -> Uuid {
+        let segment_id = seal_and_seed_segment(core, transport, key_bytes, conv, bucket, events);
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "UPDATE archive_segment_map SET state = 'archive_verified'
+                      WHERE segment_id = ?1",
+                    rusqlite::params![segment_id.to_string()],
+                )
+                .unwrap();
+        });
+        segment_id
+    }
+
+    #[test]
+    fn compact_archive_merges_segments_for_same_bucket() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let m3 = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        let s1 = seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m1, 100), make_event(conv, m2, 200)],
+        );
+        let s2 = seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m3, 300)],
+        );
+
+        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(&transport);
+        let mut compacts: Vec<crate::archive::segment_builder::BuiltSegment> = Vec::new();
+        let result = core
+            .compact_archive(
+                &router,
+                conv,
+                "2026-04",
+                &epoch_bytes,
+                |_sid| Ok(epoch_bytes),
+                |built| {
+                    compacts.push(built.clone());
+                    Ok(())
+                },
+            )
+            .expect("compact");
+        assert_eq!(result.buckets_compacted, 1);
+        assert_eq!(result.segments_superseded, 2);
+        assert_eq!(result.segments_emitted, 1);
+        assert!(result.bytes_before > 0);
+        assert!(result.bytes_after > 0);
+        assert_eq!(compacts.len(), 1);
+
+        // Decoding the new compact segment must list all three
+        // messages.
+        let plaintext = crate::archive::download::decrypt_archive_segment(
+            &crate::archive::download::encode_archive_segment_blob(
+                &compacts[0].segment_id,
+                &compacts[0].merkle_root,
+                &compacts[0].nonce,
+                &compacts[0].ciphertext,
+            ),
+            &epoch_bytes,
+        )
+        .unwrap();
+        let payload = crate::archive::download::decode_archive_segment_payload(&plaintext).unwrap();
+        let mids: Vec<_> = payload.events.iter().filter_map(|e| e.message_id).collect();
+        assert!(mids.contains(&m1));
+        assert!(mids.contains(&m2));
+        assert!(mids.contains(&m3));
+
+        // Source rows transitioned to `archive_compacted`.
+        core.with_db(|db| {
+            for sid in [s1, s2] {
+                let state: String = db
+                    .connection()
+                    .query_row(
+                        "SELECT state FROM archive_segment_map WHERE segment_id = ?1",
+                        rusqlite::params![sid.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(state, "archive_compacted");
+            }
+        });
+    }
+
+    #[test]
+    fn compact_archive_applies_tombstones() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let live_mid = Uuid::now_v7();
+        let dead_mid = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        // Segment 1 holds two messages.
+        seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![
+                make_event(conv, live_mid, 100),
+                make_event(conv, dead_mid, 200),
+            ],
+        );
+        // Segment 2 is a delete tombstone for `dead_mid`.
+        let tombstone_event = crate::archive::event_journal::ArchiveEvent {
+            event_type: crate::archive::event_journal::ArchiveEventType::MessageDeleted,
+            conversation_id: conv,
+            message_id: Some(dead_mid),
+            payload: vec![],
+            created_at_ms: 300,
+        };
+        seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![tombstone_event],
+        );
+
+        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(&transport);
+        let mut compacts: Vec<crate::archive::segment_builder::BuiltSegment> = Vec::new();
+        let _ = core
+            .compact_archive(
+                &router,
+                conv,
+                "2026-04",
+                &epoch_bytes,
+                |_sid| Ok(epoch_bytes),
+                |built| {
+                    compacts.push(built.clone());
+                    Ok(())
+                },
+            )
+            .expect("compact");
+        assert_eq!(compacts.len(), 1);
+        let plaintext = crate::archive::download::decrypt_archive_segment(
+            &crate::archive::download::encode_archive_segment_blob(
+                &compacts[0].segment_id,
+                &compacts[0].merkle_root,
+                &compacts[0].nonce,
+                &compacts[0].ciphertext,
+            ),
+            &epoch_bytes,
+        )
+        .unwrap();
+        let payload = crate::archive::download::decode_archive_segment_payload(&plaintext).unwrap();
+        let mids: Vec<_> = payload.events.iter().filter_map(|e| e.message_id).collect();
+        assert!(mids.contains(&live_mid), "live message survives");
+        assert!(!mids.contains(&dead_mid), "tombstoned message is dropped");
+        // The tombstone itself is also dropped.
+        for ev in &payload.events {
+            assert_ne!(
+                ev.event_type,
+                crate::archive::event_journal::ArchiveEventType::MessageDeleted
+            );
+        }
+    }
+
+    #[test]
+    fn compact_archive_transitions_old_segments_to_compacted() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        let s1 = seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m1, 100)],
+        );
+        let s2 = seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m2, 200)],
+        );
+
+        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(&transport);
+        let _ = core
+            .compact_archive(
+                &router,
+                conv,
+                "2026-04",
+                &epoch_bytes,
+                |_sid| Ok(epoch_bytes),
+                |_built| Ok(()),
+            )
+            .expect("compact");
+        core.with_db(|db| {
+            for sid in [s1, s2] {
+                let state: String = db
+                    .connection()
+                    .query_row(
+                        "SELECT state FROM archive_segment_map WHERE segment_id = ?1",
+                        rusqlite::params![sid.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(state, "archive_compacted");
+            }
+        });
+    }
+
+    #[test]
+    fn compact_archive_noop_for_single_segment() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+        let m1 = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        let s1 = seal_and_seed_verified_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m1, 100)],
+        );
+
+        let router = crate::archive::download::ArchiveSegmentRouter::kchat_only(&transport);
+        let mut compacts: Vec<crate::archive::segment_builder::BuiltSegment> = Vec::new();
+        let result = core
+            .compact_archive(
+                &router,
+                conv,
+                "2026-04",
+                &epoch_bytes,
+                |_sid| Ok(epoch_bytes),
+                |built| {
+                    compacts.push(built.clone());
+                    Ok(())
+                },
+            )
+            .expect("noop");
+        assert_eq!(result.buckets_inspected, 1);
+        assert_eq!(result.buckets_compacted, 0);
+        assert_eq!(result.segments_superseded, 0);
+        assert_eq!(result.segments_emitted, 0);
+        assert!(compacts.is_empty());
+        // Source row remains at archive_verified.
+        core.with_db(|db| {
+            let state: String = db
+                .connection()
+                .query_row(
+                    "SELECT state FROM archive_segment_map WHERE segment_id = ?1",
+                    rusqlite::params![s1.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "archive_verified");
+        });
     }
 }

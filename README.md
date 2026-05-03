@@ -12,7 +12,7 @@
 > Media Encryption and Blob Service — `In progress | ~95%` (chunked
 > media pipeline + thumbnailing landed; tiered media-storage routing
 > wired through `MediaBlobSink`).**
-> **Phase 3 — Personal Archive and Offload — `In progress | ~75%`
+> **Phase 3 — Personal Archive and Offload — `In progress | ~85%`
 > (foundation: archive event journal wired into `MessagePersister`,
 > archive segment builder, archive manifest chain builder, archive
 > segment upload orchestration, archive state machine transitions,
@@ -27,7 +27,7 @@
 > sink, iCloud `CloudKit` bridge, Google Drive bridge), tiered
 > eviction policy (cloud-offload first → full eviction),
 > `CoreImpl::enforce_storage_budget`).**
-> **Phase 4 — Backup and Restore — `In progress | ~55%`
+> **Phase 4 — Backup and Restore — `In progress | ~75%`
 > (full Rust backup + restore foundation: typed
 > `BackupEventJournal`, CBOR + zstd + XChaCha20-Poly1305 segment
 > builder under `K_backup_segment`, Ed25519-signed
@@ -35,9 +35,16 @@
 > with `device_id` AAD attribution, daily → weekly → monthly
 > compaction policy with tombstone application, manifest chain
 > verifier with structured failure modes, restore state machine
-> persistence helpers, and the skeleton-first restore pipeline
+> persistence helpers, the skeleton-first restore pipeline
 > wired through `CoreImpl::restore_from_backup` to terminal
-> `FullRestoreComplete`).**
+> `FullRestoreComplete`, end-to-end
+> `CoreImpl::run_incremental_backup` and
+> `CoreImpl::compact_backup`, the `BackupSink` trait + ZK Object
+> Fabric backup sink with Pattern C convergent encryption,
+> encrypted search-index shard build/restore, archive
+> compaction orchestration (`CoreImpl::compact_archive`), and
+> the recovery-key + device-to-device transfer foundation in
+> `restore::key_recovery`).**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -234,29 +241,34 @@ chat-storage-search/
         message/                            # Phase 1: persister + edit / delete landed
           mod.rs
           processor.rs                      # IngestedMessage / OutboxEntry / MessagePersister (edit / delete)
-        search/                             # Phase 1: FTS5 + structured + fuzzy search landed
+        search/                             # Phase 1: FTS5 + structured + fuzzy search landed; Phase 4: encrypted search-index shard build / restore
           mod.rs
           tokenizer.rs                      # ICU + ScriptClass + FuzzyGranularity
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding
+          shard_builder.rs                  # build_text_search_shard / build_fuzzy_search_shard / restore_text_search_shard / restore_fuzzy_search_shard (encrypted search shards for Phase 4 backup / restore)
+        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding + compaction
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
           segment_builder.rs                # SegmentBuildRequest / BuiltSegment / ArchiveSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305)
           manifest_builder.rs               # ArchiveManifestBuilder: genesis → gen N chain, BLAKE3 manifest hash, Ed25519 signature, AEAD-seal under K_archive_manifest, wrapped_prior_epoch_keys carry-through
           upload.rs                         # upload_archive_segment over TransportClient + persist_segment_map_row
-          download.rs                       # download_archive_segment / decrypt_archive_segment / decode_archive_segment_payload / fetch_and_decrypt_segment (XChaCha20-Poly1305 open + zstd decompress + CBOR decode)
-          prefetch.rs                       # batch_prefetch_bucket / batch_prefetch_bucket_with_padding: one transport hop per (conversation_id, time_bucket)
+          download.rs                       # download_archive_segment / decrypt_archive_segment / decode_archive_segment_payload / fetch_and_decrypt_segment / ArchiveSegmentRouter (KChat backend ↔ ZK Object Fabric per-row routing)
+          prefetch.rs                       # batch_prefetch_bucket / batch_prefetch_bucket_with_router / batch_prefetch_bucket_with_padding: one transport hop per (conversation_id, time_bucket)
           epoch_keys.rs                     # EpochKeyManager: current epoch in Zeroizing<[u8; 32]>, prior keys wrapped via AES-256-KW, rotate / unwrap_prior_epoch_key / delete_epoch_key
           routing.rs                        # route_archive_upload / route_archive_download / route_manifest_upload (KChat backend ↔ ZK Object Fabric)
           privacy.rs                        # should_pad / compute_padding_count / generate_dummy_segment_id (UUIDv4) / pad_with_dummy_requests (privacy_level = High)
-        backup/                             # Phase 4 foundation: event journal + segment builder + manifest builder + compaction
+          compaction.rs                     # apply_archive_tombstones + ArchiveCompactionResult (per-bucket merge of archive_verified segments → archive_compacted)
+        backup/                             # Phase 4 foundation: event journal + segment builder + manifest builder + compaction + sinks
           mod.rs
           event_journal.rs                  # BackupEventType / BackupEvent / BackupEventJournal (write_event / read_events_since / read_unsegmented / cursor)
           segment_builder.rs                # BackupSegmentBuildRequest / BuiltBackupSegment / BackupSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305) + decrypt_backup_segment
           manifest_builder.rs               # BackupManifestBuildRequest / SealedBackupManifest / build_backup_manifest (genesis → gen N chain, Ed25519 signature, AEAD-sealed under K_backup_manifest with device_id AAD)
           compaction.rs                     # CompactionTier / CompactionPolicy / CompactionPlan + plan + apply_tombstones (daily → weekly → monthly)
+          sinks/                            # BackupSink trait + backup-vault implementations
+            mod.rs                          # BackupSink + NoopBackupSink (object-safe trait surface)
+            zk_fabric.rs                    # ZkofBackupSink: backups/{manifest_id}, backups/segments/{segment_id}; Pattern C convergent encryption (bit-identical to Go SDK)
         media/                              # Phase 2: chunker + processor + upload + download + cache + routing + thumbnail
           mod.rs
           chunker.rs                        # chunk + AEAD-seal, size-class padding, verify_and_decrypt
@@ -279,11 +291,12 @@ chat-storage-search/
           scoring.rs                        # ContentKind weights + 30-day half-life recency decay + size bonus (PROPOSAL §5.4)
           eviction.rs                       # plan_eviction + plan_eviction_with_pressure + plan_tiered_eviction (cloud-offload first → full eviction) + execute_eviction (state-machine demotion)
           hydration.rs                      # HydrationQueue (P0..P5 priority + FIFO) + enqueue_prefetch_window
-        restore/                            # Phase 4 foundation: state machine persistence + manifest verifier + skeleton-first pipeline
+        restore/                            # Phase 4 foundation: state machine persistence + manifest verifier + skeleton-first pipeline + key recovery
           mod.rs
           state_machine.rs                  # restore_state row helpers (load / save / transition / reset) layered over local_store::state_machines::RestoreState
           manifest_verifier.rs              # verify_manifest_chain: walks gen 0..latest, Ed25519 + previous_manifest_hash check, returns EmptyChain / SignatureInvalid / ChainBreak / GapDetected / GenesisHashNotZero
           pipeline.rs                       # RestorePipeline: conversation list → skeletons → search shards → recent bodies → enable lazy media; persists every RestoreState transition
+          key_recovery.rs                   # RecoveryKey (AES-256-KW wrap of K_user_master, hex display) + DeviceTransferPayload (XChaCha20-Poly1305 seal of K_user_master + 3 derived roots, transfer-code-derived AEAD key)
         scheduler/                          # placeholder (Phase 4 / 7)
         transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient
       benches/
@@ -294,6 +307,7 @@ chat-storage-search/
         epoch_key_derivation.rs             # Phase 3: K_archive_epoch determinism / rotation / wrap-unwrap / cross-epoch decrypt / info-string vectors
         archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
         backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test
+        backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
         media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
         storage_budget_enforcement.rs       # Phase 3 end-to-end: pressure assessment → candidate collection → tiered eviction → executor (every PressureLevel × every EvictionTier)
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip

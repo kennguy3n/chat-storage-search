@@ -328,10 +328,15 @@ impl<'a> MessagePersister<'a> {
     }
 
     fn persist_ingested_message_inner(&self, msg: &IngestedMessage) -> Result<(), ProcessorError> {
-        let kind = if msg.text_content.is_some() {
-            MessageKind::Text
-        } else if !msg.media_descriptors.is_empty() {
+        // When a message arrives with both text and media descriptors,
+        // media takes priority for the row's `kind` because the offload /
+        // archive / hydration paths key off `MessageKind::Media` to drive
+        // thumbnail-then-original flows. The text body is still persisted
+        // and indexed below.
+        let kind = if !msg.media_descriptors.is_empty() {
             MessageKind::Media
+        } else if msg.text_content.is_some() {
+            MessageKind::Text
         } else {
             // validate_ingest already rejects this combination, but
             // double-check rather than risk a malformed row.
@@ -343,10 +348,12 @@ impl<'a> MessagePersister<'a> {
         // Task 9 (`docs/PROPOSAL.md §5.7`): a message arriving with
         // a `MediaDescriptor` carries the *thumbnail* + the
         // backend-side metadata for the original. The original
-        // bytes haven't been pulled yet, so the row lands in
-        // `MediaState::ThumbnailOnly` and the orchestration layer
-        // hands the user a tap-to-rehydrate flow (Task 5).
-        let initial_media_state = if matches!(kind, MessageKind::Media) {
+        // bytes haven't been pulled yet, so the skeleton lands in
+        // `MediaState::ThumbnailOnly` whenever any descriptor is
+        // attached, regardless of whether a text body is also
+        // present, so the skeleton's `media_state` stays consistent
+        // with the per-asset `media_asset.media_state` rows.
+        let initial_media_state = if !msg.media_descriptors.is_empty() {
             Some(MediaState::ThumbnailOnly)
         } else {
             None
@@ -1403,6 +1410,50 @@ mod tests {
             .query_row("SELECT count(*) FROM media_asset", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn persist_text_plus_media_message_sets_media_state_on_skeleton() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let desc = sample_descriptor(0x21);
+        let asset_id = desc.asset_id.to_string();
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("caption with media".into()),
+            media_descriptors: vec![desc],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        let mid = msg.message_id.to_string();
+        let skel = db.get_message_skeleton(&mid).unwrap().expect("skeleton");
+        // Media must take priority over text for kind classification, and
+        // the skeleton's media_state must agree with the per-asset row
+        // even when a text caption is also present.
+        assert_eq!(skel.kind, MessageKind::Media);
+        assert_eq!(skel.media_state, Some(MediaState::ThumbnailOnly));
+
+        let asset = db.get_media_asset(&asset_id).unwrap().expect("asset");
+        assert_eq!(asset.media_state, MediaState::ThumbnailOnly);
+
+        // Text body still persists and is searchable via FTS.
+        let body = db.get_message_body(&mid).unwrap().expect("body");
+        assert_eq!(body.text_content.as_deref(), Some("caption with media"));
+        let fts_hit: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+                params!["caption"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hit, 1, "FTS must index the caption");
     }
 
     #[test]

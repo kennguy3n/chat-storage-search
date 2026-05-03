@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~75%`). Phase 4 — Backup and Restore (`In progress | ~55%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~85%`). Phase 4 — Backup and Restore (`In progress | ~75%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -684,7 +684,7 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~75%`
+**Status**: `In progress | ~85%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
@@ -908,8 +908,17 @@ Checklist:
       `CoreImpl::enforce_storage_budget`, which now executes the
       cloud-offload plan and the full-eviction plan in order and
       reports the combined `freed_bytes` / `evicted_count`.)
-- [ ] `storage_backend` column on `archive_segment_map` for
+- [x] `storage_backend` column on `archive_segment_map` for
       tracking where each segment lives.
+      (`local_store::schema::StorageBackend` typed enum +
+      column on `archive_segment_map`. The download path
+      reads it via `archive::download::ArchiveSegmentRouter`,
+      which dispatches to either `TransportClient` (for
+      `kchat_backend`) or an `S3Client` (for
+      `zk_object_fabric`). `archive::prefetch::batch_prefetch_bucket`
+      / `_with_router` honor the per-row backend.
+      `CoreImpl::rehydrate_timeline_skeletons_with_router`
+      makes the backend-aware scroll-back path explicit.)
 
 **Decision gate**: Messages and media offload + rehydrate
 transparently; storage budget is enforced; timeline renders
@@ -1003,7 +1012,7 @@ Notes:
 
 ## Phase 4: Backup and Restore
 
-**Status**: `In progress | ~55%`
+**Status**: `In progress | ~75%`
 
 **Goal**: Incremental backup to platform sinks and skeleton-first
 restore.
@@ -1042,8 +1051,20 @@ Checklist:
 - [ ] iOS iCloud backup sink.
 - [ ] Android backup sink strategy (Auto Backup for envelopes;
       Large Backup / SAF for full data).
-- [ ] **ZK Object Fabric backup sink** (S3 API; Pattern C convergent
+- [x] **ZK Object Fabric backup sink** (S3 API; Pattern C convergent
       encryption; bit-identical interop with the Go SDK).
+      (`crates/core/src/backup/sinks/zk_fabric.rs::ZkofBackupSink`:
+      uploads sealed manifests to `backups/{manifest_id}` and
+      sealed segments to `backups/segments/{segment_id}`
+      against a configured S3 bucket; Pattern C convergent
+      encryption is wired via
+      `crypto::convergent::derive_convergent_dek` so identical
+      tenant + plaintext produces a deterministic ciphertext —
+      bit-identical to the Go SDK at
+      `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
+      `BackupSink` trait + `NoopBackupSink` for tests.
+      Tests cover round-trip, convergent determinism, and
+      `Box<dyn BackupSink>` object safety.)
 - [x] Backup compaction (daily → weekly checkpoint → monthly prune).
       (`crates/core/src/backup/compaction.rs`:
       `CompactionTier::{Daily, Weekly, Monthly}` +
@@ -1093,10 +1114,43 @@ Checklist:
       forward-only `try_transition`. Snake-case `Display` /
       `FromStr` round-trip; serde wire form matches the SQL
       column.)
-- [ ] Key recovery (device-to-device, recovery key, passphrase;
+- [~] Key recovery (device-to-device, recovery key, passphrase;
       server escrow off by default).
-- [ ] Search index backup and restore (encrypted shards).
-- [ ] Multilingual backup-restore corpus validation.
+      (`crates/core/src/restore/key_recovery.rs`: `RecoveryKey`
+      wraps `K_user_master` via AES-256-KW (RFC 3394) with a
+      hex display helper; `generate_recovery_key` /
+      `recover_from_key` round-trip and reject wrong keys via
+      the wrap integrity check value. `DeviceTransferPayload` +
+      `prepare_device_transfer` / `accept_device_transfer`
+      AEAD-seal `K_user_master` + the three derived roots
+      (`K_archive_root`, `K_backup_root`, `K_search_root`)
+      under a transfer key derived from a numeric / QR code via
+      HKDF-SHA-256. Server escrow remains OFF by default per
+      `docs/PHASES.md §Phase 4`. Passphrase flow is the next
+      milestone.)
+- [x] Search index backup and restore (encrypted shards).
+      (`crates/core/src/search/shard_builder.rs`:
+      `build_text_search_shard` / `build_fuzzy_search_shard`
+      read `search_fts` / `search_fuzzy_words` rows for a
+      `(conversation_id, time_bucket)` pair, encode through
+      `formats::SearchIndexShard` (`IndexType::Text` /
+      `IndexType::Fuzzy`), and AEAD-seal under
+      `K_text_index_shard` / `K_fuzzy_index_shard` derived from
+      `K_search_root`. `restore_text_search_shard` /
+      `restore_fuzzy_search_shard` invert the path. Tests cover
+      build / restore round-trip, wrong-key failure, and
+      multilingual content survival across Latin / CJK /
+      Arabic.)
+- [x] Multilingual backup-restore corpus validation.
+      (`crates/core/tests/backup_restore_multilingual.rs`:
+      ingests 8+ scripts (English, Russian, Chinese, Japanese,
+      Arabic, Thai, Hindi, mixed Latin+CJK), drives the segment
+      builder + 2-generation manifest chain through
+      `verify_manifest_chain`, runs `RestorePipeline::run`
+      against a fresh in-memory store, and asserts every
+      conversation / skeleton / body lands on the new device
+      with the FTS / fuzzy / structured filters intact.
+      Soft-skips CJK / Thai FTS assertions on non-ICU builds.)
 
 **Decision gate**: Full backup / restore cycle works on every
 target platform. New device renders conversation list and returns
@@ -1107,10 +1161,9 @@ same tenant and observing a single stored copy.
 
 Notes:
 
-- 2026-05-03: Phase-4 foundation landed (Tasks 1–10 of the
-  Phase 3/4 batch). The backup pipeline now has a full
-  end-to-end Rust path: `BackupEvent` typed taxonomy →
-  `BackupEventJournal` cursor-drained reader → CBOR + zstd +
+- 2026-05-03: Phase-4 foundation landed. The backup pipeline now
+  has a full end-to-end Rust path: `BackupEvent` typed taxonomy
+  → `BackupEventJournal` cursor-drained reader → CBOR + zstd +
   XChaCha20-Poly1305 segment seal under `K_backup_segment` →
   Ed25519-signed, generation-chained manifest sealed under
   `K_backup_manifest` with `device_id` AAD attribution → a
@@ -1121,10 +1174,177 @@ Notes:
   `FullRestoreComplete`. iCloud / Google Drive / ZKOF
   `MediaBlobSink` scaffolds (Phase 3 sink slots) ship in the
   same change. Cross-module coverage lives at
-  `crates/core/tests/backup_pipeline.rs`. Outstanding Phase-4
-  scope: Android sink strategy, key-recovery flows, encrypted
-  search-index shard backup, and multilingual restore corpus
-  validation.
+  `crates/core/tests/backup_pipeline.rs`.
+- 2026-05-03 (Phase 3/4 batch — Tasks 1–10): the ten tasks
+  itemised in the Phase 3/4 plan all landed in tree, lifting
+  Phase 3 from `~75%` to `~85%` and Phase 4 from `~55%` to
+  `~75%`. All 921 tests in the workspace pass; clippy is clean
+  with `-D warnings`; `cargo fmt --all -- --check` is clean.
+  1. **Text+media skeleton consistency**
+     (`crates/core/src/message/processor.rs`): when a message
+     has BOTH `text_content` and `media_descriptors`, the
+     skeleton now resolves `kind = MessageKind::Media` and
+     `media_state = Some(MediaState::ThumbnailOnly)` so the
+     `media_asset` rows the loop persists are no longer
+     orphaned by a `media_state = NULL` skeleton header. Test:
+     `persist_text_plus_media_message_sets_media_state_on_skeleton`.
+  2. **`rehydrate_media_for_message` 3-phase refactor**
+     (`crates/core/src/core_impl.rs` +
+     `crates/core/src/media/download.rs`): the previous
+     implementation held `self.db.lock()` across every
+     sequential `transport.fetch_blob_range()` chunk, blocking
+     `send_text` / `search` / `ingest` for the duration of a
+     download. Now split into `prepare_rehydration` (read
+     metadata under lock) → `execute_rehydration_download`
+     (chunk download + BLAKE3 root verify, no DB reference) →
+     `commit_rehydration` (SAVEPOINT-bounded
+     `media_state` + `bytes_local` flip back under lock).
+     A regression test spawns a parallel `search` while a mock
+     transport sleeps inside `fetch_blob_range` and asserts
+     the search returns immediately rather than blocking.
+  3. **`CoreImpl::run_incremental_backup` end-to-end**
+     (`crates/core/src/core_impl.rs`): replaces the
+     `Error::NotImplemented("run_incremental_backup")` stub.
+     Reads `BackupEventJournal::read_unsegmented`, derives
+     `K_backup_segment` from `K_backup_root` via
+     `crypto::key_hierarchy::derive_backup_segment`, builds a
+     sealed segment via `BackupSegmentBuilder::build_segment`,
+     uploads via the configured transport / `BackupSink`,
+     builds + signs the next manifest generation via
+     `build_backup_manifest`, advances the cursor, and returns
+     a populated `BackupResult`. Tests:
+     `run_incremental_backup_with_pending_events_produces_segment`,
+     `run_incremental_backup_with_no_events_is_noop`,
+     `run_incremental_backup_advances_cursor`,
+     `run_incremental_backup_idempotent_on_retry`.
+  4. **`BackupSink` trait + ZK Object Fabric backup sink**
+     (`crates/core/src/backup/sinks/{mod.rs,zk_fabric.rs}`):
+     mirrors `MediaBlobSink` for the backup vault.
+     `BackupSink` is object-safe with
+     `upload_backup_segment` / `upload_backup_manifest` /
+     `fetch_backup_manifest` / `fetch_backup_segment` /
+     `list_backup_manifests`. `ZkofBackupSink` uses Pattern C
+     convergent encryption from `crypto::convergent` and is
+     bit-identical to the Go SDK at
+     `kennguy3n/zk-object-fabric/encryption/client_sdk/`. S3
+     key layout is `backups/{manifest_id}` for manifests and
+     `backups/segments/{segment_id}` for segments. A
+     `NoopBackupSink` is provided for tests. Tests:
+     `zkof_backup_sink_upload_and_fetch_round_trip`,
+     `pattern_c_convergent_encryption_produces_deterministic_output`,
+     `backup_sink_trait_is_object_safe`.
+  5. **`CoreImpl::compact_backup` orchestration**
+     (`crates/core/src/core_impl.rs`): consumes
+     `CompactionPolicy::plan` (`crates/core/src/backup/compaction.rs`)
+     against the current wall-clock and walks each
+     `CompactionGroup`: decrypts every source segment via
+     `decrypt_backup_segment`, concatenates events, runs
+     `apply_tombstones`, re-seals via
+     `BackupSegmentBuilder::build_segment`, uploads the new
+     segment, and emits a fresh manifest superseding the
+     compacted ones. Returns a `BackupCompactionResult` with
+     groups compacted / segments superseded / bytes saved.
+     Tests:
+     `compact_backup_merges_aged_daily_segments_into_weekly`,
+     `compact_backup_noop_when_no_eligible_segments`,
+     `compact_backup_applies_tombstones`.
+  6. **Encrypted search-index shard backup / restore**
+     (`crates/core/src/search/shard_builder.rs`):
+     `build_text_search_shard` / `build_fuzzy_search_shard`
+     read `search_fts` / `search_fuzzy_words` rows for a
+     `(conversation_id, time_bucket)` pair, encode through
+     `formats::SearchIndexShard` (`IndexType::Text` /
+     `IndexType::Fuzzy`), zstd-compress, and AEAD-seal under
+     `K_text_index_shard` / `K_fuzzy_index_shard` derived
+     from `K_search_root`.
+     `restore_text_search_shard` /
+     `restore_fuzzy_search_shard` invert the path. Tests:
+     `text_shard_build_and_restore_round_trip`,
+     `fuzzy_shard_build_and_restore_round_trip`,
+     `wrong_key_fails_shard_decrypt`,
+     `multilingual_content_survives_shard_round_trip`.
+  7. **Multilingual backup-restore corpus**
+     (`crates/core/tests/backup_restore_multilingual.rs`):
+     end-to-end integration test that ingests messages across
+     8+ scripts (English, Russian / Cyrillic, Chinese / Han,
+     Japanese / Hiragana+Katakana, Arabic, Thai, Hindi /
+     Devanagari, mixed-script `"Meeting at 3pm 会議室で"`),
+     runs `run_incremental_backup`, builds a 2-generation
+     manifest chain, verifies the chain via
+     `verify_manifest_chain`, runs `RestorePipeline::run`
+     against a fresh in-memory store, and asserts every
+     conversation / skeleton / body lands on the new device,
+     FTS / fuzzy / structured filters return hits per script,
+     and `RestoreState` reaches `FullRestoreComplete`.
+     Soft-skips CJK / Thai FTS assertions on non-ICU builds
+     (same pattern as `multilingual_search.rs`).
+  8. **`storage_backend` routing in archive download /
+     prefetch / rehydration**
+     (`crates/core/src/archive/{download.rs,prefetch.rs}` +
+     `crates/core/src/core_impl.rs`):
+     `archive::download::ArchiveSegmentRouter` reads each
+     `archive_segment_map.storage_backend` row and dispatches
+     to either `TransportClient::fetch_archive_segment` (for
+     `kchat_backend`) or the ZKOF `S3Client` adapter (for
+     `zk_object_fabric`).
+     `archive::prefetch::batch_prefetch_bucket_with_router`
+     honors the per-row backend, and
+     `CoreImpl::rehydrate_timeline_skeletons_with_router`
+     propagates the routing through the scroll-back path.
+     Tests:
+     `fetch_segment_routes_to_transport_for_kchat_backend`,
+     `fetch_segment_routes_to_s3_for_zkof_backend`,
+     `prefetch_bucket_reads_storage_backend_per_row`.
+  9. **Archive compaction at `CoreImpl` level**
+     (`crates/core/src/archive/compaction.rs` +
+     `crates/core/src/core_impl.rs`):
+     `apply_archive_tombstones` mirrors the backup compaction
+     helper for `ArchiveEvent` (drops `MessageDeleted` /
+     `ConversationDeleted` events themselves and any earlier
+     events for tombstoned ids, including orphan
+     `MediaReceived`). `ArchiveCompactionResult` carries
+     per-bucket counters
+     (`buckets_inspected` / `buckets_compacted` /
+     `segments_superseded` / `segments_emitted` /
+     `bytes_before` / `bytes_after`).
+     `CoreImpl::compact_archive(conversation_id, time_bucket,
+     ...)` runs the five-phase flow: (A) `SELECT`
+     `archive_verified` segments and prefetch ciphertexts via
+     `ArchiveSegmentRouter`, (B) decrypt each, concatenate,
+     track superseded ids, (C)
+     `apply_archive_tombstones` and rebuild via
+     `ArchiveSegmentBuilder::build_segment`, (D) emit through
+     a caller-provided `commit_compact` callback, (E)
+     SAVEPOINT-bounded UPDATE of every superseded row to
+     `archive_compacted`. Tests:
+     `compact_archive_merges_segments_for_same_bucket`,
+     `compact_archive_applies_tombstones`,
+     `compact_archive_transitions_old_segments_to_compacted`,
+     `compact_archive_noop_for_single_segment`.
+  10. **Key recovery foundation (recovery key + device-to-device
+      transfer)**
+      (`crates/core/src/restore/key_recovery.rs`):
+      `RecoveryKey` is a 256-bit secret that AES-256-KW-wraps
+      `K_user_master` (RFC 3394) and exposes a 64-char
+      lowercase hex display for write-down during setup.
+      `generate_recovery_key` / `recover_from_key` round-trip
+      and reject wrong keys via the wrap integrity check
+      value. `DeviceTransferPayload` is an
+      XChaCha20-Poly1305-sealed bundle of
+      (`K_user_master`, `K_archive_root`, `K_backup_root`,
+      `K_search_root`) under a transfer key derived from a
+      numeric / QR transfer code via HKDF-SHA-256 (info =
+      `kchat-device-transfer-v1`). Server escrow remains OFF
+      by default per `docs/PHASES.md §Phase 4`. Tests:
+      `recovery_key_generate_and_recover_round_trip`,
+      `recovery_key_wrong_key_fails`,
+      `recovery_key_display_round_trip`,
+      `recovery_key_display_rejects_bad_input`,
+      `recovery_key_is_deterministic_for_same_master_and_recovery_key`,
+      `device_transfer_round_trip`,
+      `device_transfer_wrong_code_fails`,
+      `device_transfer_empty_code_rejected`,
+      `device_transfer_payload_length_validates`.
 
 ---
 
@@ -1270,6 +1490,117 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase-3 / Phase-4 batch of 10 (this PR)
+
+Lands the next batch on top of PRs #27 and #28. Closes the Phase-3
+`storage_backend` plumbing, finishes the Phase-4 backup pipeline
+(incremental backup, ZK Object Fabric sink, compaction), and lays
+down the Phase-4 restore-side machinery (search shards,
+multilingual corpus, key recovery, archive compaction). All ten
+tasks ship with unit + integration tests and a clean
+`cargo test --workspace` (921 tests passing) +
+`cargo fmt --check` + `cargo clippy --all-targets --all-features
+-- -D warnings`.
+
+1. **Text+media skeleton `media_state` consistency**
+   (`message::processor`): when an `IngestedMessage` carries both
+   `text_content` and `media_descriptors`, the skeleton now
+   resolves `kind = MessageKind::Media` and
+   `media_state = Some(ThumbnailOnly)` so the row matches the
+   `media_asset` writes. New regression test
+   `persist_text_plus_media_message_sets_media_state_on_skeleton`.
+2. **Three-phase media rehydration** (`core_impl::rehydrate_media_for_message`):
+   the db mutex is now released between (Phase 1) reading the
+   `media_asset` row + planning, (Phase 2) downloading +
+   verifying the BLAKE3 root, and (Phase 3) committing
+   `media_state = original_local`. `media::download` exposes
+   `prepare_rehydration` / `execute_rehydration_download` /
+   `commit_rehydration` for the new shape; existing single-call
+   tests still pass.
+3. **`CoreImpl::run_incremental_backup` end-to-end**: replaces
+   the `Error::NotImplemented` stub. Reads
+   `BackupEventJournal::read_unsegmented` → derives
+   `K_backup_segment` via `derive_backup_segment` → builds via
+   `BackupSegmentBuilder::build_segment` → builds + signs the
+   manifest via `build_backup_manifest` → advances the cursor.
+   Returns a populated `BackupResult` and is idempotent on a
+   second call without new events.
+4. **ZK Object Fabric backup sink with Pattern C**
+   (`backup::sinks::zk_fabric`): `BackupSink` trait
+   (`upload_backup_segment`, `upload_backup_manifest`,
+   `fetch_backup_manifest`, `fetch_backup_segment`,
+   `list_backup_manifests`); `ZkofBackupSink` implementation
+   wires Pattern C convergent encryption from
+   `crypto::convergent::derive_convergent_dek` so the Rust
+   ciphertext matches the Go SDK at
+   `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
+   `NoopBackupSink` for tests; `Box<dyn BackupSink>` is object
+   safe.
+5. **`CoreImpl::compact_backup`**: drives `CompactionPolicy::plan`
+   over the local backup-segment ledger, decrypts each source
+   segment, concatenates events, runs `apply_tombstones`,
+   re-seals via `BackupSegmentBuilder::build_segment`, and
+   returns a `BackupCompactionResult` summarising groups
+   compacted / segments superseded / bytes saved. New
+   integration tests cover the daily → weekly merge and the
+   tombstone application.
+6. **Encrypted search-index shard build/restore**
+   (`search::shard_builder`): `build_text_search_shard` /
+   `build_fuzzy_search_shard` read `search_fts` /
+   `search_fuzzy_words` for `(conversation_id, time_bucket)`,
+   encode via `formats::SearchIndexShard`, and AEAD-seal under
+   per-(account, conversation, bucket, kind)-derived shard
+   keys. `restore_text_search_shard` /
+   `restore_fuzzy_search_shard` invert. Tests cover round-trip,
+   wrong-key, and multilingual content (Latin / CJK / Arabic).
+7. **Multilingual backup-restore corpus integration test**
+   (`crates/core/tests/backup_restore_multilingual.rs`):
+   end-to-end test that ingests 8+ scripts (English, Russian,
+   Chinese, Japanese, Arabic, Thai, Hindi, mixed Latin+CJK),
+   drives `run_incremental_backup` to produce sealed segments,
+   builds a 2-generation manifest chain, runs
+   `verify_manifest_chain` and `RestorePipeline::run` against
+   a fresh in-memory store, and asserts every conversation /
+   skeleton / body lands with FTS / fuzzy / structured filters
+   intact. Soft-skips CJK / Thai FTS assertions on non-ICU
+   builds.
+8. **Storage-backend routing in archive download / prefetch /
+   rehydration** (`archive::download::ArchiveSegmentRouter`,
+   `archive::prefetch::batch_prefetch_bucket_with_router`,
+   `CoreImpl::rehydrate_timeline_skeletons_with_router`): the
+   `archive_segment_map.storage_backend` column finally drives
+   per-row routing — `kchat_backend` → `TransportClient`,
+   `zk_object_fabric` → `S3Client` adapter. Tests cover
+   `fetch_segment_routes_to_transport_for_kchat_backend`,
+   `fetch_segment_routes_to_s3_for_zkof_backend`, and
+   `prefetch_bucket_reads_storage_backend_per_row`.
+9. **Archive compaction orchestration**
+   (`archive::compaction` + `CoreImpl::compact_archive`):
+   per `(conversation_id, time_bucket)`, collects
+   `archive_state = archive_verified` segments, decrypts each
+   via the `ArchiveSegmentRouter`, applies
+   `apply_archive_tombstones` (drops `MessageDeleted` /
+   `ConversationDeleted` events themselves and any earlier
+   events for tombstoned ids), re-seals via
+   `ArchiveSegmentBuilder::build_segment`, and atomically
+   transitions superseded rows to `archive_compacted` inside a
+   SAVEPOINT. Tests cover the merge, the tombstone semantics,
+   the state-machine transitions, and the no-op-for-singleton
+   case.
+10. **Key recovery foundation** (`restore::key_recovery`):
+    `RecoveryKey` is a 256-bit human-readable secret (64-char
+    lowercase hex) that AES-256-KW-wraps `K_user_master`;
+    `generate_recovery_key` / `recover_from_key` round-trip and
+    fail-fast on wrong keys via the RFC 3394 integrity check
+    value. `DeviceTransferPayload` AEAD-seals
+    `(K_user_master, K_archive_root, K_backup_root,
+    K_search_root)` under a transfer key derived from a numeric
+    code via HKDF-SHA-256. Server escrow remains OFF by default
+    per `docs/PHASES.md §Phase 4`.
+
+Status moves: Phase 3 → `In progress | ~85%`; Phase 4 →
+`In progress | ~75%`.
 
 ### 2026-05-03 — Phase-3 / Phase-4 cross-cutting batch of 10
 

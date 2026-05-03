@@ -325,11 +325,37 @@ pub struct SendMediaResult {
 
 /// Result of [`KChatCore::run_incremental_backup`].
 ///
-/// Phase-1 placeholder. The full backup contract (segment count,
-/// manifest hash, byte budget consumed, …) lands with the backup
-/// engine in Phase 4.
+/// Populated by [`crate::core_impl::CoreImpl::run_incremental_backup`]
+/// once the backup engine wiring is installed (Task 3 of the
+/// Phase 3/4 batch). Default is the no-events / no-keys-installed
+/// shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupResult {}
+pub struct BackupResult {
+    /// Number of sealed [`crate::backup::segment_builder::BuiltBackupSegment`]
+    /// records the run produced. Each segment seals a contiguous
+    /// range of [`crate::backup::event_journal::BackupEvent`]s.
+    #[serde(default)]
+    pub segments_built: u64,
+    /// How many of the sealed segments were uploaded through the
+    /// configured [`crate::transport::TransportClient`]. Always
+    /// `<= segments_built`. Will be `0` when no transport is
+    /// installed (the segments are built but the caller is
+    /// expected to upload them out-of-band).
+    #[serde(default)]
+    pub segments_uploaded: u64,
+    /// Total backup events sealed across all segments produced by
+    /// this run.
+    #[serde(default)]
+    pub events_segmented: u64,
+    /// `generation` of the manifest committed by this run, when a
+    /// manifest was produced. `None` for noop runs.
+    #[serde(default)]
+    pub manifest_generation: Option<u64>,
+    /// Whether the manifest produced by this run was uploaded
+    /// through the configured transport.
+    #[serde(default)]
+    pub manifest_uploaded: bool,
+}
 
 /// Result of [`KChatCore::enforce_storage_budget`].
 ///
