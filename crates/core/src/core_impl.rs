@@ -46,8 +46,9 @@ use crate::message::processor::{
 use crate::search::query_engine::QueryEngine;
 use crate::transport::{DeliveryClient, RawDeliveryMessage};
 use crate::{
-    BackupResult, BackupSource, ClientMessageId, DeliveryCursor, Error, HydratedMessage, KChatCore,
-    MessageView, OffloadResult, RestoreResult, Result, SearchQuery, SearchResult, SearchScope,
+    BackupResult, BackupSource, ClientMessageId, DeliveryCursor, DeviceRegistration, Error,
+    HydratedMessage, KChatCore, MessageView, OffloadResult, RestoreResult, Result, SearchQuery,
+    SearchResult, SearchScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -255,25 +256,6 @@ impl CoreImpl {
         Ok(())
     }
 
-    /// Delete `conversation_id` along with every dependent row
-    /// (skeletons, bodies, FTS rows, fuzzy tokens). Errors with
-    /// [`Error::Storage`] when the row does not exist.
-    ///
-    /// Backed by [`LocalStoreDb::delete_conversation`], which runs
-    /// the cascade inside a single `SAVEPOINT` for atomicity.
-    pub fn delete_conversation(&self, conversation_id: Uuid) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let n = db
-            .delete_conversation(&conversation_id.to_string())
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            )));
-        }
-        Ok(())
-    }
-
     /// Return the messages in `conversation_id` as a flat
     /// timeline view (skeleton fields + optional plaintext body),
     /// ordered newest-first. `before_ms`, when `Some`, restricts
@@ -342,6 +324,13 @@ impl KChatCore for CoreImpl {
         Ok(())
     }
 
+    fn register_device(&self, _device_id: &str) -> Result<DeviceRegistration> {
+        // Phase-1 stub: MLS credential / KeyPackage publication and
+        // device-key derivation arrive when the MLS layer lands
+        // later in Phase 1 / Phase 2.
+        Err(Error::NotImplemented("register_device"))
+    }
+
     fn send_text(
         &self,
         conversation_id: Uuid,
@@ -384,14 +373,11 @@ impl KChatCore for CoreImpl {
         for raw in &fetched.messages {
             converted.push(raw_delivery_to_ingested(raw)?);
         }
-        let result = self.ingest_messages(&converted)?;
-        // The transport's `next_cursor` is intentionally not
-        // surfaced through `IngestResult` in Phase 1 — the
-        // typed cursor field lands with the result-shape
-        // expansion in Phase 2. Tests that need to pin the
-        // cursor pass-through assert it through
-        // [`crate::transport::MockDeliveryClient::seen_cursors`].
-        let _ = fetched.next_cursor;
+        let mut result = self.ingest_messages(&converted)?;
+        // Propagate the transport cursor through `IngestResult` so
+        // bridge layers can drive paginated drains without poking
+        // into the transport mock.
+        result.next_cursor = fetched.next_cursor;
         Ok(result)
     }
 
@@ -425,6 +411,19 @@ impl KChatCore for CoreImpl {
         persister
             .delete_for_everyone(&message_id.to_string())
             .map_err(|e| Error::Message(e.to_string()))
+    }
+
+    fn delete_conversation(&self, conversation_id: Uuid) -> Result<()> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let n = db
+            .delete_conversation(&conversation_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if n == 0 {
+            return Err(Error::Storage(format!(
+                "no conversation with id={conversation_id}"
+            )));
+        }
+        Ok(())
     }
 
     fn get_message(&self, message_id: Uuid) -> Result<Option<MessageView>> {
@@ -1219,6 +1218,76 @@ mod tests {
         assert_eq!(r.duplicate_count, 0);
     }
 
+    #[test]
+    fn core_impl_ingest_remote_propagates_next_cursor() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let staged = crate::transport::FetchResult {
+            messages: vec![raw_msg(
+                conv,
+                Uuid::now_v7(),
+                1_700_000_000_000,
+                "cursor-prop",
+            )],
+            next_cursor: Some("cursor-abc".into()),
+        };
+        let mock = crate::transport::MockDeliveryClient::new().with_response(None, Ok(staged));
+        core.set_delivery_client(Box::new(mock));
+
+        let r = core
+            .ingest_remote_messages(conv, None)
+            .expect("ingest_remote");
+        assert_eq!(r.new_messages, 1);
+        assert_eq!(r.next_cursor.as_deref(), Some("cursor-abc"));
+    }
+
+    #[test]
+    fn core_impl_ingest_remote_none_cursor_when_drained() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mock = crate::transport::MockDeliveryClient::new().with_response(
+            None,
+            Ok(crate::transport::FetchResult {
+                messages: vec![],
+                next_cursor: None,
+            }),
+        );
+        core.set_delivery_client(Box::new(mock));
+
+        let r = core
+            .ingest_remote_messages(conv, None)
+            .expect("ingest_remote");
+        assert_eq!(r.new_messages, 0);
+        assert!(r.next_cursor.is_none());
+    }
+
+    #[test]
+    fn core_impl_ingest_messages_inherent_leaves_next_cursor_none() {
+        // The inherent `ingest_messages(&[…])` entry point has no
+        // transport context, so `next_cursor` must remain `None`.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let r = core
+            .ingest_messages(&[IngestedMessage {
+                message_id: Uuid::now_v7(),
+                conversation_id: conv,
+                sender_id: "user-1".into(),
+                created_at_ms: 1_700_000_000_000,
+                text_content: Some("inherent".into()),
+                media_descriptors: vec![],
+                reply_to: None,
+            }])
+            .expect("ingest");
+        assert_eq!(r.new_messages, 1);
+        assert!(r.next_cursor.is_none());
+    }
+
     // ----------------------------------------------------------------
     // Task 5 — list_conversations reflects latest activity
     // ----------------------------------------------------------------
@@ -1490,5 +1559,116 @@ mod tests {
         let core = fresh_core();
         let err = core.delete_conversation(Uuid::now_v7()).unwrap_err();
         assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn core_impl_delete_conversation_removes_all_data() {
+        // Mirrors `core_impl_delete_conversation_removes_messages_and_search`
+        // but pins the cascade end-to-end on the raw `LocalStoreDb`
+        // rows: conversation, skeleton, body, FTS, fuzzy.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // One outbox-minted message (send_text) + one ingested
+        // message — exercises both write paths through the cascade.
+        let m_send = core.send_text(conv, "delta epsilon", None).expect("send");
+        let m_ingest = Uuid::now_v7();
+        core.ingest_messages(&[IngestedMessage {
+            message_id: m_ingest,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("zeta eta".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        }])
+        .expect("ingest");
+
+        core.delete_conversation(conv).expect("delete_conversation");
+
+        // Conversation row + every message row + every body row
+        // gone. Test directly through the `LocalStoreDb` to defeat
+        // any future `MessageView` reshape that hides rows but
+        // leaves them persisted.
+        core.with_db(|db| {
+            assert!(db.get_conversation(&conv.to_string()).unwrap().is_none());
+            assert!(db
+                .get_message_skeleton(&m_send.0.to_string())
+                .unwrap()
+                .is_none());
+            assert!(db
+                .get_message_skeleton(&m_ingest.to_string())
+                .unwrap()
+                .is_none());
+            assert!(db
+                .get_message_body(&m_send.0.to_string())
+                .unwrap()
+                .is_none());
+            assert!(db
+                .get_message_body(&m_ingest.to_string())
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn core_impl_delete_conversation_search_cleanup() {
+        // Verify FTS + fuzzy hits drop out of search after a
+        // conversation is deleted. Distinct from
+        // `core_impl_delete_conversation_removes_messages_and_search`
+        // because it pre-asserts both FTS *and* fuzzy hits for
+        // multiple tokens before deletion, then asserts they are
+        // gone afterward.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        core.send_text(conv, "alphafox-unique", None)
+            .expect("send a");
+        core.send_text(conv, "betagolf-unique", None)
+            .expect("send b");
+
+        for token in ["alphafox", "betagolf"] {
+            let hits = core
+                .search(
+                    SearchQuery {
+                        query_string: token.into(),
+                        ..SearchQuery::default()
+                    },
+                    SearchScope::LocalOnly,
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 1, "pre-delete: {token}");
+        }
+
+        core.delete_conversation(conv).expect("delete_conversation");
+
+        for token in ["alphafox", "betagolf"] {
+            let hits = core
+                .search(
+                    SearchQuery {
+                        query_string: token.into(),
+                        ..SearchQuery::default()
+                    },
+                    SearchScope::LocalOnly,
+                )
+                .unwrap();
+            assert!(hits.is_empty(), "post-delete: {token}");
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Task 4 — register_device stub
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn core_impl_register_device_returns_not_implemented() {
+        let core = fresh_core();
+        let err = core.register_device("device-abc").unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented("register_device")),
+            "got {err:?}",
+        );
     }
 }

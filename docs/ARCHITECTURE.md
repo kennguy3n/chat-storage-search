@@ -124,7 +124,23 @@ goes through the FFI bridge for the host platform.
 >   the workspace builds and tests without a system SQLCipher /
 >   OpenSSL install. Platform-specific wrapping of `K_local_db`
 >   (Keychain / Keystore / DPAPI) is still stubbed and lands later
->   in Phase 1 with the UniFFI / JNI bridges.
+>   in Phase 1 alongside the production UniFFI / JNI packaging.
+>   The Phase-1 **bridge scaffolds** themselves are already in
+>   tree: `crates/ios-bridge/` carries the UDL at
+>   `src/kchat.udl`, a `build.rs` that calls
+>   `uniffi::generate_scaffolding`, and FFI-shaped wrappers
+>   around `CoreImpl` (UUIDs cross the FFI as canonical
+>   strings; argument validation throws
+>   `KChatError::InvalidArgument`).
+>   `crates/android-bridge/` carries the
+>   `Java_com_kchat_core_KChatBridge_*` JNI entry points
+>   (`initialize`, `destroy`, `sendText`, `search`,
+>   `editMessage`, `deleteForMe`, `deleteForEveryone`,
+>   `getMessage`, `getConversationMessages`) plus a pure-Rust
+>   `KChatBridgeHandle` so unit tests exercise the same code
+>   paths without a JNIEnv. Errors throw
+>   `com.kchat.core.KChatException`; `MessageView` /
+>   `SearchResult` batches marshal as JSON for brevity.
 > * `crates/core/src/local_store/state_machines.rs` defines the
 >   `body_state`, `media_state`, `archive_state`, `backup_state`,
 >   and `restore_state` enums with `try_transition`, `Display` /
@@ -219,32 +235,46 @@ goes through the FFI bridge for the host platform.
 >   each `RawDeliveryMessage` into `IngestedMessage` (parsing
 >   ids back to `Uuid`), and forwards into the existing
 >   `ingest_messages` pipeline so deduplication / FTS / fuzzy
->   / journal writes are unchanged. When no transport is
->   configured the trait method returns
->   `Err(Error::Transport("no delivery client configured"))`
->   so callers fail fast instead of silently no-oping. The
+>   / journal writes are unchanged. The transport's
+>   `next_cursor` is propagated end-to-end through the
+>   `IngestResult.next_cursor: Option<String>` field so
+>   bridge layers can drive paginated drains directly off
+>   the result without poking at the transport mock; the
 >   inherent `CoreImpl::ingest_messages(&[IngestedMessage])`
->   remains the batch-ingest path tests and bridges currently
->   use without going through the transport.
+>   path leaves the field as `None` because it has no
+>   transport context. When no transport is configured the
+>   trait method returns
+>   `Err(Error::Transport("no delivery client configured"))`
+>   so callers fail fast instead of silently no-oping.
 >   Inherent **conversation-management methods**
 >   (`create_conversation`, `list_conversations`,
 >   `get_conversation`, `update_conversation_pin`,
->   `update_conversation_mute`, `delete_conversation`) wrap the
->   matching helpers on `LocalStoreDb` and surface
->   `Error::Storage` when the conversation does not exist so
->   the bridge layer can show the failure to the user.
->   `delete_conversation` cascades through every dependent
->   row (`media_search_index` → `search_fuzzy` → `search_fts`
->   → `search_vector` → `media_asset` → `message_body` →
->   `message_skeleton` → `conversation`) inside a single
->   `SAVEPOINT`, leaving sibling conversations untouched. The
->   ordering is dictated by the schema's foreign-key
->   direction: `media_search_index.asset_id` references
->   `media_asset(asset_id)` and `media_asset.message_id`
->   references `message_skeleton(message_id)`, so both must
->   drain top-down before the skeleton delete runs;
+>   `update_conversation_mute`) wrap the matching helpers on
+>   `LocalStoreDb` and surface `Error::Storage` when the
+>   conversation does not exist so the bridge layer can show
+>   the failure to the user. The trait now also exposes
+>   **`delete_conversation(uuid)`** so bridge clients can drive
+>   the cascade through the public API; it cascades through
+>   every dependent row (`media_search_index` → `search_fuzzy`
+>   → `search_fts` → `search_vector` → `media_asset` →
+>   `message_body` → `message_skeleton` → `conversation`)
+>   inside a single `SAVEPOINT`, leaving sibling conversations
+>   untouched. The ordering is dictated by the schema's
+>   foreign-key direction: `media_search_index.asset_id`
+>   references `media_asset(asset_id)` and
+>   `media_asset.message_id` references
+>   `message_skeleton(message_id)`, so both must drain
+>   top-down before the skeleton delete runs;
 >   `search_vector` carries no FK but the rows are
 >   message-scoped and never want to outlive the skeleton.
+>   The trait also carries a Phase-1 stub
+>   **`register_device(&str) -> Result<DeviceRegistration>`**
+>   that returns
+>   `Err(Error::NotImplemented("register_device"))` until the
+>   MLS credential / KeyPackage publication pipeline lands;
+>   the empty `DeviceRegistration` placeholder lives next to
+>   the other Phase-1 placeholder result types in
+>   `crates/core/src/lib.rs` so the FFI shape is stable.
 >   Inherent **timeline + single-message helpers**
 >   (`get_timeline(uuid, before_ms, limit)` for newest-first
 >   `TimelineRow` pages, plus `get_message_with_body(uuid)`

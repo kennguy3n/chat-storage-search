@@ -8,7 +8,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~95%`.**
+> Search + MLS Integration — `In progress | ~96%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -66,15 +66,27 @@
 > `ingest_remote_messages`** that pulls from a configured
 > `Box<dyn DeliveryClient>` and reuses the existing batch-ingest
 > pipeline (deduplication / FTS / fuzzy / journal writes
-> unchanged), the **conversation-management
+> unchanged) — `IngestResult.next_cursor` is now propagated
+> end-to-end through the result so paginated drains can drive
+> directly off the response without poking at the transport
+> mock, the **conversation-management
 > API** on `CoreImpl` (`create_conversation` /
 > `list_conversations` / `get_conversation` /
-> `update_conversation_pin` / `update_conversation_mute`), the
+> `update_conversation_pin` / `update_conversation_mute` /
+> `delete_conversation` — the last one cascading through every
+> dependent row inside a single `SAVEPOINT`), the
 > **Phase-1 stub trait surface** for the rest of
-> `docs/PROPOSAL.md §12` (`send_media`, `hydrate_message`,
-> `run_incremental_backup`, `enforce_storage_budget`,
-> `restore_from_backup`) returning
-> `Err(Error::NotImplemented(<method>))`, the multilingual
+> `docs/PROPOSAL.md §12` (`register_device`, `send_media`,
+> `hydrate_message`, `run_incremental_backup`,
+> `enforce_storage_budget`, `restore_from_backup`) returning
+> `Err(Error::NotImplemented(<method>))`, the **bridge
+> scaffolds** at `crates/ios-bridge/` (UniFFI 0.28 with
+> `kchat.udl` mirroring the public `KChatCore` surface and a
+> `build.rs` that calls `uniffi::generate_scaffolding`) and
+> `crates/android-bridge/` (jni 0.21 with the
+> `Java_com_kchat_core_KChatBridge_*` entry points wrapping a
+> pure-Rust `KChatBridgeHandle` so unit tests exercise the
+> bridge surface without a JNIEnv), the multilingual
 > integration tests at `crates/core/tests/multilingual_search.rs`
 > + `crates/core/tests/multilingual_fuzzy_search.rs` (combined
 > FTS5 + fuzzy across Latin / Cyrillic / Arabic / Thai trigrams,
@@ -83,7 +95,10 @@
 > (`crates/core/benches/phase1_benchmarks.rs`) validating the
 > < 20 ms / < 150 ms p95 budgets.
 >
-> Outstanding for Phase 1: UniFFI / JNI bridges and the
+> Outstanding for Phase 1: production UniFFI / JNI packaging
+> (the bridge scaffolds at `crates/{ios,android}-bridge/` are
+> in place but the generated Swift package and Kotlin façade
+> are not yet wired into KChat.app / KChat-Android) and the
 > platform-specific `K_local_db` wrap (Keychain / Keystore /
 > DPAPI). The transport surface and the transport-driven
 > `ingest_remote_messages` are now in place; what remains for
@@ -179,8 +194,8 @@ chat-storage-search/
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
         pattern_c_interop_vectors.json
-    ios-bridge/                             # UniFFI → Swift (Phase 1)
-    android-bridge/                         # JNI → Kotlin (Phase 1)
+    ios-bridge/                             # UniFFI → Swift (Phase 1 scaffold: kchat.udl + build.rs + FFI wrappers)
+    android-bridge/                         # JNI → Kotlin (Phase 1 scaffold: Java_com_kchat_core_KChatBridge_* entry points)
     desktop/                                # macOS + Windows (Phase 7)
   tests/
     generate_vectors/
@@ -306,19 +321,40 @@ The Phase 0 + Phase 1 test surface covers:
   with three messages indexed + searchable, no-transport
   `Error::Transport`, dedup on retry through the same mock
   cursor, and cursor pass-through verified by the mock's
-  per-call assertion), the
+  per-call assertion), `IngestResult.next_cursor`
+  propagation (transport `Some(cursor)` flows through
+  unchanged, `None` when the delivery store is drained, and
+  the inherent `ingest_messages` entry point leaves it
+  `None`), the
   conversation-management surface (`create_conversation` /
   `list_conversations` / `get_conversation` / pin / mute /
-  `delete_conversation`, including
+  trait-level `delete_conversation`, including
   `list_conversations_reflects_latest_message_activity`
   which pins the auto-bump of `last_message_id` /
   `last_activity_ms` from the persistence path, plus the
   cascade test that confirms messages and search hits are
   gone after `delete_conversation` and the missing-id
   `Error::Storage` path), and
-  the Phase-1 `Error::NotImplemented` stubs for `send_media` /
-  `hydrate_message` / `run_incremental_backup` /
-  `enforce_storage_budget` / `restore_from_backup`.
+  the Phase-1 `Error::NotImplemented` stubs for
+  `register_device` / `send_media` / `hydrate_message` /
+  `run_incremental_backup` / `enforce_storage_budget` /
+  `restore_from_backup`.
+* [`ios-bridge`](crates/ios-bridge/src/lib.rs) — UniFFI 0.28
+  scaffold tests covering bridge construction, the
+  wrong-key-length error path, the `Platform` round-trip,
+  the `SearchQuery` / UUID parsing helpers, the
+  `register_device` `NotImplemented` stub, and a full
+  `send_text → get_message` round-trip through the FFI
+  shape.
+* [`android-bridge`](crates/android-bridge/src/lib.rs) — JNI
+  0.21 scaffold tests against the pure-Rust
+  `KChatBridgeHandle` (initialize / send-text round-trip,
+  search, edit, `delete_for_me` / `delete_for_everyone`,
+  `get_conversation_messages` pagination,
+  `ingest_remote_messages` `next_cursor` propagation, plus
+  the unknown-platform / wrong-key-length / invalid-UUID
+  error paths and a compile-time signature-stability test
+  for the `Java_com_kchat_core_KChatBridge_*` entry points).
 * [`transport`](crates/core/src/transport/mod.rs) — unit tests
   for both transport surfaces: the narrower **`DeliveryClient`**
   used by `ingest_remote_messages` (`TransportError` `Display`
