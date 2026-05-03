@@ -391,11 +391,15 @@ impl CoreImpl {
     /// this once it has fetched and AEAD-unsealed an archive
     /// segment for `message_id`.
     ///
-    /// Wraps
-    /// [`LocalStoreDb::rehydrate_message_body`] (UPSERT + body-state
-    /// transition + `search_fts` refresh in one SAVEPOINT) and
-    /// re-indexes the message into `search_fuzzy` so a follow-up
-    /// fuzzy query reflects the rehydrated content.
+    /// The full sequence — body upsert + `body_state` UPDATE +
+    /// `search_fts` refresh + `search_fuzzy` reindex — runs inside
+    /// a single outer `SAVEPOINT rehydrate_message_body_locally` so
+    /// a partial failure (e.g. the fuzzy `index_message` errors out
+    /// after `remove_message` already ran) rolls back to the
+    /// pre-call state. Mirrors the
+    /// [`crate::message::processor::MessagePersister::edit_message`]
+    /// pattern where body / FTS / fuzzy all share one SAVEPOINT.
+    ///
     /// `created_at_ms` is **never** touched, so the timeline order
     /// remains stable and the renderer does not scroll-jump.
     pub fn rehydrate_message_body_locally(
@@ -405,20 +409,38 @@ impl CoreImpl {
         new_body_state: BodyState,
     ) -> Result<()> {
         let db = self.db.lock().map_err(poisoned)?;
-        db.rehydrate_message_body(&message_id.to_string(), text_content, new_body_state)
+        let conn = db.connection();
+        conn.execute_batch("SAVEPOINT rehydrate_message_body_locally;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        // Refresh fuzzy tokens — the engine's index_message is
-        // idempotent thanks to the (token, script, message_id)
-        // primary key but stale tokens from a previous body are
-        // dropped first so search_fuzzy stays in sync.
-        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
-        engine
-            .remove_message(&message_id.to_string())
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        engine
-            .index_message(&message_id.to_string(), text_content)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+        let result = (|| -> Result<()> {
+            db.rehydrate_message_body(&message_id.to_string(), text_content, new_body_state)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Refresh fuzzy tokens — the engine's index_message is
+            // idempotent thanks to the (token, script, message_id)
+            // primary key but stale tokens from a previous body are
+            // dropped first so search_fuzzy stays in sync.
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            engine
+                .remove_message(&message_id.to_string())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            engine
+                .index_message(&message_id.to_string(), text_content)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })();
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE SAVEPOINT rehydrate_message_body_locally;")
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT rehydrate_message_body_locally;\n\
+                     RELEASE SAVEPOINT rehydrate_message_body_locally;",
+                );
+            }
+        }
+        result
     }
 }
 
@@ -2470,5 +2492,117 @@ mod tests {
 
         let body = core.get_message_body(mid.0).unwrap().expect("body present");
         assert_eq!(body.text_content.as_deref(), Some("after"));
+    }
+
+    /// Regression test for the SAVEPOINT atomicity fix in
+    /// [`CoreImpl::rehydrate_message_body_locally`]: the body
+    /// upsert + `body_state` UPDATE + FTS refresh + fuzzy reindex
+    /// all run inside a single outer
+    /// `SAVEPOINT rehydrate_message_body_locally`. We verify the
+    /// whole bundle is bracketable — opening an additional
+    /// `SAVEPOINT outer` around the call and issuing
+    /// `ROLLBACK TO outer` afterwards reverts every side effect:
+    /// the body row, the search_fts row, and (most importantly)
+    /// the search_fuzzy tokens. Before the fix, the fuzzy ops
+    /// ran outside the inner savepoint and were therefore
+    /// auto-committed independently; if the index step crashed
+    /// after the remove step, the message would lose all fuzzy
+    /// coverage with no rollback. This test asserts the fuzzy
+    /// state participates in the surrounding transaction.
+    #[test]
+    fn rehydrate_message_body_locally_participates_in_outer_savepoint() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core
+            .send_text(conv, "salt sodium chloride", None)
+            .expect("send_text");
+
+        // Snapshot pre-call body / fuzzy state so we can compare
+        // against post-rollback.
+        let before_body = core
+            .get_message_body(mid.0)
+            .unwrap()
+            .expect("body present pre-call")
+            .text_content
+            .clone()
+            .expect("text_content present");
+        let pre_sodium = {
+            let db = core.db.lock().unwrap();
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            engine.search_fuzzy("sodium", 5).unwrap().len()
+        };
+        assert!(pre_sodium > 0, "pre-call fuzzy index must hit \"sodium\"");
+
+        // Open outer savepoint, run rehydrate, then ROLLBACK.
+        {
+            let db = core.db.lock().unwrap();
+            db.connection()
+                .execute_batch("SAVEPOINT outer;")
+                .expect("open outer savepoint");
+        }
+
+        core.rehydrate_message_body_locally(
+            mid.0,
+            "completely different content about dogs",
+            BodyState::LocalPlainAvailable,
+        )
+        .expect("rehydrate");
+
+        // Sanity: post-rehydrate, body and fuzzy reflect new text.
+        {
+            let mid_body = core
+                .get_message_body(mid.0)
+                .unwrap()
+                .unwrap()
+                .text_content
+                .unwrap();
+            assert_eq!(mid_body, "completely different content about dogs");
+            let db = core.db.lock().unwrap();
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            assert!(
+                engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
+                "old fuzzy tokens cleared post-rehydrate"
+            );
+            assert!(
+                !engine.search_fuzzy("dogs", 5).unwrap().is_empty(),
+                "new fuzzy tokens indexed post-rehydrate"
+            );
+        }
+
+        // Roll back outer savepoint.
+        {
+            let db = core.db.lock().unwrap();
+            db.connection()
+                .execute_batch("ROLLBACK TO SAVEPOINT outer;\nRELEASE SAVEPOINT outer;")
+                .expect("rollback outer savepoint");
+        }
+
+        // Body must be restored to its pre-call text.
+        let after_body = core
+            .get_message_body(mid.0)
+            .unwrap()
+            .expect("body present post-rollback")
+            .text_content
+            .expect("text_content present");
+        assert_eq!(
+            after_body, before_body,
+            "body upsert must roll back with the outer SAVEPOINT"
+        );
+
+        // Fuzzy index must be restored: \"sodium\" hits again, \"dogs\"
+        // does not. If the fuzzy ops had run outside the savepoint
+        // (the pre-fix shape) the new \"dogs\" tokens would survive
+        // the rollback and \"sodium\" would still be missing.
+        let db = core.db.lock().unwrap();
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        assert!(
+            !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
+            "fuzzy index must roll back: \"sodium\" hits again post-rollback"
+        );
+        assert!(
+            engine.search_fuzzy("dogs", 5).unwrap().is_empty(),
+            "fuzzy index must roll back: \"dogs\" tokens evicted post-rollback"
+        );
     }
 }

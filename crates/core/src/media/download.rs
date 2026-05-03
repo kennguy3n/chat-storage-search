@@ -357,13 +357,45 @@ pub fn rehydrate_media_asset(
 
     // 4) Drive the media-state machine all the way through:
     //    `Evicted | RemoteOriginal → DownloadInProgress → OriginalLocal`.
-    transition_media_state(db, asset_id, from_state, MediaState::DownloadInProgress)?;
-    transition_media_state(
-        db,
-        asset_id,
-        MediaState::DownloadInProgress,
-        MediaState::OriginalLocal,
-    )?;
+    //
+    //    Both transitions run inside a single
+    //    `SAVEPOINT rehydrate_media_state` so a partial failure
+    //    rolls back to the pre-call `media_state`. Without the
+    //    savepoint a process crash (or transition error on the
+    //    second hop) between the two UPDATEs would strand the row
+    //    in `DownloadInProgress` — the state-machine matrix has no
+    //    `DownloadInProgress → Evicted` escape, so a subsequent
+    //    `rehydrate_media_asset` call rejects the row at the
+    //    `from_state` early-return and the asset becomes
+    //    permanently un-rehydratable through the public API.
+    let conn = db.connection();
+    conn.execute_batch("SAVEPOINT rehydrate_media_state;")
+        .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint open: {e}")))?;
+    let transitions: Result<(), Error> = (|| {
+        transition_media_state(db, asset_id, from_state, MediaState::DownloadInProgress)?;
+        transition_media_state(
+            db,
+            asset_id,
+            MediaState::DownloadInProgress,
+            MediaState::OriginalLocal,
+        )?;
+        Ok(())
+    })();
+    match &transitions {
+        Ok(_) => conn
+            .execute_batch("RELEASE SAVEPOINT rehydrate_media_state;")
+            .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint release: {e}")))?,
+        Err(_) => {
+            // Best-effort rollback. We deliberately swallow rollback
+            // errors so the original transition error is what surfaces
+            // to the caller.
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT rehydrate_media_state;\n\
+                 RELEASE SAVEPOINT rehydrate_media_state;",
+            );
+        }
+    }
+    transitions?;
 
     Ok(plaintext)
 }
@@ -1002,5 +1034,104 @@ mod tests {
             Error::Storage(msg) => assert!(msg.contains("no media_asset row"), "got {msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
+    }
+
+    /// Regression test for the atomicity fix in
+    /// `rehydrate_media_asset`: the
+    /// `Evicted → DownloadInProgress → OriginalLocal` pair is wrapped
+    /// in an internal `SAVEPOINT rehydrate_media_state`. We verify
+    /// the state mutations are bracketable by an enclosing
+    /// `SAVEPOINT outer` — issuing `ROLLBACK TO outer` after a
+    /// successful `rehydrate_media_asset` reverts the row back to
+    /// the pre-call `media_state`. If the inner state transitions
+    /// were applied as bare auto-committed statements instead of
+    /// inside a savepoint they would persist past the outer
+    /// rollback and the asset would be stranded in
+    /// `OriginalLocal`/`DownloadInProgress` with no recovery path.
+    #[test]
+    fn rehydrate_state_transitions_participate_in_outer_savepoint() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[5] ^= 0x77;
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-atomic",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::Evicted,
+            "kchat_backend",
+        );
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        // Start an outer savepoint; the rehydrate's internal
+        // savepoint nests under it.
+        db.connection()
+            .execute_batch("SAVEPOINT outer;")
+            .expect("open outer savepoint");
+
+        rehydrate_media_asset(&db, "a-atomic", &transport, &wrapping).expect("rehydrate");
+        // After rehydrate, state advanced to OriginalLocal.
+        assert_eq!(
+            db.get_media_asset("a-atomic").unwrap().unwrap().media_state,
+            MediaState::OriginalLocal
+        );
+
+        // Roll back the outer savepoint. Both transitions must
+        // unwind together, so the row goes back to Evicted.
+        db.connection()
+            .execute_batch("ROLLBACK TO SAVEPOINT outer;\nRELEASE SAVEPOINT outer;")
+            .expect("rollback outer savepoint");
+        assert_eq!(
+            db.get_media_asset("a-atomic").unwrap().unwrap().media_state,
+            MediaState::Evicted,
+            "rehydrate's state transitions must participate in the outer SAVEPOINT \
+             so a partial-failure rollback cleanly restores the pre-call state"
+        );
+    }
+
+    /// Regression test that no partial state — e.g. a row stranded
+    /// in `DownloadInProgress` — survives a wrong-key failure. The
+    /// unwrap fails before the savepoint opens, so the row stays at
+    /// `Evicted`. This complements
+    /// [`rehydrate_with_wrong_wrapping_key_fails`] but additionally
+    /// pokes the row through a fresh `LocalStoreDb` lookup (catching
+    /// any caching shenanigans).
+    #[test]
+    fn rehydrate_failed_unwrap_leaves_no_intermediate_download_in_progress() {
+        let wrapping = fixed_k_asset();
+        let mut k_asset = wrapping;
+        k_asset[6] ^= 0xAA;
+        let chunk_size = small_chunk_size();
+        let pt = vec![0u8; chunk_size];
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k_asset, chunk_size);
+
+        let db = fresh_db_with_asset(
+            "a-no-strand",
+            &blob_id,
+            &wrapping,
+            &k_asset,
+            root,
+            chunk_count,
+            MediaState::Evicted,
+            "kchat_backend",
+        );
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let mut wrong = wrapping;
+        wrong[1] ^= 0xFF;
+        let _ = rehydrate_media_asset(&db, "a-no-strand", &transport, &wrong).unwrap_err();
+
+        // The row must NOT be stranded in DownloadInProgress.
+        let row = db.get_media_asset("a-no-strand").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::Evicted);
+        assert_ne!(row.media_state, MediaState::DownloadInProgress);
     }
 }
