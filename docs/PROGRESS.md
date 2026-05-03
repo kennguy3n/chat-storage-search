@@ -940,6 +940,52 @@ Notes:
 
 ## Changelog
 
+### 2026-05-03 — Post-optimization benchmark rerun (Phase-1 baseline + cross-repo summary)
+
+Re-ran `cargo test --workspace` and
+`cargo bench -p kchat-core` after the cross-repo improvements
+A–H (unified `llama-server`, Apple MLX SLM + Whisper,
+embedding cache, INT4 quantization, DirectML EP for Windows,
+model warm-up, Whisper MLX) landed across the four KChat
+repos. The `chat-storage-search` Phase-1 hot paths are
+unchanged on this Linux x86 VM — improvements A–H introduce
+alternative code paths (Apple MLX, Windows DirectML, server
+warm-up) that this repo's Phase-1 surface doesn't exercise.
+
+- `cargo test --workspace`: 538 passed, 0 failed, 0 ignored
+  across 13 test targets (kchat-core unit + 5 integration,
+  kchat-android-bridge, kchat-desktop, kchat-ios-bridge, +
+  doctests). Verified via `grep -rE '#\[ignore' crates/` that
+  no tests are silently skipped — particularly important for
+  the multilingual / FTS5 / fuzzy search integration tests.
+- `cargo bench -p kchat-core`
+  (`crates/core/benches/phase1_benchmarks.rs`): all five
+  benchmarks land three orders of magnitude under their
+  PROPOSAL §13 latency budgets:
+  - `insert_text_message`: median 144 µs (target < 20 ms p95).
+  - `insert_batch_100/100_text_messages`: median 10.04 ms
+    (target < 2 s for the batch).
+  - `search_recent_messages`: median 110 µs (target < 150 ms p95).
+  - `search_with_structured_filters`: median 147 µs (same target).
+  - `fts_prefix_search`: median 102 µs (same target).
+- Phase 6 ML benchmarks (XLM-R / MobileCLIP-S2 / Whisper) are
+  explicitly listed as "not yet runnable" in the new
+  `docs/benchmarks/phase1-benchmark-results.md` — Phase 6
+  has not started in this repo (only the Apple MLX Whisper
+  backend scaffold has landed, see entry below), and the
+  on-Apple-Silicon MLX runtime path cannot be measured on
+  this Linux x86 VM.
+
+Files added:
+- `docs/benchmarks/phase1-benchmark-results.md` — Phase-1
+  test + criterion results, environment, target comparison,
+  Phase-6 deferral note, cross-platform skips, reproduction
+  command.
+- `docs/benchmarks/cross-repo-summary.md` — consolidated
+  performance + verification table across all four KChat
+  repos (slm-guardrail, cv-guard, slm-chat-demo,
+  chat-storage-search) with no-mock verification checklist.
+
 ### 2026-05-03 — Phase 6 scaffold: Apple MLX Whisper backend (Apple Silicon) → ONNX Runtime fallback
 
 - Added `crates/core/src/models/whisper.rs`: pure
