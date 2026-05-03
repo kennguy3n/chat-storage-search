@@ -54,11 +54,15 @@ impl StorageBudget {
         }
     }
 
-    fn warning_bytes(&self) -> u64 {
+    /// Absolute byte threshold above which usage triggers
+    /// [`PressureLevel::Warning`].
+    pub fn warning_bytes(&self) -> u64 {
         self.max_bytes * (self.warning_threshold_pct as u64) / 100
     }
 
-    fn critical_bytes(&self) -> u64 {
+    /// Absolute byte threshold above which usage triggers
+    /// [`PressureLevel::Critical`].
+    pub fn critical_bytes(&self) -> u64 {
         self.max_bytes * (self.critical_threshold_pct as u64) / 100
     }
 }
@@ -98,6 +102,33 @@ pub struct BudgetAssessment {
     pub headroom_bytes: i64,
     /// Pressure level the orchestration layer should react to.
     pub pressure_level: PressureLevel,
+}
+
+impl BudgetAssessment {
+    /// Bytes the eviction planner should aim to free, computed
+    /// relative to the threshold the current usage crossed.
+    ///
+    /// * `None` → `0` (no work).
+    /// * `Warning` → bring usage back to `warning_bytes`.
+    /// * `Critical` → bring usage back to `critical_bytes`.
+    /// * `Extreme` → bring usage back to `max_bytes`.
+    ///
+    /// This is the value [`crate::offload::eviction::plan_eviction`]
+    /// expects as its `target_bytes` argument. Computing it from
+    /// `(-headroom_bytes).max(0)` is wrong for Warning and
+    /// Critical: in both of those bands, headroom is positive
+    /// (usage is still under `max_bytes`), so the saturated value
+    /// would be `0` and the planner would emit an empty plan.
+    pub fn eviction_target_bytes(&self) -> u64 {
+        let total = self.usage.total_bytes;
+        let threshold = match self.pressure_level {
+            PressureLevel::None => return 0,
+            PressureLevel::Warning => self.budget.warning_bytes(),
+            PressureLevel::Critical => self.budget.critical_bytes(),
+            PressureLevel::Extreme => self.budget.max_bytes,
+        };
+        total.saturating_sub(threshold)
+    }
 }
 
 /// Pressure level derived from [`StorageUsage`] vs.
@@ -310,6 +341,52 @@ mod tests {
         assert!(PressureLevel::Warning.requires_eviction());
         assert!(PressureLevel::Critical.requires_eviction());
         assert!(PressureLevel::Extreme.requires_eviction());
+    }
+
+    fn assessment_with(level: PressureLevel, total: u64) -> BudgetAssessment {
+        let budget = budget_1k();
+        let usage = usage_with(total);
+        BudgetAssessment {
+            usage,
+            budget,
+            headroom_bytes: compute_headroom(&usage, &budget),
+            pressure_level: level,
+        }
+    }
+
+    #[test]
+    fn eviction_target_zero_when_no_pressure() {
+        // Any usage below warning has level=None and must produce 0.
+        let a = assessment_with(PressureLevel::None, 100);
+        assert_eq!(a.eviction_target_bytes(), 0);
+    }
+
+    #[test]
+    fn eviction_target_brings_warning_back_to_warning_band() {
+        // Bug guard: previously `(-headroom).max(0)` evaluated to 0
+        // for Warning because headroom is positive (usage < max).
+        // The threshold-relative target must be non-zero so the
+        // planner actually evicts.
+        let a = assessment_with(PressureLevel::Warning, 600);
+        // warning_bytes = 1024 * 50/100 = 512; target = 600 - 512.
+        assert_eq!(a.eviction_target_bytes(), 88);
+    }
+
+    #[test]
+    fn eviction_target_brings_critical_back_to_critical_band() {
+        // Bug guard: same as Warning — Critical headroom is also
+        // positive (usage still under max_bytes), so the old
+        // calculation was 0. The threshold-relative target must
+        // chase critical_bytes, not max_bytes.
+        let a = assessment_with(PressureLevel::Critical, 900);
+        // critical_bytes = 1024 * 80/100 = 819; target = 900 - 819.
+        assert_eq!(a.eviction_target_bytes(), 81);
+    }
+
+    #[test]
+    fn eviction_target_brings_extreme_back_to_max_bytes() {
+        let a = assessment_with(PressureLevel::Extreme, 2000);
+        assert_eq!(a.eviction_target_bytes(), 2000 - 1024);
     }
 
     #[test]

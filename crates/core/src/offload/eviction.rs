@@ -84,11 +84,13 @@ pub fn plan_eviction(
 /// Apply `plan` to the local store.
 ///
 /// For every candidate in `plan.candidates`, this issues an
-/// `UPDATE media_asset SET media_state = 'archive_only',
-/// bytes_local = 0` plus an
-/// `UPDATE message_skeleton SET archive_state = 'archive_only_local'`
-/// transition. The orchestration layer is expected to wrap the
-/// call in its own transaction.
+/// `UPDATE media_asset SET media_state = 'evicted', bytes_local = 0`.
+/// The string literal must match
+/// [`MediaState::as_str`](crate::local_store::state_machines::MediaState)
+/// — `'evicted'` is the canonical state for assets whose local data
+/// has been reclaimed by the storage budget enforcer. The
+/// orchestration layer is expected to wrap the call in its own
+/// transaction.
 pub fn execute_eviction(conn: &Connection, plan: &EvictionPlan) -> Result<EvictionResult, Error> {
     let mut freed = 0u64;
     let mut evicted = 0u32;
@@ -96,7 +98,7 @@ pub fn execute_eviction(conn: &Connection, plan: &EvictionPlan) -> Result<Evicti
         let updated = conn
             .execute(
                 "UPDATE media_asset
-                    SET media_state = 'archive_only',
+                    SET media_state = 'evicted',
                         bytes_local = 0
                   WHERE message_id = ?1",
                 params![cand.message_id.to_string()],
@@ -224,5 +226,87 @@ mod tests {
         };
         let result = execute_eviction(db.connection(), &plan).unwrap();
         assert_eq!(result, EvictionResult::default());
+    }
+
+    #[test]
+    fn execute_eviction_writes_canonical_evicted_state() {
+        // The bug this regression-tests: `execute_eviction` previously
+        // wrote `media_state = 'archive_only'`, which is not a valid
+        // `MediaState` string and would make the column unparseable.
+        use crate::local_store::db::LocalStoreDb;
+        use crate::local_store::schema::{Conversation, MediaAsset, MessageKind, MessageSkeleton};
+        use crate::local_store::state_machines::{
+            ArchiveState, BackupState, BodyState, MediaState,
+        };
+
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        db.insert_conversation(&Conversation {
+            conversation_id: "c-evict".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        })
+        .unwrap();
+
+        let mid = Uuid::now_v7();
+        db.insert_message_skeleton(&MessageSkeleton {
+            message_id: mid.to_string(),
+            conversation_id: "c-evict".into(),
+            sender_id: "s".into(),
+            created_at_ms: 1,
+            received_at_ms: 1,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(MediaState::OriginalLocal),
+            archive_state: ArchiveState::ArchiveVerified,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        })
+        .unwrap();
+        db.insert_media_asset(&MediaAsset {
+            asset_id: "asset-1".into(),
+            message_id: mid.to_string(),
+            mime_type: "image/png".into(),
+            bytes_total: 1024,
+            bytes_local: 1024,
+            media_state: MediaState::OriginalLocal,
+            wrapped_k_asset: vec![0u8; 40],
+            chunk_count: 1,
+            merkle_root: vec![0u8; 32],
+            blob_id: "blob-1".into(),
+            storage_sink: "kchat_backend".into(),
+        })
+        .unwrap();
+
+        let plan = EvictionPlan {
+            candidates: vec![(
+                EvictionCandidate {
+                    message_id: mid,
+                    conversation_id: Uuid::now_v7(),
+                    content_kind: ContentKind::Image,
+                    bytes: 1024,
+                    last_accessed_ms: 0,
+                    is_pinned: false,
+                    archive_state: ArchiveState::ArchiveVerified,
+                },
+                1.0,
+            )],
+            target_bytes: 1024,
+            total_bytes: 1024,
+        };
+        let result = execute_eviction(db.connection(), &plan).unwrap();
+        assert_eq!(result.evicted_count, 1);
+        assert_eq!(result.freed_bytes, 1024);
+
+        // The persisted state must round-trip through MediaState's
+        // parser. Reading via get_media_asset (which calls
+        // MediaState::try_from(&str)) is the regression hook.
+        let asset = db.get_media_asset("asset-1").unwrap().unwrap();
+        assert_eq!(asset.media_state, MediaState::Evicted);
+        assert_eq!(asset.bytes_local, 0);
     }
 }

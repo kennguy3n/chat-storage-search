@@ -639,7 +639,12 @@ impl KChatCore for CoreImpl {
                 evicted_count: 0,
             });
         }
-        let target_bytes = (-assessment.headroom_bytes).max(0) as u64;
+        // `eviction_target_bytes` is threshold-relative (Warning →
+        // warning_bytes, Critical → critical_bytes, Extreme →
+        // max_bytes). Driving the planner directly off
+        // `(-headroom).max(0)` would only produce a non-zero target
+        // for Extreme pressure.
+        let target_bytes = assessment.eviction_target_bytes();
         let plan = plan_eviction(Vec::new(), target_bytes, now_ms_for_send_media());
         let result = execute_eviction(db.connection(), &plan)?;
         Ok(OffloadResult {
