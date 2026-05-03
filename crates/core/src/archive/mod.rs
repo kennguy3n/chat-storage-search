@@ -12,4 +12,7 @@
 //! specification.
 
 pub mod event_journal;
+pub mod manifest_builder;
+pub mod prefetch;
 pub mod segment_builder;
+pub mod upload;

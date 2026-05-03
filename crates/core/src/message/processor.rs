@@ -21,6 +21,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal, ArchiveEventType};
 use crate::formats::media_descriptor::MediaDescriptor;
 use crate::local_store::db::{DbError, LocalStoreDb};
 use crate::local_store::schema::{
@@ -395,10 +396,27 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_received".into(),
-            payload,
+            payload: payload.clone(),
             created_at_ms: now_ms(),
         };
         self.db.insert_backup_event(&entry)?;
+
+        // Mirror the backup-side event into the Phase-3 archive
+        // event journal so the segment builder will pick this
+        // message up on its next drain. The write happens inside
+        // the same `SAVEPOINT persist_ingest;` boundary opened by
+        // `persist_ingested_message`, so a rollback discards both
+        // journals together.
+        let archive_event = ArchiveEvent {
+            event_type: ArchiveEventType::MessageReceived,
+            conversation_id: msg.conversation_id,
+            message_id: Some(msg.message_id),
+            payload,
+            created_at_ms: skel.created_at_ms,
+        };
+        ArchiveEventJournal::new()
+            .write_event(self.db.connection(), &archive_event)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -497,10 +515,26 @@ impl<'a> MessagePersister<'a> {
         let journal = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "outbox_pending".into(),
-            payload,
+            payload: payload.clone(),
             created_at_ms: now_ms(),
         };
         self.db.insert_backup_event(&journal)?;
+
+        // Mirror the send into the archive event journal as a
+        // `MessageReceived` event — from the personal archive's
+        // point of view, an outbox-originated message lands in
+        // the local store the same way an MLS-ingested one does.
+        // The write rides inside `SAVEPOINT persist_outbox;`.
+        let archive_event = ArchiveEvent {
+            event_type: ArchiveEventType::MessageReceived,
+            conversation_id: entry.conversation_id,
+            message_id: Some(entry.client_message_id),
+            payload,
+            created_at_ms: entry.created_at_ms,
+        };
+        ArchiveEventJournal::new()
+            .write_event(self.db.connection(), &archive_event)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -621,10 +655,30 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_edited".into(),
-            payload,
+            payload: payload.clone(),
             created_at_ms: edited_at_ms,
         };
         self.db.insert_backup_event(&entry)?;
+
+        // Archive-side mirror of the edit. Rides inside
+        // `SAVEPOINT edit_message;` so a downstream failure
+        // discards both journal writes.
+        let conversation_id = Uuid::parse_str(&skel.conversation_id).map_err(|e| {
+            ProcessorError::StorageError(format!("invalid conversation_id in store: {e}"))
+        })?;
+        let message_id = Uuid::parse_str(&skel.message_id).map_err(|e| {
+            ProcessorError::StorageError(format!("invalid message_id in store: {e}"))
+        })?;
+        let archive_event = ArchiveEvent {
+            event_type: ArchiveEventType::MessageEdited,
+            conversation_id,
+            message_id: Some(message_id),
+            payload,
+            created_at_ms: edited_at_ms,
+        };
+        ArchiveEventJournal::new()
+            .write_event(self.db.connection(), &archive_event)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -705,10 +759,29 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_deleted".into(),
-            payload,
+            payload: payload.clone(),
             created_at_ms: deleted_at_ms,
         };
         self.db.insert_backup_event(&entry)?;
+
+        // Archive-side delete event. Rides inside
+        // `SAVEPOINT delete_message;`.
+        let conversation_id = Uuid::parse_str(&skel.conversation_id).map_err(|e| {
+            ProcessorError::StorageError(format!("invalid conversation_id in store: {e}"))
+        })?;
+        let message_id = Uuid::parse_str(&skel.message_id).map_err(|e| {
+            ProcessorError::StorageError(format!("invalid message_id in store: {e}"))
+        })?;
+        let archive_event = ArchiveEvent {
+            event_type: ArchiveEventType::MessageDeleted,
+            conversation_id,
+            message_id: Some(message_id),
+            payload,
+            created_at_ms: deleted_at_ms,
+        };
+        ArchiveEventJournal::new()
+            .write_event(self.db.connection(), &archive_event)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -1668,5 +1741,81 @@ mod tests {
             Some(cmid.0.to_string()).as_deref()
         );
         assert_eq!(row.last_activity_ms, created_at);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3: archive event journal mirroring (Task 1)
+    //
+    // Every persist / edit / delete entry-point must mirror its
+    // backup-side journal write into the Phase-3
+    // `archive_event_journal`. The tests below assert the row count
+    // and event_type tag; full payload round-tripping is covered by
+    // the archive event journal's own unit tests.
+    // -----------------------------------------------------------------
+
+    fn archive_event_count(db: &LocalStoreDb, event_type: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM archive_event_journal WHERE event_type = ?1",
+                params![event_type],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn persist_ingested_message_writes_archive_event() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("hello archive".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+        assert_eq!(archive_event_count(&db, "message_received"), 1);
+    }
+
+    #[test]
+    fn persist_outbox_entry_writes_archive_event() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let entry = MessageProcessor::create_outbox_entry(conv, "outbox archive", None).unwrap();
+        p.persist_outbox_entry(&entry).expect("persist outbox");
+        assert_eq!(archive_event_count(&db, "message_received"), 1);
+    }
+
+    #[test]
+    fn edit_message_writes_archive_event() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "before edit");
+        p.edit_message(&mid.to_string(), "after edit")
+            .expect("edit");
+        assert_eq!(archive_event_count(&db, "message_edited"), 1);
+        // The receive event should still be there from the
+        // initial persist.
+        assert_eq!(archive_event_count(&db, "message_received"), 1);
+    }
+
+    #[test]
+    fn delete_for_everyone_writes_archive_event() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "deletable");
+        p.delete_for_everyone(&mid.to_string()).expect("delete");
+        assert_eq!(archive_event_count(&db, "message_deleted"), 1);
     }
 }

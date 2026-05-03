@@ -15,11 +15,12 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::local_store::state_machines::ArchiveState;
 use crate::Error;
 
-use super::scoring::{compute_eviction_score, EvictionCandidate};
+use super::scoring::{compute_eviction_score, ContentKind, EvictionCandidate};
 
 /// Result of [`plan_eviction`].
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +125,132 @@ pub fn execute_eviction(conn: &Connection, plan: &EvictionPlan) -> Result<Evicti
         freed_bytes: freed,
         evicted_count: evicted,
     })
+}
+
+/// Map a MIME type string to the eviction-priority bucket from
+/// `docs/PROPOSAL.md §5.4`.
+///
+/// Thumbnails are not directly distinguishable from full images at
+/// the `media_asset` level, so this mapper folds them into
+/// [`ContentKind::Image`]. The thumbnail variant remains in the
+/// priority table for the in-process planner where the caller can
+/// label them explicitly.
+fn classify_mime_type(mime_type: &str) -> ContentKind {
+    let lower = mime_type.to_ascii_lowercase();
+    if lower.starts_with("video/") {
+        ContentKind::Video
+    } else if lower.starts_with("audio/") {
+        ContentKind::Voice
+    } else if lower.starts_with("image/") {
+        ContentKind::Image
+    } else if lower.starts_with("application/") {
+        ContentKind::Document
+    } else if lower.starts_with("text/") {
+        ContentKind::Text
+    } else {
+        // Unknown MIME → treat as a document so a pressure sweep
+        // still reclaims the space rather than leaving it stranded.
+        ContentKind::Document
+    }
+}
+
+/// Collect every `media_asset` row that is currently eligible for
+/// offload, joined with its owning `message_skeleton` and
+/// `conversation` so the eviction planner has the full context it
+/// needs to score.
+///
+/// Filters applied at the SQL layer:
+///
+/// * `message_skeleton.archive_state = 'archive_verified'` —
+///   evicting an asset that has not yet been verified-uploaded
+///   would lose it permanently.
+/// * `conversation.pinned = 0` — pinned conversations are exempt
+///   from eviction (`docs/PROPOSAL.md §5.4`).
+/// * `media_asset.media_state = 'original_local'` — the asset's
+///   bytes are still on disk; already-evicted / cold rows have no
+///   bytes to free.
+/// * `message_skeleton.created_at_ms < (now_ms - min_offload_age_ms)`
+///   — leave recently-arrived media alone so the typical
+///   "scroll back to last week" pattern stays hot.
+///
+/// Rows are ordered by the §5.4 priority table:
+/// video → documents → images → voice → text. Within a kind, oldest
+/// rows come first so the sweep starts at the back of the timeline.
+pub fn collect_eviction_candidates(
+    conn: &Connection,
+    min_offload_age_ms: i64,
+    now_ms: i64,
+) -> Result<Vec<EvictionCandidate>, Error> {
+    let cutoff_ms = now_ms.saturating_sub(min_offload_age_ms);
+    let mut stmt = conn
+        .prepare(
+            "SELECT ma.asset_id,
+                    ma.message_id,
+                    ms.conversation_id,
+                    ma.mime_type,
+                    ma.bytes_local,
+                    ms.created_at_ms
+               FROM media_asset ma
+               JOIN message_skeleton ms ON ms.message_id = ma.message_id
+               JOIN conversation c     ON c.conversation_id = ms.conversation_id
+              WHERE ms.archive_state = 'archive_verified'
+                AND c.pinned = 0
+                AND ma.media_state = 'original_local'
+                AND ms.created_at_ms < ?1
+              ORDER BY
+                CASE
+                    WHEN ma.mime_type LIKE 'video/%'       THEN 1
+                    WHEN ma.mime_type LIKE 'application/%' THEN 2
+                    WHEN ma.mime_type LIKE 'image/%'       THEN 3
+                    WHEN ma.mime_type LIKE 'audio/%'       THEN 4
+                    ELSE 5
+                END ASC,
+                ms.created_at_ms ASC",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![cutoff_ms], |row| {
+            let asset_id: String = row.get(0)?;
+            let message_id: String = row.get(1)?;
+            let conversation_id: String = row.get(2)?;
+            let mime_type: String = row.get(3)?;
+            let bytes_local: i64 = row.get(4)?;
+            let created_at_ms: i64 = row.get(5)?;
+            Ok((
+                asset_id,
+                message_id,
+                conversation_id,
+                mime_type,
+                bytes_local,
+                created_at_ms,
+            ))
+        })
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (asset_id, message_id, conversation_id, mime_type, bytes_local, created_at_ms) =
+            row.map_err(|e| Error::Storage(e.to_string()))?;
+        let asset_id = Uuid::parse_str(&asset_id)
+            .map_err(|e| Error::Storage(format!("invalid asset_id: {e}")))?;
+        let message_id = Uuid::parse_str(&message_id)
+            .map_err(|e| Error::Storage(format!("invalid message_id: {e}")))?;
+        let conversation_id = Uuid::parse_str(&conversation_id)
+            .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}")))?;
+        let bytes = u64::try_from(bytes_local.max(0)).unwrap_or(0);
+        out.push(EvictionCandidate {
+            asset_id,
+            message_id,
+            conversation_id,
+            content_kind: classify_mime_type(&mime_type),
+            bytes,
+            last_accessed_ms: created_at_ms,
+            is_pinned: false,
+            archive_state: ArchiveState::ArchiveVerified,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -431,5 +558,266 @@ mod tests {
         let thumb_row = db.get_media_asset(&thumb.to_string()).unwrap().unwrap();
         assert_eq!(thumb_row.media_state, MediaState::OriginalLocal);
         assert_eq!(thumb_row.bytes_local, 256);
+    }
+
+    // -----------------------------------------------------------------
+    // collect_eviction_candidates — Task 2
+    //
+    // The query joins media_asset → message_skeleton → conversation
+    // and applies the §5.4 filter set. The helpers below seed
+    // database fixtures the tests can mix-and-match.
+    // -----------------------------------------------------------------
+
+    fn open_eviction_db() -> crate::local_store::db::LocalStoreDb {
+        crate::local_store::db::LocalStoreDb::open_in_memory(&[0; 32]).unwrap()
+    }
+
+    fn seed_conversation(db: &crate::local_store::db::LocalStoreDb, conv_id: &Uuid, pinned: bool) {
+        use crate::local_store::schema::Conversation;
+        db.insert_conversation(&Conversation {
+            conversation_id: conv_id.to_string(),
+            title_cipher: None,
+            pinned,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        })
+        .unwrap();
+    }
+
+    fn seed_media(
+        db: &crate::local_store::db::LocalStoreDb,
+        conv_id: &Uuid,
+        archive_state: ArchiveState,
+        media_state: crate::local_store::state_machines::MediaState,
+        mime: &str,
+        bytes_local: i64,
+        created_at_ms: i64,
+    ) -> (Uuid, Uuid) {
+        use crate::local_store::schema::{MediaAsset, MessageKind, MessageSkeleton};
+        use crate::local_store::state_machines::{BackupState, BodyState};
+        let mid = Uuid::now_v7();
+        let aid = Uuid::now_v7();
+        db.insert_message_skeleton(&MessageSkeleton {
+            message_id: mid.to_string(),
+            conversation_id: conv_id.to_string(),
+            sender_id: "s".into(),
+            created_at_ms,
+            received_at_ms: created_at_ms,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(media_state),
+            archive_state,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        })
+        .unwrap();
+        db.insert_media_asset(&MediaAsset {
+            asset_id: aid.to_string(),
+            message_id: mid.to_string(),
+            mime_type: mime.into(),
+            bytes_total: bytes_local,
+            bytes_local,
+            media_state,
+            wrapped_k_asset: vec![0u8; 40],
+            chunk_count: 1,
+            merkle_root: vec![0u8; 32],
+            blob_id: format!("blob-{aid}"),
+            storage_sink: "kchat_backend".into(),
+        })
+        .unwrap();
+        (mid, aid)
+    }
+
+    #[test]
+    fn collect_candidates_excludes_pinned_conversations() {
+        use crate::local_store::state_machines::MediaState;
+        let db = open_eviction_db();
+        let pinned = Uuid::now_v7();
+        let unpinned = Uuid::now_v7();
+        seed_conversation(&db, &pinned, true);
+        seed_conversation(&db, &unpinned, false);
+
+        let (_pinned_msg, pinned_asset) = seed_media(
+            &db,
+            &pinned,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            4096,
+            0,
+        );
+        let (_unpinned_msg, unpinned_asset) = seed_media(
+            &db,
+            &unpinned,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            4096,
+            0,
+        );
+
+        // now_ms = a year out, min_offload_age = 0, so age filter
+        // is satisfied by both rows.
+        let cands = collect_eviction_candidates(db.connection(), 0, 365 * 24 * 60 * 60 * 1000)
+            .expect("collect");
+        let asset_ids: Vec<_> = cands.iter().map(|c| c.asset_id).collect();
+        assert!(asset_ids.contains(&unpinned_asset));
+        assert!(!asset_ids.contains(&pinned_asset));
+        assert_eq!(cands.len(), 1);
+    }
+
+    #[test]
+    fn collect_candidates_excludes_non_verified() {
+        use crate::local_store::state_machines::MediaState;
+        let db = open_eviction_db();
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv, false);
+
+        let (_not_archived_msg, not_archived) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::NotArchived,
+            MediaState::OriginalLocal,
+            "image/png",
+            1024,
+            0,
+        );
+        let (_verified_msg, verified) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            1024,
+            0,
+        );
+
+        let cands = collect_eviction_candidates(db.connection(), 0, 365 * 24 * 60 * 60 * 1000)
+            .expect("collect");
+        let asset_ids: Vec<_> = cands.iter().map(|c| c.asset_id).collect();
+        assert!(asset_ids.contains(&verified));
+        assert!(!asset_ids.contains(&not_archived));
+        assert_eq!(cands.len(), 1);
+    }
+
+    #[test]
+    fn collect_candidates_respects_min_age() {
+        use crate::local_store::state_machines::MediaState;
+        let db = open_eviction_db();
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv, false);
+
+        let now_ms = 1_700_000_000_000_i64;
+        let day_ms = 24 * 60 * 60 * 1000_i64;
+        let (_old_msg, old_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            1024,
+            now_ms - 30 * day_ms,
+        );
+        let (_recent_msg, recent_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            1024,
+            now_ms - 60 * 1000, // 1 minute old
+        );
+
+        // min_offload_age = 7 days → only the 30-day-old asset
+        // should pass the age cutoff.
+        let cands =
+            collect_eviction_candidates(db.connection(), 7 * day_ms, now_ms).expect("collect");
+        let asset_ids: Vec<_> = cands.iter().map(|c| c.asset_id).collect();
+        assert!(asset_ids.contains(&old_asset));
+        assert!(!asset_ids.contains(&recent_asset));
+        assert_eq!(cands.len(), 1);
+    }
+
+    #[test]
+    fn collect_candidates_empty_when_no_matches() {
+        let db = open_eviction_db();
+        let cands = collect_eviction_candidates(db.connection(), 0, 0).expect("collect");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn collect_candidates_orders_by_priority_then_age() {
+        // Order test: video → application/document → image →
+        // audio → text-or-other. Within a kind, oldest first.
+        use crate::local_store::state_machines::MediaState;
+        let db = open_eviction_db();
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv, false);
+
+        // Insert in reverse priority order so the SQL ORDER BY
+        // is exercised (insertion order is not the answer).
+        let (_t_msg, txt_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "text/plain",
+            1024,
+            0,
+        );
+        let (_a_msg, audio_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "audio/m4a",
+            1024,
+            0,
+        );
+        let (_i_msg, img_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "image/png",
+            1024,
+            0,
+        );
+        let (_d_msg, doc_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "application/pdf",
+            1024,
+            0,
+        );
+        let (_v_msg, video_asset) = seed_media(
+            &db,
+            &conv,
+            ArchiveState::ArchiveVerified,
+            MediaState::OriginalLocal,
+            "video/mp4",
+            1024,
+            0,
+        );
+
+        let cands = collect_eviction_candidates(db.connection(), 0, 365 * 24 * 60 * 60 * 1000)
+            .expect("collect");
+        let actual: Vec<_> = cands.iter().map(|c| c.asset_id).collect();
+        assert_eq!(
+            actual,
+            vec![
+                video_asset, // §5.4 priority 1
+                doc_asset,   // §5.4 priority 2
+                img_asset,   // §5.4 priority 3
+                audio_asset, // §5.4 priority 4
+                txt_asset,   // §5.4 priority 5 (else-bucket)
+            ],
+            "ORDER BY did not match §5.4 priority sequence"
+        );
     }
 }

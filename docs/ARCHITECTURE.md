@@ -491,16 +491,33 @@ the standard library and chosen primitives.
 >
 > The Phase 3 modules `archive` and `offload` are no longer
 > placeholders: `archive::event_journal` (append-only mutation
-> log feeding the segment builder), `archive::segment_builder`
-> (CBOR → zstd → XChaCha20-Poly1305 sealed segments under
-> `K_archive_segment(segment_id)`), and
+> log feeding the segment builder; **wired into
+> `MessagePersister`** so every persist / edit / delete path and
+> `CoreImpl::send_media` writes a matching `ArchiveEvent` inside
+> the existing SAVEPOINT alongside the `BackupEvent`),
+> `archive::segment_builder` (CBOR → zstd → XChaCha20-Poly1305
+> sealed segments under `K_archive_segment(segment_id)`),
+> `archive::manifest_builder` (genesis → gen N chain, BLAKE3 over
+> canonical-CBOR signing payload, Ed25519 signature, AEAD-seal
+> under `K_archive_manifest`), `archive::upload`
+> (`upload_archive_segment` drives the `TransportClient` upload
+> sequence and verifies the commit-time ciphertext Merkle root;
+> `persist_segment_map_row` records the resulting blob in
+> `archive_segment_map`), `archive::prefetch::batch_prefetch_bucket`
+> (one transport hop per `(conversation_id, time_bucket)` per
+> PROPOSAL §5.6), `local_store::db::update_archive_state` (atomic
+> batch UPDATE gated by `ArchiveState::try_transition`), and
 > `offload::{budget, scoring, eviction, hydration}` (storage
-> budget enforcer, eviction scoring per PROPOSAL §5.4, eviction
-> planner / executor, P0..P5 hydration priority queue) all
-> landed alongside `CoreImpl::hydrate_message` and
-> `CoreImpl::enforce_storage_budget`. The remote archive fetch
-> path (manifest reader / segment download / replay) is queued
-> for the next Phase 3 milestone.
+> budget enforcer, eviction scoring per PROPOSAL §5.4 with a
+> `pinned`-row guard returning `f64::MIN`, eviction planner /
+> executor, P0..P5 hydration priority queue). All of this is
+> wired into `CoreImpl`: `enforce_storage_budget` now harvests
+> candidate rows via `collect_eviction_candidates` (no more
+> `Vec::new()` placeholder), and `hydrate_message` enqueues every
+> request into a `Mutex<HydrationQueue>` with the priority mapped
+> from the reason string by `parse_hydration_reason`. The
+> remote archive fetch path (manifest reader / segment download
+> / replay) is queued for the next Phase 3 milestone.
 
 ---
 

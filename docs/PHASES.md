@@ -178,33 +178,94 @@ storage-pressure management.
 > archive segment uploader against `TransportClient` are queued
 > for the next milestone. See `docs/PROGRESS.md` Phase 3 for the
 > detailed checklist.
+>
+> 2026-05-03 (later in the day): Phase-2 finishing pass + Phase-3
+> foundation: the archive event journal is wired into
+> `MessagePersister` (so every persist / edit / delete /
+> `send_media` writes an `ArchiveEvent` inside the existing
+> SAVEPOINT), `offload::eviction::collect_eviction_candidates`
+> is wired into `CoreImpl::enforce_storage_budget` (replaces the
+> previous `Vec::new()` placeholder),
+> `offload::scoring::compute_eviction_score` returns `f64::MIN`
+> on pinned candidates, the archive manifest chain builder
+> (`archive::manifest_builder`) and segment upload orchestrator
+> (`archive::upload::upload_archive_segment`) landed, the archive
+> state machine has a batched `update_archive_state` gated by
+> `try_transition`, the hydration queue is wired into
+> `CoreImpl` (`hydrate_message` enqueues every request mapped to
+> P0–P5 by `parse_hydration_reason`;
+> `CoreImpl::enqueue_prefetch_window` exposes the P3 viewport
+> widener), and `archive::prefetch::batch_prefetch_bucket` is the
+> first single-bucket transport hop per PROPOSAL §5.6. The
+> end-to-end pipeline is exercised by the new
+> `crates/core/tests/archive_pipeline.rs` integration test, plus
+> `crates/core/tests/epoch_key_derivation.rs` for the per-epoch
+> key vectors.
 
 Checklist:
 
-- [ ] Archive event journal (every durable mutation writes an
-      archive event).
-- [ ] Archive segment builder: per-conversation, per-time-bucket
+- [x] Archive event journal (every durable mutation writes an
+      archive event). _(Wired into `MessagePersister`'s
+      `persist_ingested_message`, `persist_outbox_entry`,
+      `edit_message`, `delete_for_me`, `delete_for_everyone`, and
+      into `CoreImpl::send_media` via `ArchiveEventType::MediaReceived`,
+      all inside the existing SAVEPOINT alongside the
+      `BackupEvent` write.)_
+- [~] Archive segment builder: per-conversation, per-time-bucket
       segments for `message_delta`, `timeline_skeleton`,
       `media_key_delta`, `search_text_index`,
       `search_vector_index`, `media_index`, `checkpoint`.
-- [ ] Archive manifest chain (generation N+1 referencing N via
+      _(`archive::segment_builder::ArchiveSegmentBuilder::build_segment`
+      builds `BuiltSegment` for `MessageDelta`; the other segment
+      types are still queued on the same code path.)_
+- [~] Archive manifest chain (generation N+1 referencing N via
       `previous_manifest_hash`; Ed25519 signature).
-- [ ] Encrypted segment upload to the KChat backend's blob service.
-- [ ] Whole-object Merkle-root verification after upload commit.
-- [ ] Archive state machine (`not_archived` → `archive_pending` →
+      _(`archive::manifest_builder::ArchiveManifestBuilder` builds
+      genesis + chained manifests, signs with Ed25519, and
+      AEAD-seals under `K_archive_manifest` derived from the
+      active epoch key.)_
+- [~] Encrypted segment upload to the KChat backend's blob service.
+      _(`archive::upload::upload_archive_segment` drives
+      `TransportClient::init_blob_upload → upload_chunk →
+      commit_blob`; `persist_segment_map_row` records the result
+      in `archive_segment_map` with `state = 'archive_uploaded'`.)_
+- [~] Whole-object Merkle-root verification after upload commit.
+      _(`upload_archive_segment` rejects mismatched
+      `commit_blob.merkle_root` before any state-machine
+      transition.)_
+- [~] Archive state machine (`not_archived` → `archive_pending` →
       `archive_uploaded` → `archive_verified` → `archive_compacted`).
-- [ ] Storage budget enforcement (`enforceStorageBudget`).
-- [ ] Eviction scoring formula (PROPOSAL §5.4).
-- [ ] Eviction priority order: video → documents → images → voice →
+      _(`local_store::db::update_archive_state` validates every
+      row's predecessor via `ArchiveState::try_transition` before
+      issuing a batch UPDATE; rejects illegal jumps.)_
+- [~] Storage budget enforcement (`enforceStorageBudget`).
+      _(`CoreImpl::enforce_storage_budget` now harvests
+      candidates via `collect_eviction_candidates` and runs them
+      through `plan_eviction` / `execute_eviction`.)_
+- [~] Eviction scoring formula (PROPOSAL §5.4). _(With pinned-row
+      guard returning `f64::MIN` so the scoring path is also
+      pin-safe even if a pinned row leaks past the SQL filter.)_
+- [~] Eviction priority order: video → documents → images → voice →
       thumbnails (under severe pressure) → cold text bodies (under
-      extreme pressure).
-- [ ] Pinned-chat / pinned-message exclusion.
+      extreme pressure). _(Carried by `CONTENT_KIND_WEIGHTS` plus
+      `plan_eviction`.)_
+- [x] Pinned-chat / pinned-message exclusion. _(Three-deep:
+      `collect_eviction_candidates` filters
+      `conversation.pinned = 0`, `plan_eviction` skips pinned rows
+      before scoring, and `compute_eviction_score` returns
+      `f64::MIN` if a pinned candidate still reaches it.)_
 - [ ] Timeline-skeleton rehydration on scroll-back (no scroll-jump
       on update).
 - [ ] Lazy media rehydration on tap.
-- [ ] Prefetch window management (viewport ± 100–150 messages).
-- [ ] Hydration priority queue (P0 → P5).
-- [ ] Epoch-rotated archive key derivation: `K_archive_root` →
+- [~] Prefetch window management (viewport ± 100–150 messages).
+      _(`HydrationQueue::enqueue_prefetch_window` plus
+      `CoreImpl::enqueue_prefetch_window` widen a viewport into
+      P3 prefetch enqueues.)_
+- [x] Hydration priority queue (P0 → P5). _(Wired into
+      `CoreImpl::hydrate_message`; reasons map through
+      `parse_hydration_reason` (`search_result_tap` → P0 …
+      `idle_fill` → P5; unknown reasons collapse to P5).)_
+- [~] Epoch-rotated archive key derivation: `K_archive_root` →
       `K_archive_epoch(epoch_id)` → `K_archive_segment` /
       `K_archive_manifest`. HKDF info =
       `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
@@ -213,9 +274,15 @@ Checklist:
       epoch keys wrapped under `K_archive_root` and recorded in
       the archive manifest chain. Optional epoch-key deletion
       for forward secrecy.
-- [ ] Epoch key derivation test vectors (Rust): deterministic
+- [x] Epoch key derivation test vectors (Rust): deterministic
       derivation, epoch rotation, wrapped-key round-trip,
       cross-epoch segment decrypt after manifest-chain unwrap.
+      _(`crates/core/tests/epoch_key_derivation.rs` —
+      `deterministic_epoch_derivation`,
+      `different_epochs_produce_different_keys`,
+      `epoch_key_wrap_unwrap_round_trip`,
+      `cross_epoch_segment_decrypt`,
+      `epoch_key_info_string_matches_spec`.)_
 - [ ] ZK Object Fabric as optional archive backend: S3-compatible
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
@@ -223,10 +290,12 @@ Checklist:
 - [ ] Archive backend routing: transport client routes archive
       operations to KChat backend or ZKOF based on configuration.
       Manifest index stored as a well-known S3 key when using ZKOF.
-- [ ] Batch-by-bucket prefetch: on any archive segment miss, fetch
+- [~] Batch-by-bucket prefetch: on any archive segment miss, fetch
       all segments for the `(conversation_id, time_bucket)` pair.
       Reduces per-segment access-pattern metadata to per-bucket
-      granularity.
+      granularity. _(`archive::prefetch::batch_prefetch_bucket`
+      queries `archive_segment_map` and streams every matching
+      segment through `TransportClient::fetch_archive_segment`.)_
 - [ ] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.

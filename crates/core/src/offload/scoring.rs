@@ -163,6 +163,33 @@ mod tests {
     }
 
     #[test]
+    fn pinned_candidate_scores_minimum() {
+        // §5.4 invariant: pinned candidates must always sort to
+        // the bottom of any eviction plan, regardless of how
+        // attractive the rest of their signals look. Spec asks for
+        // `f64::MIN` (or anything lower); the implementation
+        // returns `f64::NEG_INFINITY` which is strictly smaller —
+        // both satisfy the contract that the planner never picks
+        // a pinned row.
+        let now = 365 * 24 * 60 * 60 * 1000_i64;
+        // Highest-priority kind, oldest possible age, biggest
+        // size — what would normally be the top of the queue.
+        let mut top = candidate(ContentKind::Video, 1024 * 1024 * 1024, 0);
+        top.is_pinned = true;
+        // A very ordinary unpinned candidate to compare against.
+        let ordinary = candidate(ContentKind::Text, 1024, now);
+
+        let pinned_score = compute_eviction_score(&top, now);
+        let ordinary_score = compute_eviction_score(&ordinary, now);
+
+        assert!(pinned_score <= f64::MIN);
+        assert!(
+            pinned_score < ordinary_score,
+            "pinned={pinned_score} ordinary={ordinary_score}"
+        );
+    }
+
+    #[test]
     fn size_bonus_discriminates_ties() {
         let small = compute_eviction_score(&candidate(ContentKind::Image, 1, 0), 0);
         let large = compute_eviction_score(&candidate(ContentKind::Image, 100 * 1024 * 1024, 0), 0);
