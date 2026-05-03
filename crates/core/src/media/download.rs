@@ -343,7 +343,7 @@ pub fn rehydrate_media_asset(
                 BlobClass::Media,
             )?
         }
-        "icloud" | "google_drive" | "zk_object_fabric" => {
+        "i_cloud" | "google_drive" | "zk_object_fabric" => {
             return Err(Error::NotImplemented(
                 "rehydrate_media_asset: MediaBlobSink rehydration",
             ));
