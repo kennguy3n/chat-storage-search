@@ -244,41 +244,45 @@ pub fn download_single_chunk(
     xchacha20_poly1305::open(k_asset, &nonce, &ciphertext, &aad).map_err(crate::Error::from)
 }
 
-/// Rehydrate a previously evicted media asset from cold storage,
-/// driven by the row in `media_asset` for `asset_id`.
+/// All metadata extracted from the `media_asset` row needed to drive
+/// a chunked download outside the db lock.
 ///
-/// Implements the Phase-3 lazy-rehydrate flow from
-/// `docs/PROPOSAL.md §5.5`:
+/// Produced by [`prepare_rehydration`] — that function holds the
+/// `LocalStoreDb` only long enough to read the row and validate the
+/// pre-state, then returns this plan so the caller can drop the
+/// mutex guard before issuing N sequential
+/// [`TransportClient::fetch_blob_range`] calls in
+/// [`execute_rehydration_download`].
 ///
-/// 1. Look up the `media_asset` row for `asset_id`. The row carries
-///    `wrapped_k_asset`, `chunk_count`, `merkle_root`, `blob_id`,
-///    and `storage_sink`.
-/// 2. Unwrap `K_asset` under the wrapping key passed in by the
-///    caller (typically `K_local_db` / `K_archive_root`). The raw
-///    key is held in [`Zeroizing`] so a panic mid-way still scrubs
-///    it.
-/// 3. Drive [`download_chunked_media`] (KChat backend sink) — the
-///    routing knob `storage_sink` is checked so the (future)
-///    `MediaBlobSink` path can be wired in once the iCloud / Drive /
-///    ZKOF adapters land. Today only `kchat_backend` round-trips
-///    end-to-end; other sinks return [`Error::NotImplemented`].
-/// 4. Transition `media_state` through
-///    `Evicted → DownloadInProgress → OriginalLocal` (or
-///    `RemoteOriginal → DownloadInProgress → OriginalLocal`) using
-///    [`transition_media_state`] so the state machine matrix
-///    (`docs/PROPOSAL.md §3.2`) is enforced.
+/// The wrapped `K_asset` (`wrapped_k_asset`) is captured here rather
+/// than the unwrapped key so callers can decide where to unwrap it;
+/// the unwrap happens inside [`execute_rehydration_download`] and
+/// the cleartext key is held in [`Zeroizing`] for the lifetime of
+/// the download.
+#[derive(Debug, Clone)]
+pub struct RehydrationPlan {
+    pub asset_id: String,
+    pub blob_id: String,
+    pub storage_sink: String,
+    pub chunk_count: u32,
+    pub merkle_root: [u8; 32],
+    pub wrapped_k_asset: Vec<u8>,
+    /// State the row sat in *before* rehydration started. Either
+    /// `Evicted` or `RemoteOriginal`; [`prepare_rehydration`] rejects
+    /// every other state.
+    pub from_state: MediaState,
+}
+
+/// Phase 1 of the three-phase rehydration: read the `media_asset`
+/// row, validate the legal pre-state, and pull every field the
+/// download phase needs.
 ///
-/// Returns the **plaintext** bytes of the asset.
-///
-/// `wrapping_key` must match the key the upload pipeline used to
-/// wrap `K_asset` (see [`crate::media::processor::process_media`]).
-pub fn rehydrate_media_asset(
-    db: &LocalStoreDb,
-    asset_id: &str,
-    transport: &dyn TransportClient,
-    wrapping_key: &[u8; KEY_LEN],
-) -> Result<Vec<u8>, Error> {
-    // 1) Look up the row.
+/// Implements the metadata-read half of `docs/PROPOSAL.md §5.5` so
+/// the long-running download phase can run with the db mutex
+/// **released** — concurrent `send_text` / `search` / `ingest`
+/// callers must not block on a multi-chunk media fetch (Task 2 of
+/// the Phase 3/4 batch).
+pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<RehydrationPlan, Error> {
     let row = db
         .get_media_asset(asset_id)
         .map_err(|e| Error::Storage(e.to_string()))?
@@ -288,11 +292,6 @@ pub fn rehydrate_media_asset(
             ))
         })?;
 
-    // The state machine only exits to `download_in_progress` from
-    // `Evicted` or `RemoteOriginal` — anything else is either
-    // already-local or a terminal state, and we surface the legality
-    // check early so we don't issue a download for an
-    // already-resident asset.
     let from_state = match row.media_state {
         MediaState::Evicted | MediaState::RemoteOriginal => row.media_state,
         MediaState::OriginalLocal => {
@@ -307,13 +306,6 @@ pub fn rehydrate_media_asset(
         }
     };
 
-    // 2) Unwrap K_asset under the caller-supplied wrapping key. The
-    //    cleartext key is held in `Zeroizing` so an early-return
-    //    error still scrubs it before unwinding.
-    let raw = unwrap_key(wrapping_key, &row.wrapped_k_asset).map_err(Error::from)?;
-    let k_asset: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(raw);
-
-    // Convert merkle_root to fixed array.
     if row.merkle_root.len() != 32 {
         return Err(Error::Storage(format!(
             "rehydrate_media_asset: merkle_root for {asset_id} is {} bytes (expected 32)",
@@ -323,55 +315,93 @@ pub fn rehydrate_media_asset(
     let mut merkle_root = [0u8; 32];
     merkle_root.copy_from_slice(&row.merkle_root);
 
-    // 3) Route by `storage_sink`. Only `kchat_backend` round-trips
-    //    end-to-end today; the iCloud / Drive / ZKOF sink
-    //    implementations land in their own subtasks.
-    let plaintext = match row.storage_sink.as_str() {
-        "kchat_backend" => {
-            let chunk_count: u32 = u32::try_from(row.chunk_count.max(0)).map_err(|_| {
-                Error::Storage(format!(
-                    "rehydrate_media_asset: chunk_count {} out of range",
-                    row.chunk_count
-                ))
-            })?;
-            download_chunked_media(
-                transport,
-                &row.blob_id,
-                chunk_count,
-                merkle_root,
-                &k_asset,
-                BlobClass::Media,
-            )?
-        }
-        "icloud" | "google_drive" | "zk_object_fabric" => {
-            return Err(Error::NotImplemented(
-                "rehydrate_media_asset: MediaBlobSink rehydration",
-            ));
-        }
-        other => {
-            return Err(Error::Storage(format!(
-                "rehydrate_media_asset: unknown storage_sink {other:?}"
-            )));
-        }
-    };
+    let chunk_count: u32 = u32::try_from(row.chunk_count.max(0)).map_err(|_| {
+        Error::Storage(format!(
+            "rehydrate_media_asset: chunk_count {} out of range",
+            row.chunk_count
+        ))
+    })?;
 
-    // 4) Drive the media-state machine all the way through:
-    //    `Evicted | RemoteOriginal → DownloadInProgress → OriginalLocal`.
-    //
-    //    Both transitions run inside a single
-    //    `SAVEPOINT rehydrate_media_state` so a partial failure
-    //    rolls back to the pre-call `media_state`. Without the
-    //    savepoint a process crash (or transition error on the
-    //    second hop) between the two UPDATEs would strand the row
-    //    in `DownloadInProgress` — the state-machine matrix has no
-    //    `DownloadInProgress → Evicted` escape, so a subsequent
-    //    `rehydrate_media_asset` call rejects the row at the
-    //    `from_state` early-return and the asset becomes
-    //    permanently un-rehydratable through the public API.
+    Ok(RehydrationPlan {
+        asset_id: row.asset_id,
+        blob_id: row.blob_id,
+        storage_sink: row.storage_sink,
+        chunk_count,
+        merkle_root,
+        wrapped_k_asset: row.wrapped_k_asset,
+        from_state,
+    })
+}
+
+/// Phase 2 of the three-phase rehydration: unwrap `K_asset`, drive
+/// the chunked download, AEAD-open every chunk, and verify the
+/// whole-object BLAKE3 root.
+///
+/// Holds **no** db reference — the `LocalStoreDb` mutex stays
+/// released for the (potentially many seconds long) duration of
+/// `chunk_count` sequential
+/// [`TransportClient::fetch_blob_range`] calls. The cleartext key
+/// lives in [`Zeroizing`] for the lifetime of this call so a panic
+/// mid-way still scrubs it.
+///
+/// Routing on `plan.storage_sink` keeps the same matrix
+/// `kchat_backend` round-trips today implements; iCloud / Drive /
+/// ZKOF return [`Error::NotImplemented`] until their bridge
+/// implementations land. The `MediaBlobSink` path will swap into
+/// this function later without touching the lock-discipline
+/// contract above.
+pub fn execute_rehydration_download(
+    plan: &RehydrationPlan,
+    transport: &dyn TransportClient,
+    wrapping_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>, Error> {
+    let raw = unwrap_key(wrapping_key, &plan.wrapped_k_asset).map_err(Error::from)?;
+    let k_asset: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(raw);
+
+    match plan.storage_sink.as_str() {
+        "kchat_backend" => download_chunked_media(
+            transport,
+            &plan.blob_id,
+            plan.chunk_count,
+            plan.merkle_root,
+            &k_asset,
+            BlobClass::Media,
+        ),
+        "icloud" | "google_drive" | "zk_object_fabric" => Err(Error::NotImplemented(
+            "rehydrate_media_asset: MediaBlobSink rehydration",
+        )),
+        other => Err(Error::Storage(format!(
+            "rehydrate_media_asset: unknown storage_sink {other:?}"
+        ))),
+    }
+}
+
+/// Phase 3 of the three-phase rehydration: flip `media_state` from
+/// `from_state → DownloadInProgress → OriginalLocal` and update
+/// `bytes_local`, all under a single
+/// `SAVEPOINT rehydrate_media_state` so a partial failure rolls
+/// back to the pre-call state.
+///
+/// `from_state` is captured in [`RehydrationPlan`] from phase 1 —
+/// re-reading the row here would race against any concurrent
+/// `update_media_state` writer (e.g. an eviction sweep), and we
+/// want the savepoint scope to fail loudly if that happens rather
+/// than silently rebuilding the transition matrix.
+///
+/// Without the savepoint a process crash between the two UPDATEs
+/// would strand the row in `DownloadInProgress` — the state-machine
+/// matrix has no `DownloadInProgress → Evicted` escape so the asset
+/// would become un-rehydratable through the public API.
+pub fn commit_rehydration(
+    db: &LocalStoreDb,
+    asset_id: &str,
+    from_state: MediaState,
+    plaintext_len: usize,
+) -> Result<(), Error> {
     let conn = db.connection();
     conn.execute_batch("SAVEPOINT rehydrate_media_state;")
         .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint open: {e}")))?;
-    let transitions: Result<(), Error> = (|| {
+    let result: Result<(), Error> = (|| {
         transition_media_state(db, asset_id, from_state, MediaState::DownloadInProgress)?;
         transition_media_state(
             db,
@@ -379,9 +409,22 @@ pub fn rehydrate_media_asset(
             MediaState::DownloadInProgress,
             MediaState::OriginalLocal,
         )?;
+        // Update bytes_local to reflect that the original now lives
+        // on disk. SAVEPOINT-scoped so a partial failure rolls back
+        // alongside the state transitions.
+        let bytes_local = i64::try_from(plaintext_len).map_err(|_| {
+            Error::Storage(format!(
+                "rehydrate_media_asset: plaintext_len {plaintext_len} does not fit in i64"
+            ))
+        })?;
+        conn.execute(
+            "UPDATE media_asset SET bytes_local = ?1 WHERE asset_id = ?2",
+            rusqlite::params![bytes_local, asset_id],
+        )
+        .map_err(|e| Error::Storage(format!("rehydrate_media_state bytes_local update: {e}")))?;
         Ok(())
     })();
-    match &transitions {
+    match &result {
         Ok(_) => conn
             .execute_batch("RELEASE SAVEPOINT rehydrate_media_state;")
             .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint release: {e}")))?,
@@ -395,8 +438,49 @@ pub fn rehydrate_media_asset(
             );
         }
     }
-    transitions?;
+    result
+}
 
+/// Rehydrate a previously evicted media asset from cold storage,
+/// driven by the row in `media_asset` for `asset_id`.
+///
+/// Implements the Phase-3 lazy-rehydrate flow from
+/// `docs/PROPOSAL.md §5.5`. As of Task 2 of the Phase 3/4 batch
+/// this function is a thin wrapper that composes the three
+/// independently usable phases:
+///
+/// 1. [`prepare_rehydration`] reads the `media_asset` row and
+///    builds a [`RehydrationPlan`].
+/// 2. [`execute_rehydration_download`] unwraps `K_asset` and drives
+///    `chunk_count` sequential
+///    [`TransportClient::fetch_blob_range`] calls,
+///    AEAD-opens each chunk, and verifies the BLAKE3 root.
+/// 3. [`commit_rehydration`] flips `media_state` through
+///    `from_state → DownloadInProgress → OriginalLocal` and updates
+///    `bytes_local`, inside a `SAVEPOINT rehydrate_media_state`.
+///
+/// Production callers (e.g.
+/// [`crate::CoreImpl::rehydrate_media_for_message`]) drive the
+/// three phases directly so they can release the
+/// `Mutex<LocalStoreDb>` guard between phases 1 and 2 — the
+/// chunked download must not block concurrent
+/// `send_text` / `search` / `ingest` callers. This wrapper is kept
+/// for unit-test ergonomics where the caller already owns a
+/// `&LocalStoreDb` and doesn't need fine-grained lock control.
+///
+/// Returns the **plaintext** bytes of the asset.
+///
+/// `wrapping_key` must match the key the upload pipeline used to
+/// wrap `K_asset` (see [`crate::media::processor::process_media`]).
+pub fn rehydrate_media_asset(
+    db: &LocalStoreDb,
+    asset_id: &str,
+    transport: &dyn TransportClient,
+    wrapping_key: &[u8; KEY_LEN],
+) -> Result<Vec<u8>, Error> {
+    let plan = prepare_rehydration(db, asset_id)?;
+    let plaintext = execute_rehydration_download(&plan, transport, wrapping_key)?;
+    commit_rehydration(db, &plan.asset_id, plan.from_state, plaintext.len())?;
     Ok(plaintext)
 }
 

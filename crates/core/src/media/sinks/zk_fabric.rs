@@ -154,6 +154,15 @@ pub trait S3Client: Send + Sync + std::fmt::Debug {
 
     /// Idempotently delete `(bucket, key)`.
     fn delete_object(&self, bucket: &str, key: &str) -> Result<(), Error>;
+
+    /// List every key under `prefix` in `bucket`. Used by the
+    /// backup sink to enumerate manifest IDs at restore time.
+    /// Defaults to [`Error::NotImplemented`] so existing
+    /// media-sink implementations are not forced to implement
+    /// listing — only the backup sink path requires it.
+    fn list_objects(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>, Error> {
+        Err(Error::NotImplemented("S3Client::list_objects"))
+    }
 }
 
 /// Stub `S3Client` returning [`Error::NotImplemented`] from every

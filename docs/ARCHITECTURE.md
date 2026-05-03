@@ -1285,6 +1285,111 @@ A break in the chain (a `previous_manifest_hash` mismatch or
 signature failure) halts restore and surfaces a recoverable error
 to the UI; restore never silently re-roots.
 
+### 9.5 Backup sub-module layout
+
+The Rust modules implementing the diagrams above:
+
+* `crates/core/src/backup/event_journal.rs` — typed
+  `BackupEventType` taxonomy, `BackupEvent` row, and
+  `BackupEventJournal` with `write_event`, `read_events_since`,
+  `read_unsegmented`, `advance_cursor`. The journal is written
+  inside the same SAVEPOINT as the matching `archive_event_journal`
+  row by `MessagePersister`.
+* `crates/core/src/backup/segment_builder.rs` —
+  `BackupSegmentBuilder::build_segment` (CBOR encode → zstd
+  compress → XChaCha20-Poly1305 seal under `K_backup_segment`)
+  and `decrypt_backup_segment` for the inverse path.
+* `crates/core/src/backup/manifest_builder.rs` —
+  `build_backup_manifest` (genesis → gen-N chain, Ed25519 over
+  canonical CBOR, AEAD-seal under `K_backup_manifest` with
+  `device_id` mixed into the AAD).
+* `crates/core/src/backup/compaction.rs` — `CompactionPolicy::plan`
+  drives the daily → weekly → monthly merge; `apply_tombstones`
+  drops events superseded by `MessageDeleted` /
+  `ConversationDeleted` / `MediaDeleted`. The
+  `CoreImpl::compact_backup` orchestration ingests the plan and
+  re-seals each merged group.
+* `crates/core/src/backup/sinks/mod.rs` — object-safe `BackupSink`
+  trait (`upload_backup_segment`, `upload_backup_manifest`,
+  `fetch_backup_manifest`, `fetch_backup_segment`,
+  `list_backup_manifests`) plus `NoopBackupSink` for tests.
+* `crates/core/src/backup/sinks/zk_fabric.rs` — `ZkofBackupSink`
+  uploads sealed manifests to `backups/{manifest_id}` and sealed
+  segments to `backups/segments/{segment_id}` against a
+  configured S3 bucket. Pattern C convergent encryption from
+  `crypto::convergent::derive_convergent_dek` keeps the
+  ciphertext bit-identical to the Go SDK at
+  `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
+
+`CoreImpl::run_incremental_backup` is the orchestrator: read
+`BackupEventJournal::read_unsegmented` → derive
+`K_backup_segment` → build via `BackupSegmentBuilder` → build +
+sign manifest → advance cursor.
+
+### 9.6 Restore sub-module layout
+
+* `crates/core/src/restore/state_machine.rs` — persistence
+  helpers (`load`, `save`, `transition`, `reset`) for the
+  single-row `restore_state` table layered on
+  `local_store::state_machines::RestoreState`.
+* `crates/core/src/restore/manifest_verifier.rs` —
+  `verify_manifest_chain` walks gen 0 → latest, verifies every
+  Ed25519 signature, and enforces the
+  `previous_manifest_hash == compute_manifest_hash(prev)`
+  invariant. Returns structured `EmptyChain` /
+  `SignatureInvalid { generation }` /
+  `ChainBreak { generation, expected, actual }` /
+  `GapDetected { missing_generation }` /
+  `GenesisHashNotZero { actual }` /
+  `HashComputationFailed { generation }`.
+* `crates/core/src/restore/pipeline.rs` — `RestorePipeline`
+  drives the priority sequence (conversation list → skeletons
+  → search shards → recent bodies → enable lazy media) and
+  persists every `RestoreState` transition between steps.
+* `crates/core/src/restore/key_recovery.rs` — Phase-4 key
+  recovery foundation: `RecoveryKey` is a 256-bit secret that
+  AES-256-KW-wraps `K_user_master` (hex-encoded for display);
+  `DeviceTransferPayload` is an XChaCha20-Poly1305-sealed
+  bundle of `(K_user_master, K_archive_root, K_backup_root,
+  K_search_root)` under a key derived from a numeric / QR
+  transfer code via HKDF-SHA-256. Server escrow remains OFF by
+  default per `docs/PHASES.md §Phase 4`.
+
+### 9.7 Search-shard sub-module layout
+
+* `crates/core/src/search/shard_builder.rs` — encrypted search
+  index shards used for backup / restore.
+  `build_text_search_shard` / `build_fuzzy_search_shard` read
+  `search_fts` / `search_fuzzy_words` rows for a
+  `(conversation_id, time_bucket)` pair, encode through
+  `formats::SearchIndexShard` (`IndexType::Text` /
+  `IndexType::Fuzzy`), zstd-compress, and AEAD-seal under
+  per-shard keys derived from `K_search_root`.
+  `restore_text_search_shard` / `restore_fuzzy_search_shard`
+  invert the path. Tests cover round-trip, wrong-key, and
+  multilingual content (Latin / CJK / Arabic).
+
+### 9.8 Archive compaction at production scale
+
+* `crates/core/src/archive/compaction.rs` —
+  `apply_archive_tombstones` mirrors the backup compaction
+  helper but filters `ArchiveEvent` (drops `MessageDeleted` /
+  `ConversationDeleted` events themselves and any earlier
+  events for tombstoned ids). `ArchiveCompactionResult` carries
+  per-bucket counters (`buckets_inspected`, `buckets_compacted`,
+  `segments_superseded`, `segments_emitted`, `bytes_before`,
+  `bytes_after`).
+* `CoreImpl::compact_archive` orchestrates the five-phase
+  flow: (A) `SELECT` `archive_verified` segments for the
+  `(conversation_id, time_bucket)` pair, (B) decrypt each via
+  `ArchiveSegmentRouter` (which dispatches per-row to the
+  KChat transport or the ZKOF S3 client), (C) concatenate +
+  `apply_archive_tombstones`, (D) re-seal via
+  `ArchiveSegmentBuilder::build_segment`, (E) atomically
+  transition superseded rows to `archive_compacted` inside a
+  SAVEPOINT and emit the new compact segment via the caller's
+  upload callback.
+
 ---
 
 ## 10. Transport Layer

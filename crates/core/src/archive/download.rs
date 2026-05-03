@@ -19,12 +19,16 @@
 //! and decrypt it end-to-end via this module so any drift in the
 //! compression / AEAD framing is caught at the binary level.
 
+use std::sync::Arc;
+
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::crypto::aead::xchacha20_poly1305::{open, NONCE_LEN};
 use crate::crypto::content_hash::content_hash;
 use crate::crypto::CryptoError;
+use crate::local_store::schema::StorageBackend;
+use crate::media::sinks::zk_fabric::{S3Client, ZkFabricSinkConfig};
 use crate::transport::TransportClient;
 use crate::Error;
 
@@ -197,6 +201,121 @@ pub fn fetch_and_decrypt_segment(
     k_archive_segment: &[u8; 32],
 ) -> Result<Vec<u8>, Error> {
     let blob = download_archive_segment(transport, segment_id)?;
+    decrypt_archive_segment(&blob, k_archive_segment)
+}
+
+// ---------------------------------------------------------------------------
+// Phase-4 (Task 8): storage_backend-aware fetch routing.
+// ---------------------------------------------------------------------------
+
+/// Routing seam for archive-segment fetches.
+///
+/// `archive_segment_map.storage_backend` (`docs/PROPOSAL.md §10.1`)
+/// records which backend an archive segment was uploaded under.
+/// On the download path the orchestrator must route the fetch to
+/// the matching backend — the legacy KChat blob service via
+/// [`TransportClient::fetch_archive_segment`], or the ZK Object
+/// Fabric tier via an [`S3Client`] and a configured
+/// [`ZkFabricSinkConfig`].
+///
+/// This struct holds both fetcher implementations behind a single
+/// borrow so the prefetch + rehydrate paths can dispatch in a
+/// single step.
+#[derive(Clone)]
+pub struct ArchiveSegmentRouter<'a> {
+    /// Always populated. Used when `storage_backend ==
+    /// kchat_backend` (the default).
+    pub transport: &'a dyn TransportClient,
+    /// Optional ZKOF S3 client. Required when any segment row in
+    /// `archive_segment_map` uses
+    /// [`StorageBackend::ZkObjectFabric`]; absent when every row
+    /// is on the legacy KChat backend.
+    pub s3: Option<Arc<dyn S3Client>>,
+    /// Optional ZKOF tenant configuration. Mirrors `s3` — the
+    /// orchestrator either supplies both fields or neither.
+    pub zkof_config: Option<ZkFabricSinkConfig>,
+}
+
+impl<'a> std::fmt::Debug for ArchiveSegmentRouter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveSegmentRouter")
+            .field("has_s3", &self.s3.is_some())
+            .field("zkof_config", &self.zkof_config)
+            .finish()
+    }
+}
+
+impl<'a> ArchiveSegmentRouter<'a> {
+    /// Build a router that only knows about the legacy KChat
+    /// backend. Use when no segment row references
+    /// [`StorageBackend::ZkObjectFabric`].
+    pub fn kchat_only(transport: &'a dyn TransportClient) -> Self {
+        Self {
+            transport,
+            s3: None,
+            zkof_config: None,
+        }
+    }
+
+    /// Build a router that can route to either the KChat backend
+    /// or the ZKOF tier.
+    pub fn with_zkof(
+        transport: &'a dyn TransportClient,
+        s3: Arc<dyn S3Client>,
+        zkof_config: ZkFabricSinkConfig,
+    ) -> Self {
+        Self {
+            transport,
+            s3: Some(s3),
+            zkof_config: Some(zkof_config),
+        }
+    }
+
+    /// Fetch the encrypted archive-segment blob for `segment_id`
+    /// from the backend named by `storage_backend`.
+    ///
+    /// Returns [`Error::Storage`] when the row references
+    /// [`StorageBackend::ZkObjectFabric`] but the router was
+    /// built without an S3 client (i.e. via [`Self::kchat_only`]).
+    pub fn fetch(
+        &self,
+        storage_backend: StorageBackend,
+        segment_id: &str,
+    ) -> Result<Vec<u8>, Error> {
+        match storage_backend {
+            StorageBackend::KChatBackend => self.transport.fetch_archive_segment(segment_id),
+            StorageBackend::ZkObjectFabric => {
+                let s3 = self.s3.as_ref().ok_or_else(|| {
+                    Error::Storage(
+                        "ArchiveSegmentRouter: zk_object_fabric segment without s3 client".into(),
+                    )
+                })?;
+                let cfg = self.zkof_config.as_ref().ok_or_else(|| {
+                    Error::Storage(
+                        "ArchiveSegmentRouter: zk_object_fabric segment without ZkFabricSinkConfig"
+                            .into(),
+                    )
+                })?;
+                let key = format!("archive/segments/{segment_id}");
+                // Mirrors `ZkofBackupSink::fetch_backup_segment`:
+                // S3 clamps the range to the object's length so
+                // the magic-end is the simplest "fetch all" idiom.
+                s3.get_object_range(&cfg.bucket, &key, 0..u64::MAX)
+            }
+        }
+    }
+}
+
+/// Convenience wrapper: route a fetch through
+/// [`ArchiveSegmentRouter::fetch`] and decrypt under
+/// `k_archive_segment`. Mirrors [`fetch_and_decrypt_segment`].
+pub fn fetch_and_decrypt_segment_for_backend(
+    router: &ArchiveSegmentRouter<'_>,
+    storage_backend: StorageBackend,
+    segment_id: &str,
+    k_archive_segment: &[u8; 32],
+) -> Result<Vec<u8>, Error> {
+    let blob = router.fetch(storage_backend, segment_id)?;
     decrypt_archive_segment(&blob, k_archive_segment)
 }
 

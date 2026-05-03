@@ -16,6 +16,7 @@
 //!   conversations → skeleton timeline → search shards → recent
 //!   bodies → enable lazy media restore.
 
+pub mod key_recovery;
 pub mod manifest_verifier;
 pub mod pipeline;
 pub mod state_machine;

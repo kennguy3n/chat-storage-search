@@ -22,10 +22,13 @@
 //!    metadata so the caller can decrypt and merge.
 
 use rusqlite::{params, Connection};
+use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::archive::download::ArchiveSegmentRouter;
 use crate::archive::privacy::{compute_padding_count, pad_with_dummy_requests, should_pad};
 use crate::config::KChatCoreConfig;
+use crate::local_store::schema::StorageBackend;
 use crate::transport::TransportClient;
 use crate::Error;
 
@@ -95,7 +98,66 @@ pub fn batch_prefetch_bucket(
 
     let mut out = Vec::with_capacity(materialised.len());
     for (segment_id, blob_id, storage_backend) in materialised {
-        let ciphertext = transport.fetch_archive_segment(&segment_id)?;
+        // Phase 4 (Task 8): row-level backend routing. Rows
+        // without a known `storage_backend` value (e.g. legacy
+        // pre-PR #28 rows that pre-dated the column default
+        // backfill) fall back to the KChat backend.
+        let backend =
+            StorageBackend::from_str(&storage_backend).unwrap_or(StorageBackend::KChatBackend);
+        let router = ArchiveSegmentRouter::kchat_only(transport);
+        let ciphertext = router.fetch(backend, &segment_id)?;
+        out.push(PrefetchedSegment {
+            segment_id,
+            blob_id,
+            storage_backend,
+            ciphertext,
+        });
+    }
+    Ok(out)
+}
+
+/// Backend-aware variant of [`batch_prefetch_bucket`]. Reads
+/// `archive_segment_map.storage_backend` for every row and
+/// dispatches the fetch through the supplied
+/// [`ArchiveSegmentRouter`] — supports
+/// [`StorageBackend::ZkObjectFabric`] segments in addition to the
+/// legacy KChat path.
+pub fn batch_prefetch_bucket_with_router(
+    conn: &Connection,
+    router: &ArchiveSegmentRouter<'_>,
+    conversation_id: Uuid,
+    time_bucket: &str,
+) -> Result<Vec<PrefetchedSegment>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT segment_id, blob_id, storage_backend
+               FROM archive_segment_map
+              WHERE conversation_id = ?1 AND time_bucket = ?2",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let rows = stmt
+        .query_map(params![conversation_id.to_string(), time_bucket], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let mut materialised = Vec::new();
+    for row in rows {
+        let (segment_id, blob_id, storage_backend) =
+            row.map_err(|e| Error::Storage(e.to_string()))?;
+        materialised.push((segment_id, blob_id, storage_backend));
+    }
+
+    let mut out = Vec::with_capacity(materialised.len());
+    for (segment_id, blob_id, storage_backend) in materialised {
+        let backend =
+            StorageBackend::from_str(&storage_backend).unwrap_or(StorageBackend::KChatBackend);
+        let ciphertext = router.fetch(backend, &segment_id)?;
         out.push(PrefetchedSegment {
             segment_id,
             blob_id,
@@ -457,5 +519,183 @@ mod tests {
         assert!(segments.is_empty());
         // compute_padding_count(0) == 0 → no dummies either.
         assert!(transport.calls().is_empty());
+    }
+
+    // ---------------------------------------------------------
+    // Phase 4 (Task 8): storage_backend-aware routing tests.
+    // ---------------------------------------------------------
+
+    /// In-memory `S3Client` for ZKOF-routed prefetch tests.
+    /// Mirrors the in-memory mock used by the backup-sink tests.
+    #[derive(Debug, Default)]
+    struct InMemoryS3 {
+        objects: Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
+        get_calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl InMemoryS3 {
+        fn put(&self, bucket: &str, key: &str, bytes: Vec<u8>) {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert((bucket.to_string(), key.to_string()), bytes);
+        }
+
+        fn get_calls(&self) -> Vec<(String, String)> {
+            self.get_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::media::sinks::zk_fabric::S3Client for InMemoryS3 {
+        fn put_object(&self, bucket: &str, key: &str, bytes: &[u8]) -> Result<(), Error> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert((bucket.to_string(), key.to_string()), bytes.to_vec());
+            Ok(())
+        }
+
+        fn get_object_range(
+            &self,
+            bucket: &str,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<Vec<u8>, Error> {
+            self.get_calls
+                .lock()
+                .unwrap()
+                .push((bucket.to_string(), key.to_string()));
+            let store = self.objects.lock().unwrap();
+            let bytes = store
+                .get(&(bucket.to_string(), key.to_string()))
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+            let start = range.start.min(bytes.len() as u64) as usize;
+            let end = range.end.min(bytes.len() as u64) as usize;
+            Ok(bytes[start..end].to_vec())
+        }
+
+        fn delete_object(&self, _bucket: &str, _key: &str) -> Result<(), Error> {
+            Err(Error::NotImplemented("InMemoryS3::delete_object"))
+        }
+    }
+
+    fn seed_zkof_segment_row(
+        db: &LocalStoreDb,
+        segment_id: &str,
+        conversation_id: &str,
+        time_bucket: &str,
+        blob_id: &str,
+    ) {
+        db.connection()
+            .execute(
+                "INSERT INTO archive_segment_map(
+                    segment_id, conversation_id, time_bucket,
+                    segment_type, blob_id, storage_backend,
+                    merkle_root, state
+                 ) VALUES (?1, ?2, ?3, 'message_delta', ?4,
+                           'zk_object_fabric', ?5, 'archive_uploaded')",
+                params![
+                    segment_id,
+                    conversation_id,
+                    time_bucket,
+                    blob_id,
+                    [0u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn fetch_segment_routes_to_transport_for_kchat_backend() {
+        let transport = FixtureTransport::default();
+        transport.install("seg-K", vec![0xAA; 16]);
+        let router = ArchiveSegmentRouter::kchat_only(&transport);
+        let bytes = router
+            .fetch(StorageBackend::KChatBackend, "seg-K")
+            .expect("fetch");
+        assert_eq!(bytes, vec![0xAA; 16]);
+        assert_eq!(transport.calls(), vec!["seg-K".to_string()]);
+    }
+
+    #[test]
+    fn fetch_segment_routes_to_s3_for_zkof_backend() {
+        let s3 = std::sync::Arc::new(InMemoryS3::default());
+        s3.put("bucket-A", "archive/segments/seg-Z", vec![0xBB; 32]);
+        let cfg = crate::media::sinks::zk_fabric::ZkFabricSinkConfig {
+            endpoint_url: "https://example.invalid".into(),
+            bucket: "bucket-A".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        };
+        let transport = FixtureTransport::default();
+        let router = ArchiveSegmentRouter::with_zkof(&transport, s3.clone(), cfg);
+        let bytes = router
+            .fetch(StorageBackend::ZkObjectFabric, "seg-Z")
+            .expect("fetch");
+        assert_eq!(bytes, vec![0xBB; 32]);
+        // The KChat transport must NOT have been called.
+        assert!(transport.calls().is_empty(), "transport must be untouched");
+        // The S3 client must have been called for the right key.
+        assert_eq!(
+            s3.get_calls(),
+            vec![("bucket-A".to_string(), "archive/segments/seg-Z".to_string())]
+        );
+    }
+
+    #[test]
+    fn fetch_segment_zkof_without_s3_is_storage_error() {
+        let transport = FixtureTransport::default();
+        let router = ArchiveSegmentRouter::kchat_only(&transport);
+        let err = router
+            .fetch(StorageBackend::ZkObjectFabric, "seg-Z")
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(msg) if msg.contains("zk_object_fabric")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prefetch_bucket_reads_storage_backend_per_row() {
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2026-04";
+        // One legacy KChat row, one ZKOF row, in the same bucket.
+        seed_segment_map_row(&db, "seg-K", &conv.to_string(), bucket, "blob-K");
+        seed_zkof_segment_row(&db, "seg-Z", &conv.to_string(), bucket, "blob-Z");
+
+        let s3 = std::sync::Arc::new(InMemoryS3::default());
+        s3.put("bucket-A", "archive/segments/seg-Z", vec![0xCC; 24]);
+        let cfg = crate::media::sinks::zk_fabric::ZkFabricSinkConfig {
+            endpoint_url: "https://example.invalid".into(),
+            bucket: "bucket-A".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        };
+        let transport = FixtureTransport::default();
+        transport.install("seg-K", vec![0xDD; 12]);
+
+        let router = ArchiveSegmentRouter::with_zkof(&transport, s3.clone(), cfg);
+        let segments = batch_prefetch_bucket_with_router(db.connection(), &router, conv, bucket)
+            .expect("router prefetch");
+        assert_eq!(segments.len(), 2);
+
+        // Each row's `storage_backend` column propagates to the
+        // returned PrefetchedSegment.
+        let mut by_id: HashMap<&str, &PrefetchedSegment> = HashMap::new();
+        for seg in &segments {
+            by_id.insert(seg.segment_id.as_str(), seg);
+        }
+        assert_eq!(by_id["seg-K"].storage_backend, "kchat_backend");
+        assert_eq!(by_id["seg-Z"].storage_backend, "zk_object_fabric");
+        assert_eq!(by_id["seg-K"].ciphertext, vec![0xDD; 12]);
+        assert_eq!(by_id["seg-Z"].ciphertext, vec![0xCC; 24]);
+
+        // Each backend was reached for exactly its own segment.
+        assert_eq!(transport.calls(), vec!["seg-K".to_string()]);
+        assert_eq!(
+            s3.get_calls(),
+            vec![("bucket-A".to_string(), "archive/segments/seg-Z".to_string())]
+        );
     }
 }
