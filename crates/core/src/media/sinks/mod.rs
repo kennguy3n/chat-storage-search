@@ -45,7 +45,7 @@ pub struct MediaBlobReference {
     pub blob_id: String,
     /// Storage sink tag — same shape as
     /// [`crate::local_store::schema::MediaAsset::storage_sink`].
-    /// Canonical values: `"kchat_backend"`, `"i_cloud"`,
+    /// Canonical values: `"kchat_backend"`, `"icloud"`,
     /// `"google_drive"`, `"zk_object_fabric"`.
     pub storage_sink: String,
     /// Optional sink-specific metadata blob. Opaque to the media
@@ -191,7 +191,7 @@ mod tests {
     fn media_blob_reference_round_trips_through_clone() {
         let r = MediaBlobReference {
             blob_id: "blob-42".to_string(),
-            storage_sink: "i_cloud".to_string(),
+            storage_sink: "icloud".to_string(),
             sink_metadata: Some(b"opaque".to_vec()),
         };
         assert_eq!(r, r.clone());

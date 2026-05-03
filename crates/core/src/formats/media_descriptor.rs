@@ -57,7 +57,7 @@ pub struct MediaDescriptor {
     /// as a CloudKit record name or Drive file ID). Plaintext
     /// metadata only. The interpretation depends on
     /// [`Self::storage_sink`]: a `"kchat_backend"` value means the
-    /// blob lives in the KChat blob service, an `"i_cloud"` value
+    /// blob lives in the KChat blob service, an `"icloud"` value
     /// means it lives in the user's iCloud container, and so on.
     /// See `docs/PROPOSAL.md §5.7` (tiered media storage).
     pub blob_id: Uuid,
@@ -69,7 +69,7 @@ pub struct MediaDescriptor {
     pub wrapped_k_asset: Vec<u8>,
 
     /// Storage sink tag for the media blob (`"kchat_backend"`,
-    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`).
+    /// `"icloud"`, `"google_drive"`, `"zk_object_fabric"`).
     /// `None` means the blob lives on the default sink
     /// (`"kchat_backend"`); existing CBOR payloads written before
     /// this field was added decode as `None` thanks to
@@ -136,7 +136,7 @@ mod tests {
             },
             blob_id: Uuid::now_v7(),
             wrapped_k_asset: (0..40u8).collect(),
-            storage_sink: Some("i_cloud".to_string()),
+            storage_sink: Some("icloud".to_string()),
         };
         let bytes = serde_cbor::to_vec(&desc).unwrap();
         let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).unwrap();
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(decoded.merkle_root, desc.merkle_root);
         assert_eq!(decoded.blob_id, desc.blob_id);
         assert_eq!(decoded.wrapped_k_asset, desc.wrapped_k_asset);
-        assert_eq!(decoded.storage_sink.as_deref(), Some("i_cloud"));
+        assert_eq!(decoded.storage_sink.as_deref(), Some("icloud"));
     }
 
     #[test]

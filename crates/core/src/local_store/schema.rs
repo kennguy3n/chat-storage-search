@@ -308,7 +308,7 @@ pub struct MediaAsset {
     /// [`Self::storage_sink`] (see `docs/PROPOSAL.md §5.7`).
     pub blob_id: String,
     /// Storage sink the media blob lives on (`"kchat_backend"`,
-    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`).
+    /// `"icloud"`, `"google_drive"`, `"zk_object_fabric"`).
     /// Defaults to `"kchat_backend"` for legacy rows. See
     /// `docs/PROPOSAL.md §5.7` (tiered media storage).
     pub storage_sink: String,

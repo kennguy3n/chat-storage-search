@@ -45,7 +45,7 @@ pub enum ArchiveBackend {
 /// superset: `KChatBackend` is the Phase-1 default, the user-cloud
 /// variants land in Phase 3 and may grow inner fields then.
 ///
-/// The serialized variant tags (`"kchat_backend"`, `"i_cloud"`,
+/// The serialized variant tags (`"kchat_backend"`, `"icloud"`,
 /// `"google_drive"`, `"zk_object_fabric"`) are pinned via explicit
 /// `#[serde(rename = "...")]` attributes so they always match the
 /// `media_asset.storage_sink` SQL column default and the
@@ -62,7 +62,7 @@ pub enum StorageSink {
     #[serde(rename = "kchat_backend")]
     KChatBackend,
     /// iCloud (CloudKit file storage). Implementation lands in Phase 3.
-    #[serde(rename = "i_cloud")]
+    #[serde(rename = "icloud")]
     ICloud {
         /// CloudKit container path (or platform-specific equivalent)
         /// where media blobs are stored.
@@ -215,7 +215,7 @@ mod tests {
         // The `storage_sink` tag has to match the `media_asset.storage_sink`
         // SQL default (`'kchat_backend'`) and the canonical values listed
         // in the `MediaBlobReference::storage_sink` doc — `kchat_backend`,
-        // `i_cloud`, `google_drive`, `zk_object_fabric`. Pin all four so a
+        // `icloud`, `google_drive`, `zk_object_fabric`. Pin all four so a
         // future re-introduction of `rename_all = "snake_case"` (which
         // would split `KChatBackend` at the K/C boundary and emit
         // `"k_chat_backend"`) is caught by CI.
@@ -225,7 +225,7 @@ mod tests {
                 StorageSink::ICloud {
                     container_path: "iCloud.com.kchat.media".to_string(),
                 },
-                "i_cloud",
+                "icloud",
             ),
             (
                 StorageSink::GoogleDrive {

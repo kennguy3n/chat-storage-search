@@ -578,7 +578,7 @@ to that sink without touching the thumbnail or archive path.
 **Rehydration path.** On a tap or scroll-back hit, the media
 engine reads `media_asset.storage_sink` for the asset and
 dispatches to the matching `MediaBlobSink` implementation:
-`"kchat_backend"` → `TransportClient`, `"i_cloud"` → iCloud sink,
+`"kchat_backend"` → `TransportClient`, `"icloud"` → iCloud sink,
 `"google_drive"` → Drive sink, `"zk_object_fabric"` → ZKOF sink.
 The chunk verification (per-chunk SHA-256 + whole-object Merkle
 root) and AEAD open with `K_asset` are unchanged — only the

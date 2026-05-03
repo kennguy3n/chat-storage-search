@@ -382,7 +382,7 @@ fn tiered_eviction_drains_cloud_offload_before_full_eviction() {
         "video/mp4",
         60 * 1024,
         ArchiveState::ArchiveVerified,
-        "i_cloud",
+        "icloud",
         MediaState::OriginalLocal,
         0,
     );
@@ -403,7 +403,7 @@ fn tiered_eviction_drains_cloud_offload_before_full_eviction() {
     let cands = collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms()).unwrap();
     let cloud = cands
         .iter()
-        .find(|c| c.storage_sink == "i_cloud")
+        .find(|c| c.storage_sink == "icloud")
         .expect("cloud candidate");
     let backend = cands
         .iter()
@@ -439,7 +439,7 @@ fn tiered_eviction_falls_through_when_cloud_pool_is_too_small() {
         "video/mp4",
         5 * 1024,
         ArchiveState::ArchiveVerified,
-        "i_cloud",
+        "icloud",
         MediaState::OriginalLocal,
         0,
     );

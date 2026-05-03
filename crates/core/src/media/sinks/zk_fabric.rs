@@ -356,7 +356,7 @@ mod tests {
         let (sink, _s3) = fresh_sink();
         let blob_ref = MediaBlobReference {
             blob_id: "asset-x".into(),
-            storage_sink: "i_cloud".into(),
+            storage_sink: "icloud".into(),
             sink_metadata: None,
         };
         let err = sink.fetch_media_chunk(&blob_ref, 0).unwrap_err();

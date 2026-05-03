@@ -134,7 +134,7 @@ pub struct EvictionCandidate {
     /// cloud (cloud-offload first) or only on the KChat backend
     /// (full eviction). Canonical values mirror
     /// [`crate::config::StorageSink`]: `"kchat_backend"`,
-    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`.
+    /// `"icloud"`, `"google_drive"`, `"zk_object_fabric"`.
     pub storage_sink: String,
 }
 

@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn eviction_tier_classifies_user_cloud_as_cloud_offload() {
-        for sink in ["i_cloud", "google_drive", "zk_object_fabric"] {
+        for sink in ["icloud", "google_drive", "zk_object_fabric"] {
             let c = cand_with_sink(ContentKind::Video, 100, 0, sink);
             assert_eq!(
                 EvictionTier::classify(&c),
@@ -1092,7 +1092,7 @@ mod tests {
         // KChat-backend candidates. Asking for 800 bytes must
         // pull entirely from the cloud pool.
         let cands = vec![
-            cand_with_sink(ContentKind::Video, 1000, 0, "i_cloud"),
+            cand_with_sink(ContentKind::Video, 1000, 0, "icloud"),
             cand(ContentKind::Video, 1000, 0),
         ];
         let plan = plan_tiered_eviction(cands, 800, 0, PressureLevel::Warning);
@@ -1107,7 +1107,7 @@ mod tests {
         // 200 bytes of cloud + 1000 bytes of KChat. Asking for
         // 800 bytes must pull both pools.
         let cands = vec![
-            cand_with_sink(ContentKind::Video, 200, 0, "i_cloud"),
+            cand_with_sink(ContentKind::Video, 200, 0, "icloud"),
             cand(ContentKind::Video, 1000, 0),
         ];
         let plan = plan_tiered_eviction(cands, 800, 0, PressureLevel::Warning);
@@ -1124,7 +1124,7 @@ mod tests {
         // Warning the cloud pool drops them and the full pool too
         // — only the video survives.
         let cands = vec![
-            cand_with_sink(ContentKind::Text, 100, 0, "i_cloud"),
+            cand_with_sink(ContentKind::Text, 100, 0, "icloud"),
             cand(ContentKind::Video, 1000, 0),
         ];
         let plan = plan_tiered_eviction(cands, u64::MAX, 0, PressureLevel::Warning);

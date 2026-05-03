@@ -1075,7 +1075,7 @@ sequenceDiagram
             Core->>Tr: "GET /v1/blobs/{blob_id}?range=..."
             Tr->>BE: "encrypted media chunks"
             BE-->>Tr: "ciphertext"
-        else "storage_sink = i_cloud / google_drive / zk_object_fabric"
+        else "storage_sink = icloud / google_drive / zk_object_fabric"
             Core->>Sink: "MediaBlobSink::fetch_media_chunk(blob_ref, idx)"
             Sink-->>Core: "ciphertext (CloudKit / Drive API / S3 GetObject)"
         end
