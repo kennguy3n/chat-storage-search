@@ -355,10 +355,21 @@ Checklist:
       `epoch_key_wrap_unwrap_round_trip`,
       `cross_epoch_segment_decrypt`,
       `epoch_key_info_string_matches_spec`.)_
-- [ ] ZK Object Fabric as optional archive backend: S3-compatible
+- [x] ZK Object Fabric as optional archive backend: S3-compatible
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
       + ZKOF tenant credentials.
+      _(`crates/core/src/archive/routing.rs::ZkofArchiveAdapter`
+      now wires a real `Arc<dyn S3Client>`. Segment uploads land
+      at `archive/segments/{segment_id}` and manifest uploads at
+      `archive/manifests/{manifest_id}`, matching the layout of
+      `backup/sinks/zk_fabric.rs`.
+      `CoreImpl::install_zkof_archive_backend(s3, config)` wires
+      it in alongside `zkof_archive_config` / `zkof_archive_s3`
+      slots; `rehydrate_timeline_skeletons_with_router` dispatches
+      to the ZKOF adapter when
+      `KChatCoreConfig::archive_backend == Zkof`. Round-trip tests
+      use `InMemoryS3` and exercise upload → fetch → decrypt.)_
 - [x] Archive backend routing: transport client routes archive
       operations to KChat backend or ZKOF based on configuration.
       Manifest index stored as a well-known S3 key when using ZKOF.
@@ -550,10 +561,26 @@ Checklist:
       `K_backup_manifest` with `device_id` mixed into the AAD for
       device attribution. Negative tests cover wrong-key /
       wrong-device-id failures.)_
-- [ ] iOS iCloud backup sink (iCloud container file storage).
-- [ ] Android backup sink strategy: Auto Backup for small recovery
+- [x] iOS iCloud backup sink (iCloud container file storage).
+      _(`crates/core/src/backup/sinks/icloud.rs::ICloudBackupSink`:
+      `ICloudBackupBridge` (object-safe, `Send + Sync`) exposes
+      `upload_file` / `download_file` / `list_files` /
+      `delete_file`. The sink maps `segment_id` →
+      `backups/segments/{segment_id}` and `manifest_id` →
+      `backups/{manifest_id}` records. `NoopICloudBackupBridge`
+      returns `Error::NotImplemented("icloud_backup_bridge")` for
+      tests.)_
+- [x] Android backup sink strategy: Auto Backup for small recovery
       envelopes / manifest pointers; Large Backup or SAF for full
       data.
+      _(`crates/core/src/backup/sinks/android.rs::AndroidBackupSink`:
+      `AndroidBackupBridge` splits manifest envelopes
+      (`write_auto_backup` / `read_auto_backup` — Auto Backup
+      ≤ 25 MiB record cap) from full segment data
+      (`write_saf` / `read_saf` / `list_saf` — Storage Access
+      Framework, no size cap). `list_backup_manifests` filters
+      Auto Backup entries to manifest records only.
+      `NoopAndroidBackupBridge` stub.)_
 - [x] **ZK Object Fabric backup sink** (S3 API; Pattern C convergent
       encryption; bit-identical interop with the Go SDK at
       `kennguy3n/zk-object-fabric/encryption/client_sdk/`).
@@ -632,7 +659,7 @@ Checklist:
       `IdentityRestored`; backwards / skip transitions error.
       Snake-case `Display` / `FromStr` round-trip; serde wire
       form matches the SQL column.)_
-- [~] Key recovery (device-to-device transfer, recovery key,
+- [x] Key recovery (device-to-device transfer, recovery key,
       passphrase). Server escrow remains off by default.
       _(`crates/core/src/restore/key_recovery.rs`: `RecoveryKey`
       wraps `K_user_master` via AES-256-KW (RFC 3394) with a
@@ -646,8 +673,18 @@ Checklist:
       `kchat-device-transfer-v1`).
       `prepare_device_transfer` / `accept_device_transfer`
       round-trip, reject wrong / empty codes, and validate
-      payload nonce length. Server escrow remains OFF by
-      default. Passphrase flow is the next milestone.)_
+      payload nonce length. The envelope itself derives
+      `Zeroize` + `ZeroizeOnDrop`, and every CBOR / AEAD-opened
+      plaintext now flows through `Zeroizing<Vec<u8>>`.
+      Passphrase recovery (`PassphraseRecoveryEnvelope`,
+      `wrap_master_key_with_passphrase` /
+      `unwrap_master_key_with_passphrase`) uses Argon2id with
+      OWASP-mobile parameters (`m_cost = 65536`, `t_cost = 3`,
+      `p_cost = 1`, output 32 bytes) feeding AES-256-KW; same
+      `(passphrase, salt)` is deterministic, different salts
+      produce different keys, and a wrong passphrase fails the
+      AES-KW integrity check. Server escrow remains OFF by
+      default.)_
 - [x] Search index backup and restore (encrypted text / fuzzy /
       vector / media shards).
       _(`crates/core/src/search/shard_builder.rs`:
@@ -706,9 +743,19 @@ Checklist:
       sealed with `K_text_index_shard`).
 - [ ] Search shard fetch from the backend
       (`GET /v1/archive/index-shards?conversation_hash=&bucket=&type=`).
-- [ ] Cold-result hydration: search hit on offloaded content →
+- [~] Cold-result hydration: search hit on offloaded content →
       fetch shard → decrypt locally → search → hydrate body / media
       on tap.
+      _(`crates/core/src/search/query_engine.rs::mark_cold_results`
+      flips `is_cold = true` on every hit whose backing skeleton
+      has `body_state = 'remote_archive_only'` when the caller
+      passes `SearchScope::IncludeCold`. `CoreImpl::search`
+      enqueues those hits into the `HydrationQueue` at
+      `HydrationReason::SearchResultTap` (P0) priority;
+      `CoreImpl::search_and_prefetch_cold` returns
+      `(results, cold_count)` so the platform layer can render a
+      "hydrating…" badge. Encrypted shard fetch + on-device
+      decrypt + hydration write-back arrives next.)_
 - [ ] Unified query engine: parse → fan-out → merge → rerank.
 - [ ] Ranking formula implementation (PROPOSAL §7.5).
 - [ ] Mixed-language query handling: a single query may interleave
@@ -716,10 +763,19 @@ Checklist:
       index.
 - [ ] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
-- [ ] Batch shard prefetch by time bucket: when fetching encrypted
+- [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
       metadata signal on the shard-listing endpoint.
+      _(`crates/core/src/search/shard_prefetch.rs::batch_prefetch_shards`
+      fans out a single transport call per `IndexType` variant in
+      the deterministic `[Text, Fuzzy, Vector, Media]` order and
+      returns `Vec<PrefetchedShard>` with non-empty rows only.
+      `batch_prefetch_shards_with_padding` mixes in dummy
+      `(conversation_hash, bucket)` requests when
+      `KChatCoreConfig::privacy_level == High`, reusing
+      `archive::privacy::generate_dummy_segment_id` so dummy ids
+      cannot collide with real UUIDv7 segment ids.)_
 
 **Decision gate**: Fuzzy search returns relevant hits across all
 target scripts, including mixed-script queries. Cold content
@@ -822,15 +878,40 @@ Checklist:
 - [ ] Media blob sink stress test: 10K+ media files across mixed
       sinks (KChat backend + iCloud + Google Drive + ZKOF in the
       same account); verify rehydration from each.
-- [ ] **Failure test suite**, all passing:
-  - chunk upload interrupted mid-stream
-  - manifest upload interrupted mid-write
-  - wrong backup key on restore
-  - corrupted chunk (Merkle / SHA-256 mismatch)
-  - device removed from MLS group between backup and restore
-  - search shard missing from the backend
-  - low-storage condition during restore
-  - manifest chain break detected on restore
+- [~] **Failure test suite**, all passing:
+  - [x] chunk upload interrupted mid-stream
+        _(`crates/core/tests/failure_scenarios.rs::chunk_upload_interrupted_then_resumed_succeeds`:
+        `MockTransportClient` returns `Error::Transport("connection reset")`
+        after 2 of 5 chunks; `upload_chunked_media` surfaces the error and
+        `resume_upload` skips the completed chunks before driving the rest
+        through `commit_blob`.)_
+  - [ ] manifest upload interrupted mid-write
+  - [x] wrong backup key on restore
+        _(`crates/core/tests/failure_scenarios.rs::wrong_backup_segment_key_fails_aead_open`
+        bit-flips `K_backup_segment` and asserts `Error::Crypto`;
+        `wrong_signing_key_on_manifest_chain_fails_signature_invalid`
+        verifies a chain under an imposter Ed25519 key and asserts
+        `VerificationError::SignatureInvalid { generation: 0 }`.)_
+  - [x] corrupted chunk (Merkle / SHA-256 mismatch)
+        _(`crates/core/tests/failure_scenarios.rs::corrupted_chunk_ciphertext_fails_sha256_fast_fail`
+        flips one byte of `sealed_chunks[1].ciphertext` and asserts
+        `verify_and_decrypt` fails the SHA-256 fast-fail naming
+        chunk 1 — no AEAD work runs;
+        `tampered_merkle_root_in_descriptor_fails_blake3_root_check`
+        tampers with the descriptor's `merkle_root` and asserts the
+        AEAD AAD binding rejects it.)_
+  - [ ] device removed from MLS group between backup and restore
+  - [ ] search shard missing from the backend
+  - [ ] low-storage condition during restore
+  - [x] manifest chain break detected on restore
+        _(`crates/core/tests/failure_scenarios.rs::manifest_chain_break_returns_chain_break_with_expected_and_actual`
+        builds a 3-generation chain, replaces gen-1's
+        `previous_manifest_hash` with `[0x42; 32]`, re-signs gen-1
+        and gen-2 (so signatures are valid — only the chain link
+        breaks), and asserts `verify_manifest_chain` returns
+        `VerificationError::ChainBreak { generation: 1, expected,
+        actual }` with `expected == compute_manifest_hash(gen0)`
+        and `actual == [0x42; 32]`.)_
 
 **Decision gate**: Production-ready performance on the target
 device matrix (defined per platform during Phase 7). The full

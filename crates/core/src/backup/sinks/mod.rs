@@ -24,6 +24,8 @@
 //! The trait is object-safe so the orchestration layer can hold a
 //! single `Box<dyn BackupSink>` and dispatch from any worker.
 
+pub mod android;
+pub mod icloud;
 pub mod zk_fabric;
 
 /// Routing seam for backup uploads / fetches / lists.

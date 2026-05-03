@@ -28,12 +28,38 @@
 //!                                                  └──────────────────┘
 //! ```
 
+use std::sync::Arc;
+
+use crate::archive::download::encode_archive_segment_blob;
 use crate::archive::manifest_builder::SealedArchiveManifest;
 use crate::archive::segment_builder::BuiltSegment;
 use crate::archive::upload::upload_archive_segment;
 use crate::config::{ArchiveBackend, KChatCoreConfig};
+use crate::crypto::content_hash::content_hash;
+use crate::crypto::convergent::{
+    decrypt_object_pattern_c, derive_convergent_dek, encrypt_object_pattern_c, DEFAULT_CHUNK_SIZE,
+};
+use crate::media::sinks::zk_fabric::{S3Client, ZkFabricSinkConfig};
 use crate::transport::TransportClient;
 use crate::Error;
+
+/// Object key prefix for archive segment ciphertext: per
+/// `docs/PROPOSAL.md §10.2`, every segment lives at
+/// `archive/segments/{segment_id}` in the ZKOF bucket.
+pub const ZKOF_ARCHIVE_SEGMENT_KEY_PREFIX: &str = "archive/segments/";
+
+/// Object key prefix for archive manifest CBOR bundles. Manifests
+/// are keyed on their `manifest_id` (a UUID) so two distinct
+/// generations cannot accidentally clobber each other.
+pub const ZKOF_ARCHIVE_MANIFEST_KEY_PREFIX: &str = "archive/manifests/";
+
+fn zkof_archive_segment_key(segment_id: &str) -> String {
+    format!("{ZKOF_ARCHIVE_SEGMENT_KEY_PREFIX}{segment_id}")
+}
+
+fn zkof_archive_manifest_key(manifest_id: &str) -> String {
+    format!("{ZKOF_ARCHIVE_MANIFEST_KEY_PREFIX}{manifest_id}")
+}
 
 /// ZKOF / S3 adapter for archive operations. The HTTP client is
 /// stubbed under [`StubZkofArchiveAdapter`] for Phase 3 — every
@@ -82,6 +108,168 @@ impl ZkofArchiveAdapter for StubZkofArchiveAdapter {
             "StubZkofArchiveAdapter::upload_manifest",
         ))
     }
+}
+
+/// Production [`ZkofArchiveAdapter`] backed by an [`S3Client`].
+///
+/// Mirrors [`crate::backup::sinks::zk_fabric::ZkofBackupSink`]
+/// for the **archive** pipeline: every payload is wrapped in a
+/// Pattern C convergent-encryption frame keyed by the configured
+/// tenant id before it crosses the S3 boundary, so duplicate
+/// archive segments dedup on the cloud side without the cloud
+/// ever holding the per-tenant `K_archive_*` keys.
+///
+/// Object key layout (matches `docs/PROPOSAL.md §10.2`):
+///
+/// ```text
+/// archive/segments/{segment_id}     — segment blob
+///                                     (encode_archive_segment_blob)
+/// archive/manifests/{manifest_id}   — sealed manifest CBOR
+/// ```
+///
+/// Both layers (the AEAD seal under `K_archive_segment` /
+/// `K_archive_manifest` and the Pattern C convergent layer here)
+/// are independent — losing either is not enough to read the
+/// bytes back.
+#[derive(Debug, Clone)]
+pub struct S3ZkofArchiveAdapter {
+    s3: Arc<dyn S3Client>,
+    config: ZkFabricSinkConfig,
+    tenant_id: String,
+}
+
+impl S3ZkofArchiveAdapter {
+    /// Construct an adapter bound to the supplied S3 client,
+    /// ZKOF config, and tenant id.
+    ///
+    /// The tenant id is fed into the Pattern C DEK derivation so
+    /// two tenants encrypting the same plaintext produce
+    /// different ciphertexts (no cross-tenant dedup).
+    pub fn new(
+        s3: Arc<dyn S3Client>,
+        config: ZkFabricSinkConfig,
+        tenant_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        let tenant_id = tenant_id.into();
+        if tenant_id.is_empty() {
+            return Err(Error::Storage(
+                "S3ZkofArchiveAdapter: tenant_id must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            s3,
+            config,
+            tenant_id,
+        })
+    }
+
+    /// S3 bucket the adapter targets.
+    pub fn bucket(&self) -> &str {
+        &self.config.bucket
+    }
+
+    /// Tenant id stamped into Pattern C DEK derivation.
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+
+    /// Convergent-seal `plaintext` with this adapter's tenant id.
+    /// Exposed for tests / determinism vectors.
+    pub fn pattern_c_seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        let hash = content_hash(plaintext);
+        let dek = derive_convergent_dek(&hash, &self.tenant_id)
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}")))?;
+        encrypt_object_pattern_c(plaintext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C seal: {e}")))
+    }
+
+    /// Pattern C `open` — inverse of [`Self::pattern_c_seal`].
+    /// Requires the original plaintext's BLAKE3 hash because the
+    /// DEK is content-derived; the caller hands it the hash via
+    /// the manifest / segment metadata. Exposed for tests.
+    pub fn pattern_c_open(
+        &self,
+        ciphertext: &[u8],
+        plaintext_hash: &[u8; 32],
+    ) -> Result<Vec<u8>, Error> {
+        let dek = derive_convergent_dek(plaintext_hash, &self.tenant_id)
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}")))?;
+        decrypt_object_pattern_c(ciphertext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C open: {e}")))
+    }
+}
+
+impl ZkofArchiveAdapter for S3ZkofArchiveAdapter {
+    fn upload_segment(&self, segment: &BuiltSegment) -> Result<String, Error> {
+        // Encode the on-the-wire segment blob (matching the KChat
+        // upload contract) so the same `decrypt_archive_segment`
+        // helper opens both backends.
+        let blob = encode_archive_segment_blob(
+            &segment.segment_id,
+            &segment.merkle_root,
+            &segment.nonce,
+            &segment.ciphertext,
+        );
+        let sealed = self.pattern_c_seal(&blob)?;
+        let key = zkof_archive_segment_key(&segment.segment_id.to_string());
+        self.s3.put_object(&self.config.bucket, &key, &sealed)?;
+        Ok(key)
+    }
+
+    fn fetch_segment(&self, segment_id: &str) -> Result<Vec<u8>, Error> {
+        let key = zkof_archive_segment_key(segment_id);
+        // Pattern C is content-addressed: the adapter does not
+        // own the plaintext hash, so it returns the raw
+        // convergent bytes. The orchestrator (which holds the
+        // ledger row carrying the plaintext hash) finishes the
+        // open via [`Self::pattern_c_open`] before decoding.
+        // Mirrors [`ZkofBackupSink::fetch_backup_segment`].
+        self.s3
+            .get_object_range(&self.config.bucket, &key, 0..u64::MAX)
+    }
+
+    fn upload_manifest(&self, manifest: &SealedArchiveManifest) -> Result<(), Error> {
+        let cbor = encode_sealed_archive_manifest(manifest)?;
+        let sealed = self.pattern_c_seal(&cbor)?;
+        let key = zkof_archive_manifest_key(&manifest.manifest.manifest_id.to_string());
+        self.s3.put_object(&self.config.bucket, &key, &sealed)
+    }
+}
+
+/// CBOR-encode a [`SealedArchiveManifest`] for cross-backend
+/// transport. The inner [`ArchiveManifest`] already implements
+/// `Serialize`; the wrapper holds an [`ed25519_dalek::Signature`]
+/// (no `Serialize` impl) plus the AEAD nonce / ciphertext, so we
+/// project the bundle into a plain `(manifest, signature_bytes,
+/// nonce, ciphertext)` shape that round-trips cleanly through
+/// CBOR / Pattern C.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireSealedArchiveManifest {
+    manifest: crate::formats::manifest::ArchiveManifest,
+    #[serde(with = "serde_bytes")]
+    signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    nonce: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Vec<u8>,
+}
+
+/// Encode a [`SealedArchiveManifest`] into the on-the-wire CBOR
+/// shape used by [`S3ZkofArchiveAdapter::upload_manifest`].
+/// Exposed (crate-internal) so tests can round-trip through the
+/// same encoder.
+pub(crate) fn encode_sealed_archive_manifest(
+    manifest: &SealedArchiveManifest,
+) -> Result<Vec<u8>, Error> {
+    let wire = WireSealedArchiveManifest {
+        manifest: manifest.manifest.clone(),
+        signature: manifest.signature.to_bytes().to_vec(),
+        nonce: manifest.nonce.to_vec(),
+        ciphertext: manifest.ciphertext.clone(),
+    };
+    serde_cbor::to_vec(&wire)
+        .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: cbor encode manifest: {e}")))
 }
 
 /// Route an archive segment upload to the configured backend.
@@ -416,5 +604,139 @@ mod tests {
             stub.upload_manifest(&manifest).unwrap_err(),
             Error::NotImplemented(_)
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // S3-backed adapter — round-trip + key-layout integration tests.
+    // -----------------------------------------------------------------
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc as StdArc;
+
+    /// Minimal in-memory S3 implementing the same contract as the
+    /// production gateway: byte-range reads clamp past the object
+    /// length and `list_objects` returns sorted keys.
+    #[derive(Debug, Default)]
+    struct InMemoryS3 {
+        objects: Mutex<BTreeMap<(String, String), Vec<u8>>>,
+    }
+
+    impl S3Client for InMemoryS3 {
+        fn put_object(&self, bucket: &str, key: &str, bytes: &[u8]) -> Result<(), Error> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert((bucket.into(), key.into()), bytes.to_vec());
+            Ok(())
+        }
+
+        fn get_object_range(
+            &self,
+            bucket: &str,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<Vec<u8>, Error> {
+            let objects = self.objects.lock().unwrap();
+            let bytes = objects
+                .get(&(bucket.into(), key.into()))
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+            let start = range.start.min(bytes.len() as u64) as usize;
+            let end = range.end.min(bytes.len() as u64) as usize;
+            Ok(bytes[start..end].to_vec())
+        }
+
+        fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, Error> {
+            let objects = self.objects.lock().unwrap();
+            let mut out: Vec<String> = objects
+                .keys()
+                .filter(|(b, k)| b == bucket && k.starts_with(prefix))
+                .map(|(_, k)| k.clone())
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+
+        fn delete_object(&self, bucket: &str, key: &str) -> Result<(), Error> {
+            self.objects
+                .lock()
+                .unwrap()
+                .remove(&(bucket.into(), key.into()));
+            Ok(())
+        }
+    }
+
+    fn fresh_zkof_config() -> ZkFabricSinkConfig {
+        ZkFabricSinkConfig {
+            endpoint_url: "https://zkof.example.com".into(),
+            access_key: "AKIA-TEST".into(),
+            secret_key: "secret".into(),
+            bucket: "kchat-archive".into(),
+        }
+    }
+
+    #[test]
+    fn s3_zkof_archive_adapter_rejects_empty_tenant() {
+        let s3 = StdArc::new(InMemoryS3::default());
+        let err = S3ZkofArchiveAdapter::new(s3, fresh_zkof_config(), "").unwrap_err();
+        assert!(matches!(err, Error::Storage(msg) if msg.contains("tenant_id")));
+    }
+
+    #[test]
+    fn s3_zkof_archive_adapter_segment_round_trip() {
+        // Build a real BuiltSegment, push it through the adapter,
+        // pull it back, Pattern-C-open it, and verify the on-the-
+        // wire blob round-trips bit-for-bit.
+        let s3: StdArc<dyn S3Client> = StdArc::new(InMemoryS3::default());
+        let adapter =
+            S3ZkofArchiveAdapter::new(s3.clone(), fresh_zkof_config(), "tenant-roundtrip").unwrap();
+        let segment = fresh_segment();
+        let key = adapter.upload_segment(&segment).expect("upload");
+        let expected_key = format!("archive/segments/{}", segment.segment_id);
+        assert_eq!(key, expected_key);
+
+        let fetched = adapter
+            .fetch_segment(&segment.segment_id.to_string())
+            .expect("fetch");
+        let plaintext_blob = encode_archive_segment_blob(
+            &segment.segment_id,
+            &segment.merkle_root,
+            &segment.nonce,
+            &segment.ciphertext,
+        );
+        let blob_hash = content_hash(&plaintext_blob);
+        let opened = adapter.pattern_c_open(&fetched, &blob_hash).expect("open");
+        assert_eq!(opened, plaintext_blob);
+    }
+
+    #[test]
+    fn s3_zkof_archive_adapter_manifest_keyed_by_id() {
+        let s3: StdArc<dyn S3Client> = StdArc::new(InMemoryS3::default());
+        let adapter =
+            S3ZkofArchiveAdapter::new(s3.clone(), fresh_zkof_config(), "tenant-mfst").unwrap();
+        let manifest = stub_manifest();
+        adapter.upload_manifest(&manifest).expect("upload manifest");
+        // The S3 key must be `archive/manifests/{manifest_id}` —
+        // pull it back via list_objects to confirm.
+        let keys = s3
+            .list_objects(adapter.bucket(), ZKOF_ARCHIVE_MANIFEST_KEY_PREFIX)
+            .expect("list");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0],
+            format!("archive/manifests/{}", manifest.manifest.manifest_id)
+        );
+    }
+
+    #[test]
+    fn s3_zkof_archive_adapter_routes_via_route_archive_upload() {
+        let config = fresh_config(ArchiveBackend::Zkof);
+        let s3: StdArc<dyn S3Client> = StdArc::new(InMemoryS3::default());
+        let adapter = S3ZkofArchiveAdapter::new(s3, fresh_zkof_config(), "tenant-route").unwrap();
+        let transport = CapturingTransport::default();
+        let segment = fresh_segment();
+        let key =
+            route_archive_upload(&config, &transport, &adapter, &segment).expect("route upload");
+        assert!(key.starts_with(ZKOF_ARCHIVE_SEGMENT_KEY_PREFIX));
+        assert!(transport.last_blob_id.lock().unwrap().is_none());
     }
 }

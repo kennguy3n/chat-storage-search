@@ -20,10 +20,17 @@
 //! always ranks below an FTS hit on the same query — and a row that
 //! matches both engines accumulates both contributions.
 //!
-//! [`SearchScope::IncludeCold`] is treated identically to
-//! [`SearchScope::LocalOnly`] for now — the personal-archive fan-out
-//! lands later in Phase 3 / Phase 5. Both scopes return only local
-//! rows in Phase 1, with `is_cold = false`.
+//! [`SearchScope::IncludeCold`] now flags rows whose
+//! `message_skeleton.body_state = 'remote_archive_only'` with
+//! `SearchResult::is_cold = true` so the orchestration layer can
+//! enqueue them into the [`crate::offload::HydrationQueue`] at
+//! priority `SearchResultTap` (Phase 5, Task 7). The actual
+//! archive fan-out (downloading the offloaded body before the
+//! query returns) still lands in a follow-up — `is_cold = true`
+//! is the wire signal that the body is *available* in the
+//! archive but not currently in the local store.
+//! [`SearchScope::LocalOnly`] always returns `is_cold = false`,
+//! preserving the offline-only contract.
 
 use std::collections::{HashMap, HashSet};
 
@@ -76,21 +83,62 @@ impl<'a> QueryEngine<'a> {
     pub fn execute_search_with_limit(
         &self,
         query: &SearchQuery,
-        _scope: &SearchScope,
+        scope: &SearchScope,
         limit: usize,
     ) -> DbResult<Vec<SearchResult>> {
-        // SearchScope::IncludeCold is documented as the default but
-        // the cold (archive) fan-out lands in Phase 3 / Phase 5; for
-        // Phase 1 the only difference is that LocalOnly explicitly
-        // forbids any future archive call. Both scopes return local
-        // rows here, with `is_cold = false`.
-
         let trimmed = query.query_string.trim();
-        if trimmed.is_empty() {
-            self.execute_structured_only(query, limit)
+        let mut out = if trimmed.is_empty() {
+            self.execute_structured_only(query, limit)?
         } else {
-            self.execute_fts_and_fuzzy_with_filters(query, trimmed, limit)
+            self.execute_fts_and_fuzzy_with_filters(query, trimmed, limit)?
+        };
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.mark_cold_results(&mut out)?;
         }
+        Ok(out)
+    }
+
+    /// Stamp `SearchResult::is_cold = true` on every row whose
+    /// owning skeleton has `body_state = 'remote_archive_only'`.
+    /// Rows whose body is `local_plain_available` /
+    /// `local_encrypted_available` keep `is_cold = false` so the
+    /// hydration queue does not chase already-resident bodies.
+    fn mark_cold_results(&self, results: &mut [SearchResult]) -> DbResult<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = results.iter().map(|r| r.message_id.to_string()).collect();
+        let placeholders = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id, body_state
+               FROM message_skeleton
+              WHERE message_id IN ({placeholders})"
+        );
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            binds.push(Value::Text(id.clone()));
+        }
+        let mut state_by_id: HashMap<String, String> = HashMap::new();
+        let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (mid, state) = r?;
+            state_by_id.insert(mid, state);
+        }
+        for result in results.iter_mut() {
+            if let Some(state) = state_by_id.get(&result.message_id.to_string()) {
+                if state == "remote_archive_only" {
+                    result.is_cold = true;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ----------------------------------------------------------------
@@ -891,5 +939,113 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_id, bob_mid);
         assert_eq!(results[0].sender_id, "bob");
+    }
+
+    // -------------------------------------------------------------------
+    // Cold-result hydration (Task 7)
+    // -------------------------------------------------------------------
+
+    /// Mark `message_id` as offloaded by transitioning its
+    /// `body_state` to `remote_archive_only` directly. The full
+    /// state-machine path is `local_plain_available` →
+    /// `remote_archive_only`, but for the test we just need the
+    /// row to read back as cold.
+    fn flip_to_remote_archive_only(db: &LocalStoreDb, message_id: &str) {
+        db.connection()
+            .execute(
+                "UPDATE message_skeleton SET body_state = 'remote_archive_only'
+                  WHERE message_id = ?1",
+                params![message_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn include_cold_marks_offloaded_results_as_cold() {
+        let db = populated_db();
+        // Pick the row at ts=2_000 ("hello there") and offload it.
+        let cold_mid = db
+            .connection()
+            .query_row(
+                "SELECT message_id FROM message_skeleton WHERE created_at_ms = 2000",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        flip_to_remote_archive_only(&db, &cold_mid);
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let cold_results = engine
+            .execute_search(&q, &SearchScope::IncludeCold)
+            .unwrap();
+        let warm_results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+
+        // Both scopes return the same row set today (no archive
+        // fan-out yet); only IncludeCold flags the offloaded row.
+        let cold_flagged = cold_results
+            .iter()
+            .filter(|r| r.message_id.to_string() == cold_mid)
+            .filter(|r| r.is_cold)
+            .count();
+        let warm_flagged = warm_results
+            .iter()
+            .filter(|r| r.message_id.to_string() == cold_mid)
+            .filter(|r| r.is_cold)
+            .count();
+        assert_eq!(cold_flagged, 1, "IncludeCold must flag the cold row");
+        assert_eq!(warm_flagged, 0, "LocalOnly must NEVER flag rows as cold");
+    }
+
+    #[test]
+    fn include_cold_leaves_local_rows_untouched() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search(&q, &SearchScope::IncludeCold)
+            .unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(!r.is_cold, "no row was offloaded; nothing should be cold");
+        }
+    }
+
+    #[test]
+    fn include_cold_marks_structured_only_results() {
+        let db = populated_db();
+        let cold_mid = db
+            .connection()
+            .query_row(
+                "SELECT message_id FROM message_skeleton WHERE created_at_ms = 4000",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        flip_to_remote_archive_only(&db, &cold_mid);
+
+        let engine = QueryEngine::new(&db);
+        // Structured-only: empty query string, sender filter only.
+        let q = SearchQuery {
+            sender_filter: Some("carol".into()),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search(&q, &SearchScope::IncludeCold)
+            .unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            if r.message_id.to_string() == cold_mid {
+                assert!(r.is_cold, "structured-only path must also flag cold rows");
+            } else {
+                assert!(!r.is_cold);
+            }
+        }
     }
 }

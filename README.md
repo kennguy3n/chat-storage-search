@@ -12,7 +12,7 @@
 > Media Encryption and Blob Service — `In progress | ~95%` (chunked
 > media pipeline + thumbnailing landed; tiered media-storage routing
 > wired through `MediaBlobSink`).**
-> **Phase 3 — Personal Archive and Offload — `In progress | ~85%`
+> **Phase 3 — Personal Archive and Offload — `In progress | ~95%`
 > (foundation: archive event journal wired into `MessagePersister`,
 > archive segment builder, archive manifest chain builder, archive
 > segment upload orchestration, archive state machine transitions,
@@ -27,7 +27,7 @@
 > sink, iCloud `CloudKit` bridge, Google Drive bridge), tiered
 > eviction policy (cloud-offload first → full eviction),
 > `CoreImpl::enforce_storage_budget`).**
-> **Phase 4 — Backup and Restore — `In progress | ~75%`
+> **Phase 4 — Backup and Restore — `In progress | ~85%`
 > (full Rust backup + restore foundation: typed
 > `BackupEventJournal`, CBOR + zstd + XChaCha20-Poly1305 segment
 > builder under `K_backup_segment`, Ed25519-signed
@@ -44,7 +44,25 @@
 > encrypted search-index shard build/restore, archive
 > compaction orchestration (`CoreImpl::compact_archive`), and
 > the recovery-key + device-to-device transfer foundation in
-> `restore::key_recovery`).**
+> `restore::key_recovery`, the iCloud (`ICloudBackupSink`) and
+> Android (`AndroidBackupSink`) backup sinks, the ZKOF
+> archive-backend wiring (`ZkofArchiveAdapter` over
+> `Arc<dyn S3Client>`), the search-index shard restore wired into
+> `RestorePipeline::restore_search_index_shards_with_replay`, and
+> passphrase-based key recovery in `restore::key_recovery`
+> (Argon2id + AES-256-KW + serde envelope) including the
+> `DeviceTransferEnvelope` zeroize fix).**
+> **Phase 5 — Search (Fuzzy + Encrypted Shards) —
+> `In progress | ~15%`** (cold-result hydration via
+> `SearchScope::IncludeCold` + `HydrationQueue` enqueue at
+> `SearchResultTap` priority; batch-by-bucket
+> `search::shard_prefetch::batch_prefetch_shards` over all four
+> `IndexType` variants in deterministic
+> `[Text, Fuzzy, Vector, Media]` order; padding variant for
+> `privacy_level = High`; `BackgroundScheduler` trait foundation
+> with iOS `BGTaskScheduler` / Android `WorkManager` bridges
+> and a `NoopScheduler` stub; first 4 of 8 Phase-7 failure
+> scenarios under `tests/failure_scenarios.rs`).
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -248,6 +266,7 @@ chat-storage-search/
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
           shard_builder.rs                  # build_text_search_shard / build_fuzzy_search_shard / restore_text_search_shard / restore_fuzzy_search_shard (encrypted search shards for Phase 4 backup / restore)
+          shard_prefetch.rs                 # batch_prefetch_shards / batch_prefetch_shards_with_padding: one batch per (conversation_hash, bucket) over [Text, Fuzzy, Vector, Media] — coarsens metadata signal (Phase 5)
         archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding + compaction
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
@@ -269,6 +288,8 @@ chat-storage-search/
           sinks/                            # BackupSink trait + backup-vault implementations
             mod.rs                          # BackupSink + NoopBackupSink (object-safe trait surface)
             zk_fabric.rs                    # ZkofBackupSink: backups/{manifest_id}, backups/segments/{segment_id}; Pattern C convergent encryption (bit-identical to Go SDK)
+            icloud.rs                       # ICloudBackupSink: ICloudBackupBridge (upload_file / download_file / list_files / delete_file) → backups/{manifest_id} + backups/segments/{segment_id} record names; NoopICloudBackupBridge stub
+            android.rs                      # AndroidBackupSink: AndroidBackupBridge (write_auto_backup / read_auto_backup / write_saf / read_saf / list_saf) — manifests via Auto Backup (≤ 25 MiB), segments via SAF; NoopAndroidBackupBridge stub
         media/                              # Phase 2: chunker + processor + upload + download + cache + routing + thumbnail
           mod.rs
           chunker.rs                        # chunk + AEAD-seal, size-class padding, verify_and_decrypt
@@ -297,7 +318,7 @@ chat-storage-search/
           manifest_verifier.rs              # verify_manifest_chain: walks gen 0..latest, Ed25519 + previous_manifest_hash check, returns EmptyChain / SignatureInvalid / ChainBreak / GapDetected / GenesisHashNotZero
           pipeline.rs                       # RestorePipeline: conversation list → skeletons → search shards → recent bodies → enable lazy media; persists every RestoreState transition
           key_recovery.rs                   # RecoveryKey (AES-256-KW wrap of K_user_master, hex display) + DeviceTransferPayload (XChaCha20-Poly1305 seal of K_user_master + 3 derived roots, transfer-code-derived AEAD key)
-        scheduler/                          # placeholder (Phase 4 / 7)
+        scheduler/                          # Phase 5 / 7: BackgroundScheduler trait (Send+Sync, object-safe), TaskType (IncrementalBackup / ArchiveCompaction / IndexMaintenance / MediaCacheEviction / ModelWarmup), ScheduledTask, NoopScheduler, IosBgTaskBridge / AndroidWorkManagerBridge platform bridges + Noop stubs
         transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
@@ -306,8 +327,9 @@ chat-storage-search/
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
         epoch_key_derivation.rs             # Phase 3: K_archive_epoch determinism / rotation / wrap-unwrap / cross-epoch decrypt / info-string vectors
         archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
-        backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test
+        backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test; search-shard restore round-trip
         backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
+        failure_scenarios.rs                # Phase 7 failure-test foundation (4 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes
         media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
         storage_budget_enforcement.rs       # Phase 3 end-to-end: pressure assessment → candidate collection → tiered eviction → executor (every PressureLevel × every EvictionTier)
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip

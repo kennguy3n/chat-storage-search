@@ -32,7 +32,9 @@ use crate::backup::event_journal::{BackupEvent, BackupEventType};
 use crate::backup::segment_builder::{decrypt_backup_segment, BuiltBackupSegment};
 use crate::crypto::key_hierarchy::KeyMaterial;
 use crate::formats::manifest::BackupManifest;
+use crate::formats::search_shard::{IndexType, SearchIndexShard};
 use crate::local_store::state_machines::{BodyState, RestoreState};
+use crate::search::shard_builder::{restore_fuzzy_search_shard, restore_text_search_shard};
 use crate::Error;
 
 use super::state_machine;
@@ -74,6 +76,32 @@ pub struct RestoredBody {
     /// CBOR-encoded payload from the originating
     /// [`BackupEvent::payload`].
     pub payload: Vec<u8>,
+}
+
+/// One sealed search-index shard plus the per-shard AEAD key the
+/// orchestrator stored alongside it. The lifetime is tied to the
+/// borrow the orchestrator holds while it walks the manifest.
+#[derive(Debug, Clone)]
+pub struct SealedSearchShardEntry<'a> {
+    /// Shard frame as carried in the backup manifest.
+    pub shard: &'a SearchIndexShard,
+    /// The `K_*_index_shard(shard_id)` the shard was sealed
+    /// under. Phase 5 will move this into a sealed
+    /// `wrapped_k_shard` field on the manifest entry; the
+    /// pipeline does not derive the key itself today.
+    pub k_shard: &'a KeyMaterial,
+}
+
+/// Per-shard summary returned by
+/// [`RestorePipeline::restore_search_index_shards_with_replay`]
+/// so the orchestrator can log progress without re-walking the
+/// returned row vectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredShardSummary {
+    /// Which index this shard restored into.
+    pub index_type: IndexType,
+    /// Number of rows the pipeline inserted into the local store.
+    pub rows_inserted: usize,
 }
 
 /// Outcome of a successful pipeline run.
@@ -156,13 +184,110 @@ impl RestorePipeline {
             .collect()
     }
 
-    /// Step 3: search index shards. Phase-4 placeholder — search
-    /// shard segments are wired in a follow-up. The signature is
-    /// already in place so the orchestrator does not change when
-    /// the implementation lands.
+    /// Step 3: search index shards. Phase-4 no-input variant —
+    /// preserved so the orchestrator's old call sites do not
+    /// fail to compile when shard segments are not yet attached
+    /// to the manifest. New callers should prefer
+    /// [`Self::restore_search_index_shards_with_replay`] which
+    /// actually decrypts shard ciphertext and replays the row
+    /// vector into the local `search_fts` / `search_fuzzy`
+    /// tables.
     pub fn restore_search_index_shards(&self) -> Result<(), Error> {
-        // No-op today.
         Ok(())
+    }
+
+    /// Step 3 (production variant): decrypt every supplied
+    /// [`SearchIndexShard`] under its companion `K_*_index_shard`
+    /// key and replay the contained rows into the local-store
+    /// FTS5 / fuzzy tables.
+    ///
+    /// `shards` is the slice the orchestrator pulled out of the
+    /// backup manifest. Each entry pairs the wire-format shard
+    /// frame with the per-shard AEAD key (`K_text_index_shard` or
+    /// `K_fuzzy_index_shard`, derived under `K_search_root` per
+    /// `crypto::key_hierarchy::derive_*_index_shard`).
+    ///
+    /// All inserts happen inside a single
+    /// [`Connection::transaction`] so a malformed shard rolls back
+    /// every previous shard the call processed — search-index
+    /// restore is all-or-nothing per call.
+    ///
+    /// Returns the per-shard `(IndexType, row_count)` summary so
+    /// the orchestrator can log progress without opening the
+    /// transaction itself.
+    pub fn restore_search_index_shards_with_replay(
+        &self,
+        conn: &mut Connection,
+        shards: &[SealedSearchShardEntry<'_>],
+    ) -> Result<Vec<RestoredShardSummary>, Error> {
+        let mut summary = Vec::with_capacity(shards.len());
+        let tx = conn
+            .transaction()
+            .map_err(|e| Error::Storage(format!("restore_search_index_shards: begin tx: {e}")))?;
+        for entry in shards {
+            match entry.shard.index_type {
+                IndexType::Text => {
+                    let rows = restore_text_search_shard(entry.shard, entry.k_shard)?;
+                    for row in &rows {
+                        tx.execute(
+                            "INSERT INTO search_fts(
+                                message_id, conversation_id, sender_id,
+                                created_at_ms, text_content
+                             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![
+                                row.message_id,
+                                row.conversation_id,
+                                row.sender_id,
+                                row.created_at_ms,
+                                row.text_content,
+                            ],
+                        )
+                        .map_err(|e| {
+                            Error::Storage(format!(
+                                "restore_search_index_shards: insert search_fts: {e}"
+                            ))
+                        })?;
+                    }
+                    summary.push(RestoredShardSummary {
+                        index_type: IndexType::Text,
+                        rows_inserted: rows.len(),
+                    });
+                }
+                IndexType::Fuzzy => {
+                    let rows = restore_fuzzy_search_shard(entry.shard, entry.k_shard)?;
+                    for row in &rows {
+                        tx.execute(
+                            "INSERT INTO search_fuzzy(
+                                token, script, message_id
+                             ) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![row.token, row.script, row.message_id],
+                        )
+                        .map_err(|e| {
+                            Error::Storage(format!(
+                                "restore_search_index_shards: insert search_fuzzy: {e}"
+                            ))
+                        })?;
+                    }
+                    summary.push(RestoredShardSummary {
+                        index_type: IndexType::Fuzzy,
+                        rows_inserted: rows.len(),
+                    });
+                }
+                IndexType::Vector | IndexType::Media => {
+                    // Vector / media shards are wired in Phase 5.
+                    // For now, count them as 0-row entries so the
+                    // orchestrator's progress reporting still
+                    // sees them, but do not attempt decryption.
+                    summary.push(RestoredShardSummary {
+                        index_type: entry.shard.index_type,
+                        rows_inserted: 0,
+                    });
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| Error::Storage(format!("restore_search_index_shards: commit: {e}")))?;
+        Ok(summary)
     }
 
     /// Step 4: hydrate bodies for messages within `recency_window_ms`
@@ -488,5 +613,156 @@ mod tests {
             1_000_000,
         );
         assert!(res.is_err(), "expected decrypt error, got {res:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // Search-shard replay (Task 6)
+    // -------------------------------------------------------------------
+
+    fn fresh_db_unrestricted() -> LocalStoreDb {
+        // The shard-replay path inserts directly into search_fts /
+        // search_fuzzy; it does not exercise the restore-state
+        // machine. Use a brand-new in-memory DB without forcing
+        // any state transitions.
+        LocalStoreDb::open_in_memory(&[0x99; 32]).expect("open in-memory")
+    }
+
+    fn fresh_search_keys() -> (KeyMaterial, KeyMaterial) {
+        use crate::crypto::key_hierarchy::{derive_search_root, derive_text_index_shard};
+        let identity = KeyMaterial::from_bytes([0xCC; 32]);
+        let search_root = derive_search_root(&identity).unwrap();
+        let text_shard =
+            derive_text_index_shard(&search_root, &Uuid::now_v7().into_bytes()).unwrap();
+        let fuzzy_shard =
+            derive_text_index_shard(&search_root, &Uuid::now_v7().into_bytes()).unwrap();
+        (text_shard, fuzzy_shard)
+    }
+
+    fn fresh_conversation_hash_key() -> KeyMaterial {
+        KeyMaterial::from_bytes([0xDD; 32])
+    }
+
+    #[test]
+    fn restore_search_index_shards_with_replay_inserts_text_rows() {
+        use crate::search::shard_builder::{build_text_search_shard, FtsRow};
+        let mut db = fresh_db_unrestricted();
+        let (text_key, _fuzzy_key) = fresh_search_keys();
+        let conv_key = fresh_conversation_hash_key();
+
+        let mid = Uuid::now_v7().to_string();
+        let cid = Uuid::now_v7().to_string();
+        let rows = vec![FtsRow {
+            message_id: mid.clone(),
+            conversation_id: cid.clone(),
+            sender_id: "alice".into(),
+            created_at_ms: 1_700_000_000,
+            text_content: "lighthouse beacon".into(),
+        }];
+        let built =
+            build_text_search_shard(rows, &cid, "2026-04", &text_key, &conv_key).expect("build");
+
+        let entries = vec![SealedSearchShardEntry {
+            shard: &built.shard,
+            k_shard: &built.k_shard,
+        }];
+        let summary = RestorePipeline::new()
+            .restore_search_index_shards_with_replay(db.connection_mut(), &entries)
+            .expect("replay");
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].index_type, IndexType::Text);
+        assert_eq!(summary[0].rows_inserted, 1);
+
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+                rusqlite::params!["lighthouse"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn restore_search_index_shards_with_replay_inserts_fuzzy_rows() {
+        use crate::search::shard_builder::{build_fuzzy_search_shard, FuzzyRow};
+        let mut db = fresh_db_unrestricted();
+        let (_text_key, fuzzy_key) = fresh_search_keys();
+        let conv_key = fresh_conversation_hash_key();
+
+        let mid = Uuid::now_v7().to_string();
+        let rows = vec![
+            FuzzyRow {
+                token: "lig".into(),
+                script: "Latn".into(),
+                message_id: mid.clone(),
+            },
+            FuzzyRow {
+                token: "igh".into(),
+                script: "Latn".into(),
+                message_id: mid.clone(),
+            },
+        ];
+        let built = build_fuzzy_search_shard(rows, "conv-A", "2026-04", &fuzzy_key, &conv_key)
+            .expect("build");
+
+        let entries = vec![SealedSearchShardEntry {
+            shard: &built.shard,
+            k_shard: &built.k_shard,
+        }];
+        let summary = RestorePipeline::new()
+            .restore_search_index_shards_with_replay(db.connection_mut(), &entries)
+            .expect("replay");
+        assert_eq!(summary[0].index_type, IndexType::Fuzzy);
+        assert_eq!(summary[0].rows_inserted, 2);
+
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fuzzy WHERE message_id = ?1",
+                rusqlite::params![mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn restore_search_index_shards_rolls_back_on_bad_key() {
+        use crate::search::shard_builder::{build_text_search_shard, FtsRow};
+        let mut db = fresh_db_unrestricted();
+        let (text_key, _fuzzy_key) = fresh_search_keys();
+        let conv_key = fresh_conversation_hash_key();
+
+        let cid = Uuid::now_v7().to_string();
+        let rows = vec![FtsRow {
+            message_id: Uuid::now_v7().to_string(),
+            conversation_id: cid.clone(),
+            sender_id: "bob".into(),
+            created_at_ms: 1,
+            text_content: "should not commit".into(),
+        }];
+        let built =
+            build_text_search_shard(rows, &cid, "2026-04", &text_key, &conv_key).expect("build");
+        let bogus = KeyMaterial::from_bytes([0x11; 32]);
+        let entries = vec![SealedSearchShardEntry {
+            shard: &built.shard,
+            k_shard: &bogus,
+        }];
+
+        let res = RestorePipeline::new()
+            .restore_search_index_shards_with_replay(db.connection_mut(), &entries);
+        assert!(res.is_err(), "expected rollback, got {res:?}");
+
+        // No rows must have been committed.
+        let count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+                rusqlite::params!["should"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
