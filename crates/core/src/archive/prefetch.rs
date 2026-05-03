@@ -32,6 +32,28 @@ use crate::local_store::schema::StorageBackend;
 use crate::transport::TransportClient;
 use crate::Error;
 
+/// Reject any segment row whose `storage_backend` column is not
+/// [`StorageBackend::KChatBackend`]. The KChat-only prefetch
+/// entry points cannot dispatch to ZKOF (no `S3Client` is in
+/// scope), so silently routing through the KChat transport would
+/// 404 on every ZKOF row. Callers with mixed backends must use
+/// [`batch_prefetch_bucket_with_router`] instead.
+fn ensure_all_kchat_backend(rows: &[(String, String, String)]) -> Result<(), Error> {
+    for (segment_id, _, storage_backend) in rows {
+        let backend =
+            StorageBackend::from_str(storage_backend).unwrap_or(StorageBackend::KChatBackend);
+        if backend != StorageBackend::KChatBackend {
+            return Err(Error::Storage(format!(
+                "batch_prefetch_bucket: segment {segment_id} uses storage_backend \
+                 '{storage_backend}'; the legacy KChat-only entry point cannot route \
+                 it. Use batch_prefetch_bucket_with_router with an ArchiveSegmentRouter \
+                 built via ArchiveSegmentRouter::with_zkof(...)."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Encrypted archive segment payload, paired with the metadata
 /// the orchestration layer needs to decrypt and merge it.
 ///
@@ -96,16 +118,14 @@ pub fn batch_prefetch_bucket(
         materialised.push((segment_id, blob_id, storage_backend));
     }
 
+    // KChat-only entry: surface ZKOF rows as a structured error
+    // so callers know to upgrade to the router-aware variant
+    // instead of silently 404-ing.
+    ensure_all_kchat_backend(&materialised)?;
+
     let mut out = Vec::with_capacity(materialised.len());
     for (segment_id, blob_id, storage_backend) in materialised {
-        // Phase 4 (Task 8): row-level backend routing. Rows
-        // without a known `storage_backend` value (e.g. legacy
-        // pre-PR #28 rows that pre-dated the column default
-        // backfill) fall back to the KChat backend.
-        let backend =
-            StorageBackend::from_str(&storage_backend).unwrap_or(StorageBackend::KChatBackend);
-        let router = ArchiveSegmentRouter::kchat_only(transport);
-        let ciphertext = router.fetch(backend, &segment_id)?;
+        let ciphertext = transport.fetch_archive_segment(&segment_id)?;
         out.push(PrefetchedSegment {
             segment_id,
             blob_id,
@@ -213,11 +233,17 @@ pub fn batch_prefetch_bucket_with_padding(
 
     let mut real_rows: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    let mut backend_check: Vec<(String, String, String)> = Vec::new();
     for row in rows {
         let (segment_id, blob_id, storage_backend) =
             row.map_err(|e| Error::Storage(e.to_string()))?;
+        backend_check.push((segment_id.clone(), blob_id.clone(), storage_backend.clone()));
         real_rows.insert(segment_id, (blob_id, storage_backend));
     }
+    // KChat-only entry: surface ZKOF rows as a structured error
+    // so callers know to upgrade to the router-aware variant
+    // instead of silently 404-ing.
+    ensure_all_kchat_backend(&backend_check)?;
 
     // 2) Compute how many dummies to mint and shuffle them in
     //    with the real ids.
@@ -697,5 +723,71 @@ mod tests {
             s3.get_calls(),
             vec![("bucket-A".to_string(), "archive/segments/seg-Z".to_string())]
         );
+    }
+
+    #[test]
+    fn batch_prefetch_bucket_errors_explicitly_on_zkof_rows() {
+        // The legacy KChat-only entry point cannot route ZKOF
+        // rows (no S3Client in scope). It must surface a
+        // structured `Error::Storage` pointing the caller at
+        // `_with_router` rather than silently 404-ing through
+        // `transport.fetch_archive_segment`.
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2026-04";
+        seed_segment_map_row(&db, "seg-K", &conv.to_string(), bucket, "blob-K");
+        seed_zkof_segment_row(&db, "seg-Z", &conv.to_string(), bucket, "blob-Z");
+
+        let transport = FixtureTransport::default();
+        transport.install("seg-K", vec![0xAA; 8]);
+
+        let err = batch_prefetch_bucket(db.connection(), &transport, conv, bucket).unwrap_err();
+        match err {
+            Error::Storage(msg) => {
+                assert!(msg.contains("seg-Z"), "got: {msg}");
+                assert!(msg.contains("zk_object_fabric"), "got: {msg}");
+                assert!(
+                    msg.contains("batch_prefetch_bucket_with_router"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+        // The transport must NOT have been called for any row —
+        // the validator runs before the fetch loop, so we don't
+        // even start a doomed KChat fetch on the seg-K row.
+        assert!(transport.calls().is_empty());
+    }
+
+    #[test]
+    fn batch_prefetch_bucket_with_padding_high_privacy_errors_on_zkof_rows() {
+        // Same guard for the High-privacy padded variant: the
+        // hot path inside `batch_prefetch_bucket_with_padding`
+        // calls `transport.fetch_archive_segment` directly, so
+        // a ZKOF row would silently 404. Validate up front.
+        let db = LocalStoreDb::open_in_memory(&[0; 32]).unwrap();
+        let conv = Uuid::now_v7();
+        let bucket = "2026-04";
+        seed_segment_map_row(&db, "seg-K", &conv.to_string(), bucket, "blob-K");
+        seed_zkof_segment_row(&db, "seg-Z", &conv.to_string(), bucket, "blob-Z");
+
+        let transport = FixtureTransport::default();
+        let config = fresh_config(crate::config::PrivacyLevel::High);
+
+        let err =
+            batch_prefetch_bucket_with_padding(&config, db.connection(), &transport, conv, bucket)
+                .unwrap_err();
+        match err {
+            Error::Storage(msg) => {
+                assert!(msg.contains("zk_object_fabric"), "got: {msg}");
+                assert!(
+                    msg.contains("batch_prefetch_bucket_with_router"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+        // Validator must run before any padded fetch loop.
+        assert!(transport.calls().is_empty());
     }
 }
