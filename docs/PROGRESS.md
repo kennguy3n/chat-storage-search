@@ -666,6 +666,32 @@ Checklist:
 - [ ] Lazy media rehydration on tap.
 - [ ] Prefetch window (viewport ± 100–150 messages).
 - [ ] Hydration priority queue (P0–P5).
+- [ ] Epoch-rotated archive key derivation: `K_archive_root` →
+      `K_archive_epoch(epoch_id)` → `K_archive_segment` /
+      `K_archive_manifest`. HKDF info =
+      `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
+      cadence: monthly (matching `time_bucket`).
+- [ ] Epoch key lifecycle: current epoch key in memory; prior
+      epoch keys wrapped under `K_archive_root` and recorded in
+      the archive manifest chain. Optional epoch-key deletion
+      for forward secrecy.
+- [ ] Epoch key derivation test vectors (Rust): deterministic
+      derivation, epoch rotation, wrapped-key round-trip,
+      cross-epoch segment decrypt after manifest-chain unwrap.
+- [ ] ZK Object Fabric as optional archive backend: S3-compatible
+      transport adapter for archive segment upload / download /
+      manifest storage. Configured via `archive_backend = "zkof"`
+      + ZKOF tenant credentials.
+- [ ] Archive backend routing: transport client routes archive
+      operations to KChat backend or ZKOF based on configuration.
+      Manifest index stored as a well-known S3 key when using ZKOF.
+- [ ] Batch-by-bucket prefetch: on any archive segment miss, fetch
+      all segments for the `(conversation_id, time_bucket)` pair.
+      Reduces per-segment access-pattern metadata to per-bucket
+      granularity.
+- [ ] Dummy request padding (optional, off by default): mix real
+      rehydration fetches with dummy fetches to random segment IDs.
+      Enabled via `privacy_level = "high"`.
 
 **Decision gate**: Messages and media offload + rehydrate
 transparently; storage budget is enforced; timeline renders
@@ -740,6 +766,10 @@ Checklist:
 - [ ] Mixed-language query handling.
 - [ ] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
+- [ ] Batch shard prefetch by time bucket: when fetching encrypted
+      index shards, fetch all shard types for the target
+      `(conversation_hash, bucket)` in one batch to coarsen the
+      metadata signal on the shard-listing endpoint.
 
 **Decision gate**: Fuzzy search returns relevant hits across all
 target scripts, including mixed-script queries. Cold (offloaded)

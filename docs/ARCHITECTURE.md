@@ -45,7 +45,7 @@ flowchart TD
 
     subgraph External["External Services"]
         BE["KChat Backend<br/>(PostgreSQL, MLS distribution)"]
-        ZKOF["ZK Object Fabric<br/>(S3 API, optional backup)"]
+        ZKOF["ZK Object Fabric<br/>(S3 API, optional backup + archive)"]
         Platform["Platform Services<br/>(Keychain / Keystore,<br/>BGTaskScheduler / WorkManager,<br/>Vision / ML Kit, iCloud,<br/>Auto Backup / SAF)"]
     end
 
@@ -464,13 +464,13 @@ data flow, not request flow.
 flowchart LR
     Local["Local Store<br/>(device, SQLCipher)"]
     Delivery["Delivery Store<br/>(KChat backend, MLS fanout)"]
-    Archive["Personal Archive<br/>(KChat backend, encrypted segments)"]
+    Archive["Personal Archive<br/>(KChat backend or ZK Object Fabric)"]
     Backup["Backup Vault<br/>(iCloud / Android backup / ZK Object Fabric)"]
 
     Delivery -->|"ingest plaintext (post-MLS-decrypt)"| Local
     Local -->|"send (pre-MLS-encrypt)"| Delivery
-    Local -->|"offload"| Archive
-    Archive -->|"rehydrate on scroll-back / search hit"| Local
+    Local -->|"offload (batch-by-bucket)"| Archive
+    Archive -->|"rehydrate on scroll-back / search hit<br/>(batch-by-bucket prefetch)"| Local
     Local -->|"incremental backup"| Backup
     Backup -->|"restore"| Local
 ```
@@ -708,6 +708,7 @@ it serves AEAD-sealed bytes against typed key handles.
 flowchart TD
     UM["K_user_master"]
     AR["K_archive_root"]
+    AE["K_archive_epoch(epoch_id)"]
     BR["K_backup_root"]
     SR["K_search_root"]
     PR["K_profile_private_data"]
@@ -724,8 +725,9 @@ flowchart TD
     UM --> BR
     UM --> SR
     UM --> PR
-    AR --> AS
-    AR --> AM
+    AR --> AE
+    AE --> AS
+    AE --> AM
     BR --> BS
     BR --> BM
     SR --> TS
@@ -799,20 +801,27 @@ sequenceDiagram
     participant Cr as "crypto"
     participant Tr as "transport"
     participant BE as "KChat backend"
+    participant ZKOF as "ZK Object Fabric"
 
     Core->>Core: "read archive event journal since cursor"
     Core->>Core: "group by (conversation_id, time_bucket)"
     Core->>Core: "build CBOR payload, zstd compress"
-    Core->>Cr: "AEAD seal with K_archive_segment"
+    Core->>Cr: "AEAD seal with K_archive_segment<br/>(derived from K_archive_epoch)"
     Cr-->>Core: "ciphertext + Merkle root"
-    Core->>Tr: "blob init (chunked upload)"
-    Tr->>BE: "POST /v1/blobs/init"
-    BE-->>Tr: "blob_id"
-    Core->>Tr: "upload chunks"
-    Tr->>BE: "PUT /v1/blobs/{blob_id}/chunks/{idx}"
-    Core->>Tr: "commit blob"
-    Tr->>BE: "POST /v1/blobs/{blob_id}/commit"
-    BE-->>Tr: "merkle_root"
+    alt "archive_backend = kchat"
+        Core->>Tr: "blob init (chunked upload)"
+        Tr->>BE: "POST /v1/blobs/init"
+        BE-->>Tr: "blob_id"
+        Core->>Tr: "upload chunks"
+        Tr->>BE: "PUT /v1/blobs/{blob_id}/chunks/{idx}"
+        Core->>Tr: "commit blob"
+        Tr->>BE: "POST /v1/blobs/{blob_id}/commit"
+        BE-->>Tr: "merkle_root"
+    else "archive_backend = zkof"
+        Core->>Tr: "S3 PutObject (multipart)"
+        Tr->>ZKOF: "S3 PutObject (multipart)"
+        ZKOF-->>Tr: "ETag + Merkle root"
+    end
     Core->>Core: "verify backend Merkle root == local"
     Core->>Cr: "build & seal manifest gen N+1"
     Cr-->>Core: "manifest ciphertext"
@@ -853,11 +862,18 @@ sequenceDiagram
     alt "body local"
         Core-->>UI: "render plaintext"
     else "body cold"
-        Core->>Tr: "fetch archive segment by segment_id"
-        Tr->>BE: "GET /v1/archive/segments/{segment_id}"
-        BE-->>Tr: "encrypted segment chunks"
+        alt "archive_backend = kchat"
+            Core->>Tr: "batch-fetch all segments for (conversation_id, time_bucket)"
+            Tr->>BE: "GET /v1/archive/segments/{segment_id} (batch)"
+            BE-->>Tr: "encrypted segment chunks"
+        else "archive_backend = zkof"
+            Core->>Tr: "batch-fetch all segments for (conversation_id, time_bucket)"
+            Tr->>BE: "S3 GetObject by segment key (batch)"
+            BE-->>Tr: "encrypted segment chunks"
+        end
+        Note over Core,Tr: "if privacy_level = high,<br/>mix in dummy fetches to random segment_ids"
         Core->>Core: "verify per-chunk SHA-256 + Merkle root"
-        Core->>Core: "AEAD decrypt with K_archive_segment"
+        Core->>Core: "AEAD decrypt with K_archive_segment<br/>(derived from K_archive_epoch)"
         Core->>DB: "update body in place"
         Core-->>UI: "render plaintext (no scroll jump)"
     end
@@ -875,6 +891,12 @@ flowchart LR
     Win --> Q
     Q --> NetIO["chunk fetch + decrypt"]
 ```
+
+Prefetch granularity is **per time bucket**: when any segment in a
+`(conversation_id, time_bucket)` is needed, all segments for that
+pair are fetched. This aligns the prefetch unit with the archive
+segment grouping and reduces per-segment access-pattern metadata
+to per-bucket granularity (see PROPOSAL.md §5.6).
 
 ---
 
