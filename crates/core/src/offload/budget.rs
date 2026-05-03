@@ -246,9 +246,14 @@ pub fn collect_storage_usage(conn: &Connection) -> Result<StorageUsage, Error> {
         conn,
         "SELECT COALESCE(SUM(LENGTH(text_content)), 0) FROM search_fts",
     )?;
+    // Per-row overhead: ~8 bytes covers the script + offset
+    // columns; the previous form `SUM(LENGTH(token)) + 8` added the
+    // overhead exactly once instead of per row, so a million-row
+    // index undercounted by ~8MB. The `LENGTH(token) + 8` lives
+    // inside `SUM(...)` to scale with row count.
     let fuzzy_bytes = scalar_u64(
         conn,
-        "SELECT COALESCE(SUM(LENGTH(token)) + 8, 0) FROM search_fuzzy",
+        "SELECT COALESCE(SUM(LENGTH(token) + 8), 0) FROM search_fuzzy",
     )?;
     let vector_bytes = scalar_u64(
         conn,
@@ -410,5 +415,38 @@ mod tests {
         // (the per-row 256-byte estimate only applies to existing
         // rows).
         assert_eq!(usage.message_bytes, 0);
+    }
+
+    #[test]
+    fn fuzzy_overhead_scales_per_row() {
+        // Bug guard: the previous SQL `SUM(LENGTH(token)) + 8`
+        // added the 8-byte per-row overhead exactly once. With
+        // four rows that meant `index_bytes` undercounted by
+        // 3 × 8 = 24 bytes. The corrected `SUM(LENGTH(token) + 8)`
+        // scales with row count, so this test enforces the linear
+        // relationship: deleting half the rows must drop
+        // `index_bytes` by `(token_len + 8) × removed_rows`.
+        let db = crate::local_store::db::LocalStoreDb::open_in_memory(&[0x42; 32]).unwrap();
+        let conn = db.connection();
+        for token in ["aaa", "bbb", "ccc", "ddd"] {
+            conn.execute(
+                "INSERT INTO search_fuzzy(token, script, message_id) VALUES (?1, 'Latn', ?2)",
+                rusqlite::params![token, format!("msg-{token}")],
+            )
+            .unwrap();
+        }
+        let four = collect_storage_usage(conn).unwrap().index_bytes;
+        // 4 rows × (3-byte token + 8-byte overhead) = 44.
+        assert_eq!(four, 44);
+
+        conn.execute("DELETE FROM search_fuzzy WHERE token IN ('aaa', 'bbb')", [])
+            .unwrap();
+        let two = collect_storage_usage(conn).unwrap().index_bytes;
+        // 2 rows × (3-byte token + 8-byte overhead) = 22.
+        assert_eq!(two, 22);
+        // The drop must equal the per-row overhead × removed
+        // rows. With the buggy formula the drop would be 6
+        // (token-length only).
+        assert_eq!(four - two, 22);
     }
 }

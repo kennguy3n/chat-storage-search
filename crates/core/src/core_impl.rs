@@ -51,6 +51,7 @@ use crate::message::processor::{
 };
 use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
 use crate::offload::eviction::{execute_eviction, plan_eviction};
+use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::query_engine::QueryEngine;
 use crate::transport::{DeliveryClient, RawDeliveryMessage};
 use crate::{
@@ -532,8 +533,11 @@ impl KChatCore for CoreImpl {
             db.insert_message_skeleton(&skel)
                 .map_err(|e| Error::Storage(e.to_string()))?;
 
-            // Caption (if any) is persisted as the message body so
-            // the existing search / edit paths see it.
+            // Caption (if any) is persisted as the message body and
+            // mirrored into the FTS / fuzzy indexes so it shows up
+            // in `core.search()` results — same shape as the
+            // `send_text` path's `MessagePersister::persist_outbox_entry_inner`
+            // (see `crates/core/src/message/processor.rs:478-486`).
             if let Some(caption) = caption {
                 let body = MessageBody {
                     message_id: skel.message_id.clone(),
@@ -542,6 +546,23 @@ impl KChatCore for CoreImpl {
                     rich_meta: None,
                 };
                 db.insert_message_body(&body)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                conn.execute(
+                    "INSERT INTO search_fts(
+                        message_id, conversation_id, sender_id,
+                        created_at_ms, text_content
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        skel.message_id,
+                        skel.conversation_id,
+                        skel.sender_id,
+                        skel.created_at_ms,
+                        caption,
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+                FuzzySearchEngine::new(&db)
+                    .index_message(&skel.message_id, caption)
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
 
@@ -566,6 +587,17 @@ impl KChatCore for CoreImpl {
             };
             db.insert_media_asset(&asset)
                 .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Bump the owning conversation's last_message_id /
+            // last_activity_ms so list_conversations surfaces the
+            // freshly-sent media message at the top. Mirrors
+            // `MessagePersister::persist_outbox_entry_inner`.
+            db.update_conversation_last_message(
+                &skel.conversation_id,
+                &skel.message_id,
+                skel.created_at_ms,
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
             Ok(SendMediaResult {
                 client_message_id: ClientMessageId(message_id),
@@ -1044,6 +1076,63 @@ mod tests {
             .send_media(conv, Uuid::now_v7(), Vec::new(), "image/png", None)
             .unwrap_err();
         assert!(matches!(err, Error::Message(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn send_media_caption_is_searchable() {
+        // Bug guard: the caption MUST land in `search_fts` /
+        // `search_fuzzy` so `core.search()` returns the media
+        // message. Without the FTS / fuzzy index path inside the
+        // SAVEPOINT this returns 0 hits.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        core.send_media(
+            conv,
+            mid,
+            fake_image_bytes(),
+            "image/png",
+            Some("kayaking trip with grandparents"),
+        )
+        .expect("send_media");
+
+        let q = SearchQuery {
+            query_string: "kayaking".to_string(),
+            ..SearchQuery::default()
+        };
+        let hits = core.search(q, SearchScope::LocalOnly).expect("search");
+        assert_eq!(hits.len(), 1, "caption FTS row missing? hits={hits:?}");
+        assert_eq!(hits[0].message_id, mid);
+    }
+
+    #[test]
+    fn send_media_bumps_conversation_last_activity() {
+        // Bug guard: the conversation list ranks by
+        // `last_activity_ms`. If `send_media` skips
+        // `update_conversation_last_message`, the conversation
+        // stays at `last_activity_ms = 1` (the seed value) and the
+        // freshly-sent media message never appears at the top.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mid = Uuid::now_v7();
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        let convs = core.list_conversations().expect("list");
+        let row = convs
+            .into_iter()
+            .find(|c| c.conversation_id == conv.to_string())
+            .expect("seeded conversation");
+        assert_eq!(
+            row.last_message_id.as_deref(),
+            Some(mid.to_string().as_str())
+        );
+        // seed value was 1; the persister's now_ms() is wall-clock,
+        // so anything strictly greater than the seed is correct.
+        assert!(row.last_activity_ms > 1, "last_activity_ms not bumped");
     }
 
     // ----------------------------------------------------------------
