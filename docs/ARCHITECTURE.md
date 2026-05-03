@@ -1213,6 +1213,7 @@ sequenceDiagram
 | Background work            | `BGTaskScheduler` (`BGProcessingTask` for backup / archive / index maintenance)                              |
 | OCR                        | `VNRecognizeTextRequest` (multilingual; 18+ languages supported in current iOS)                              |
 | ML inference               | Core ML (preferred) or ONNX Runtime CoreML EP                                                                |
+| Audio transcription        | Apple MLX (`mlx-community/whisper-base-mlx`, preferred on Apple Silicon — routes to the Neural Engine) or ONNX Runtime fallback |
 | Model warm-up              | XLM-R session created in `BGProcessingTask` during first idle after launch                                   |
 | iCloud backup              | App's iCloud container file storage for encrypted backup files                                               |
 | Audio session              | Foreground for live recording; background-friendly transcription via Whisper-tiny / Whisper-base             |
@@ -1240,6 +1241,7 @@ sequenceDiagram
 | Background work            | `NSBackgroundActivityScheduler` + cooperative scheduler                                                      |
 | OCR                        | `VNRecognizeTextRequest` (Vision)                                                                            |
 | ML inference               | Core ML or ONNX Runtime CoreML EP                                                                            |
+| Audio transcription        | Apple MLX (`mlx-community/whisper-base-mlx`, preferred on Apple Silicon — routes to the Neural Engine); ONNX Runtime CPU EP fallback on Intel Macs |
 | Model warm-up              | XLM-R session created eagerly at startup; kept resident                                                      |
 | Search integration         | Optional Spotlight integration for app-internal search anchors                                               |
 

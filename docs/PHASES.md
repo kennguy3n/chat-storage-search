@@ -352,9 +352,13 @@ Checklist:
 - [ ] `MobileCLIP-S2` integration for image search (multilingual
       text→image, ~80 MB INT8 ONNX).
 - [ ] Video keyframe sampling and `MobileCLIP-S2` embeddings.
-- [ ] Whisper multilingual integration for voice-message transcription
-      (`whisper-base` default, ~140 MB; `whisper-tiny` on low-end
-      Android, ~75 MB).
+- [ ] Whisper multilingual integration for voice-message transcription:
+      Apple MLX (`mlx-community/whisper-base-mlx`) on Apple Silicon
+      (preferred — Neural Engine, lower latency / battery cost);
+      ONNX Runtime (`whisper-base` ~140 MB INT8, INT4 not supported
+      for audio transcription) on all other platforms (Intel macOS,
+      Windows, Android, Linux); `whisper-tiny` (~75 MB) on low-end
+      Android. See PROPOSAL §7.6 / §7.7.
 - [ ] Platform OCR bridge: Vision (`VNRecognizeTextRequest`) on
       iOS / macOS; ML Kit Text Recognition v2 on Android;
       `Windows.Media.Ocr` / Tesseract on Windows.

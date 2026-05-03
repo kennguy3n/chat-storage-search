@@ -825,12 +825,12 @@ older or larger conversations from search, which contradicts the
 
 ### 7.6 On-device ML models (multilingual)
 
-| Model                          | Purpose                     | Size (INT8 ONNX) | Size (INT4 ONNX) | Languages            | Platform                        |
-| ------------------------------ | --------------------------- | ---------------- | ---------------- | -------------------- | ------------------------------- |
-| `XLM-R`                        | Text embeddings             | ~80–100 MB       | ~40–50 MB        | 100+                 | All (CPU)                       |
-| `MobileCLIP-S2`                | Image / video embeddings    | ~80 MB           | ~40 MB           | language-agnostic    | All (CPU)                       |
-| `Whisper-base` (multilingual)  | Audio transcription         | ~140 MB          | n/a              | 99                   | All (CPU)                       |
-| `Whisper-tiny` (multilingual)  | Low-end audio transcription | ~75 MB           | n/a              | 99                   | All (CPU); low-end Android default |
+| Model                          | Purpose                     | Size (INT8 ONNX) | Size (INT4 ONNX) | Apple MLX                        | Languages            | Platform                                                          |
+| ------------------------------ | --------------------------- | ---------------- | ---------------- | -------------------------------- | -------------------- | ----------------------------------------------------------------- |
+| `XLM-R`                        | Text embeddings             | ~80–100 MB       | ~40–50 MB        | (ONNX only)                      | 100+                 | All (CPU)                                                         |
+| `MobileCLIP-S2`                | Image / video embeddings    | ~80 MB           | ~40 MB           | (ONNX only)                      | language-agnostic    | All (CPU)                                                         |
+| `Whisper-base` (multilingual)  | Audio transcription         | ~140 MB          | n/a              | `mlx-community/whisper-base-mlx` | 99                   | iOS / macOS (Apple Silicon): MLX (preferred); All others: ONNX (fallback) |
+| `Whisper-tiny` (multilingual)  | Low-end audio transcription | ~75 MB           | n/a              | (ONNX only)                      | 99                   | All (CPU); low-end Android default                                |
 
 `XLM-R` is the same encoder used by the guardrail system
 (`kennguy3n/slm-guardrail`). Standardizing on it here unifies the
@@ -922,10 +922,23 @@ database is open).
 
 | Platform | Inference                                      | OCR                                | Notes                                                          |
 | -------- | ---------------------------------------------- | ---------------------------------- | -------------------------------------------------------------- |
-| iOS      | Core ML (preferred) or ONNX Runtime CoreML EP  | `VNRecognizeTextRequest` (Vision)  | Background inference under BGTaskScheduler. INT4 supported via ONNX Runtime CoreML EP for embedding models on devices with tight storage. |
+| iOS      | MLX (preferred for Whisper) or Core ML or ONNX Runtime CoreML EP | `VNRecognizeTextRequest` (Vision)  | Background inference under BGTaskScheduler. INT4 supported via ONNX Runtime CoreML EP for embedding models on devices with tight storage. |
 | Android  | ONNX Runtime NNAPI EP, fallback to CPU EP      | ML Kit Text Recognition v2         | WorkManager job constrained on battery + thermal + network. INT4 default for embeddings on low-end Android (tight storage budget); INT8 on flagship. |
-| macOS    | Core ML or ONNX Runtime CoreML EP              | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
+| macOS    | MLX (preferred for Whisper) or Core ML or ONNX Runtime CoreML EP | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
 | Windows  | ONNX Runtime DirectML EP (preferred) or CPU EP (fallback) | Multilingual OCR via Tesseract / Windows.Media.Ocr | DirectML EP for GPU-equipped machines; CPU EP fallback for CPU-only laptops; INT8/INT4 (`MatMulNBits`) quantized models essential. INT4 is the default on Windows tablets / low-storage SKUs. |
+
+> On Apple Silicon, `Whisper-base` runs via Apple MLX
+> ([`mlx-community/whisper-base-mlx`](https://huggingface.co/mlx-community/whisper-base-mlx)),
+> which routes to the Neural Engine for significantly lower
+> latency and battery cost than ONNX Runtime CPU EP. ONNX Runtime
+> CPU EP remains the fallback on non-Apple-Silicon Macs (Intel
+> hardware) and on all other platforms (Android, Windows, Linux).
+> The runtime selection is implemented in
+> `crates/core/src/models/whisper.rs` as a pure
+> [`select_whisper_backend`] state machine (mirrors the
+> DirectML → CPU pattern from
+> [`crate::models::embeddings_onnx`]) so the routing logic is
+> exhaustively unit-tested on any host.
 
 #### 7.7.1 Model warm-up strategy
 
