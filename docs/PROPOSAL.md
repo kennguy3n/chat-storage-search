@@ -33,8 +33,10 @@ KChat.
 - **Local encrypted storage**: SQLCipher database, encrypted file
   cache for media originals and thumbnails.
 - **Personal archive** stored as encrypted segments on KChat's
-  PostgreSQL backend (the backend is untrusted; segments are
-  AEAD-sealed on-device).
+  PostgreSQL backend or, when configured, on ZK Object Fabric
+  (S3 API). Both backends are untrusted; segments are AEAD-sealed
+  on-device. The archive backend is selected per-deployment via
+  `archive_backend` configuration.
 - **Incremental backup** to platform sinks: iCloud, Android Auto
   Backup, Android Large Backup, Storage Access Framework, and ZK
   Object Fabric (S3 API, Pattern C convergent encryption).
@@ -80,9 +82,9 @@ KChat.
   media keys, and backup keys never leave the device.
 - **Four-store architecture**: Local store (interactive, on-device),
   Delivery store (interactive, MLS fanout on the backend), Personal
-  archive (interactive cold store on the backend), Backup vault
-  (non-interactive disaster recovery to iCloud / Android backup / ZK
-  Object Fabric).
+  archive (interactive cold store on the KChat backend or ZK Object
+  Fabric), Backup vault (non-interactive disaster recovery to iCloud /
+  Android backup / ZK Object Fabric).
 - **Multilingual from day one**: ICU-based tokenization, multilingual
   embedding models, script-aware fuzzy matching. The design rejects
   any choice that quietly assumes English-only input.
@@ -130,8 +132,9 @@ KChat.
 Account recovery material
   └── K_user_master                   (256-bit; root of derivation)
         ├── K_archive_root
-        │     ├── K_archive_segment(segment_id)
-        │     └── K_archive_manifest(manifest_id)
+        │     └── K_archive_epoch(epoch_id)        ← NEW: epoch-rotated
+        │           ├── K_archive_segment(segment_id)
+        │           └── K_archive_manifest(manifest_id)
         ├── K_backup_root
         │     ├── K_backup_segment(segment_id)
         │     └── K_backup_manifest(manifest_id)
@@ -151,15 +154,26 @@ Per media object
   K_asset = random 256-bit key
     ├── delivered inside the MLS-protected application message
     ├── stored locally wrapped by K_local_db
-    ├── archived wrapped by K_archive_root
+    ├── archived wrapped by K_archive_epoch (current epoch)
     └── backed up wrapped by K_backup_root
 ```
 
 All sub-keys are derived with HKDF-SHA256 from the parent key using
 labelled `info` strings (`"kchat-archive-root-v1"`,
+`"kchat-archive-epoch-v1" || epoch_id`,
 `"kchat-search-root-v1"`, `"kchat-backup-segment-v1" || segment_id`,
 etc.). Versioned info strings let us rotate a derivation path
 without colliding with deployed manifests.
+
+Archive epoch rotation: `K_archive_epoch(epoch_id)` is derived from
+`K_archive_root` with `info = "kchat-archive-epoch-v1" || epoch_id`.
+The default epoch cadence is monthly, matching the archive
+`time_bucket` granularity. The current epoch key is held in memory;
+prior epoch keys are wrapped under `K_archive_root` and recorded in
+the archive manifest chain so that restore can unwrap any historical
+epoch. An operator or user may optionally delete old epoch keys from
+the device to achieve forward secrecy at the cost of losing
+scroll-back into those epochs.
 
 ### 2.2 Platform key storage
 
@@ -372,7 +386,7 @@ on restore.
 | ---------------------- | ------------------------------------------------------------------------ |
 | `message_delta`        | New / edited / deleted message bodies for a conversation + time bucket   |
 | `timeline_skeleton`    | Compact `message_skeleton` rows for scroll-back rendering                |
-| `media_key_delta`      | New `K_asset` wraps under `K_archive_root` for offloaded media           |
+| `media_key_delta`      | New `K_asset` wraps under `K_archive_epoch` (current epoch) for offloaded media |
 | `search_text_index`    | Encrypted FTS / fuzzy index shards keyed by conversation + bucket        |
 | `search_vector_index`  | Encrypted HNSW shard fragments keyed by conversation + bucket            |
 | `media_index`          | OCR / transcript / caption rows for media in this bucket                 |
@@ -385,7 +399,7 @@ on restore.
 3. Build a per-segment CBOR payload per segment type.
 4. zstd-compress.
 5. AEAD-seal with `K_archive_segment(segment_id)` derived from
-   `K_archive_root`.
+   `K_archive_epoch(epoch_id)` for the current epoch.
 6. Upload the ciphertext as a chunked encrypted blob via the
    transport client (§10).
 7. Verify the returned Merkle root matches the one we computed
@@ -482,6 +496,29 @@ Hydration priority queue:
 | P3       | Adjacent prefetch (within ± 100–150 messages)              |
 | P4       | Background restore (after fresh restore, behind P0–P3)     |
 | P5       | Opportunistic cache fill (idle + charging + Wi-Fi)         |
+
+### 5.6 Access-pattern privacy
+
+Two mechanisms reduce the metadata the archive backend learns from
+rehydration traffic:
+
+**Batch-by-bucket prefetch.** When any segment in a
+`(conversation_id, time_bucket)` pair is needed, the client fetches
+*all* segments for that pair in a single batch. This coarsens the
+metadata signal from "user accessed message #47291 at 14:03:22" to
+"user accessed April 2026 for conversation X". The batch aligns
+with the existing per-conversation, per-time-bucket segment
+grouping (§5.2) so no additional server-side indexing is required.
+Batch prefetch also improves UX by reducing round-trips on
+continued scroll.
+
+**Dummy request padding (optional).** When `privacy_level = "high"`,
+the client mixes real rehydration fetches with dummy fetches to
+random segment IDs. The backend returns ciphertext the client
+discards. This raises the cost of timing correlation for a
+sophisticated adversary. Dummy padding is off by default
+(`privacy_level = "standard"`) because it increases bandwidth
+consumption.
 
 ---
 
@@ -612,6 +649,13 @@ The first leaks user intent (the literal search term) to the
 backend. The second leaks only coarse shard-access metadata —
 which conversation hash and which time bucket the user is browsing
 — and is unavoidable in a system where indexes can be offloaded.
+
+When fetching encrypted index shards, the client SHOULD fetch all
+shard types for the target `(conversation_hash, bucket)` in a single
+batch rather than issuing per-type requests. This coarsens the
+metadata signal from "user searched text in April 2026 for
+conversation X" to "user accessed April 2026 shards for
+conversation X".
 
 ### 7.2 Search content types
 
@@ -915,6 +959,24 @@ The transport client is responsible for:
   only `POST /v1/backup/manifests` and the corresponding fetch are
   KChat-hosted; alternative sinks bypass these endpoints.
 
+### 10.1 Archive backend routing
+
+When `archive_backend` is set to `"zkof"`, archive segment upload,
+download, and manifest storage route to the ZK Object Fabric S3 API
+instead of the KChat backend's `/v1/blobs/*` and `/v1/archive/*`
+endpoints. The mapping is:
+
+| KChat backend endpoint                          | ZKOF equivalent                                      |
+| ----------------------------------------------- | ---------------------------------------------------- |
+| `POST /v1/blobs/init` + chunk upload + commit   | S3 `PutObject` (multipart upload for large segments)  |
+| `GET /v1/archive/segments/{segment_id}`         | S3 `GetObject` by segment key                         |
+| `GET /v1/archive/manifests?after_generation=...` | S3 `GetObject` on a well-known manifest-index key    |
+| `GET /v1/archive/index-shards?...`              | S3 `GetObject` by shard key                           |
+
+The transport client selects the backend at initialization based on
+configuration. Both backends receive identical ciphertext; the
+crypto layer is unaware of the routing decision.
+
 ---
 
 ## 11. Background Processing
@@ -1032,4 +1094,6 @@ is *include cold*, with a small ranking penalty per §7.5.
 | Archive segment loss on backend                                   | Whole-object Merkle root verification; re-archive from local if the segment is still on-device; surface the loss to the user when neither side has it.                                  |
 | Platform backup size limits (Android Auto Backup 25 MB)           | Auto Backup carries only recovery envelopes + manifest pointers; full data goes to Large Backup, SAF, or ZK Object Fabric.                                                              |
 | ZK Object Fabric Pattern C interop drift                          | Cross-language test vectors locked in Phase 0; Rust implementation diff-tested against the Go SDK on every release.                                                                     |
+| Access-pattern metadata leakage on rehydration                    | Batch-by-bucket prefetch coarsens the signal to per-bucket granularity; optional dummy request padding (`privacy_level = "high"`) further obscures access patterns. See §5.6.          |
+| Archive key compromise exposes full history                       | Epoch-rotated archive keys (`K_archive_epoch`) limit the blast radius to the current epoch + any prior epochs whose wrapped keys the attacker can unwrap. Optional epoch-key deletion provides forward secrecy at the cost of scroll-back depth. See §2.1. |
 | FFI panic propagation                                             | Rust core never `panic!`s across the boundary; all errors surface as typed `Result` variants; UniFFI / JNI wrappers translate to platform exceptions / `Error` enums.                   |

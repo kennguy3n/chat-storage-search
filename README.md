@@ -469,6 +469,16 @@ happen **on-device**. Any architectural change that would shift
 plaintext or derived plaintext (tokens, embeddings, OCR text) onto
 the backend is a privacy regression and is rejected.
 
+To further reduce metadata leakage, the archive rehydration path
+uses **batch-by-bucket prefetch**: when any segment in a
+`(conversation_id, time_bucket)` is needed, all segments for that
+pair are fetched, coarsening the access-pattern signal. An optional
+**dummy request padding** mode (`privacy_level = "high"`) mixes
+real fetches with decoy requests. Archive keys are
+**epoch-rotated** (`K_archive_epoch`) so that a key compromise
+limits the blast radius to the current epoch rather than the full
+history. See [docs/PROPOSAL.md §2.1 and §5.6](docs/PROPOSAL.md).
+
 ## Four-store model
 
 KChat persistence is split into four logically distinct stores. The
@@ -480,7 +490,7 @@ wiped device can return to the steady state of the first three.
 | ------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------- | ------------ |
 | Local store        | Fast UX, search, timeline, thumbnails                  | Device (SQLCipher + encrypted files)                                    | Yes          |
 | Delivery store     | MLS message fanout and short-term retention            | KChat backend (PostgreSQL)                                              | Yes          |
-| Personal archive   | Scroll-back, lazy rehydration, storage offload         | KChat backend (PostgreSQL encrypted blobs)                              | Yes          |
+| Personal archive   | Scroll-back, lazy rehydration, storage offload         | KChat backend (PostgreSQL encrypted blobs) or ZK Object Fabric (S3 API) | Yes          |
 | Backup vault       | Disaster recovery / new-device restore                 | iCloud / Android backup / KChat encrypted backup (ZK Object Fabric)     | No           |
 
 The four-store split is a hard architectural rule. Backup and
@@ -572,6 +582,15 @@ The exact binding points:
 | Chunk size (Pattern C)                     | 16 MiB (matches `client_sdk.DefaultChunkSize`)                                                                |
 | Cipher                                     | XChaCha20-Poly1305 (24-byte nonce, 16-byte Poly1305 tag), AAD = empty                                         |
 | Frame layout                               | `[24-byte nonce][4-byte BE ciphertext length][ciphertext+tag]`                                                |
+
+ZK Object Fabric can also serve as the **personal archive backend**
+(not just backup). When `archive_backend = "zkof"` is configured,
+archive segment upload, download, and manifest storage route to the
+S3 API instead of the KChat backend's blob service. This separates
+archive ciphertext from the KChat operator, reducing legal-compulsion
+and data-accumulation risks. The archive uses KChat's own per-chunk
+AAD scheme (§8.3 of PROPOSAL.md), not Pattern C — the two paths
+remain distinct.
 
 For all other paths (KChat's own backend blob service, archive
 segments, search index shards) KChat layers on a **per-chunk AAD**
