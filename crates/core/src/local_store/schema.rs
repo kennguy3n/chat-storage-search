@@ -116,12 +116,27 @@ CREATE TABLE IF NOT EXISTS media_search_index (
     PRIMARY KEY (asset_id, kind, text)
 );
 
--- Backup pipeline
+-- Backup pipeline. Mirrors `archive_event_journal` with optional
+-- `conversation_id` / `message_id` discriminators; the backup
+-- segment builder dispatches on `event_type` and conversation
+-- id when packing an incremental segment (see
+-- `docs/PHASES.md` Phase 4 — backup segments).
 CREATE TABLE IF NOT EXISTS backup_event_journal (
-    event_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_type    TEXT NOT NULL,
-    payload       BLOB NOT NULL,            -- CBOR
-    created_at_ms INTEGER NOT NULL
+    event_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type      TEXT NOT NULL,
+    conversation_id TEXT,
+    message_id      TEXT,
+    payload         BLOB NOT NULL,            -- CBOR
+    created_at_ms   INTEGER NOT NULL
+);
+
+-- Single-row cursor consumed by the backup segment builder; it
+-- advances `cursor_seq` after each segment is sealed and
+-- uploaded so the next builder run only re-emits unsegmented
+-- events. Mirrors `archive_event_cursor`.
+CREATE TABLE IF NOT EXISTS backup_event_cursor (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    cursor_seq  INTEGER NOT NULL DEFAULT 0
 );
 
 -- Archive pipeline
@@ -175,6 +190,7 @@ pub const TABLES: &[&str] = &[
     "search_vector",
     "media_search_index",
     "backup_event_journal",
+    "backup_event_cursor",
     "archive_segment_map",
     "archive_event_journal",
     "archive_event_cursor",
@@ -402,6 +418,12 @@ pub struct BackupEventJournalEntry {
     pub event_seq: i64,
     /// Event-type tag (`"message_received"`, `"media_asset_created"`, …).
     pub event_type: String,
+    /// Owning conversation, when the event has one. `None` for
+    /// global events such as identity rotations.
+    pub conversation_id: Option<String>,
+    /// Originating message, when the event has one. `None` for
+    /// conversation-level or global events.
+    pub message_id: Option<String>,
     /// CBOR-encoded payload.
     pub payload: Vec<u8>,
     /// Wall-clock millisecond timestamp the event was journaled.

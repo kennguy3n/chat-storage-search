@@ -432,6 +432,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_received".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: now_ms(),
         };
@@ -551,6 +553,8 @@ impl<'a> MessagePersister<'a> {
         let journal = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "outbox_pending".into(),
+            conversation_id: Some(conv.clone()),
+            message_id: Some(mid.clone()),
             payload: payload.clone(),
             created_at_ms: now_ms(),
         };
@@ -610,6 +614,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "outbox_sent".into(),
+            conversation_id: Some(conv),
+            message_id: Some(client_message_id.to_string()),
             payload,
             created_at_ms: now_ms(),
         };
@@ -691,6 +697,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_edited".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: edited_at_ms,
         };
@@ -795,6 +803,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_deleted".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: deleted_at_ms,
         };

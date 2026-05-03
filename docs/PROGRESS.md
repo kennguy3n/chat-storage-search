@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~60%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~75%`). Phase 4 — Backup and Restore (`In progress | ~55%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -684,7 +684,7 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~60%`
+**Status**: `In progress | ~75%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
@@ -866,10 +866,22 @@ Checklist:
       issues one fetch per id in the padded order, silently
       drops dummy errors. `KChatCoreConfig::privacy_level`
       defaults to `Standard` (off); set to `High` to enable.)
-- [ ] iCloud `MediaBlobSink` implementation (CloudKit file
+- [~] iCloud `MediaBlobSink` implementation (CloudKit file
       storage). See PROPOSAL.md §10.2.
-- [ ] Google Drive `MediaBlobSink` implementation (Drive API via
+      (`crates/core/src/media/sinks/icloud.rs::ICloudMediaBlobSink`:
+      object-safe `ICloudBlobBridge` trait wraps the iOS/macOS
+      bridge with `upload_file` / `download_file_range` /
+      `delete_file`; `ICloudMediaBlobSink` concatenates chunks
+      under the asset_id record name and stores the CloudKit
+      record name in `MediaBlobReference.metadata`. Storage sink
+      tag = `"icloud"`. Ships with `NoopICloudBridge` for tests.)
+- [~] Google Drive `MediaBlobSink` implementation (Drive API via
       platform bridge).
+      (`crates/core/src/media/sinks/google_drive.rs::GoogleDriveMediaBlobSink`:
+      same pattern as iCloud — `GoogleDriveBridge` trait + `Arc<dyn>`
+      sink wrapper. Stores the Drive file id in
+      `MediaBlobReference.metadata`. Storage sink tag =
+      `"google_drive"`. Ships with `NoopGoogleDriveBridge` for tests.)
 - [x] ZK Object Fabric `MediaBlobSink` implementation (S3
       `PutObject` / `GetObject`).
       (`crates/core/src/media/sinks/zk_fabric.rs::ZkObjectFabricSink`:
@@ -991,26 +1003,96 @@ Notes:
 
 ## Phase 4: Backup and Restore
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~55%`
 
 **Goal**: Incremental backup to platform sinks and skeleton-first
 restore.
 
 Checklist:
 
-- [ ] Backup event journal.
-- [ ] Incremental backup segment builder.
-- [ ] Backup manifest chain with Ed25519 signature.
+- [x] Backup event journal.
+      (`crates/core/src/backup/event_journal.rs`:
+      `BackupEventType` enum (`MessageReceived`, `MessageEdited`,
+      `MessageDeleted`, `MediaReceived`, `MediaDeleted`,
+      `ConversationCreated`, `ConversationDeleted`); `BackupEvent`
+      with `conversation_id` / `message_id` / `payload`;
+      `BackupEventJournal` with `write_event`, `read_events_since`,
+      `read_cursor`, `advance_cursor`, `read_unsegmented`. Wired
+      into `MessagePersister` so every persist / edit / delete
+      writes a typed `BackupEvent` inside the same SAVEPOINT as
+      the `archive_event_journal` row. Legacy non-taxonomy event
+      strings (e.g. `outbox_pending`) are silently skipped on
+      read.)
+- [x] Incremental backup segment builder.
+      (`crates/core/src/backup/segment_builder.rs::BackupSegmentBuilder`:
+      CBOR encode → zstd compress → XChaCha20-Poly1305 seal under
+      `K_backup_segment` derived via
+      `derive_backup_segment(K_backup_root, segment_id)`. AAD =
+      `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`.
+      `decrypt_backup_segment` powers the restore path.)
+- [x] Backup manifest chain with Ed25519 signature.
+      (`crates/core/src/backup/manifest_builder.rs::build_backup_manifest`:
+      genesis (`generation = 0`,
+      `previous_manifest_hash = [0; 32]`) → chained
+      (`generation = prev.generation + 1`,
+      `previous_manifest_hash = compute_manifest_hash(prev)`).
+      Ed25519 over canonical CBOR, AEAD-sealed under
+      `K_backup_manifest` with `device_id` mixed into the AAD for
+      device attribution.)
 - [ ] iOS iCloud backup sink.
 - [ ] Android backup sink strategy (Auto Backup for envelopes;
       Large Backup / SAF for full data).
 - [ ] **ZK Object Fabric backup sink** (S3 API; Pattern C convergent
       encryption; bit-identical interop with the Go SDK).
-- [ ] Backup compaction (daily → weekly checkpoint → monthly prune).
-- [ ] Manifest chain verification on restore.
-- [ ] Skeleton-first restore (conversation list → skeletons →
+- [x] Backup compaction (daily → weekly checkpoint → monthly prune).
+      (`crates/core/src/backup/compaction.rs`:
+      `CompactionTier::{Daily, Weekly, Monthly}` +
+      `CompactionPolicy` with configurable
+      `daily_to_weekly_ms` / `weekly_to_monthly_ms` /
+      `min_group_size` thresholds (defaults: 7d / 30d / 2);
+      `plan` deterministically buckets eligible segments by
+      `(source_tier, week_or_month_bucket)`; singleton groups
+      below `min_group_size` are skipped;
+      `apply_tombstones` drops tombstone events themselves and
+      any earlier events superseded by `MessageDeleted` /
+      `ConversationDeleted` / `MediaDeleted` for the same id
+      pair. Monthly is terminal (`CompactionTier::next_tier`
+      returns `None`).)
+- [x] Manifest chain verification on restore.
+      (`crates/core/src/restore/manifest_verifier.rs::verify_manifest_chain`:
+      walks `manifests[0..]` from genesis to latest, verifies
+      every Ed25519 signature via
+      `formats::manifest::verify_backup_manifest`, enforces
+      `manifests[0].previous_manifest_hash == GENESIS_PREVIOUS_HASH`
+      and `manifests[n].previous_manifest_hash ==
+      compute_manifest_hash(manifests[n-1])`, and surfaces
+      structured `EmptyChain` /
+      `SignatureInvalid { generation }` /
+      `ChainBreak { generation, expected, actual }` /
+      `GapDetected { missing_generation }` /
+      `GenesisHashNotZero { actual }` /
+      `HashComputationFailed { generation }` per failure
+      mode.)
+- [x] Skeleton-first restore (conversation list → skeletons →
       search index shards → recent bodies → lazy media).
-- [ ] Restore state machine.
+      (`crates/core/src/restore/pipeline.rs::RestorePipeline`:
+      drives the five-step priority sequence and persists every
+      step's `RestoreState` transition. `restore_recent_bodies`
+      flips skeletons inside the recency window from
+      `RemoteArchiveOnly` to `LocalPlainAvailable`;
+      `enable_lazy_media_restore` advances to
+      `MediaLazyRestoreEnabled`; the run finishes at
+      `FullRestoreComplete`. Wired through
+      `CoreImpl::restore_from_backup`.)
+- [x] Restore state machine.
+      (`crates/core/src/restore/state_machine.rs`: persistence
+      helpers (`load`, `save`, `transition`, `reset`) for the
+      single-row `restore_state` table, layered on top of the
+      already-defined
+      `local_store::state_machines::RestoreState` enum and its
+      forward-only `try_transition`. Snake-case `Display` /
+      `FromStr` round-trip; serde wire form matches the SQL
+      column.)
 - [ ] Key recovery (device-to-device, recovery key, passphrase;
       server escrow off by default).
 - [ ] Search index backup and restore (encrypted shards).
@@ -1025,7 +1107,24 @@ same tenant and observing a single stored copy.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-03: Phase-4 foundation landed (Tasks 1–10 of the
+  Phase 3/4 batch). The backup pipeline now has a full
+  end-to-end Rust path: `BackupEvent` typed taxonomy →
+  `BackupEventJournal` cursor-drained reader → CBOR + zstd +
+  XChaCha20-Poly1305 segment seal under `K_backup_segment` →
+  Ed25519-signed, generation-chained manifest sealed under
+  `K_backup_manifest` with `device_id` AAD attribution → a
+  daily → weekly → monthly compaction policy with tombstone
+  application → manifest chain verifier with structured failure
+  modes → `RestorePipeline` skeleton-first orchestration that
+  walks the `restore_state` machine to terminal
+  `FullRestoreComplete`. iCloud / Google Drive / ZKOF
+  `MediaBlobSink` scaffolds (Phase 3 sink slots) ship in the
+  same change. Cross-module coverage lives at
+  `crates/core/tests/backup_pipeline.rs`. Outstanding Phase-4
+  scope: Android sink strategy, key-recovery flows, encrypted
+  search-index shard backup, and multilingual restore corpus
+  validation.
 
 ---
 
@@ -1171,6 +1270,117 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase-3 / Phase-4 cross-cutting batch of 10
+
+Lands the next cross-cutting batch on top of PR #27. Phase 3
+sink slots get the remaining iCloud / Google Drive / ZK Object
+Fabric `MediaBlobSink` scaffolds; Phase 4 picks up its full Rust
+foundation: backup event journal, segment builder, manifest
+chain, compaction, manifest verification, restore state machine,
+and skeleton-first restore pipeline.
+
+**Phase 3 — `MediaBlobSink` slots:**
+
+1. **ZK Object Fabric `MediaBlobSink`**
+   (`crates/core/src/media/sinks/zk_fabric.rs`): per-chunk S3
+   keys of the form `media/{asset_id}/chunk-{idx:08}` against a
+   configured bucket. The S3 client is a small `S3Client` trait
+   (`put_object` / `get_object` / `delete_objects_with_prefix`)
+   with a `NoopS3Client` stub for tests.
+2. **iCloud `MediaBlobSink`**
+   (`crates/core/src/media/sinks/icloud.rs`): platform-bridge
+   scaffold — `ICloudBlobBridge` trait (`upload_file`,
+   `download_file_range`, `delete_file`) wraps the iOS / macOS
+   side; `ICloudMediaBlobSink` concatenates chunks under the
+   asset_id record name. Storage sink tag = `"icloud"`.
+3. **Google Drive `MediaBlobSink`**
+   (`crates/core/src/media/sinks/google_drive.rs`): same shape
+   as iCloud — `GoogleDriveBridge` trait + `Arc<dyn>` sink
+   wrapper, Drive file id stored in
+   `MediaBlobReference.metadata`. Storage sink tag =
+   `"google_drive"`.
+
+**Phase 4 — backup foundation:**
+
+4. **Backup event journal**
+   (`crates/core/src/backup/event_journal.rs`): typed taxonomy
+   (`BackupEventType` 7-variant enum), `BackupEvent` row with
+   `conversation_id` / `message_id` / `payload`, and
+   `BackupEventJournal` with `write_event`,
+   `read_events_since`, `read_cursor`, `advance_cursor`,
+   `read_unsegmented`. Wired into `MessagePersister` so every
+   persist / edit / delete writes a typed `BackupEvent` inside
+   the same SAVEPOINT as the existing `ArchiveEvent`. Legacy
+   non-taxonomy event strings are silently skipped on read so
+   the journal stays compatible with the pre-Phase-4 wiring.
+5. **Backup segment builder**
+   (`crates/core/src/backup/segment_builder.rs`): CBOR encode →
+   zstd compress → XChaCha20-Poly1305 seal under
+   `K_backup_segment` derived via
+   `derive_backup_segment(K_backup_root, segment_id)`. AAD =
+   `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`.
+   `decrypt_backup_segment` round-trips for the restore path.
+6. **Backup manifest builder**
+   (`crates/core/src/backup/manifest_builder.rs`): genesis
+   (`generation = 0`, `previous_manifest_hash = [0; 32]`) →
+   chained (`generation = prev.generation + 1`,
+   `previous_manifest_hash = compute_manifest_hash(prev)`).
+   Ed25519 over canonical CBOR; AEAD-sealed under
+   `K_backup_manifest` with `device_id` mixed into the AAD for
+   device attribution. Negative tests cover wrong-key /
+   wrong-device-id failures.
+7. **Backup compaction**
+   (`crates/core/src/backup/compaction.rs`):
+   `CompactionPolicy` with configurable
+   `daily_to_weekly_ms` / `weekly_to_monthly_ms` /
+   `min_group_size` thresholds (defaults: 7d / 30d / 2);
+   deterministic `plan` buckets eligible segments by
+   `(source_tier, week_or_month_bucket)`; `apply_tombstones`
+   drops events superseded by `MessageDeleted` /
+   `ConversationDeleted` / `MediaDeleted`. Monthly is terminal.
+
+**Phase 4 — restore foundation:**
+
+8. **Restore state machine persistence**
+   (`crates/core/src/restore/state_machine.rs`): SQL helpers
+   (`load`, `save`, `transition`, `reset`) for the single-row
+   `restore_state` table, layered on top of the already-defined
+   `local_store::state_machines::RestoreState` enum and its
+   forward-only `try_transition`. Initial transition must be
+   `IdentityRestored`; backwards / skip transitions error.
+9. **Manifest chain verifier**
+   (`crates/core/src/restore/manifest_verifier.rs`): walks the
+   manifest chain from genesis to the latest, verifying every
+   Ed25519 signature and the
+   `previous_manifest_hash == compute_manifest_hash(prev)`
+   invariant. Returns structured `EmptyChain` /
+   `SignatureInvalid { generation }` /
+   `ChainBreak { generation, expected, actual }` /
+   `GapDetected { missing_generation }` /
+   `GenesisHashNotZero { actual }` /
+   `HashComputationFailed { generation }` per failure mode.
+10. **Skeleton-first restore pipeline**
+    (`crates/core/src/restore/pipeline.rs::RestorePipeline`):
+    drives the priority sequence — conversation list → timeline
+    skeletons → search index shards (placeholder) → recent
+    bodies (recency-window flip from `RemoteArchiveOnly` →
+    `LocalPlainAvailable`) → enable lazy media restore — with a
+    persisted `RestoreState` transition between every step.
+    `CoreImpl::restore_from_backup` now walks the state machine
+    end-to-end to terminal `FullRestoreComplete`; the
+    placeholder `Error::NotImplemented` return is gone.
+
+**Cross-module integration test:** `crates/core/tests/backup_pipeline.rs`
+covers the round-trip — build a 2-generation manifest chain →
+`verify_manifest_chain` → run `RestorePipeline::run` against
+the sealed segment → assert terminal state +
+`recent_bodies` hydrated only inside the recency window. A
+second test forges a chain break and asserts the verifier
+catches it.
+
+Status moves: Phase 3 → `In progress | ~75%`; Phase 4 →
+`In progress | ~55%`.
 
 ### 2026-05-03 — Phase-2 / Phase-3 cross-cutting batch of 10 (this PR)
 

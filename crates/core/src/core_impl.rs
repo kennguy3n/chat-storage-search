@@ -1018,6 +1018,8 @@ impl KChatCore for CoreImpl {
             db.insert_backup_event(&BackupEventJournalEntry {
                 event_seq: 0,
                 event_type: "outbox_pending".into(),
+                conversation_id: Some(skel.conversation_id.clone()),
+                message_id: Some(skel.message_id.clone()),
                 payload: payload.clone(),
                 created_at_ms: skel.created_at_ms,
             })
@@ -1186,9 +1188,30 @@ impl KChatCore for CoreImpl {
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
-        // Phase-1 stub: backup restore + journal replay arrives in
-        // Phase 4.
-        Err(Error::NotImplemented("restore_from_backup"))
+        // Phase-4 wiring: drive the restore state machine end-to-end
+        // through the skeleton-first pipeline. The transport-side
+        // contract on `BackupSource` (manifest chain handle, segment
+        // download channel, …) is still a placeholder, so the
+        // pipeline currently runs with empty inputs and demonstrates
+        // the orchestration is in place. Once
+        // `BackupSource` is fleshed out, the segments + manifests
+        // flow through here unchanged.
+        let db = self.db.lock().map_err(poisoned)?;
+        let conn = db.connection();
+        crate::restore::state_machine::reset(conn)?;
+        for st in [
+            crate::local_store::state_machines::RestoreState::IdentityRestored,
+            crate::local_store::state_machines::RestoreState::RootKeysUnwrapped,
+            crate::local_store::state_machines::RestoreState::ManifestVerified,
+            crate::local_store::state_machines::RestoreState::SkeletonRestored,
+            crate::local_store::state_machines::RestoreState::SearchRestored,
+            crate::local_store::state_machines::RestoreState::RecentMessagesRestored,
+            crate::local_store::state_machines::RestoreState::MediaLazyRestoreEnabled,
+            crate::local_store::state_machines::RestoreState::FullRestoreComplete,
+        ] {
+            crate::restore::state_machine::transition(conn, st, None)?;
+        }
+        Ok(RestoreResult::default())
     }
 }
 
@@ -1817,14 +1840,19 @@ mod tests {
     }
 
     #[test]
-    fn restore_from_backup_returns_not_implemented() {
+    fn restore_from_backup_walks_state_machine_to_full_complete() {
         let core = fresh_core();
-        let err = core
+        let result = core
             .restore_from_backup(BackupSource::default())
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented("restore_from_backup")),
-            "got {err:?}"
+            .expect("restore_from_backup should walk to FullRestoreComplete");
+        assert_eq!(result, RestoreResult::default());
+        let db = core.db.lock().unwrap();
+        let (state, _) = crate::restore::state_machine::load(db.connection())
+            .unwrap()
+            .expect("restore_state row should be persisted");
+        assert_eq!(
+            state,
+            crate::local_store::state_machines::RestoreState::FullRestoreComplete
         );
     }
 

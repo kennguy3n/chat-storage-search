@@ -1166,19 +1166,29 @@ impl LocalStoreDb {
     pub fn insert_backup_event(&self, entry: &BackupEventJournalEntry) -> DbResult<()> {
         if entry.event_seq == 0 {
             self.conn.execute(
-                "INSERT INTO backup_event_journal (event_type, payload, created_at_ms)
-                 VALUES (?1, ?2, ?3)",
-                params![entry.event_type, entry.payload, entry.created_at_ms],
+                "INSERT INTO backup_event_journal
+                    (event_type, conversation_id, message_id, payload, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    entry.event_type,
+                    entry.conversation_id,
+                    entry.message_id,
+                    entry.payload,
+                    entry.created_at_ms,
+                ],
             )?;
         } else {
             self.conn.execute(
-                "INSERT INTO backup_event_journal (event_seq, event_type, payload, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO backup_event_journal
+                    (event_seq, event_type, conversation_id, message_id, payload, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     entry.event_seq,
                     entry.event_type,
+                    entry.conversation_id,
+                    entry.message_id,
                     entry.payload,
-                    entry.created_at_ms
+                    entry.created_at_ms,
                 ],
             )?;
         }
@@ -1605,6 +1615,8 @@ mod tests {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_received".into(),
+            conversation_id: Some("conv-x".into()),
+            message_id: Some("msg-y".into()),
             payload: vec![0xa1, 0xa2],
             created_at_ms: 1_700_000_000_000,
         };
