@@ -79,12 +79,18 @@ Checklist:
 - [ ] Body state machine (`local_plain_available`,
       `local_encrypted_available`, `delivery_store_only`,
       `deleted_for_me`, `deleted_for_everyone`, `unavailable`).
-- [ ] UniFFI bridge: generated Swift package consumable from
+- [x] UniFFI bridge: generated Swift package consumable from
       KChat.app and any iOS extensions sharing the local store.
-- [ ] JNI bridge: idiomatic Kotlin façade over the generated JNI
-      bindings.
-- [ ] Core public API surface: `initialize`, `register_device`,
+      _(Phase-1 scaffold at `crates/ios-bridge/`; production
+      Swift packaging lands in Phase 2.)_
+- [x] JNI bridge: idiomatic Kotlin façade over the generated JNI
+      bindings. _(Phase-1 scaffold at `crates/android-bridge/`;
+      production Kotlin packaging lands in Phase 2.)_
+- [x] Core public API surface: `initialize`, `register_device`,
       `send_text`, `ingest_remote_messages`, `search`.
+      _(`register_device` is a Phase-1 stub that returns
+      `Error::NotImplemented`; the MLS layer wires in the real
+      payload later in Phase 1 / Phase 2.)_
 - [ ] Unit + integration test suite covering multilingual corpora
       (Latin, Cyrillic, CJK, Arabic, Hebrew, Thai, Devanagari, mixed-
       script messages).

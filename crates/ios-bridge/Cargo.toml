@@ -3,10 +3,16 @@ name = "kchat-ios-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "iOS UniFFI bridge for kchat-core. Phase 0 placeholder — actual UniFFI bindings land in Phase 1."
+description = "iOS UniFFI bridge for kchat-core. Phase 1 scaffold — UDL + scaffolding for the public KChatCore API."
 
 [lib]
-crate-type = ["lib"]
+crate-type = ["lib", "cdylib"]
 
 [dependencies]
 kchat-core = { path = "../core" }
+uniffi = { version = "0.28", features = ["cli"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+thiserror = "2"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

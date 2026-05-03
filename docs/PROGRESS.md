@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~95%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`).
 - **Last updated**: 2026-05-02
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -280,9 +280,44 @@ Checklist:
       `conversation` row. Returns the count of conversation
       rows deleted; `CoreImpl::delete_conversation(uuid)`
       maps `0` to `Error::Storage` so callers can
-      distinguish "not found" from "removed".)_
-- [ ] UniFFI bridge for iOS / Swift.
-- [ ] JNI bridge for Android / Kotlin.
+      distinguish "not found" from "removed". Now exposed
+      on the public `KChatCore` trait so bridge clients can
+      drive the cascade without poking into `CoreImpl` directly.)_
+- [x] `register_device` stub on the `KChatCore` trait.
+      _(Phase-1 placeholder; returns
+      `Err(Error::NotImplemented("register_device"))` so the
+      bridge layers can pin the FFI shape today and the MLS
+      credential / KeyPackage publication pipeline can fill it
+      in later in Phase 1 / Phase 2 without breaking callers.)_
+- [x] `next_cursor` propagated through `IngestResult`.
+      _(`message::processor::IngestResult` now carries the
+      `Option<String>` opaque transport cursor populated by
+      `CoreImpl::ingest_remote_messages` from
+      `transport::FetchResult::next_cursor`. The inherent
+      `CoreImpl::ingest_messages` entry point — which has no
+      transport context — leaves it as `None`, and the bridge
+      layers expose it on their FFI mirrors so paginated drains
+      do not have to read the transport mock directly.)_
+- [x] UniFFI bridge for iOS / Swift. _(`crates/ios-bridge/`
+      Phase-1 scaffold: UDL at `src/kchat.udl` mirrors the
+      `KChatCore` surface, `build.rs` invokes
+      `uniffi::generate_scaffolding`, and `src/lib.rs` wraps
+      `CoreImpl` behind FFI-shaped types with UUID parsing and
+      `Error → KChatError` mapping. Production Swift packaging,
+      transport / archive / backup methods, and the bindgen-cli
+      entry point land in Phase 2; the scaffold is verifiable
+      today through the `kchat-ios-bridge` test suite.)_
+- [x] JNI bridge for Android / Kotlin. _(`crates/android-bridge/`
+      Phase-1 scaffold: `Java_com_kchat_core_KChatBridge_*`
+      entry points (`initialize`, `destroy`, `sendText`,
+      `search`, `editMessage`, `deleteForMe`,
+      `deleteForEveryone`, `getMessage`,
+      `getConversationMessages`) wrap a pure-Rust
+      `KChatBridgeHandle` so unit tests exercise the same code
+      paths without a JNIEnv. Errors throw
+      `com.kchat.core.KChatException`; `MessageView` /
+      `SearchResult` batches marshal as JSON for brevity at the
+      JNI boundary.)_
 - [x] Core public API surface: `initialize`, `register_device`,
       `send_text`, `edit_message`, `delete_for_me`,
       `delete_for_everyone`, `get_message`,
@@ -800,6 +835,51 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-02 — Phase 1 bridges + trait surface cleanup
+
+- UniFFI bridge scaffold for iOS landed at `crates/ios-bridge/`.
+  Adds `uniffi = "0.28"` (regular + build dependencies),
+  `src/kchat.udl` mirroring the public `KChatCore` surface,
+  `build.rs` that calls `uniffi::generate_scaffolding`, and
+  `src/lib.rs` with FFI-shaped wrappers (`KChatCoreConfig`,
+  `Platform`, `SearchQuery`, `SearchResult`, `SearchScope`,
+  `ContentKind`, `MessageView`, `ClientMessageId`,
+  `DeliveryCursor`, `IngestResult`, `DeviceRegistration`) plus a
+  `KChatCore` UDL `interface` whose Rust implementation wraps
+  `kchat_core::CoreImpl`. UUIDs cross the FFI as canonical
+  strings; argument validation throws
+  `KChatError::InvalidArgument`. Seven unit tests round-trip
+  `send_text` → `get_message`, exercise the wrong-key-length
+  error path, and pin the `Platform` / `SearchQuery`
+  conversions.
+- JNI bridge scaffold for Android landed at
+  `crates/android-bridge/`. Adds `jni = "0.21"` and exposes a
+  pure-Rust `KChatBridgeHandle` plus the
+  `Java_com_kchat_core_KChatBridge_*` entry points
+  (`initialize`, `destroy`, `sendText`, `search`,
+  `editMessage`, `deleteForMe`, `deleteForEveryone`,
+  `getMessage`, `getConversationMessages`). Errors throw
+  `com.kchat.core.KChatException`; `MessageView` /
+  `SearchResult` batches marshal as JSON for brevity. Eleven
+  unit tests exercise the bridge surface without a JNIEnv
+  (round-trip send / search / edit / delete / pagination,
+  invalid UUID / wrong key length / unknown platform error
+  paths, plus a compile-only delegate-signatures test).
+- `KChatCore` trait surface tightened. `delete_conversation`
+  is now a trait method (was inherent on `CoreImpl`),
+  `register_device(&str) -> Result<DeviceRegistration>` was
+  added as a Phase-1 stub returning
+  `Error::NotImplemented("register_device")`, and a new
+  `DeviceRegistration` placeholder type lives next to the
+  other Phase-1 placeholders in `crates/core/src/lib.rs`.
+- `IngestResult.next_cursor: Option<String>` propagated
+  through `CoreImpl::ingest_remote_messages` from
+  `transport::FetchResult::next_cursor`. The TODO that
+  punted this to Phase 2 is gone; the inherent
+  `CoreImpl::ingest_messages` entry point continues to leave
+  `next_cursor` as `None` because it has no transport
+  context.
 
 ### 2026-05-02 — Model stack optimization
 

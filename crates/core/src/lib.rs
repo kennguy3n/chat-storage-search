@@ -323,6 +323,15 @@ pub struct RestoreResult {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupSource {}
 
+/// Result of [`KChatCore::register_device`].
+///
+/// Phase-1 placeholder. The full registration contract (MLS
+/// credential bundle, KeyPackage handle, server-assigned device
+/// id, attestation evidence, …) lands when the MLS / device-key
+/// layer arrives later in Phase 1 / Phase 2.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRegistration {}
+
 /// Public, schema-stable view of a stored message.
 ///
 /// `MessageView` is the return shape of
@@ -381,6 +390,16 @@ pub trait KChatCore: Send + Sync {
     /// to a steady state.
     fn initialize(&mut self, config: KChatCoreConfig) -> Result<()>;
 
+    /// Register this device with the MLS / identity layer for
+    /// `device_id`. Returns a [`DeviceRegistration`] handle the
+    /// caller persists.
+    ///
+    /// **Phase-1 stub.** The full MLS credential / KeyPackage
+    /// publication pipeline lands later in Phase 1 / Phase 2.
+    /// Until then this method returns
+    /// `Err(Error::NotImplemented("register_device"))`.
+    fn register_device(&self, device_id: &str) -> Result<DeviceRegistration>;
+
     /// Create an outbox entry for an outbound text message and
     /// return its [`ClientMessageId`].
     fn send_text(
@@ -425,6 +444,17 @@ pub trait KChatCore: Send + Sync {
     /// `body_state = deleted_for_everyone` so the timeline can
     /// render a tombstone.
     fn delete_for_everyone(&self, message_id: Uuid) -> Result<()>;
+
+    /// Delete `conversation_id` along with every dependent row —
+    /// message skeletons, message bodies, FTS rows, fuzzy tokens,
+    /// and media-asset rows. Errors with [`Error::Storage`] when
+    /// the conversation does not exist so callers can distinguish
+    /// "not found" from "removed" without parsing free-form text.
+    ///
+    /// Backed by the cascade implemented in
+    /// `LocalStoreDb::delete_conversation`, which runs every
+    /// dependent delete inside a single `SAVEPOINT` for atomicity.
+    fn delete_conversation(&self, conversation_id: Uuid) -> Result<()>;
 
     /// Fetch a single message (skeleton + optional body text) by id.
     /// Returns `Ok(None)` when no such message exists.
@@ -680,6 +710,14 @@ mod tests {
         let v = BackupSource::default();
         let json = serde_json::to_string(&v).unwrap();
         let back: BackupSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn device_registration_round_trips_through_serde() {
+        let v = DeviceRegistration::default();
+        let json = serde_json::to_string(&v).unwrap();
+        let back: DeviceRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
     }
 }

@@ -1,0 +1,179 @@
+// UniFFI Definition Language for the iOS bridge.
+//
+// Mirrors the public surface of the `kchat-core` crate (see
+// `docs/PROPOSAL.md §12` and `crates/core/src/lib.rs`). UUIDs are
+// modelled as `string` here so the FFI layer is portable across
+// languages that lack a built-in UUID type — the bridge implementation
+// at `src/lib.rs` parses and validates them inside each method.
+//
+// Phase 1 scaffold: every type / enum / interface in this file maps
+// directly to a wrapper in `src/lib.rs`. The wrappers convert into
+// the canonical types from `kchat-core` and back.
+
+namespace kchat {
+};
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+// Mirrors `kchat_core::Error`. Cross-language callers see one variant
+// per category plus a free-form message.
+[Error]
+interface KChatError {
+  Crypto(string message);
+  Storage(string message);
+  Search(string message);
+  Message(string message);
+  Transport(string message);
+  NotImplemented(string method);
+  InvalidArgument(string message);
+};
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+enum Platform {
+  "Ios",
+  "Android",
+  "MacOs",
+  "Windows",
+};
+
+dictionary KChatCoreConfig {
+  string data_dir;
+  Platform platform;
+  string tenant_id;
+};
+
+// ---------------------------------------------------------------------------
+// Search surface
+// ---------------------------------------------------------------------------
+
+enum SearchScope {
+  "LocalOnly",
+  "IncludeCold",
+};
+
+enum ContentKind {
+  "Text",
+  "Image",
+  "Video",
+  "Audio",
+  "Document",
+  "Any",
+};
+
+dictionary SearchQuery {
+  string query_string;
+  string? sender_filter;
+  // UUID string. Empty / null -> no filter.
+  string? conversation_filter;
+  i64? date_from;
+  i64? date_to;
+  ContentKind? content_kind;
+};
+
+dictionary SearchResult {
+  // UUID string.
+  string message_id;
+  // UUID string.
+  string conversation_id;
+  string sender_id;
+  i64 created_at_ms;
+  string? snippet;
+  f64 rank_score;
+  boolean is_cold;
+};
+
+// ---------------------------------------------------------------------------
+// Message surface
+// ---------------------------------------------------------------------------
+
+dictionary MessageView {
+  // UUID string.
+  string message_id;
+  // UUID string.
+  string conversation_id;
+  string sender_id;
+  i64 created_at_ms;
+  i64 received_at_ms;
+  // UUID string. Empty / null -> not a reply.
+  string? reply_to;
+  i64? edited_at_ms;
+  i64? deleted_at_ms;
+  string? text_content;
+};
+
+// Result of `KChatCore.send_text` / `KChatCore.send_media`.
+// UUID string of the freshly-minted client message id.
+dictionary ClientMessageId {
+  string value;
+};
+
+// Opaque MLS delivery-store cursor.
+dictionary DeliveryCursor {
+  string value;
+};
+
+dictionary IngestResult {
+  u32 new_messages;
+  u32 updated_messages;
+  u32 duplicate_count;
+  string? next_cursor;
+};
+
+// Result of `KChatCore.register_device` — Phase-1 placeholder, the
+// MLS credential / KeyPackage payload lands later.
+dictionary DeviceRegistration {
+};
+
+// ---------------------------------------------------------------------------
+// KChatCore interface
+// ---------------------------------------------------------------------------
+
+interface KChatCore {
+  // Open `{config.data_dir}/kchat.db` with the supplied 32-byte key.
+  // Errors with `KChatError.Storage` if the database cannot be
+  // opened or with `KChatError.InvalidArgument` if `key` is not
+  // exactly 32 bytes.
+  [Throws=KChatError]
+  constructor(KChatCoreConfig config, bytes key);
+
+  // Re-open the local store at `config.data_dir`, retaining the
+  // 32-byte key passed at construction.
+  [Throws=KChatError]
+  void initialize(KChatCoreConfig config);
+
+  // Phase-1 stub. Returns `KChatError.NotImplemented`.
+  [Throws=KChatError]
+  DeviceRegistration register_device(string device_id);
+
+  [Throws=KChatError]
+  ClientMessageId send_text(string conversation_id, string text, string? reply_to);
+
+  [Throws=KChatError]
+  IngestResult ingest_remote_messages(string conversation_id, DeliveryCursor? after_cursor);
+
+  [Throws=KChatError]
+  sequence<SearchResult> search(SearchQuery query, SearchScope scope);
+
+  [Throws=KChatError]
+  void edit_message(string message_id, string new_text);
+
+  [Throws=KChatError]
+  void delete_for_me(string message_id);
+
+  [Throws=KChatError]
+  void delete_for_everyone(string message_id);
+
+  [Throws=KChatError]
+  void delete_conversation(string conversation_id);
+
+  [Throws=KChatError]
+  MessageView? get_message(string message_id);
+
+  [Throws=KChatError]
+  sequence<MessageView> get_conversation_messages(string conversation_id, i64? before_ms, u32 limit);
+};

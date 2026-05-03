@@ -107,6 +107,15 @@ pub struct IngestResult {
     pub updated_messages: u32,
     /// Duplicates skipped on the basis of `message_id`.
     pub duplicate_count: u32,
+    /// Opaque transport cursor pointing at the next page of
+    /// messages, or `None` when the delivery store is drained.
+    /// Populated by
+    /// [`crate::core_impl::CoreImpl::ingest_remote_messages`] from
+    /// the underlying [`crate::transport::FetchResult::next_cursor`];
+    /// the inherent
+    /// [`crate::core_impl::CoreImpl::ingest_messages`] entry point
+    /// (which has no transport context) leaves it as `None`.
+    pub next_cursor: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1043,20 @@ mod tests {
         assert_eq!(r.new_messages, 0);
         assert_eq!(r.updated_messages, 0);
         assert_eq!(r.duplicate_count, 0);
+        assert!(r.next_cursor.is_none());
+    }
+
+    #[test]
+    fn ingest_result_round_trips_through_serde_with_next_cursor() {
+        let r = IngestResult {
+            new_messages: 3,
+            updated_messages: 1,
+            duplicate_count: 2,
+            next_cursor: Some("cursor-abc".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: IngestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
     }
 
     #[test]
