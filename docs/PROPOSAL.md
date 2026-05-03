@@ -2,9 +2,12 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 0 — Protocol and Test Vectors (NOT STARTED). This
-> document defines the target architecture, not the current
-> implementation. See [PROGRESS.md](PROGRESS.md) for build status.
+> Status: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 —
+> Local Store + Text Search + MLS Integration (`In progress | ~95%`).
+> Phase 2 — Media Encryption and Blob Service (`In progress | ~80%`).
+> Phase 3 — Personal Archive and Offload (`In progress | ~35%`).
+> This document defines the target architecture. See
+> [PROGRESS.md](PROGRESS.md) for the live build tracker.
 
 ---
 

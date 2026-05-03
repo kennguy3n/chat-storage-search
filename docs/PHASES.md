@@ -7,6 +7,10 @@ explicit goal, a checklist, and a decision gate. Do not skip to the
 next phase until the current phase's gate has been met. Status is
 tracked in [PROGRESS.md](PROGRESS.md).
 
+> **Note:** Checklist items in this document are updated to reflect
+> completion status. For detailed implementation notes and changelogs,
+> see [PROGRESS.md](PROGRESS.md).
+
 For the technical design, see [PROPOSAL.md](PROPOSAL.md). For the
 system architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -21,31 +25,31 @@ iOS, Android, desktop, and the ZK Object Fabric backup path.
 
 Checklist:
 
-- [ ] Shared binary formats spec (CBOR for wire payloads; internal
+- [x] Shared binary formats spec (CBOR for wire payloads; internal
       Rust structs ↔ CBOR mapping).
-- [ ] Crypto container spec (AEAD construction, AAD format, chunk
+- [x] Crypto container spec (AEAD construction, AAD format, chunk
       layout) covering both KChat-internal AAD (PROPOSAL §8.3) and
       ZK Object Fabric Pattern C (empty AAD; PROPOSAL §8.4).
-- [ ] Manifest spec (backup manifest, archive manifest;
+- [x] Manifest spec (backup manifest, archive manifest;
       `previous_manifest_hash` chain; Ed25519 signature).
-- [ ] Media descriptor spec (`asset_id`, `K_asset`, mime type,
+- [x] Media descriptor spec (`asset_id`, `K_asset`, mime type,
       sizes, Merkle root, blob ID, chunk count).
-- [ ] Search index shard spec (text, fuzzy, vector, media index
+- [x] Search index shard spec (text, fuzzy, vector, media index
       shard frames; encryption envelope; coarse-bucket addressing).
-- [ ] Multilingual tokenization spec (ICU configuration, script-
+- [x] Multilingual tokenization spec (ICU configuration, script-
       specific rules, fallback behavior, fuzzy-index granularity
       per script).
-- [ ] iOS / Android / desktop / Rust cross-platform crypto test
+- [x] iOS / Android / desktop / Rust cross-platform crypto test
       vectors: same plaintext + keys + nonce ⇒ identical ciphertext,
       tag, and Merkle root in every binding.
-- [ ] **ZK Object Fabric interop test vectors**: Rust output for
+- [x] **ZK Object Fabric interop test vectors**: Rust output for
       Pattern C must match Go output from
       `kennguy3n/zk-object-fabric/encryption/client_sdk/` byte-for-byte
       across `DeriveConvergentDEK`, `deriveConvergentNonce`,
       chunk framing, and end-to-end `EncryptObject`.
-- [ ] Rust workspace scaffold (`crates/core`, `crates/ios-bridge`,
+- [x] Rust workspace scaffold (`crates/core`, `crates/ios-bridge`,
       `crates/android-bridge`, `crates/desktop`).
-- [ ] CI pipeline: Rust build + test, iOS build (UniFFI codegen
+- [x] CI pipeline: Rust build + test, iOS build (UniFFI codegen
       sanity), Android build (JNI codegen sanity), desktop build,
       cross-language test-vector run.
 
