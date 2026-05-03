@@ -250,10 +250,17 @@ pub fn apply_tombstones(events: Vec<BackupEvent>) -> Vec<BackupEvent> {
                 }
             }
 
-            // Drop per-message message-events for tombstoned messages.
+            // Drop per-message events for tombstoned messages. A
+            // `MessageDeleted` tombstone supersedes every earlier
+            // event for the same `(conversation_id, message_id)`,
+            // including any `MediaReceived` rows attached to that
+            // message, since `MessagePersister::delete_message`
+            // tears down the attached media too.
             if matches!(
                 ev.event_type,
-                BackupEventType::MessageReceived | BackupEventType::MessageEdited
+                BackupEventType::MessageReceived
+                    | BackupEventType::MessageEdited
+                    | BackupEventType::MediaReceived
             ) {
                 if let (Some(conv), Some(mid)) = (ev.conversation_id, ev.message_id) {
                     if deleted_messages.contains(&(conv, mid)) {
@@ -262,7 +269,7 @@ pub fn apply_tombstones(events: Vec<BackupEvent>) -> Vec<BackupEvent> {
                 }
             }
 
-            // Drop media-receives for tombstoned media.
+            // Drop media-receives for explicit `MediaDeleted` tombstones.
             if matches!(ev.event_type, BackupEventType::MediaReceived) {
                 if let (Some(conv), Some(mid)) = (ev.conversation_id, ev.message_id) {
                     if deleted_media.contains(&(conv, mid)) {
@@ -403,6 +410,30 @@ mod tests {
         let survivors = apply_tombstones(events);
         // Only the unrelated MessageReceived survives.
         assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].message_id, Some(other_mid));
+    }
+
+    #[test]
+    fn message_deleted_drops_orphaned_media_received_for_same_message() {
+        // `MessagePersister::delete_message` only writes a
+        // `MessageDeleted` event; any `MediaReceived` that was
+        // attached to the same `(conversation_id, message_id)` would
+        // otherwise survive into the compacted segment as an orphan
+        // pointing at a deleted skeleton row. `apply_tombstones` must
+        // drop it under the message-level tombstone.
+        let conv = Uuid::now_v7();
+        let mid = Uuid::now_v7();
+        let other_mid = Uuid::now_v7();
+        let events = vec![
+            evt(BackupEventType::MessageReceived, conv, Some(mid), 1),
+            evt(BackupEventType::MediaReceived, conv, Some(mid), 2),
+            evt(BackupEventType::MediaReceived, conv, Some(other_mid), 3),
+            evt(BackupEventType::MessageDeleted, conv, Some(mid), 4),
+        ];
+        let survivors = apply_tombstones(events);
+        // Only the unrelated MediaReceived survives.
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].event_type, BackupEventType::MediaReceived);
         assert_eq!(survivors[0].message_id, Some(other_mid));
     }
 
