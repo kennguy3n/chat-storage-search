@@ -490,8 +490,14 @@ wiped device can return to the steady state of the first three.
 | ------------------ | ------------------------------------------------------ | ----------------------------------------------------------------------- | ------------ |
 | Local store        | Fast UX, search, timeline, thumbnails                  | Device (SQLCipher + encrypted files)                                    | Yes          |
 | Delivery store     | MLS message fanout and short-term retention            | KChat backend (PostgreSQL)                                              | Yes          |
-| Personal archive   | Scroll-back, lazy rehydration, storage offload         | KChat backend (PostgreSQL encrypted blobs) or ZK Object Fabric (S3 API) | Yes          |
+| Personal archive   | Scroll-back, lazy rehydration, storage offload         | KChat backend (PostgreSQL encrypted blobs) or ZK Object Fabric (S3 API)¹ | Yes          |
 | Backup vault       | Disaster recovery / new-device restore                 | iCloud / Android backup / KChat encrypted backup (ZK Object Fabric)     | No           |
+
+¹ Media originals may optionally route to user cloud storage
+(iCloud / Google Drive / ZK Object Fabric) via the `MediaBlobSink`
+trait to reduce backend storage costs. Thumbnails, archive
+segments, and search index shards stay on the KChat backend or
+ZKOF. See [docs/PROPOSAL.md §5.7](docs/PROPOSAL.md).
 
 The four-store split is a hard architectural rule. Backup and
 archive serve different purposes and have different shapes: an
@@ -592,6 +598,15 @@ and data-accumulation risks. The archive uses KChat's own per-chunk
 AAD scheme (§8.3 of PROPOSAL.md), not Pattern C — the two paths
 remain distinct.
 
+ZKOF can additionally serve as a **media blob sink** through the
+`MediaBlobSink` trait (see [docs/PROPOSAL.md §5.7](docs/PROPOSAL.md)
+and §10.2). Setting `media_blob_sink = StorageSink::ZkObjectFabric { … }`
+on `KChatCoreConfig` routes media originals to ZKOF independently
+of the archive backend selection — ZKOF is then the platform-neutral
+target for households that span iOS and Android (no iCloud / Drive
+vendor lock-in). Backup, archive, and media sinks are three
+independent ZKOF use cases; a deployment can use any subset.
+
 For all other paths (KChat's own backend blob service, archive
 segments, search index shards) KChat layers on a **per-chunk AAD**
 binding the chunk to its blob and Merkle root — that scheme is
@@ -639,6 +654,11 @@ chat-storage-search/
           processor.rs
           chunker.rs
           thumbnail.rs
+          sinks/                  # media-blob storage sinks (PROPOSAL.md §5.7)
+            mod.rs                # MediaBlobSink trait + NoopMediaBlobSink
+            icloud.rs             # iCloud (CloudKit file storage) — Phase 3
+            google_drive.rs       # Google Drive (Drive API) — Phase 3
+            zk_fabric.rs          # ZK Object Fabric (S3 PutObject/GetObject) — Phase 3
         search/                   # search engine — all local, no server search
           mod.rs
           text_search.rs          # FTS5 exact + prefix + BM25

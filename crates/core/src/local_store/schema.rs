@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS media_asset (
     wrapped_k_asset   BLOB NOT NULL,
     chunk_count       INTEGER NOT NULL,
     merkle_root       BLOB NOT NULL,
-    blob_id           TEXT NOT NULL
+    blob_id           TEXT NOT NULL,
+    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- PROPOSAL.md §5.7
 );
 
 -- Multilingual full-text search
@@ -130,6 +131,7 @@ CREATE TABLE IF NOT EXISTS archive_segment_map (
     time_bucket          TEXT NOT NULL,     -- e.g. '2026-04'
     segment_type         TEXT NOT NULL,
     blob_id              TEXT NOT NULL,
+    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- PROPOSAL.md §10.1
     merkle_root          BLOB NOT NULL,
     state                TEXT NOT NULL      -- not_archived..archive_compacted
 );
@@ -280,8 +282,14 @@ pub struct MediaAsset {
     /// 32-byte BLAKE3 Merkle root over the per-chunk SHA-256 of the
     /// **ciphertext** chunks.
     pub merkle_root: Vec<u8>,
-    /// Backend blob identifier.
+    /// Backend blob identifier. The interpretation depends on
+    /// [`Self::storage_sink`] (see `docs/PROPOSAL.md §5.7`).
     pub blob_id: String,
+    /// Storage sink the media blob lives on (`"kchat_backend"`,
+    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`).
+    /// Defaults to `"kchat_backend"` for legacy rows. See
+    /// `docs/PROPOSAL.md §5.7` (tiered media storage).
+    pub storage_sink: String,
 }
 
 /// `backup_event_journal` row.
@@ -308,8 +316,14 @@ pub struct ArchiveSegmentMapEntry {
     pub time_bucket: String,
     /// Segment-type tag (`"message_delta"`, `"timeline_skeleton"`, …).
     pub segment_type: String,
-    /// Backend blob identifier.
+    /// Backend blob identifier. The interpretation depends on
+    /// [`Self::storage_backend`] (see `docs/PROPOSAL.md §10.1`).
     pub blob_id: String,
+    /// Storage backend the segment lives on (`"kchat_backend"`,
+    /// `"zk_object_fabric"`). Defaults to `"kchat_backend"` for
+    /// legacy rows. See `docs/PROPOSAL.md §10.1` (archive backend
+    /// routing).
+    pub storage_backend: String,
     /// 32-byte BLAKE3 Merkle root over the ciphertext chunks.
     pub merkle_root: Vec<u8>,
     /// Lifecycle state.
@@ -492,10 +506,28 @@ mod tests {
             chunk_count: 1,
             merkle_root: vec![0u8; 32],
             blob_id: "blob-1".to_string(),
+            storage_sink: "kchat_backend".to_string(),
         };
         let json = serde_json::to_string(&a).unwrap();
         let back: MediaAsset = serde_json::from_str(&json).unwrap();
         assert_eq!(a, back);
+    }
+
+    #[test]
+    fn archive_segment_map_entry_round_trip_through_serde() {
+        let s = ArchiveSegmentMapEntry {
+            segment_id: "seg-1".to_string(),
+            conversation_id: "conv-1".to_string(),
+            time_bucket: "2026-05".to_string(),
+            segment_type: "message_delta".to_string(),
+            blob_id: "blob-1".to_string(),
+            storage_backend: "kchat_backend".to_string(),
+            merkle_root: vec![0u8; 32],
+            state: ArchiveState::ArchiveVerified,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ArchiveSegmentMapEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
     }
 
     #[test]
@@ -510,23 +542,17 @@ mod tests {
         assert_eq!(r, back);
     }
 
-    #[test]
-    fn schema_sql_columns_match_struct_fields_for_message_skeleton() {
-        // We pin the column ordering in the SQL. If a struct field is
-        // added or removed without updating the SQL (or vice versa),
-        // this test fails because the column count drifts.
-        let sk = "message_skeleton";
+    /// Returns the number of column-definition lines inside the
+    /// `CREATE TABLE IF NOT EXISTS {table} ( … );` block in
+    /// [`SCHEMA_SQL`]. Used by the column-count drift tests below.
+    fn count_table_columns(table: &str) -> usize {
         let start = SCHEMA_SQL
-            .find(&format!("CREATE TABLE IF NOT EXISTS {sk} ("))
-            .expect("message_skeleton CREATE TABLE present");
+            .find(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+            .unwrap_or_else(|| panic!("{table} CREATE TABLE present"));
         let rest = &SCHEMA_SQL[start..];
         let end = rest.find(");").expect("CREATE TABLE terminated");
         let body = &rest[..end];
-        // Count column definitions: every line that is not blank, not
-        // a pure CREATE keyword, not a comment-only line, and not a
-        // tokenize / PRIMARY KEY / FOREIGN KEY clause.
-        let cols = body
-            .lines()
+        body.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .filter(|l| !l.starts_with("--"))
@@ -534,12 +560,48 @@ mod tests {
             .filter(|l| !l.starts_with("PRIMARY KEY"))
             .filter(|l| !l.starts_with("FOREIGN KEY"))
             .filter(|l| !l.starts_with("tokenize"))
-            .count();
+            .count()
+    }
+
+    #[test]
+    fn schema_sql_columns_match_struct_fields_for_message_skeleton() {
+        // We pin the column ordering in the SQL. If a struct field is
+        // added or removed without updating the SQL (or vice versa),
+        // this test fails because the column count drifts.
         // 13 columns in MessageSkeleton: message_id, conversation_id,
         // sender_id, created_at_ms, received_at_ms, kind, body_state,
         // media_state, archive_state, backup_state, reply_to,
         // edited_at_ms, deleted_at_ms.
-        assert_eq!(cols, 13, "message_skeleton column count drifted");
+        assert_eq!(
+            count_table_columns("message_skeleton"),
+            13,
+            "message_skeleton column count drifted"
+        );
+    }
+
+    #[test]
+    fn schema_sql_columns_match_struct_fields_for_media_asset() {
+        // 11 columns in MediaAsset (post-§5.7): asset_id, message_id,
+        // mime_type, bytes_total, bytes_local, media_state,
+        // wrapped_k_asset, chunk_count, merkle_root, blob_id,
+        // storage_sink.
+        assert_eq!(
+            count_table_columns("media_asset"),
+            11,
+            "media_asset column count drifted"
+        );
+    }
+
+    #[test]
+    fn schema_sql_columns_match_struct_fields_for_archive_segment_map() {
+        // 8 columns in ArchiveSegmentMapEntry (post-§10.1):
+        // segment_id, conversation_id, time_bucket, segment_type,
+        // blob_id, storage_backend, merkle_root, state.
+        assert_eq!(
+            count_table_columns("archive_segment_map"),
+            8,
+            "archive_segment_map column count drifted"
+        );
     }
 
     #[test]

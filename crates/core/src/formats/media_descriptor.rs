@@ -28,8 +28,9 @@ use super::serde_bytes_array;
 /// | `bytes_total`     | `media_asset.bytes_total`                               |
 /// | `chunk_count`     | `media_asset.chunk_count`                               |
 /// | `merkle_root`     | `media_asset.merkle_root` (32-byte BLAKE3)              |
-/// | `blob_id`         | `media_asset.blob_id` (backend blob identifier)         |
+/// | `blob_id`         | `media_asset.blob_id` (backend blob identifier; interpretation depends on `storage_sink`) |
 /// | `wrapped_k_asset` | AES-256-KW(`K_local_db` / `K_archive_root` / `K_backup_root`, `K_asset`) |
+/// | `storage_sink`    | Optional `media_asset.storage_sink` tag (see `docs/PROPOSAL.md §5.7`) |
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaDescriptor {
     /// Stable identifier for the media asset.
@@ -52,7 +53,13 @@ pub struct MediaDescriptor {
     pub merkle_root: [u8; 32],
 
     /// Backend blob identifier (e.g. ZK Object Fabric or KChat
-    /// PostgreSQL blob row id). Plaintext metadata only.
+    /// PostgreSQL blob row id, or a sink-specific identifier such
+    /// as a CloudKit record name or Drive file ID). Plaintext
+    /// metadata only. The interpretation depends on
+    /// [`Self::storage_sink`]: a `"kchat_backend"` value means the
+    /// blob lives in the KChat blob service, an `"i_cloud"` value
+    /// means it lives in the user's iCloud container, and so on.
+    /// See `docs/PROPOSAL.md §5.7` (tiered media storage).
     pub blob_id: Uuid,
 
     /// `K_asset` wrapped by the appropriate root (one of `K_local_db`,
@@ -60,6 +67,15 @@ pub struct MediaDescriptor {
     /// AES-256-KW (RFC 3394) — see [`crate::crypto::key_wrap`].
     #[serde(with = "serde_bytes")]
     pub wrapped_k_asset: Vec<u8>,
+
+    /// Storage sink tag for the media blob (`"kchat_backend"`,
+    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`).
+    /// `None` means the blob lives on the default sink
+    /// (`"kchat_backend"`); existing CBOR payloads written before
+    /// this field was added decode as `None` thanks to
+    /// `#[serde(default)]`. See `docs/PROPOSAL.md §5.7`.
+    #[serde(default)]
+    pub storage_sink: Option<String>,
 }
 
 #[cfg(test)]
@@ -83,6 +99,7 @@ mod tests {
             blob_id: Uuid::now_v7(),
             // 40 bytes = AES-256-KW wrap of a 32-byte key.
             wrapped_k_asset: vec![seed; 40],
+            storage_sink: None,
         }
     }
 
@@ -119,6 +136,7 @@ mod tests {
             },
             blob_id: Uuid::now_v7(),
             wrapped_k_asset: (0..40u8).collect(),
+            storage_sink: Some("i_cloud".to_string()),
         };
         let bytes = serde_cbor::to_vec(&desc).unwrap();
         let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).unwrap();
@@ -129,6 +147,41 @@ mod tests {
         assert_eq!(decoded.merkle_root, desc.merkle_root);
         assert_eq!(decoded.blob_id, desc.blob_id);
         assert_eq!(decoded.wrapped_k_asset, desc.wrapped_k_asset);
+        assert_eq!(decoded.storage_sink.as_deref(), Some("i_cloud"));
+    }
+
+    #[test]
+    fn legacy_payload_without_storage_sink_decodes_as_none() {
+        // Encode the descriptor *without* the `storage_sink` field so
+        // we exercise the `#[serde(default)]` migration path that
+        // pre-§5.7 CBOR payloads rely on.
+        #[derive(Serialize)]
+        struct LegacyMediaDescriptor {
+            asset_id: Uuid,
+            mime_type: String,
+            bytes_total: u64,
+            chunk_count: u32,
+            #[serde(with = "serde_bytes_array")]
+            merkle_root: [u8; 32],
+            blob_id: Uuid,
+            #[serde(with = "serde_bytes")]
+            wrapped_k_asset: Vec<u8>,
+        }
+
+        let legacy = LegacyMediaDescriptor {
+            asset_id: Uuid::now_v7(),
+            mime_type: "image/jpeg".to_string(),
+            bytes_total: 4096,
+            chunk_count: 1,
+            merkle_root: [0x42; 32],
+            blob_id: Uuid::now_v7(),
+            wrapped_k_asset: vec![0x99; 40],
+        };
+        let bytes = serde_cbor::to_vec(&legacy).unwrap();
+        let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).unwrap();
+        assert!(decoded.storage_sink.is_none());
+        assert_eq!(decoded.asset_id, legacy.asset_id);
+        assert_eq!(decoded.bytes_total, legacy.bytes_total);
     }
 
     #[test]

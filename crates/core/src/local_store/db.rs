@@ -1691,8 +1691,10 @@ mod tests {
                 .execute(
                     "INSERT INTO media_asset(
                         asset_id, message_id, mime_type, bytes_total, bytes_local,
-                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id
-                     ) VALUES (?1, ?2, 'image/png', 4, 4, 'local', X'00', 1, X'00', 'blob-x')",
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                        storage_sink
+                     ) VALUES (?1, ?2, 'image/png', 4, 4, 'local', X'00', 1, X'00', 'blob-x',
+                               'kchat_backend')",
                     params![asset_id, mid],
                 )
                 .unwrap();
