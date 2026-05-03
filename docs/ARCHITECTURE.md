@@ -568,6 +568,52 @@ the standard library and chosen primitives.
 > remote-only media on the same path. The remote archive fetch
 > path (manifest reader / segment download / replay) is queued
 > for the next Phase 3 milestone.
+>
+> The Phase 4 modules `backup` and `restore` are now in tree as
+> well: `backup::event_journal::BackupEventJournal` (typed
+> `BackupEventType` taxonomy + cursor-based drainage; **wired
+> into `MessagePersister`** alongside `ArchiveEventJournal`),
+> `backup::segment_builder::BackupSegmentBuilder` (CBOR → zstd →
+> XChaCha20-Poly1305 seal under
+> `K_backup_segment(K_backup_root, segment_id)` with AAD
+> `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`, plus
+> `decrypt_backup_segment` for the restore path),
+> `backup::manifest_builder::build_backup_manifest` (genesis +
+> chained generations → BLAKE3 over canonical-CBOR signing
+> payload → Ed25519 signature → AEAD-seal under
+> `K_backup_manifest` with `device_id` mixed into the AAD for
+> device attribution), `backup::compaction` (`CompactionTier`
+> daily → weekly → monthly state machine; deterministic
+> `CompactionPolicy::plan` buckets segments by
+> `(source_tier, week_or_month_bucket)` and applies tombstones
+> via `apply_tombstones` so superseded
+> `MessageDeleted` / `ConversationDeleted` / `MediaDeleted`
+> events do not re-enter the compacted segment),
+> `restore::state_machine::{load, save, transition, reset}` (SQL
+> helpers for the single-row `restore_state` table, layered
+> over the already-defined
+> `local_store::state_machines::RestoreState` enum),
+> `restore::manifest_verifier::verify_manifest_chain` (walks
+> generation 0 → latest, verifies every Ed25519 signature and
+> every `previous_manifest_hash` link, surfaces structured
+> `EmptyChain` / `SignatureInvalid` / `ChainBreak` /
+> `GapDetected` / `GenesisHashNotZero` /
+> `HashComputationFailed` failures), and
+> `restore::pipeline::RestorePipeline` (skeleton-first
+> conversation list → timeline skeletons → search shards
+> placeholder → recent bodies → enable lazy media, persisting a
+> `RestoreState` transition between every step). All of it is
+> bound through `CoreImpl::restore_from_backup`, which now
+> drives the persisted state machine end-to-end to terminal
+> `FullRestoreComplete` instead of returning
+> `Error::NotImplemented`. Phase 3 sink slots also caught up:
+> `media::sinks::icloud::ICloudMediaBlobSink` and
+> `media::sinks::google_drive::GoogleDriveMediaBlobSink` both
+> follow the same `MediaBlobSink` + bridge-trait pattern as
+> `media::sinks::zk_fabric::ZkObjectFabricSink`. Outstanding
+> Phase-4 scope: Android Auto-Backup / SAF strategy, key
+> recovery flows, encrypted search-index shard backup, and the
+> multilingual restore corpus.
 
 ---
 
@@ -774,6 +820,46 @@ stateDiagram-v2
     backup_pending --> backup_uploaded : "segment uploaded to sink"
     backup_uploaded --> backup_manifest_committed : "manifest signed + uploaded"
     backup_manifest_committed --> backup_expired : "compacted into checkpoint"
+```
+
+The single-row, global `restore_state` machine owned by
+`crates/core/src/local_store/state_machines.rs::RestoreState` and
+persisted via `crates/core/src/restore/state_machine.rs`:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> identity_restored : "device key recovered"
+    identity_restored --> root_keys_unwrapped : "K_user_master + sub-roots in memory"
+    root_keys_unwrapped --> manifest_verified : "manifest chain Ed25519 + hash walk"
+    manifest_verified --> skeleton_restored : "conversation list + skeletons reconstructed"
+    skeleton_restored --> search_restored : "FTS / fuzzy / vector / media shards reattached"
+    search_restored --> recent_messages_restored : "recent bodies hydrated"
+    recent_messages_restored --> media_lazy_restore_enabled : "older media downloads on tap"
+    media_lazy_restore_enabled --> full_restore_complete : "terminal"
+```
+
+Backup segment build / verify pipeline driven by
+`crates/core/src/backup/`:
+
+```mermaid
+flowchart LR
+    Persister["MessagePersister<br/>(SAVEPOINT)"]
+    Journal["BackupEventJournal<br/>(typed taxonomy)"]
+    Builder["BackupSegmentBuilder<br/>(CBOR → zstd → AEAD seal)"]
+    Manifest["build_backup_manifest<br/>(Ed25519 signature, AEAD-seal,<br/>previous_manifest_hash chain)"]
+    Compactor["CompactionPolicy<br/>(daily → weekly → monthly,<br/>apply_tombstones)"]
+    Verifier["restore::manifest_verifier<br/>(walk chain, verify Ed25519,<br/>previous_manifest_hash check)"]
+    Pipeline["RestorePipeline<br/>(skeleton-first restore)"]
+
+    Persister -->|persist / edit / delete| Journal
+    Journal -->|read_unsegmented| Builder
+    Builder -->|sealed segment| Manifest
+    Manifest -->|chain| Verifier
+    Builder -->|aged segments| Compactor
+    Compactor -->|merged segment| Manifest
+    Verifier -->|manifest set| Pipeline
+    Builder -->|sealed segments| Pipeline
 ```
 
 ---

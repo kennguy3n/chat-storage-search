@@ -432,6 +432,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_received".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: now_ms(),
         };
@@ -551,6 +553,8 @@ impl<'a> MessagePersister<'a> {
         let journal = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "outbox_pending".into(),
+            conversation_id: Some(conv.clone()),
+            message_id: Some(mid.clone()),
             payload: payload.clone(),
             created_at_ms: now_ms(),
         };
@@ -610,6 +614,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "outbox_sent".into(),
+            conversation_id: Some(conv),
+            message_id: Some(client_message_id.to_string()),
             payload,
             created_at_ms: now_ms(),
         };
@@ -691,6 +697,8 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_edited".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: edited_at_ms,
         };
@@ -795,10 +803,40 @@ impl<'a> MessagePersister<'a> {
         let entry = BackupEventJournalEntry {
             event_seq: 0,
             event_type: "message_deleted".into(),
+            conversation_id: Some(skel.conversation_id.clone()),
+            message_id: Some(skel.message_id.clone()),
             payload: payload.clone(),
             created_at_ms: deleted_at_ms,
         };
         self.db.insert_backup_event(&entry)?;
+
+        // For each media asset attached to the deleted message,
+        // emit an explicit `media_deleted` backup event. The
+        // compaction planner already drops orphan `MediaReceived`
+        // rows under a `MessageDeleted` tombstone, but writing one
+        // explicit `MediaDeleted` per asset keeps the backup
+        // taxonomy aligned with `BackupEventType::MediaDeleted` and
+        // lets downstream consumers (restore, compaction across
+        // non-adjacent segments) reason about media without having
+        // to walk the skeleton table. Multi-asset messages emit one
+        // event per asset.
+        let attached_assets = self
+            .db
+            .list_media_assets_by_message(&skel.message_id)
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
+        for asset in &attached_assets {
+            let media_payload =
+                encode_media_delete_event_payload(&asset.asset_id, &skel.message_id);
+            let media_entry = BackupEventJournalEntry {
+                event_seq: 0,
+                event_type: "media_deleted".into(),
+                conversation_id: Some(skel.conversation_id.clone()),
+                message_id: Some(skel.message_id.clone()),
+                payload: media_payload,
+                created_at_ms: deleted_at_ms,
+            };
+            self.db.insert_backup_event(&media_entry)?;
+        }
 
         // Archive-side delete event. Rides inside
         // `SAVEPOINT delete_message;`.
@@ -896,6 +934,22 @@ fn encode_delete_event_payload(message_id: &str, scope: &str) -> Vec<u8> {
     push_cbor_text(&mut out, message_id);
     push_cbor_text(&mut out, "scope");
     push_cbor_text(&mut out, scope);
+    out
+}
+
+/// Encode the CBOR map payload for a `"media_deleted"` journal
+/// entry: `{ "asset_id": <str>, "message_id": <str> }`. Emitted from
+/// `delete_message` when the deleted message had attached media so
+/// the backup-side tombstone taxonomy stays explicit (Phase-4
+/// `BackupEventType::MediaDeleted`).
+fn encode_media_delete_event_payload(asset_id: &str, message_id: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    // Map of 2 entries.
+    out.push(0xa2);
+    push_cbor_text(&mut out, "asset_id");
+    push_cbor_text(&mut out, asset_id);
+    push_cbor_text(&mut out, "message_id");
+    push_cbor_text(&mut out, message_id);
     out
 }
 
@@ -1712,6 +1766,104 @@ mod tests {
         p.delete_for_everyone(&mid_b.to_string()).unwrap();
 
         assert_eq!(journal_count(&db, "message_deleted"), 2);
+    }
+
+    #[test]
+    fn delete_with_attached_media_emits_media_deleted_event() {
+        // Persist an inbound message with one attached media
+        // descriptor, then delete it. The persister must emit BOTH a
+        // `message_deleted` and a `media_deleted` backup event so the
+        // backup-side tombstone taxonomy stays explicit
+        // (`BackupEventType::MediaDeleted`).
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("with media".into()),
+            media_descriptors: vec![MediaDescriptor {
+                asset_id,
+                mime_type: "image/jpeg".into(),
+                bytes_total: 1024,
+                chunk_count: 1,
+                merkle_root: [0u8; 32],
+                blob_id: Uuid::now_v7(),
+                wrapped_k_asset: vec![0u8; 40],
+                storage_sink: None,
+            }],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        // Sanity: text-message-only deletes do NOT emit media_deleted.
+        let bare_mid = persist_text_message(&p, conv, "no media here");
+        p.delete_for_me(&bare_mid.to_string()).unwrap();
+        assert_eq!(journal_count(&db, "media_deleted"), 0);
+
+        // Delete the media-attached message.
+        p.delete_for_everyone(&mid.to_string()).unwrap();
+
+        assert_eq!(journal_count(&db, "message_deleted"), 2);
+        assert_eq!(journal_count(&db, "media_deleted"), 1);
+    }
+
+    #[test]
+    fn delete_with_multi_asset_message_emits_one_media_deleted_per_asset() {
+        // Multi-asset messages must emit one `media_deleted` backup
+        // event per attached asset (not just one for the first
+        // asset). `LocalStoreDb::list_media_assets_by_message`
+        // returns every row deterministically ordered by `asset_id`.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+
+        let mid = Uuid::now_v7();
+        let asset_a = Uuid::now_v7();
+        let asset_b = Uuid::now_v7();
+        let asset_c = Uuid::now_v7();
+        let make_desc = |asset_id: Uuid| MediaDescriptor {
+            asset_id,
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1024,
+            chunk_count: 1,
+            merkle_root: [0u8; 32],
+            blob_id: Uuid::now_v7(),
+            wrapped_k_asset: vec![0u8; 40],
+            storage_sink: None,
+        };
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("with three media".into()),
+            media_descriptors: vec![make_desc(asset_a), make_desc(asset_b), make_desc(asset_c)],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        // Sanity-check the helper that drives the iteration.
+        let attached = db
+            .list_media_assets_by_message(&mid.to_string())
+            .expect("list");
+        assert_eq!(attached.len(), 3);
+
+        p.delete_for_everyone(&mid.to_string()).unwrap();
+
+        assert_eq!(journal_count(&db, "message_deleted"), 1);
+        assert_eq!(
+            journal_count(&db, "media_deleted"),
+            3,
+            "one media_deleted event per attached asset",
+        );
     }
 
     #[test]
