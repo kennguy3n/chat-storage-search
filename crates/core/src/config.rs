@@ -83,6 +83,34 @@ pub enum StorageSink {
     },
 }
 
+/// Privacy posture toggle for the archive prefetch / orchestration
+/// pipeline.
+///
+/// `docs/PROPOSAL.md §5.6` proposes optional **dummy request
+/// padding** to break the per-bucket access-pattern fingerprint:
+/// when [`PrivacyLevel::High`] is configured, the orchestration
+/// layer mixes dummy segment-id fetches in with the real ones so an
+/// observer at the transport / backend layer cannot distinguish
+/// "user is reading bucket X" from "user is paginating bucket Y".
+/// The default ([`PrivacyLevel::Standard`]) keeps the prefetch path
+/// cost-optimal and is what every Phase-1 / Phase-2 deployment
+/// already runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PrivacyLevel {
+    /// Phase-1 default. The prefetch issues exactly one fetch per
+    /// real segment id.
+    #[default]
+    #[serde(rename = "standard")]
+    Standard,
+    /// Phase-3 optional. The prefetch interleaves randomly
+    /// generated dummy segment ids with the real ones; the dummy
+    /// fetches return empty / 404 from the backend and are
+    /// dropped on the receiving side. Trades transport bandwidth
+    /// for traffic-analysis resistance.
+    #[serde(rename = "high")]
+    High,
+}
+
 /// Configuration for a [`crate::KChatCore`] instance.
 #[derive(Debug, Clone)]
 pub struct KChatCoreConfig {
@@ -103,6 +131,11 @@ pub struct KChatCoreConfig {
     /// and archive segments still go to Tier 0. See
     /// `docs/PROPOSAL.md §5.7`.
     pub media_blob_sink: Option<StorageSink>,
+    /// Privacy posture for archive prefetch / orchestration. The
+    /// default is [`PrivacyLevel::Standard`]; bumping it to
+    /// [`PrivacyLevel::High`] enables dummy-request padding per
+    /// `docs/PROPOSAL.md §5.6`.
+    pub privacy_level: PrivacyLevel,
 }
 
 impl KChatCoreConfig {
@@ -120,6 +153,7 @@ impl KChatCoreConfig {
             tenant_id: tenant_id.into(),
             archive_backend: ArchiveBackend::default(),
             media_blob_sink: None,
+            privacy_level: PrivacyLevel::default(),
         }
     }
 
@@ -134,6 +168,13 @@ impl KChatCoreConfig {
     #[must_use]
     pub fn with_media_blob_sink(mut self, sink: Option<StorageSink>) -> Self {
         self.media_blob_sink = sink;
+        self
+    }
+
+    /// Builder-style override for [`Self::privacy_level`].
+    #[must_use]
+    pub fn with_privacy_level(mut self, level: PrivacyLevel) -> Self {
+        self.privacy_level = level;
         self
     }
 }

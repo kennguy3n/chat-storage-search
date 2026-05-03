@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::local_store::state_machines::ArchiveState;
+use crate::offload::budget::PressureLevel;
 
 /// Coarse content classification used by the eviction scorer.
 ///
@@ -54,6 +55,36 @@ impl ContentKind {
             ContentKind::Voice => 0.5,
             ContentKind::Thumbnail => 0.3,
             ContentKind::Text => 0.1,
+        }
+    }
+
+    /// Whether this content kind is eligible for eviction at the
+    /// given [`PressureLevel`].
+    ///
+    /// `docs/PROPOSAL.md §5.4` reserves the lowest tiers for
+    /// severe pressure: image / voice / video / document originals
+    /// move under any pressure greater than `None`, but
+    /// **thumbnails** are only evictable under `Critical` /
+    /// `Extreme`, and **cold text bodies** only under `Extreme`.
+    /// The intent is to keep timeline rendering fidelity until the
+    /// budget enforcer truly has no other choice.
+    pub fn is_eligible_for_pressure(self, pressure: PressureLevel) -> bool {
+        match self {
+            // Hot media (originals) — eligible whenever there is
+            // any pressure at all.
+            ContentKind::Video
+            | ContentKind::Document
+            | ContentKind::Image
+            | ContentKind::Voice => !matches!(pressure, PressureLevel::None),
+            // Thumbnails are kept around for timeline rendering
+            // until pressure is at least `Critical`.
+            ContentKind::Thumbnail => {
+                matches!(pressure, PressureLevel::Critical | PressureLevel::Extreme)
+            }
+            // Cold text bodies are the very last resort —
+            // evicting them costs a search-fts /
+            // search-fuzzy reindex on rehydration.
+            ContentKind::Text => matches!(pressure, PressureLevel::Extreme),
         }
     }
 }
@@ -97,6 +128,14 @@ pub struct EvictionCandidate {
     /// Archive state at the time of scoring. Eviction is only
     /// safe once the candidate is `archive_verified`.
     pub archive_state: ArchiveState,
+    /// `media_asset.storage_sink` — Phase-3 tiered eviction policy
+    /// (see [`super::eviction::EvictionTier`]) consults this to
+    /// decide whether the candidate's original lives on a user
+    /// cloud (cloud-offload first) or only on the KChat backend
+    /// (full eviction). Canonical values mirror
+    /// [`crate::config::StorageSink`]: `"kchat_backend"`,
+    /// `"i_cloud"`, `"google_drive"`, `"zk_object_fabric"`.
+    pub storage_sink: String,
 }
 
 const RECENCY_HALF_LIFE_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0; // 30 days
@@ -135,6 +174,7 @@ mod tests {
             last_accessed_ms,
             is_pinned: false,
             archive_state: ArchiveState::ArchiveVerified,
+            storage_sink: "kchat_backend".to_string(),
         }
     }
 
@@ -208,5 +248,76 @@ mod tests {
                 .map(|(_, w)| *w)
                 .collect::<Vec<f64>>()
         );
+    }
+
+    // -------------------------------------------------------------
+    // PressureLevel-gated eligibility (`§5.4`).
+    // -------------------------------------------------------------
+    #[test]
+    fn no_pressure_evicts_nothing() {
+        for kind in [
+            ContentKind::Video,
+            ContentKind::Document,
+            ContentKind::Image,
+            ContentKind::Voice,
+            ContentKind::Thumbnail,
+            ContentKind::Text,
+        ] {
+            assert!(
+                !kind.is_eligible_for_pressure(PressureLevel::None),
+                "{kind:?} ineligible under None"
+            );
+        }
+    }
+
+    #[test]
+    fn warning_pressure_evicts_originals_only() {
+        for kind in [
+            ContentKind::Video,
+            ContentKind::Document,
+            ContentKind::Image,
+            ContentKind::Voice,
+        ] {
+            assert!(
+                kind.is_eligible_for_pressure(PressureLevel::Warning),
+                "{kind:?} eligible under Warning"
+            );
+        }
+        assert!(!ContentKind::Thumbnail.is_eligible_for_pressure(PressureLevel::Warning));
+        assert!(!ContentKind::Text.is_eligible_for_pressure(PressureLevel::Warning));
+    }
+
+    #[test]
+    fn critical_pressure_includes_thumbnails_excludes_text() {
+        for kind in [
+            ContentKind::Video,
+            ContentKind::Document,
+            ContentKind::Image,
+            ContentKind::Voice,
+            ContentKind::Thumbnail,
+        ] {
+            assert!(
+                kind.is_eligible_for_pressure(PressureLevel::Critical),
+                "{kind:?} eligible under Critical"
+            );
+        }
+        assert!(!ContentKind::Text.is_eligible_for_pressure(PressureLevel::Critical));
+    }
+
+    #[test]
+    fn extreme_pressure_includes_cold_text() {
+        for kind in [
+            ContentKind::Video,
+            ContentKind::Document,
+            ContentKind::Image,
+            ContentKind::Voice,
+            ContentKind::Thumbnail,
+            ContentKind::Text,
+        ] {
+            assert!(
+                kind.is_eligible_for_pressure(PressureLevel::Extreme),
+                "{kind:?} eligible under Extreme"
+            );
+        }
     }
 }

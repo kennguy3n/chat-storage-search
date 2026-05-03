@@ -245,18 +245,30 @@ Checklist:
 - [~] Eviction scoring formula (PROPOSAL §5.4). _(With pinned-row
       guard returning `f64::MIN` so the scoring path is also
       pin-safe even if a pinned row leaks past the SQL filter.)_
-- [~] Eviction priority order: video → documents → images → voice →
+- [x] Eviction priority order: video → documents → images → voice →
       thumbnails (under severe pressure) → cold text bodies (under
       extreme pressure). _(Carried by `CONTENT_KIND_WEIGHTS` plus
-      `plan_eviction`.)_
+      `plan_eviction_with_pressure`: originals are eligible at
+      `Warning+`, thumbnails at `Critical+`, cold text bodies at
+      `Extreme` only.)_
 - [x] Pinned-chat / pinned-message exclusion. _(Three-deep:
       `collect_eviction_candidates` filters
       `conversation.pinned = 0`, `plan_eviction` skips pinned rows
       before scoring, and `compute_eviction_score` returns
       `f64::MIN` if a pinned candidate still reaches it.)_
-- [ ] Timeline-skeleton rehydration on scroll-back (no scroll-jump
-      on update).
-- [ ] Lazy media rehydration on tap.
+- [x] Timeline-skeleton rehydration on scroll-back (no scroll-jump
+      on update). _(`LocalStoreDb::rehydrate_message_body` does an
+      `INSERT OR REPLACE` on `message_body` plus a `body_state`
+      UPDATE in one SAVEPOINT without touching `created_at_ms` /
+      `received_at_ms`, then re-indexes into `search_fts` and
+      `search_fuzzy_words`. Wired into `CoreImpl::hydrate_message`.)_
+- [x] Lazy media rehydration on tap. _(`media::download::rehydrate_media_asset`
+      reads `media_asset.{blob_id, storage_sink, chunk_count,
+      merkle_root, wrapped_k_asset}`, unwraps `K_asset` via
+      `K_local_db`, drives the chunked download through
+      `TransportClient` or the configured `MediaBlobSink` based
+      on `storage_sink`, verifies the BLAKE3 root, and flips
+      `media_state` to `original_local`.)_
 - [~] Prefetch window management (viewport ± 100–150 messages).
       _(`HydrationQueue::enqueue_prefetch_window` plus
       `CoreImpl::enqueue_prefetch_window` widen a viewport into
@@ -270,10 +282,14 @@ Checklist:
       `K_archive_manifest`. HKDF info =
       `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
       cadence: monthly (matching `time_bucket`).
-- [ ] Epoch key lifecycle: current epoch key in memory; prior
+- [x] Epoch key lifecycle: current epoch key in memory; prior
       epoch keys wrapped under `K_archive_root` and recorded in
       the archive manifest chain. Optional epoch-key deletion
-      for forward secrecy.
+      for forward secrecy. _(`archive::epoch_keys::EpochKeyManager`:
+      current epoch in `Zeroizing<[u8; 32]>`, prior keys wrapped
+      via AES-256-KW; `rotate(new_epoch_id)` /
+      `unwrap_prior_epoch_key` / `delete_epoch_key(epoch_id)` cover
+      the lifecycle including forward-secrecy deletion.)_
 - [x] Epoch key derivation test vectors (Rust): deterministic
       derivation, epoch rotation, wrapped-key round-trip,
       cross-epoch segment decrypt after manifest-chain unwrap.
@@ -287,28 +303,58 @@ Checklist:
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
       + ZKOF tenant credentials.
-- [ ] Archive backend routing: transport client routes archive
+- [x] Archive backend routing: transport client routes archive
       operations to KChat backend or ZKOF based on configuration.
       Manifest index stored as a well-known S3 key when using ZKOF.
+      _(`archive::routing::route_archive_upload` /
+      `route_archive_download` / `route_manifest_upload` dispatch
+      to either `TransportClient` or a `ZkofArchiveAdapter` based
+      on `KChatCoreConfig::archive_backend`. The ZKOF adapter is
+      backed by an `S3Client` trait with a `NoopS3Client` stub and
+      maps the manifest index to a well-known `manifests/index`
+      key.)_
 - [~] Batch-by-bucket prefetch: on any archive segment miss, fetch
       all segments for the `(conversation_id, time_bucket)` pair.
       Reduces per-segment access-pattern metadata to per-bucket
       granularity. _(`archive::prefetch::batch_prefetch_bucket`
       queries `archive_segment_map` and streams every matching
       segment through `TransportClient::fetch_archive_segment`.)_
-- [ ] Dummy request padding (optional, off by default): mix real
+- [x] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.
+      _(`archive::privacy::{should_pad, compute_padding_count,
+      generate_dummy_segment_id, pad_with_dummy_requests}` mint
+      UUIDv4 dummies and interleave them with real ids;
+      `archive::prefetch::batch_prefetch_bucket_with_padding`
+      issues one fetch per id in the padded order and silently
+      drops dummy errors. Off by default; enable via
+      `KChatCoreConfig::privacy_level = High`.)_
 - [ ] iCloud `MediaBlobSink` implementation (CloudKit file
       storage). See PROPOSAL.md §10.2.
 - [ ] Google Drive `MediaBlobSink` implementation (Drive API via
       the Android / desktop platform bridge). See PROPOSAL.md
       §10.2.
-- [ ] ZK Object Fabric `MediaBlobSink` implementation (S3
+- [x] ZK Object Fabric `MediaBlobSink` implementation (S3
       `PutObject` / `GetObject`). See PROPOSAL.md §10.2.
-- [ ] Tiered eviction policy: media originals offload to the
+      _(`media::sinks::zk_fabric::ZkObjectFabricSink`: maps
+      `upload_media_chunks` / `fetch_media_chunk` /
+      `delete_media_blob` to per-chunk S3 keys of the form
+      `media/{asset_id}/chunk-{idx:08}` against a configured
+      bucket. The S3 client itself is a small `S3Client` trait
+      with `NoopS3Client` stub; the actual HTTP / SDK
+      implementation lands later.)_
+- [x] Tiered eviction policy: media originals offload to the
       configured user cloud sink before archive segments offload
       to the KChat backend.
+      _(`offload::eviction::EvictionTier` classifies each
+      `EvictionCandidate` by `storage_sink`: `kchat_backend` →
+      `FullEviction`, everything else → `CloudOffload`.
+      `plan_tiered_eviction` runs a two-pass planner — drains the
+      cloud-offload pool first and only falls through to the
+      full-eviction pool if the cloud pass underruns the byte
+      budget. Wired into `CoreImpl::enforce_storage_budget` and
+      exercised end-to-end by
+      `crates/core/tests/storage_budget_enforcement.rs`.)_
 - [ ] `storage_backend` column on `archive_segment_map` for
       tracking which backend each segment lives on (`kchat_backend`
       or `zk_object_fabric`).

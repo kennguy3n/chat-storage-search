@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::local_store::state_machines::ArchiveState;
 use crate::Error;
 
+use super::budget::PressureLevel;
 use super::scoring::{compute_eviction_score, ContentKind, EvictionCandidate};
 
 /// Result of [`plan_eviction`].
@@ -44,6 +45,118 @@ pub struct EvictionResult {
     pub evicted_count: u32,
 }
 
+/// Tier classification for the Phase-3 tiered eviction policy.
+///
+/// `docs/PROPOSAL.md §5.4` and the PHASES.md "Phase 3 / tiered
+/// eviction" entry call for the budget enforcer to spend its byte
+/// budget against the cheaper tier before touching anything that
+/// requires a network rehydration:
+///
+/// 1. **CloudOffload** — the original lives on a user-cloud sink
+///    (iCloud / Google Drive / ZK Object Fabric). Evicting just
+///    means dropping the local copy; rehydration round-trips
+///    against the user's own storage and never bothers the KChat
+///    backend.
+/// 2. **FullEviction** — the original only exists on the KChat
+///    backend (or on no backend at all if archiving is in flight).
+///    Evicting requires a remote fetch on the next access.
+///
+/// The tier is purely a function of
+/// [`EvictionCandidate::storage_sink`]: anything other than
+/// `"kchat_backend"` is treated as cloud-offloadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionTier {
+    /// Original lives on a user-cloud sink — evicting just drops
+    /// the local copy.
+    CloudOffload,
+    /// Original lives only on the KChat backend (or hasn't
+    /// archived yet) — evicting means a network rehydration on
+    /// next access.
+    FullEviction,
+}
+
+impl EvictionTier {
+    /// Classify a candidate by its storage sink.
+    ///
+    /// `"kchat_backend"` → [`EvictionTier::FullEviction`]; every
+    /// other value → [`EvictionTier::CloudOffload`].
+    pub fn classify(candidate: &super::scoring::EvictionCandidate) -> Self {
+        match candidate.storage_sink.as_str() {
+            "kchat_backend" | "" => EvictionTier::FullEviction,
+            _ => EvictionTier::CloudOffload,
+        }
+    }
+}
+
+/// Result of [`plan_tiered_eviction`].
+///
+/// Splits the candidate pool into a cloud-offload pass and a
+/// full-eviction pass. The cloud pass is consumed first, and
+/// only as much of the full-eviction pass as the remaining byte
+/// budget requires.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TieredEvictionPlan {
+    /// Cloud-offload eviction plan — these candidates can be
+    /// dropped from the local store with the original still
+    /// reachable through the user-cloud sink.
+    pub cloud_offload: EvictionPlan,
+    /// Full-eviction plan — these candidates require a network
+    /// rehydration on next access.
+    pub full_eviction: EvictionPlan,
+    /// Total bytes the two passes free (cloud + full).
+    pub total_bytes: u64,
+    /// Byte budget the caller asked the planner to free.
+    pub target_bytes: u64,
+}
+
+/// Tiered eviction planner.
+///
+/// `docs/PROPOSAL.md §5.4` — first satisfy the byte budget out of
+/// candidates whose originals live on a user cloud sink (cheap
+/// to rehydrate). Only if the cloud pass falls short do we fall
+/// through to candidates whose originals live on the KChat
+/// backend (expensive — costs a remote fetch on next access).
+///
+/// The `pressure` parameter is forwarded to
+/// [`plan_eviction_with_pressure`] so each pass also respects the
+/// content-kind eligibility table.
+pub fn plan_tiered_eviction(
+    candidates: Vec<super::scoring::EvictionCandidate>,
+    target_bytes: u64,
+    now_ms: i64,
+    pressure: PressureLevel,
+) -> TieredEvictionPlan {
+    let (cloud_pool, full_pool): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| matches!(EvictionTier::classify(c), EvictionTier::CloudOffload));
+
+    // First pass — burn through cloud-offloadable candidates.
+    let cloud_plan = plan_eviction_with_pressure(cloud_pool, target_bytes, now_ms, pressure);
+
+    // Second pass — only kicks in if the cloud pass underran the
+    // budget. The remaining target is `target_bytes - cloud freed`,
+    // saturating to 0 so we never go negative.
+    let remaining = target_bytes.saturating_sub(cloud_plan.total_bytes);
+    let full_plan = if remaining == 0 {
+        EvictionPlan {
+            candidates: Vec::new(),
+            target_bytes: 0,
+            total_bytes: 0,
+        }
+    } else {
+        plan_eviction_with_pressure(full_pool, remaining, now_ms, pressure)
+    };
+
+    let total = cloud_plan.total_bytes.saturating_add(full_plan.total_bytes);
+    TieredEvictionPlan {
+        cloud_offload: cloud_plan,
+        full_eviction: full_plan,
+        total_bytes: total,
+        target_bytes,
+    }
+}
+
 /// Plan eviction.
 ///
 /// Filters out pinned and not-yet-archived candidates, scores the
@@ -54,10 +167,32 @@ pub fn plan_eviction(
     target_bytes: u64,
     now_ms: i64,
 ) -> EvictionPlan {
+    // Default pressure-level for the legacy single-arg planner is
+    // `Extreme` so every content kind remains eligible — keeps the
+    // pre-Phase-3 callers working unchanged.
+    plan_eviction_with_pressure(candidates, target_bytes, now_ms, PressureLevel::Extreme)
+}
+
+/// `plan_eviction` variant that filters candidates by the
+/// caller-supplied [`PressureLevel`] before scoring.
+///
+/// `docs/PROPOSAL.md §5.4` reserves the lowest tiers (thumbnails,
+/// cold text bodies) for severe pressure. This entry point lets the
+/// orchestration layer pass through the [`PressureLevel`] computed
+/// by [`super::budget::pressure_level`] so the planner only ever
+/// considers candidates whose [`ContentKind`] is eligible at that
+/// pressure tier.
+pub fn plan_eviction_with_pressure(
+    candidates: Vec<EvictionCandidate>,
+    target_bytes: u64,
+    now_ms: i64,
+    pressure: PressureLevel,
+) -> EvictionPlan {
     let mut scored: Vec<(EvictionCandidate, f64)> = candidates
         .into_iter()
         .filter(|c| !c.is_pinned)
         .filter(|c| c.archive_state == ArchiveState::ArchiveVerified)
+        .filter(|c| c.content_kind.is_eligible_for_pressure(pressure))
         .map(|c| {
             let s = compute_eviction_score(&c, now_ms);
             (c, s)
@@ -189,7 +324,8 @@ pub fn collect_eviction_candidates(
                     ms.conversation_id,
                     ma.mime_type,
                     ma.bytes_local,
-                    ms.created_at_ms
+                    ms.created_at_ms,
+                    ma.storage_sink
                FROM media_asset ma
                JOIN message_skeleton ms ON ms.message_id = ma.message_id
                JOIN conversation c     ON c.conversation_id = ms.conversation_id
@@ -217,6 +353,7 @@ pub fn collect_eviction_candidates(
             let mime_type: String = row.get(3)?;
             let bytes_local: i64 = row.get(4)?;
             let created_at_ms: i64 = row.get(5)?;
+            let storage_sink: String = row.get(6)?;
             Ok((
                 asset_id,
                 message_id,
@@ -224,14 +361,22 @@ pub fn collect_eviction_candidates(
                 mime_type,
                 bytes_local,
                 created_at_ms,
+                storage_sink,
             ))
         })
         .map_err(|e| Error::Storage(e.to_string()))?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (asset_id, message_id, conversation_id, mime_type, bytes_local, created_at_ms) =
-            row.map_err(|e| Error::Storage(e.to_string()))?;
+        let (
+            asset_id,
+            message_id,
+            conversation_id,
+            mime_type,
+            bytes_local,
+            created_at_ms,
+            storage_sink,
+        ) = row.map_err(|e| Error::Storage(e.to_string()))?;
         let asset_id = Uuid::parse_str(&asset_id)
             .map_err(|e| Error::Storage(format!("invalid asset_id: {e}")))?;
         let message_id = Uuid::parse_str(&message_id)
@@ -248,6 +393,7 @@ pub fn collect_eviction_candidates(
             last_accessed_ms: created_at_ms,
             is_pinned: false,
             archive_state: ArchiveState::ArchiveVerified,
+            storage_sink,
         });
     }
     Ok(out)
@@ -269,7 +415,14 @@ mod tests {
             last_accessed_ms: -age_ms,
             is_pinned: false,
             archive_state: ArchiveState::ArchiveVerified,
+            storage_sink: "kchat_backend".to_string(),
         }
+    }
+
+    fn cand_with_sink(kind: ContentKind, bytes: u64, age_ms: i64, sink: &str) -> EvictionCandidate {
+        let mut c = cand(kind, bytes, age_ms);
+        c.storage_sink = sink.to_string();
+        c
     }
 
     #[test]
@@ -433,6 +586,7 @@ mod tests {
                     last_accessed_ms: 0,
                     is_pinned: false,
                     archive_state: ArchiveState::ArchiveVerified,
+                    storage_sink: "kchat_backend".to_string(),
                 },
                 1.0,
             )],
@@ -538,6 +692,7 @@ mod tests {
                     last_accessed_ms: 0,
                     is_pinned: false,
                     archive_state: ArchiveState::ArchiveVerified,
+                    storage_sink: "kchat_backend".to_string(),
                 },
                 1.0,
             )],
@@ -819,5 +974,178 @@ mod tests {
             ],
             "ORDER BY did not match §5.4 priority sequence"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Phase-3: PressureLevel-gated planning (`§5.4`).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn plan_eviction_with_pressure_warning_excludes_thumbs_and_text() {
+        let cands = vec![
+            cand(ContentKind::Video, 1000, 0),
+            cand(ContentKind::Image, 1000, 0),
+            cand(ContentKind::Voice, 1000, 0),
+            cand(ContentKind::Thumbnail, 1000, 0),
+            cand(ContentKind::Text, 1000, 0),
+        ];
+        let plan = plan_eviction_with_pressure(cands, u64::MAX, 0, PressureLevel::Warning);
+        let kinds: Vec<ContentKind> = plan
+            .candidates
+            .iter()
+            .map(|(c, _)| c.content_kind)
+            .collect();
+        for excluded in [ContentKind::Thumbnail, ContentKind::Text] {
+            assert!(
+                !kinds.contains(&excluded),
+                "Warning pressure must not evict {excluded:?} (saw {kinds:?})"
+            );
+        }
+        for included in [ContentKind::Video, ContentKind::Image, ContentKind::Voice] {
+            assert!(
+                kinds.contains(&included),
+                "Warning pressure must evict {included:?} (saw {kinds:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_eviction_with_pressure_critical_includes_thumbs_excludes_text() {
+        let cands = vec![
+            cand(ContentKind::Video, 1000, 0),
+            cand(ContentKind::Thumbnail, 1000, 0),
+            cand(ContentKind::Text, 1000, 0),
+        ];
+        let plan = plan_eviction_with_pressure(cands, u64::MAX, 0, PressureLevel::Critical);
+        let kinds: Vec<ContentKind> = plan
+            .candidates
+            .iter()
+            .map(|(c, _)| c.content_kind)
+            .collect();
+        assert!(kinds.contains(&ContentKind::Thumbnail));
+        assert!(!kinds.contains(&ContentKind::Text));
+    }
+
+    #[test]
+    fn plan_eviction_with_pressure_extreme_evicts_everything_eligible() {
+        let cands = vec![
+            cand(ContentKind::Video, 1000, 0),
+            cand(ContentKind::Document, 1000, 0),
+            cand(ContentKind::Image, 1000, 0),
+            cand(ContentKind::Voice, 1000, 0),
+            cand(ContentKind::Thumbnail, 1000, 0),
+            cand(ContentKind::Text, 1000, 0),
+        ];
+        let plan = plan_eviction_with_pressure(cands, u64::MAX, 0, PressureLevel::Extreme);
+        assert_eq!(plan.candidates.len(), 6);
+        // Priority order is unchanged: highest-weight first.
+        let order: Vec<ContentKind> = plan
+            .candidates
+            .iter()
+            .map(|(c, _)| c.content_kind)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ContentKind::Video,
+                ContentKind::Document,
+                ContentKind::Image,
+                ContentKind::Voice,
+                ContentKind::Thumbnail,
+                ContentKind::Text,
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_eviction_with_pressure_none_returns_empty_plan() {
+        let cands = vec![
+            cand(ContentKind::Video, 1000, 0),
+            cand(ContentKind::Text, 1000, 0),
+        ];
+        let plan = plan_eviction_with_pressure(cands, u64::MAX, 0, PressureLevel::None);
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.total_bytes, 0);
+    }
+
+    #[test]
+    fn eviction_tier_classifies_kchat_as_full_eviction() {
+        let c = cand(ContentKind::Video, 100, 0);
+        assert_eq!(EvictionTier::classify(&c), EvictionTier::FullEviction);
+    }
+
+    #[test]
+    fn eviction_tier_classifies_user_cloud_as_cloud_offload() {
+        for sink in ["i_cloud", "google_drive", "zk_object_fabric"] {
+            let c = cand_with_sink(ContentKind::Video, 100, 0, sink);
+            assert_eq!(
+                EvictionTier::classify(&c),
+                EvictionTier::CloudOffload,
+                "sink {sink} must be CloudOffload"
+            );
+        }
+    }
+
+    #[test]
+    fn tiered_eviction_satisfies_budget_from_cloud_pool_first() {
+        // 1000 bytes of cloud-offloadable + 1000 bytes of
+        // KChat-backend candidates. Asking for 800 bytes must
+        // pull entirely from the cloud pool.
+        let cands = vec![
+            cand_with_sink(ContentKind::Video, 1000, 0, "i_cloud"),
+            cand(ContentKind::Video, 1000, 0),
+        ];
+        let plan = plan_tiered_eviction(cands, 800, 0, PressureLevel::Warning);
+        assert_eq!(plan.cloud_offload.candidates.len(), 1);
+        assert_eq!(plan.full_eviction.candidates.len(), 0);
+        assert_eq!(plan.cloud_offload.total_bytes, 1000);
+        assert_eq!(plan.total_bytes, 1000);
+    }
+
+    #[test]
+    fn tiered_eviction_falls_through_to_full_when_cloud_short() {
+        // 200 bytes of cloud + 1000 bytes of KChat. Asking for
+        // 800 bytes must pull both pools.
+        let cands = vec![
+            cand_with_sink(ContentKind::Video, 200, 0, "i_cloud"),
+            cand(ContentKind::Video, 1000, 0),
+        ];
+        let plan = plan_tiered_eviction(cands, 800, 0, PressureLevel::Warning);
+        assert_eq!(plan.cloud_offload.candidates.len(), 1);
+        assert_eq!(plan.cloud_offload.total_bytes, 200);
+        assert_eq!(plan.full_eviction.candidates.len(), 1);
+        assert_eq!(plan.full_eviction.total_bytes, 1000);
+        assert_eq!(plan.total_bytes, 1200);
+    }
+
+    #[test]
+    fn tiered_eviction_respects_pressure_filter_in_each_pass() {
+        // Text bodies are only eligible at Extreme pressure. With
+        // Warning the cloud pool drops them and the full pool too
+        // — only the video survives.
+        let cands = vec![
+            cand_with_sink(ContentKind::Text, 100, 0, "i_cloud"),
+            cand(ContentKind::Video, 1000, 0),
+        ];
+        let plan = plan_tiered_eviction(cands, u64::MAX, 0, PressureLevel::Warning);
+        assert_eq!(plan.cloud_offload.candidates.len(), 0);
+        assert_eq!(plan.full_eviction.candidates.len(), 1);
+        assert_eq!(
+            plan.full_eviction.candidates[0].0.content_kind,
+            ContentKind::Video
+        );
+    }
+
+    #[test]
+    fn tiered_eviction_with_no_cloud_pool_falls_straight_through() {
+        let cands = vec![
+            cand(ContentKind::Video, 1000, 0),
+            cand(ContentKind::Image, 500, 0),
+        ];
+        let plan = plan_tiered_eviction(cands, 1200, 0, PressureLevel::Warning);
+        assert_eq!(plan.cloud_offload.candidates.len(), 0);
+        assert_eq!(plan.cloud_offload.total_bytes, 0);
+        assert_eq!(plan.full_eviction.candidates.len(), 2);
+        assert_eq!(plan.full_eviction.total_bytes, 1500);
     }
 }

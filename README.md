@@ -9,15 +9,22 @@
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
 > Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
-> Media Encryption and Blob Service — `In progress | ~80%`.**
-> **Phase 3 — Personal Archive and Offload — `In progress | ~35%`
+> Media Encryption and Blob Service — `In progress | ~95%` (chunked
+> media pipeline + thumbnailing landed; tiered media-storage routing
+> wired through `MediaBlobSink`).**
+> **Phase 3 — Personal Archive and Offload — `In progress | ~60%`
 > (foundation: archive event journal wired into `MessagePersister`,
 > archive segment builder, archive manifest chain builder, archive
 > segment upload orchestration, archive state machine transitions,
-> epoch-rotated archive keys, offload budget / scoring / eviction
-> with pinned-chat exclusion / hydration priority queue wired into
-> `CoreImpl::hydrate_message`, batch-by-bucket prefetch,
-> `CoreImpl::enforce_storage_budget`).**
+> epoch-rotated archive keys with full lifecycle (`EpochKeyManager`),
+> offload budget / scoring / eviction with pressure-tier filter +
+> pinned-chat exclusion / hydration priority queue wired into
+> `CoreImpl::hydrate_message` (timeline-skeleton rehydration without
+> scroll-jump + lazy media rehydration on tap), batch-by-bucket
+> prefetch with optional dummy request padding, archive backend
+> routing (KChat backend / ZK Object Fabric), ZK Object Fabric
+> `MediaBlobSink`, tiered eviction policy (cloud-offload first → full
+> eviction), `CoreImpl::enforce_storage_budget`).**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -220,13 +227,16 @@ chat-storage-search/
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + prefetch
+        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + prefetch + epoch keys + routing + privacy padding
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
           segment_builder.rs                # SegmentBuildRequest / BuiltSegment / ArchiveSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305)
           manifest_builder.rs               # ArchiveManifestBuilder: genesis → gen N chain, BLAKE3 manifest hash, Ed25519 signature, AEAD-seal under K_archive_manifest
           upload.rs                         # upload_archive_segment over TransportClient + persist_segment_map_row
-          prefetch.rs                       # batch_prefetch_bucket: one transport hop per (conversation_id, time_bucket)
+          prefetch.rs                       # batch_prefetch_bucket / batch_prefetch_bucket_with_padding: one transport hop per (conversation_id, time_bucket)
+          epoch_keys.rs                     # EpochKeyManager: current epoch in Zeroizing<[u8; 32]>, prior keys wrapped via AES-256-KW, rotate / unwrap_prior_epoch_key / delete_epoch_key
+          routing.rs                        # route_archive_upload / route_archive_download / route_manifest_upload (KChat backend ↔ ZK Object Fabric)
+          privacy.rs                        # should_pad / compute_padding_count / generate_dummy_segment_id (UUIDv4) / pad_with_dummy_requests (privacy_level = High)
         backup/                             # placeholder (Phase 4)
         media/                              # Phase 2: chunker + processor + upload + download + cache + routing + thumbnail
           mod.rs
@@ -238,14 +248,15 @@ chat-storage-search/
           cache.rs                          # MediaCache: LRU eviction with configurable byte budget
           caption.rs                        # NFC normalization, filename sanitization, multilingual captions
           routing.rs                        # route_media_upload / route_media_download (sink dispatch)
-          sinks/                            # MediaBlobSink trait + NoopMediaBlobSink (PROPOSAL.md §5.7)
-            mod.rs
+          sinks/                            # MediaBlobSink trait + sink implementations (PROPOSAL.md §5.7)
+            mod.rs                          # MediaBlobSink + MediaBlobReference + NoopMediaBlobSink
+            zk_fabric.rs                    # ZkObjectFabricSink: per-chunk S3 keys media/{asset_id}/chunk-{idx:08}, S3Client trait + NoopS3Client
         models/                             # placeholder (Phase 6)
         offload/                            # Phase 3 foundation: budget + scoring + eviction + hydration
           mod.rs
           budget.rs                         # StorageBudget / StorageUsage / BudgetAssessment / PressureLevel / StorageBudgetEnforcer
           scoring.rs                        # ContentKind weights + 30-day half-life recency decay + size bonus (PROPOSAL §5.4)
-          eviction.rs                       # plan_eviction + execute_eviction (state-machine demotion)
+          eviction.rs                       # plan_eviction + plan_eviction_with_pressure + plan_tiered_eviction (cloud-offload first → full eviction) + execute_eviction (state-machine demotion)
           hydration.rs                      # HydrationQueue (P0..P5 priority + FIFO) + enqueue_prefetch_window
         restore/                            # placeholder (Phase 4)
         scheduler/                          # placeholder (Phase 4 / 7)
@@ -258,6 +269,7 @@ chat-storage-search/
         epoch_key_derivation.rs             # Phase 3: K_archive_epoch determinism / rotation / wrap-unwrap / cross-epoch decrypt / info-string vectors
         archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
         media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
+        storage_budget_enforcement.rs       # Phase 3 end-to-end: pressure assessment → candidate collection → tiered eviction → executor (every PressureLevel × every EvictionTier)
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
