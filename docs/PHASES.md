@@ -168,6 +168,17 @@ never duplicate completed chunks.
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
 
+> 2026-05-03: Foundation work has started. The archive event
+> journal, archive segment builder, epoch-rotated archive key
+> derivation, and the offload modules
+> (`offload::{budget, scoring, eviction, hydration}`) all landed
+> alongside `CoreImpl::hydrate_message` and
+> `CoreImpl::enforce_storage_budget`. The remote archive fetch
+> path (manifest reader / segment download / replay) and the
+> archive segment uploader against `TransportClient` are queued
+> for the next milestone. See `docs/PROGRESS.md` Phase 3 for the
+> detailed checklist.
+
 Checklist:
 
 - [ ] Archive event journal (every durable mutation writes an

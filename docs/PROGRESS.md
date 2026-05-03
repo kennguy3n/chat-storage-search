@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~55%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~70%`). Phase 3 — Personal Archive and Offload (`In progress | ~15%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -607,17 +607,18 @@ Notes:
 
 ## Phase 2: Media Encryption and Blob Service
 
-**Status**: `In progress | ~55%`
+**Status**: `In progress | ~70%`
 
 **Goal**: Chunked encrypted media upload / download, thumbnailing,
 local media cache.
 
 Checklist:
 
-- [~] Media processor: thumbnail generation, chunk encryption with
+- [x] Media processor: thumbnail generation, chunk encryption with
       random `K_asset`. (Chunk encryption + `K_asset` random gen +
       AES-256-KW wrap landed in `media::processor::process_media`;
-      thumbnail generation still pending.)
+      thumbnail generation lands in `media::thumbnail::ThumbnailGenerator`
+      using the `image` crate to downscale and re-encode as PNG.)
 - [~] Chunked encrypted blob upload / download (transport client).
       (`media::upload::upload_chunked_media` /
       `media::upload::resume_upload` drive `init → chunk(s) →
@@ -683,42 +684,75 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~15%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
 
 Checklist:
 
-- [ ] Archive event journal.
-- [ ] Archive segment builder (per-conversation / per-time-bucket).
+- [~] Archive event journal. (`crates/core/src/archive/event_journal.rs`
+      with `archive_event_journal` + `archive_event_cursor` tables;
+      reader/writer API plus `read_unsegmented` to feed the segment
+      builder.)
+- [~] Archive segment builder (per-conversation / per-time-bucket).
+      (`crates/core/src/archive/segment_builder.rs`: CBOR encode →
+      zstd compress → XChaCha20-Poly1305 seal under
+      `K_archive_segment`, BLAKE3 plaintext root, default monthly
+      `time_bucket` helper.)
 - [ ] Archive manifest chain (generation N+1, `previous_manifest_hash`,
       Ed25519 signature).
 - [ ] Encrypted segment upload to backend blob service.
 - [ ] Whole-object Merkle-root verification after upload.
 - [ ] Archive state machine (`not_archived` → `archive_pending` →
       `archive_uploaded` → `archive_verified` → `archive_compacted`).
-- [ ] Storage budget enforcement (`enforceStorageBudget`).
-- [ ] Eviction scoring formula.
-- [ ] Eviction priority order (video → documents → images → voice →
-      thumbnails → cold text bodies).
-- [ ] Pinned-chat / pinned-message exclusion.
+- [~] Storage budget enforcement (`enforceStorageBudget`).
+      (`crates/core/src/offload/budget.rs` with `StorageBudget`,
+      `StorageUsage`, `BudgetAssessment`, `PressureLevel` and a
+      stateless `StorageBudgetEnforcer::assess` driving the offload
+      orchestration loop. `CoreImpl::enforce_storage_budget` wires
+      this in.)
+- [~] Eviction scoring formula.
+      (`crates/core/src/offload/scoring.rs`:
+      `compute_eviction_score` combines `ContentKind` weight,
+      30-day half-life recency decay, and 16 MiB-normalised size
+      bonus per PROPOSAL §5.4.)
+- [~] Eviction priority order (video → documents → images → voice →
+      thumbnails → cold text bodies). (`CONTENT_KIND_WEIGHTS` in
+      `offload::scoring` plus `plan_eviction` in
+      `offload::eviction` sort candidates accordingly.)
+- [~] Pinned-chat / pinned-message exclusion.
+      (`compute_eviction_score` short-circuits to
+      `f64::NEG_INFINITY` for pinned candidates and `plan_eviction`
+      filters them out before scoring.)
 - [ ] Timeline-skeleton rehydration (no scroll-jump).
 - [ ] Lazy media rehydration on tap.
 - [ ] Prefetch window (viewport ± 100–150 messages).
-- [ ] Hydration priority queue (P0–P5).
-- [ ] Epoch-rotated archive key derivation: `K_archive_root` →
+- [~] Hydration priority queue (P0–P5).
+      (`crates/core/src/offload/hydration.rs`: deduplicating priority
+      queue keyed on `HydrationReason` with FIFO tiebreaker, plus
+      `enqueue_prefetch_window` for viewport adjacency.)
+- [~] Epoch-rotated archive key derivation: `K_archive_root` →
       `K_archive_epoch(epoch_id)` → `K_archive_segment` /
       `K_archive_manifest`. HKDF info =
       `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
       cadence: monthly (matching `time_bucket`).
+      (`crypto::key_hierarchy::{derive_archive_epoch_key,
+      derive_archive_segment_key, derive_archive_manifest_key,
+      wrap_epoch_key, unwrap_epoch_key}`.)
 - [ ] Epoch key lifecycle: current epoch key in memory; prior
       epoch keys wrapped under `K_archive_root` and recorded in
       the archive manifest chain. Optional epoch-key deletion
       for forward secrecy.
-- [ ] Epoch key derivation test vectors (Rust): deterministic
+- [~] Epoch key derivation test vectors (Rust): deterministic
       derivation, epoch rotation, wrapped-key round-trip,
       cross-epoch segment decrypt after manifest-chain unwrap.
+      (`epoch_key_derivation_is_deterministic`,
+      `different_epoch_ids_produce_different_keys`,
+      `epoch_key_wrap_unwrap_round_trip`,
+      `segment_key_from_epoch_is_deterministic`,
+      `cross_epoch_segment_decrypt` in
+      `crypto::key_hierarchy::tests`.)
 - [ ] ZK Object Fabric as optional archive backend: S3-compatible
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
@@ -753,7 +787,17 @@ addition to the KChat backend.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-03: Phase-3 foundation work landed — archive event
+  journal, archive segment builder (CBOR + zstd + XChaCha20-
+  Poly1305 seal), epoch-rotated archive key derivation,
+  `offload::{budget, scoring, eviction, hydration}` modules, and
+  the `CoreImpl::hydrate_message` + `enforce_storage_budget`
+  wiring. The remote archive fetch path (manifest reader / segment
+  download) is still queued; `hydrate_message` returns
+  `is_cold = true` for `remote_archive_only` bodies and
+  `enforce_storage_budget` is wired against the budget enforcer
+  but does not yet harvest candidate rows from the local store
+  (queued for the next milestone).
 
 ---
 
@@ -939,6 +983,74 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase-2 finishing pass + Phase-3 foundation (10-task batch)
+
+Closes the open Phase-2 thumbnail / `send_media` items and lays
+the Phase-3 archive + offload foundation in a single PR:
+
+**Phase 2:**
+
+- `media::thumbnail::ThumbnailGenerator` — decode PNG/JPEG, scale
+  to `DEFAULT_MAX_DIMENSION = 256`, re-encode as PNG; unit tests
+  cover valid input, max-dimension, unsupported MIME, and empty
+  input.
+- `CoreImpl::send_media` is wired end-to-end against the chunked
+  media pipeline: random `K_asset`, `MediaDescriptor` assembly,
+  optional thumbnail, `media_asset` row + skeleton + caption body
+  rows, all behind a `SAVEPOINT` so partial failures roll back.
+  Returns the new `SendMediaResult { client_message_id, asset_id,
+  descriptor }`.
+- `crates/core/tests/media_pipeline.rs` end-to-end integration
+  tests: `process_media` round-trip, padding, multi-chunk inputs,
+  `MediaCache` insert / touch / evict, multilingual
+  `normalize_caption` + `sanitize_filename`, `route_media_upload`
+  /`route_media_download` dispatch logic, and a
+  `ThumbnailGenerator` smoke test.
+
+**Phase 3 foundation:**
+
+- `archive::event_journal` — append-only `archive_event_journal`
+  table, `archive_event_cursor` table, and an
+  `ArchiveEventJournal` API (`write_event`, `read_events_since`,
+  `read_cursor`, `advance_cursor`, `read_unsegmented`).
+- `archive::segment_builder` — `SegmentBuildRequest`,
+  `BuiltSegment`, and `ArchiveSegmentBuilder::{group_events_by_bucket,
+  build_segment}`. Pipeline: CBOR encode → zstd compress →
+  XChaCha20-Poly1305 seal under `K_archive_segment(segment_id)`;
+  AAD ties `segment_id` and BLAKE3 plaintext root to the
+  ciphertext, blocking ciphertext-swap attacks.
+- `crypto::key_hierarchy` — epoch-rotated archive keys:
+  `derive_archive_epoch_key`, `derive_archive_segment_key`,
+  `derive_archive_manifest_key`, plus AES-256-KW `wrap_epoch_key`
+  / `unwrap_epoch_key` so the orchestration layer can persist
+  prior-epoch keys in the manifest chain.
+- `offload::budget` — `StorageBudget`, `StorageUsage`,
+  `BudgetAssessment`, `PressureLevel`, and
+  `StorageBudgetEnforcer::assess` (DB probe + headroom + pressure
+  level mapping).
+- `offload::scoring` — `ContentKind` weights matching PROPOSAL
+  §5.4 (video → text), 30-day half-life recency decay, 16 MiB
+  size-bonus normalisation, with pinned candidates
+  short-circuited to `f64::NEG_INFINITY`.
+- `offload::eviction` — `plan_eviction` (filter pinned /
+  not-archived → score → sort → accumulate to target_bytes) +
+  `execute_eviction` (state-machine demotion of `media_asset`
+  rows).
+- `offload::hydration` — `HydrationQueue` (deduplicating priority
+  queue, P0..P5 ordering by `HydrationReason`, FIFO tiebreaker,
+  `enqueue_prefetch_window` for viewport adjacency).
+- `CoreImpl::hydrate_message` — local-hit path returns the body;
+  cold (`remote_archive_only`) returns the skeleton with
+  `is_cold = true`; `deleted_for_everyone` returns
+  `Error::Message`.
+- `CoreImpl::enforce_storage_budget` — assesses pressure via the
+  budget enforcer and short-circuits to a zero result when no
+  pressure exists. The candidate-collection query that drives a
+  non-trivial plan is queued for the next milestone.
+
+Test count: workspace test count grew from ~538 to ~600+ across
+unit tests and the new `media_pipeline` integration suite.
 
 ### 2026-05-03 — Post-optimization benchmark rerun (Phase-1 baseline + cross-repo summary)
 

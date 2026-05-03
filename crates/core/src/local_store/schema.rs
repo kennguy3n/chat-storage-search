@@ -136,6 +136,26 @@ CREATE TABLE IF NOT EXISTS archive_segment_map (
     state                TEXT NOT NULL      -- not_archived..archive_compacted
 );
 
+-- Per-archive event log feeding the archive segment builder
+-- (`docs/PHASES.md` Phase 3). Mirrors `backup_event_journal` but
+-- carries the archive-side event types (message_received,
+-- message_edited, message_deleted, media_received, …) and a
+-- single-row cursor that the segment builder advances after each
+-- successful upload.
+CREATE TABLE IF NOT EXISTS archive_event_journal (
+    event_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type      TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_id      TEXT,
+    payload         BLOB NOT NULL,            -- CBOR
+    created_at_ms   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archive_event_cursor (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    cursor_seq  INTEGER NOT NULL DEFAULT 0
+);
+
 -- Restore state machine
 CREATE TABLE IF NOT EXISTS restore_state (
     id     INTEGER PRIMARY KEY CHECK (id = 1),
@@ -156,6 +176,8 @@ pub const TABLES: &[&str] = &[
     "media_search_index",
     "backup_event_journal",
     "archive_segment_map",
+    "archive_event_journal",
+    "archive_event_cursor",
     "restore_state",
 ];
 

@@ -1,0 +1,452 @@
+//! Storage budget enforcement.
+//!
+//! `docs/PROPOSAL.md §5.4` and `docs/ARCHITECTURE.md §8.2` describe
+//! the storage-budget assessment loop that the offload pipeline
+//! calls on app launch / on demand. This module turns the
+//! quantitative side of that loop into pure functions that can be
+//! exercised in unit tests:
+//!
+//! 1. Probe SQLCipher for per-table byte usage,
+//! 2. Compare the totals against a declared
+//!    [`StorageBudget`],
+//! 3. Surface a [`PressureLevel`] (`None` < `Warning`
+//!    < `Critical` < `Extreme`) that drives the eviction
+//!    pipeline (see [`super::scoring`] / [`super::eviction`]).
+//!
+//! The budget itself is decoupled from the concrete eviction
+//! strategy — every level just states *how much* needs to go
+//! without specifying *what* should go first.
+
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+use crate::Error;
+
+/// User-configurable storage budget.
+///
+/// `max_bytes` is the hard ceiling. The two thresholds expressed as
+/// percentages (`0..=100`) split the budget into three operating
+/// regions:
+///
+/// * `usage <= warning_threshold_pct%` → [`PressureLevel::None`]
+/// * `usage <= critical_threshold_pct%` → [`PressureLevel::Warning`]
+/// * `usage <= 100%` → [`PressureLevel::Critical`]
+/// * `usage  > 100%` → [`PressureLevel::Extreme`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBudget {
+    /// Hard ceiling for total local storage, in bytes.
+    pub max_bytes: u64,
+    /// Percentage of `max_bytes` at which to start the warning
+    /// region. Must satisfy `0 <= warning < critical <= 100`.
+    pub warning_threshold_pct: u8,
+    /// Percentage of `max_bytes` at which to start the critical
+    /// region. Must satisfy `warning < critical <= 100`.
+    pub critical_threshold_pct: u8,
+}
+
+impl StorageBudget {
+    /// Default budget: 8 GiB ceiling, warn at 75%, critical at 90%.
+    pub fn default_recommended() -> Self {
+        Self {
+            max_bytes: 8 * 1024 * 1024 * 1024,
+            warning_threshold_pct: 75,
+            critical_threshold_pct: 90,
+        }
+    }
+
+    /// Absolute byte threshold above which usage triggers
+    /// [`PressureLevel::Warning`].
+    pub fn warning_bytes(&self) -> u64 {
+        self.max_bytes * (self.warning_threshold_pct as u64) / 100
+    }
+
+    /// Absolute byte threshold above which usage triggers
+    /// [`PressureLevel::Critical`].
+    pub fn critical_bytes(&self) -> u64 {
+        self.max_bytes * (self.critical_threshold_pct as u64) / 100
+    }
+}
+
+/// Per-storage-class breakdown produced by
+/// [`StorageBudgetEnforcer::assess`].
+///
+/// `total_bytes` is the sum of the class-specific buckets and is
+/// what the assessor compares against the budget. Individual
+/// buckets are exposed so the eviction pipeline can pick the
+/// right candidate set per pressure level (see PROPOSAL §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StorageUsage {
+    /// Sum of every bucket below.
+    pub total_bytes: u64,
+    /// `message_skeleton` + `message_body`.
+    pub message_bytes: u64,
+    /// `media_asset.bytes_local`.
+    pub media_bytes: u64,
+    /// `search_fts` + `search_fuzzy` + `search_vector` +
+    /// `media_search_index`.
+    pub index_bytes: u64,
+    /// Process-side caches not stored in SQLite (Phase 5+ wires a
+    /// non-zero number once the on-disk media cache lands; for
+    /// now reported as 0).
+    pub cache_bytes: u64,
+}
+
+/// Assessment result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetAssessment {
+    /// Observed usage.
+    pub usage: StorageUsage,
+    /// Declared budget.
+    pub budget: StorageBudget,
+    /// Negative when over-budget (Extreme pressure).
+    pub headroom_bytes: i64,
+    /// Pressure level the orchestration layer should react to.
+    pub pressure_level: PressureLevel,
+}
+
+impl BudgetAssessment {
+    /// Bytes the eviction planner should aim to free, computed
+    /// relative to the threshold the current usage crossed.
+    ///
+    /// * `None` → `0` (no work).
+    /// * `Warning` → bring usage back to `warning_bytes`.
+    /// * `Critical` → bring usage back to `critical_bytes`.
+    /// * `Extreme` → bring usage back to `max_bytes`.
+    ///
+    /// This is the value [`crate::offload::eviction::plan_eviction`]
+    /// expects as its `target_bytes` argument. Computing it from
+    /// `(-headroom_bytes).max(0)` is wrong for Warning and
+    /// Critical: in both of those bands, headroom is positive
+    /// (usage is still under `max_bytes`), so the saturated value
+    /// would be `0` and the planner would emit an empty plan.
+    pub fn eviction_target_bytes(&self) -> u64 {
+        let total = self.usage.total_bytes;
+        let threshold = match self.pressure_level {
+            PressureLevel::None => return 0,
+            PressureLevel::Warning => self.budget.warning_bytes(),
+            PressureLevel::Critical => self.budget.critical_bytes(),
+            PressureLevel::Extreme => self.budget.max_bytes,
+        };
+        total.saturating_sub(threshold)
+    }
+}
+
+/// Pressure level derived from [`StorageUsage`] vs.
+/// [`StorageBudget`]. Ordered from least to most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureLevel {
+    /// `usage <= warning_threshold`. Nothing to do.
+    None,
+    /// `warning_threshold < usage <= critical_threshold`. Begin
+    /// background eviction of cold thumbnails / text.
+    Warning,
+    /// `critical_threshold < usage <= max_bytes`. Aggressive
+    /// eviction: documents, voice, images.
+    Critical,
+    /// `usage > max_bytes`. Emergency eviction (videos + anything
+    /// not pinned), hydration prefetches paused.
+    Extreme,
+}
+
+impl PressureLevel {
+    /// Return whether this pressure level demands eviction work.
+    pub fn requires_eviction(self) -> bool {
+        !matches!(self, PressureLevel::None)
+    }
+}
+
+/// Stateless storage budget enforcer.
+///
+/// Holds no internal cache — every call re-queries the database.
+/// Phase 4+ may layer a debounced cache on top once the
+/// orchestration layer is in place.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StorageBudgetEnforcer;
+
+impl StorageBudgetEnforcer {
+    /// Build a stateless enforcer.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Probe `db` for per-bucket usage, compare against `budget`,
+    /// and return the resulting [`BudgetAssessment`].
+    pub fn assess(
+        &self,
+        db: &Connection,
+        budget: &StorageBudget,
+    ) -> Result<BudgetAssessment, Error> {
+        let usage = collect_storage_usage(db)?;
+        Ok(self.assess_with_usage(usage, budget))
+    }
+
+    /// Assemble a [`BudgetAssessment`] from a pre-computed
+    /// [`StorageUsage`]. Useful when the orchestration layer
+    /// already has the numbers from elsewhere.
+    pub fn assess_with_usage(
+        &self,
+        usage: StorageUsage,
+        budget: &StorageBudget,
+    ) -> BudgetAssessment {
+        let pressure_level = pressure_level(&usage, budget);
+        let headroom_bytes = compute_headroom(&usage, budget);
+        BudgetAssessment {
+            usage,
+            budget: *budget,
+            headroom_bytes,
+            pressure_level,
+        }
+    }
+}
+
+/// `budget.max_bytes - usage.total_bytes`, signed so callers can
+/// distinguish "over budget" from "exactly at budget" (and so the
+/// extreme-pressure branch can cleanly emit a target byte count).
+pub fn compute_headroom(usage: &StorageUsage, budget: &StorageBudget) -> i64 {
+    let max = budget.max_bytes as i128;
+    let used = usage.total_bytes as i128;
+    let diff = max - used;
+    diff.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Map `usage.total_bytes` onto a [`PressureLevel`] using
+/// `budget`'s thresholds.
+pub fn pressure_level(usage: &StorageUsage, budget: &StorageBudget) -> PressureLevel {
+    if usage.total_bytes > budget.max_bytes {
+        PressureLevel::Extreme
+    } else if usage.total_bytes > budget.critical_bytes() {
+        PressureLevel::Critical
+    } else if usage.total_bytes > budget.warning_bytes() {
+        PressureLevel::Warning
+    } else {
+        PressureLevel::None
+    }
+}
+
+/// Aggregate per-bucket byte usage from the SQLCipher store.
+///
+/// Uses heuristic sums of `LENGTH(...)` over the SQL columns each
+/// bucket owns. Exact disk usage (which would include SQLite's
+/// page overhead) is not what the offload pipeline cares about —
+/// the budget enforcement loop only needs a reasonable proxy that
+/// updates as content arrives / departs.
+pub fn collect_storage_usage(conn: &Connection) -> Result<StorageUsage, Error> {
+    let message_bytes = scalar_u64(
+        conn,
+        "SELECT
+            COALESCE((SELECT SUM(LENGTH(text_content)) FROM message_body), 0)
+          + COALESCE((SELECT COUNT(*) * 256 FROM message_skeleton), 0)",
+    )?;
+    let media_bytes = scalar_u64(
+        conn,
+        "SELECT COALESCE(SUM(bytes_local), 0) FROM media_asset",
+    )?;
+    let fts_bytes = scalar_u64(
+        conn,
+        "SELECT COALESCE(SUM(LENGTH(text_content)), 0) FROM search_fts",
+    )?;
+    // Per-row overhead: ~8 bytes covers the script + offset
+    // columns; the previous form `SUM(LENGTH(token)) + 8` added the
+    // overhead exactly once instead of per row, so a million-row
+    // index undercounted by ~8MB. The `LENGTH(token) + 8` lives
+    // inside `SUM(...)` to scale with row count.
+    let fuzzy_bytes = scalar_u64(
+        conn,
+        "SELECT COALESCE(SUM(LENGTH(token) + 8), 0) FROM search_fuzzy",
+    )?;
+    let vector_bytes = scalar_u64(
+        conn,
+        "SELECT COALESCE(SUM(LENGTH(embedding)), 0) FROM search_vector",
+    )?;
+    let media_search_bytes = scalar_u64(
+        conn,
+        "SELECT COALESCE(SUM(LENGTH(text)), 0) FROM media_search_index",
+    )?;
+    let index_bytes = fts_bytes + fuzzy_bytes + vector_bytes + media_search_bytes;
+    let cache_bytes = 0u64;
+    let total_bytes = message_bytes + media_bytes + index_bytes + cache_bytes;
+    Ok(StorageUsage {
+        total_bytes,
+        message_bytes,
+        media_bytes,
+        index_bytes,
+        cache_bytes,
+    })
+}
+
+fn scalar_u64(conn: &Connection, sql: &str) -> Result<u64, Error> {
+    let v: i64 = conn
+        .query_row(sql, [], |row| row.get(0))
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(v.max(0) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget_1k() -> StorageBudget {
+        // 1 KiB ceiling, warn at 50%, critical at 80%.
+        StorageBudget {
+            max_bytes: 1024,
+            warning_threshold_pct: 50,
+            critical_threshold_pct: 80,
+        }
+    }
+
+    fn usage_with(total: u64) -> StorageUsage {
+        StorageUsage {
+            total_bytes: total,
+            message_bytes: 0,
+            media_bytes: total,
+            index_bytes: 0,
+            cache_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn no_pressure_when_under_warning_threshold() {
+        let usage = usage_with(100);
+        assert_eq!(pressure_level(&usage, &budget_1k()), PressureLevel::None);
+    }
+
+    #[test]
+    fn warning_pressure_at_threshold() {
+        let usage = usage_with(600);
+        assert_eq!(pressure_level(&usage, &budget_1k()), PressureLevel::Warning);
+    }
+
+    #[test]
+    fn critical_pressure_at_threshold() {
+        let usage = usage_with(900);
+        assert_eq!(
+            pressure_level(&usage, &budget_1k()),
+            PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn extreme_pressure_when_over_budget() {
+        let usage = usage_with(2000);
+        assert_eq!(pressure_level(&usage, &budget_1k()), PressureLevel::Extreme);
+    }
+
+    #[test]
+    fn headroom_calculation_correct() {
+        let budget = budget_1k();
+        assert_eq!(compute_headroom(&usage_with(0), &budget), 1024);
+        assert_eq!(compute_headroom(&usage_with(1024), &budget), 0);
+        assert_eq!(compute_headroom(&usage_with(2048), &budget), -1024);
+    }
+
+    #[test]
+    fn requires_eviction_only_above_warning() {
+        assert!(!PressureLevel::None.requires_eviction());
+        assert!(PressureLevel::Warning.requires_eviction());
+        assert!(PressureLevel::Critical.requires_eviction());
+        assert!(PressureLevel::Extreme.requires_eviction());
+    }
+
+    fn assessment_with(level: PressureLevel, total: u64) -> BudgetAssessment {
+        let budget = budget_1k();
+        let usage = usage_with(total);
+        BudgetAssessment {
+            usage,
+            budget,
+            headroom_bytes: compute_headroom(&usage, &budget),
+            pressure_level: level,
+        }
+    }
+
+    #[test]
+    fn eviction_target_zero_when_no_pressure() {
+        // Any usage below warning has level=None and must produce 0.
+        let a = assessment_with(PressureLevel::None, 100);
+        assert_eq!(a.eviction_target_bytes(), 0);
+    }
+
+    #[test]
+    fn eviction_target_brings_warning_back_to_warning_band() {
+        // Bug guard: previously `(-headroom).max(0)` evaluated to 0
+        // for Warning because headroom is positive (usage < max).
+        // The threshold-relative target must be non-zero so the
+        // planner actually evicts.
+        let a = assessment_with(PressureLevel::Warning, 600);
+        // warning_bytes = 1024 * 50/100 = 512; target = 600 - 512.
+        assert_eq!(a.eviction_target_bytes(), 88);
+    }
+
+    #[test]
+    fn eviction_target_brings_critical_back_to_critical_band() {
+        // Bug guard: same as Warning — Critical headroom is also
+        // positive (usage still under max_bytes), so the old
+        // calculation was 0. The threshold-relative target must
+        // chase critical_bytes, not max_bytes.
+        let a = assessment_with(PressureLevel::Critical, 900);
+        // critical_bytes = 1024 * 80/100 = 819; target = 900 - 819.
+        assert_eq!(a.eviction_target_bytes(), 81);
+    }
+
+    #[test]
+    fn eviction_target_brings_extreme_back_to_max_bytes() {
+        let a = assessment_with(PressureLevel::Extreme, 2000);
+        assert_eq!(a.eviction_target_bytes(), 2000 - 1024);
+    }
+
+    #[test]
+    fn assess_with_usage_round_trips() {
+        let enforcer = StorageBudgetEnforcer::new();
+        let usage = usage_with(700);
+        let assessment = enforcer.assess_with_usage(usage, &budget_1k());
+        assert_eq!(assessment.usage, usage);
+        assert_eq!(assessment.budget, budget_1k());
+        assert_eq!(assessment.pressure_level, PressureLevel::Warning);
+        assert_eq!(assessment.headroom_bytes, 324);
+    }
+
+    #[test]
+    fn collect_storage_usage_reports_zero_on_empty_store() {
+        let db = crate::local_store::db::LocalStoreDb::open_in_memory(&[0x42; 32]).unwrap();
+        let usage = collect_storage_usage(db.connection()).unwrap();
+        assert_eq!(usage.media_bytes, 0);
+        assert_eq!(usage.index_bytes, 0);
+        // message_bytes is 0 because the skeleton table is empty
+        // (the per-row 256-byte estimate only applies to existing
+        // rows).
+        assert_eq!(usage.message_bytes, 0);
+    }
+
+    #[test]
+    fn fuzzy_overhead_scales_per_row() {
+        // Bug guard: the previous SQL `SUM(LENGTH(token)) + 8`
+        // added the 8-byte per-row overhead exactly once. With
+        // four rows that meant `index_bytes` undercounted by
+        // 3 × 8 = 24 bytes. The corrected `SUM(LENGTH(token) + 8)`
+        // scales with row count, so this test enforces the linear
+        // relationship: deleting half the rows must drop
+        // `index_bytes` by `(token_len + 8) × removed_rows`.
+        let db = crate::local_store::db::LocalStoreDb::open_in_memory(&[0x42; 32]).unwrap();
+        let conn = db.connection();
+        for token in ["aaa", "bbb", "ccc", "ddd"] {
+            conn.execute(
+                "INSERT INTO search_fuzzy(token, script, message_id) VALUES (?1, 'Latn', ?2)",
+                rusqlite::params![token, format!("msg-{token}")],
+            )
+            .unwrap();
+        }
+        let four = collect_storage_usage(conn).unwrap().index_bytes;
+        // 4 rows × (3-byte token + 8-byte overhead) = 44.
+        assert_eq!(four, 44);
+
+        conn.execute("DELETE FROM search_fuzzy WHERE token IN ('aaa', 'bbb')", [])
+            .unwrap();
+        let two = collect_storage_usage(conn).unwrap().index_bytes;
+        // 2 rows × (3-byte token + 8-byte overhead) = 22.
+        assert_eq!(two, 22);
+        // The drop must equal the per-row overhead × removed
+        // rows. With the buggy formula the drop would be 6
+        // (token-length only).
+        assert_eq!(four - two, 22);
+    }
+}

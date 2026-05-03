@@ -9,7 +9,12 @@
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
 > Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
-> Media Encryption and Blob Service — `In progress | ~55%`.**
+> Media Encryption and Blob Service — `In progress | ~70%`.**
+> **Phase 3 — Personal Archive and Offload — `In progress | ~15%`
+> (foundation: archive event journal, archive segment builder,
+> epoch-rotated archive keys, offload budget / scoring / eviction /
+> hydration, `CoreImpl::hydrate_message`,
+> `CoreImpl::enforce_storage_budget`).**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -212,12 +217,16 @@ chat-storage-search/
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-        archive/                            # placeholder (Phase 3)
+        archive/                            # Phase 3 foundation: event journal + segment builder
+          mod.rs
+          event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
+          segment_builder.rs                # SegmentBuildRequest / BuiltSegment / ArchiveSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305)
         backup/                             # placeholder (Phase 4)
-        media/                              # Phase 2: chunker + processor + upload + download + cache + routing
+        media/                              # Phase 2: chunker + processor + upload + download + cache + routing + thumbnail
           mod.rs
           chunker.rs                        # chunk + AEAD-seal, size-class padding, verify_and_decrypt
           processor.rs                      # process_media: random K_asset + chunk + wrap + descriptor + state-machine helpers
+          thumbnail.rs                      # ThumbnailGenerator: image decode → max_dimension scale → PNG re-encode
           upload.rs                         # upload_chunked_media + resume_upload over TransportClient
           download.rs                       # download_chunked_media + download_single_chunk
           cache.rs                          # MediaCache: LRU eviction with configurable byte budget
@@ -226,7 +235,12 @@ chat-storage-search/
           sinks/                            # MediaBlobSink trait + NoopMediaBlobSink (PROPOSAL.md §5.7)
             mod.rs
         models/                             # placeholder (Phase 6)
-        offload/                            # placeholder (Phase 3)
+        offload/                            # Phase 3 foundation: budget + scoring + eviction + hydration
+          mod.rs
+          budget.rs                         # StorageBudget / StorageUsage / BudgetAssessment / PressureLevel / StorageBudgetEnforcer
+          scoring.rs                        # ContentKind weights + 30-day half-life recency decay + size bonus (PROPOSAL §5.4)
+          eviction.rs                       # plan_eviction + execute_eviction (state-machine demotion)
+          hydration.rs                      # HydrationQueue (P0..P5 priority + FIFO) + enqueue_prefetch_window
         restore/                            # placeholder (Phase 4)
         scheduler/                          # placeholder (Phase 4 / 7)
         transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient
@@ -235,6 +249,7 @@ chat-storage-search/
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
+        media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors

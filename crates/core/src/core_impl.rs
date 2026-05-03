@@ -30,25 +30,35 @@
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
-use std::path::Path;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
 use zeroize::Zeroizing;
 
 use crate::config::KChatCoreConfig;
+use crate::crypto::aead::BlobClass;
 use crate::local_store::db::LocalStoreDb;
-use crate::local_store::schema::{Conversation, MessageBody, MessageSkeleton};
-use crate::message::processor::{
-    IngestResult, IngestedMessage, MessagePersister, MessageProcessor, ProcessorError,
+use crate::local_store::schema::{
+    BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
 };
+use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+use crate::media::processor::process_media;
+use crate::media::thumbnail::{ThumbnailGenerator, DEFAULT_MAX_DIMENSION};
+use crate::message::processor::{
+    encode_event_payload, IngestResult, IngestedMessage, MessagePersister, MessageProcessor,
+    ProcessorError,
+};
+use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
+use crate::offload::eviction::{execute_eviction, plan_eviction};
+use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::query_engine::QueryEngine;
 use crate::transport::{DeliveryClient, RawDeliveryMessage};
 use crate::{
     BackupResult, BackupSource, ClientMessageId, DeliveryCursor, DeviceRegistration, Error,
     HydratedMessage, KChatCore, MessageView, OffloadResult, RestoreResult, Result, SearchQuery,
-    SearchResult, SearchScope,
+    SearchResult, SearchScope, SendMediaResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -459,20 +469,206 @@ impl KChatCore for CoreImpl {
 
     fn send_media(
         &self,
-        _conversation_id: Uuid,
-        _local_file: &Path,
-        _caption: Option<&str>,
-    ) -> Result<ClientMessageId> {
-        // Phase-1 stub: media chunking, AEAD encryption, descriptor
-        // signing, and outbox bookkeeping land in Phase 2 alongside
-        // the media-search index.
-        Err(Error::NotImplemented("send_media"))
+        conversation_id: Uuid,
+        message_id: Uuid,
+        plaintext: Vec<u8>,
+        mime_type: &str,
+        caption: Option<&str>,
+    ) -> Result<SendMediaResult> {
+        if plaintext.is_empty() {
+            return Err(Error::Message(
+                "send_media: plaintext must not be empty".into(),
+            ));
+        }
+        if mime_type.is_empty() {
+            return Err(Error::Message(
+                "send_media: mime_type must not be empty".into(),
+            ));
+        }
+
+        // 1) Run the chunk + AEAD seal pipeline. The wrapping key is
+        //    `K_local_db` (the bytes already retained on `self.key`)
+        //    so the wrapped `K_asset` is recoverable from the local
+        //    store alone — Phase 3 will rewrap under
+        //    `K_archive_root` when an asset is offloaded.
+        let processed = process_media(&plaintext, mime_type, &self.key, BlobClass::Media, true)?;
+
+        // 2) Optionally generate a thumbnail. Errors during thumbnail
+        //    generation are non-fatal — the timeline can render the
+        //    media row without a thumbnail today, and Phase 6 will
+        //    plug in the vision / OCR pipelines that produce richer
+        //    previews.
+        let _thumbnail = ThumbnailGenerator::new()
+            .generate_thumbnail(&plaintext, mime_type, DEFAULT_MAX_DIMENSION)
+            .ok();
+
+        let now = now_ms_for_send_media();
+        let descriptor = processed.descriptor.clone();
+        let asset_id = descriptor.asset_id;
+        let blob_id = descriptor.blob_id;
+
+        // 3) Persist skeleton + body + media_asset rows inside a
+        //    single SAVEPOINT so a failure mid-write doesn't leave
+        //    dangling references.
+        let db = self.db.lock().map_err(poisoned)?;
+        let conn = db.connection();
+        conn.execute_batch("SAVEPOINT send_media;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let result = (|| -> Result<SendMediaResult> {
+            let skel = MessageSkeleton {
+                message_id: message_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                sender_id: "self".to_string(),
+                created_at_ms: now,
+                received_at_ms: now,
+                kind: MessageKind::Media,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: Some(processed.initial_media_state),
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Caption (if any) is persisted as the message body and
+            // mirrored into the FTS / fuzzy indexes so it shows up
+            // in `core.search()` results — same shape as the
+            // `send_text` path's `MessagePersister::persist_outbox_entry_inner`
+            // (see `crates/core/src/message/processor.rs:478-486`).
+            if let Some(caption) = caption {
+                let body = MessageBody {
+                    message_id: skel.message_id.clone(),
+                    text_content: Some(caption.to_string()),
+                    detected_language: None,
+                    rich_meta: None,
+                };
+                db.insert_message_body(&body)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                conn.execute(
+                    "INSERT INTO search_fts(
+                        message_id, conversation_id, sender_id,
+                        created_at_ms, text_content
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        skel.message_id,
+                        skel.conversation_id,
+                        skel.sender_id,
+                        skel.created_at_ms,
+                        caption,
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+                FuzzySearchEngine::new(&db)
+                    .index_message(&skel.message_id, caption)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+
+            let asset = MediaAsset {
+                asset_id: asset_id.to_string(),
+                message_id: skel.message_id.clone(),
+                mime_type: mime_type.to_string(),
+                bytes_total: descriptor.bytes_total as i64,
+                // Phase 2 keeps the original locally until the
+                // upload pipeline confirms — `bytes_local` matches
+                // `bytes_total` for now.
+                bytes_local: descriptor.bytes_total as i64,
+                media_state: processed.initial_media_state,
+                wrapped_k_asset: descriptor.wrapped_k_asset.clone(),
+                chunk_count: descriptor.chunk_count as i32,
+                merkle_root: descriptor.merkle_root.to_vec(),
+                blob_id: blob_id.to_string(),
+                storage_sink: descriptor
+                    .storage_sink
+                    .clone()
+                    .unwrap_or_else(|| "kchat_backend".to_string()),
+            };
+            db.insert_media_asset(&asset)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Bump the owning conversation's last_message_id /
+            // last_activity_ms so list_conversations surfaces the
+            // freshly-sent media message at the top. Mirrors
+            // `MessagePersister::persist_outbox_entry_inner`.
+            db.update_conversation_last_message(
+                &skel.conversation_id,
+                &skel.message_id,
+                skel.created_at_ms,
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Append a backup_event_journal entry so the Phase 4
+            // backup drainer sees this media message during
+            // incremental backups. Same `event_type` ('outbox_pending')
+            // and CBOR shape as the send_text path's
+            // `MessagePersister::persist_outbox_entry_inner`
+            // (`crates/core/src/message/processor.rs:496-503`).
+            let payload = encode_event_payload(
+                &skel.message_id,
+                &skel.conversation_id,
+                &skel.sender_id,
+                skel.created_at_ms,
+            );
+            db.insert_backup_event(&BackupEventJournalEntry {
+                event_seq: 0,
+                event_type: "outbox_pending".into(),
+                payload,
+                created_at_ms: skel.created_at_ms,
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+            Ok(SendMediaResult {
+                client_message_id: ClientMessageId(message_id),
+                asset_id,
+                descriptor,
+            })
+        })();
+
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("RELEASE send_media;")
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK TO send_media; RELEASE send_media;");
+            }
+        }
+        result
     }
 
-    fn hydrate_message(&self, _message_id: Uuid, _reason: &str) -> Result<HydratedMessage> {
-        // Phase-1 stub: rehydration arrives with the offload engine
-        // in Phase 3.
-        Err(Error::NotImplemented("hydrate_message"))
+    fn hydrate_message(&self, message_id: Uuid, _reason: &str) -> Result<HydratedMessage> {
+        // Phase-3 foundation: serve from local storage when a body is
+        // already present, otherwise return the skeleton with
+        // `is_cold = true`. The remote archive fetch path is still
+        // queued for `Task 10+` once the manifest reader lands.
+        let db = self.db.lock().map_err(poisoned)?;
+        let row = db
+            .get_message_with_body(&message_id.to_string())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let Some((skeleton, body)) = row else {
+            return Ok(HydratedMessage::default());
+        };
+        if skeleton.body_state == BodyState::DeletedForEveryone {
+            return Err(Error::Message(
+                "hydrate_message: message has been deleted for everyone".to_string(),
+            ));
+        }
+        let conversation_id = Uuid::parse_str(&skeleton.conversation_id).ok();
+        let message_id_uuid = Uuid::parse_str(&skeleton.message_id).ok();
+        let is_local = matches!(
+            skeleton.body_state,
+            BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
+        );
+        let text_content = body.as_ref().and_then(|b| b.text_content.clone());
+        Ok(HydratedMessage {
+            message_id: message_id_uuid,
+            conversation_id,
+            text_content: if is_local { text_content } else { None },
+            is_cold: !is_local,
+        })
     }
 
     fn run_incremental_backup(&self, _reason: &str) -> Result<BackupResult> {
@@ -482,9 +678,32 @@ impl KChatCore for CoreImpl {
     }
 
     fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
-        // Phase-1 stub: storage-budget enforcement / offload tier
-        // demotion arrives in Phase 3.
-        Err(Error::NotImplemented("enforce_storage_budget"))
+        // Phase-3 foundation: assess pressure and execute an
+        // empty plan when no candidates are surfaced. Wiring the
+        // actual candidate-collection query is queued for once
+        // the message_skeleton<->media_asset join is finalised.
+        let db = self.db.lock().map_err(poisoned)?;
+        let enforcer = StorageBudgetEnforcer::new();
+        let budget = StorageBudget::default_recommended();
+        let assessment = enforcer.assess(db.connection(), &budget)?;
+        if !assessment.pressure_level.requires_eviction() {
+            return Ok(OffloadResult {
+                freed_bytes: 0,
+                evicted_count: 0,
+            });
+        }
+        // `eviction_target_bytes` is threshold-relative (Warning →
+        // warning_bytes, Critical → critical_bytes, Extreme →
+        // max_bytes). Driving the planner directly off
+        // `(-headroom).max(0)` would only produce a non-zero target
+        // for Extreme pressure.
+        let target_bytes = assessment.eviction_target_bytes();
+        let plan = plan_eviction(Vec::new(), target_bytes, now_ms_for_send_media());
+        let result = execute_eviction(db.connection(), &plan)?;
+        Ok(OffloadResult {
+            freed_bytes: result.freed_bytes,
+            evicted_count: result.evicted_count,
+        })
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
@@ -496,6 +715,19 @@ impl KChatCore for CoreImpl {
 
 fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
     Error::Storage("local store mutex poisoned".to_string())
+}
+
+/// Wall-clock millisecond timestamp.
+///
+/// Mirrors `crate::message::processor::now_ms` (which is private)
+/// so the `send_media` / `hydrate_message` paths can stamp
+/// `received_at_ms` / `created_at_ms` without poking through the
+/// processor module.
+fn now_ms_for_send_media() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Convert a transport-level [`RawDeliveryMessage`] into the local
@@ -761,28 +993,292 @@ mod tests {
     // Phase-1 stub trait methods — Task 3
     // ----------------------------------------------------------------
 
-    #[test]
-    fn send_media_returns_not_implemented() {
-        let core = fresh_core();
-        let err = core
-            .send_media(Uuid::now_v7(), Path::new("/tmp/none"), Some("caption"))
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented("send_media")),
-            "got {err:?}"
-        );
+    fn fake_image_bytes() -> Vec<u8> {
+        // 8 × 8 PNG with a varied gradient so the encoder produces a
+        // reasonable byte count (uniform-colour PNGs collapse to a
+        // few dozen bytes which doesn't exercise the chunker).
+        use image::{ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+        let img = ImageBuffer::from_fn(64, 64, |x, y| {
+            Rgba([
+                ((x * 4) & 0xFF) as u8,
+                ((y * 4) & 0xFF) as u8,
+                ((x ^ y) & 0xFF) as u8,
+                0xFF,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        out
     }
 
     #[test]
-    fn hydrate_message_returns_not_implemented() {
+    fn send_media_persists_media_asset_and_descriptor() {
         let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let payload = fake_image_bytes();
+        let bytes_total = payload.len() as u64;
+
+        let res = core
+            .send_media(conv, mid, payload, "image/png", Some("vacation"))
+            .expect("send_media");
+        assert_eq!(res.client_message_id.0, mid);
+        assert_eq!(res.descriptor.bytes_total, bytes_total);
+        assert_eq!(res.descriptor.mime_type, "image/png");
+        assert!(res.descriptor.chunk_count >= 1);
+
+        core.with_db(|db| {
+            let asset = db
+                .get_media_asset(&res.asset_id.to_string())
+                .unwrap()
+                .expect("asset row");
+            assert_eq!(asset.message_id, mid.to_string());
+            assert_eq!(asset.mime_type, "image/png");
+            assert_eq!(asset.bytes_total as u64, bytes_total);
+            assert_eq!(asset.chunk_count as u32, res.descriptor.chunk_count);
+            assert_eq!(asset.merkle_root.len(), 32);
+        });
+    }
+
+    #[test]
+    fn send_media_creates_skeleton_with_media_state() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let skel = db
+                .get_message_skeleton(&mid.to_string())
+                .unwrap()
+                .expect("skeleton");
+            assert_eq!(skel.kind, MessageKind::Media);
+            assert!(skel.media_state.is_some());
+            assert_eq!(
+                skel.body_state,
+                crate::local_store::state_machines::BodyState::LocalPlainAvailable
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_round_trips_through_get_message() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(
+            conv,
+            mid,
+            fake_image_bytes(),
+            "image/png",
+            Some("captioned"),
+        )
+        .expect("send_media");
+
+        let view = core.get_message(mid).unwrap().expect("view");
+        assert_eq!(view.text_content.as_deref(), Some("captioned"));
+    }
+
+    #[test]
+    fn send_media_rejects_empty_plaintext() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
         let err = core
-            .hydrate_message(Uuid::now_v7(), "search-result-tap")
+            .send_media(conv, Uuid::now_v7(), Vec::new(), "image/png", None)
             .unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented("hydrate_message")),
-            "got {err:?}"
+        assert!(matches!(err, Error::Message(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn send_media_caption_is_searchable() {
+        // Bug guard: the caption MUST land in `search_fts` /
+        // `search_fuzzy` so `core.search()` returns the media
+        // message. Without the FTS / fuzzy index path inside the
+        // SAVEPOINT this returns 0 hits.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        core.send_media(
+            conv,
+            mid,
+            fake_image_bytes(),
+            "image/png",
+            Some("kayaking trip with grandparents"),
+        )
+        .expect("send_media");
+
+        let q = SearchQuery {
+            query_string: "kayaking".to_string(),
+            ..SearchQuery::default()
+        };
+        let hits = core.search(q, SearchScope::LocalOnly).expect("search");
+        assert_eq!(hits.len(), 1, "caption FTS row missing? hits={hits:?}");
+        assert_eq!(hits[0].message_id, mid);
+    }
+
+    #[test]
+    fn send_media_writes_backup_event_journal_entry() {
+        // Bug guard: send_media must mirror send_text and append
+        // a `backup_event_journal` row so the Phase 4 backup
+        // drainer sees the media message. Without this, media
+        // messages are silently excluded from incremental backups.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            // Single 'outbox_pending' row whose CBOR payload's
+            // first text field equals message_id.
+            let conn = db.connection();
+            let row: (String, Vec<u8>) = conn
+                .query_row(
+                    "SELECT event_type, payload FROM backup_event_journal
+                       ORDER BY event_seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("journal row");
+            assert_eq!(row.0, "outbox_pending");
+            // CBOR text strings of length n (n < 24) are tagged
+            // as 0x60 | n. The message_id UUID renders to 36
+            // bytes, so the payload starts with [0x84 (array-4),
+            // 0x78 (text-uint8-len), 0x24 (36)] then the bytes.
+            let mid_str = mid.to_string();
+            assert!(
+                row.1
+                    .windows(mid_str.len())
+                    .any(|w| w == mid_str.as_bytes()),
+                "payload missing message_id: {:?}",
+                row.1
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_bumps_conversation_last_activity() {
+        // Bug guard: the conversation list ranks by
+        // `last_activity_ms`. If `send_media` skips
+        // `update_conversation_last_message`, the conversation
+        // stays at `last_activity_ms = 1` (the seed value) and the
+        // freshly-sent media message never appears at the top.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        let mid = Uuid::now_v7();
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        let convs = core.list_conversations().expect("list");
+        let row = convs
+            .into_iter()
+            .find(|c| c.conversation_id == conv.to_string())
+            .expect("seeded conversation");
+        assert_eq!(
+            row.last_message_id.as_deref(),
+            Some(mid.to_string().as_str())
         );
+        // seed value was 1; the persister's now_ms() is wall-clock,
+        // so anything strictly greater than the seed is correct.
+        assert!(row.last_activity_ms > 1, "last_activity_ms not bumped");
+    }
+
+    // ----------------------------------------------------------------
+    // hydrate_message + enforce_storage_budget — Task 10
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn hydrate_local_message_returns_body() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "hello hydration", None).unwrap();
+        let hydrated = core
+            .hydrate_message(mid.0, "search_result_tap")
+            .expect("hydrate");
+        assert!(!hydrated.is_cold);
+        assert_eq!(hydrated.text_content.as_deref(), Some("hello hydration"));
+        assert_eq!(hydrated.message_id, Some(mid.0));
+        assert_eq!(hydrated.conversation_id, Some(conv));
+    }
+
+    #[test]
+    fn hydrate_unknown_message_returns_default() {
+        let core = fresh_core();
+        let result = core
+            .hydrate_message(Uuid::now_v7(), "search_result_tap")
+            .expect("hydrate");
+        assert_eq!(result, HydratedMessage::default());
+    }
+
+    #[test]
+    fn hydrate_deleted_message_returns_error() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "to-be-deleted", None).unwrap();
+        // Force the body_state into DeletedForEveryone so the
+        // hydrate path takes the error branch.
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "UPDATE message_skeleton SET body_state = 'deleted_for_everyone' WHERE message_id = ?1",
+                    rusqlite::params![mid.0.to_string()],
+                )
+                .unwrap();
+        });
+        let err = core
+            .hydrate_message(mid.0, "search_result_tap")
+            .unwrap_err();
+        assert!(matches!(err, Error::Message(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn hydrate_cold_message_returns_skeleton_with_cold_flag() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "cold-body", None).unwrap();
+        // Move the body to remote_archive_only so hydrate sees it
+        // as cold.
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "UPDATE message_skeleton SET body_state = 'remote_archive_only' WHERE message_id = ?1",
+                    rusqlite::params![mid.0.to_string()],
+                )
+                .unwrap();
+        });
+        let hydrated = core
+            .hydrate_message(mid.0, "background_restore")
+            .expect("hydrate");
+        assert!(hydrated.is_cold);
+        assert!(hydrated.text_content.is_none());
+        assert_eq!(hydrated.message_id, Some(mid.0));
+    }
+
+    #[test]
+    fn enforce_storage_budget_returns_zero_under_pressure_threshold() {
+        let core = fresh_core();
+        // Empty store — no pressure, so the result is zero.
+        let result = core.enforce_storage_budget("app_launch").expect("enforce");
+        assert_eq!(result.evicted_count, 0);
+        assert_eq!(result.freed_bytes, 0);
     }
 
     #[test]
@@ -791,16 +1287,6 @@ mod tests {
         let err = core.run_incremental_backup("scheduled").unwrap_err();
         assert!(
             matches!(err, Error::NotImplemented("run_incremental_backup")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn enforce_storage_budget_returns_not_implemented() {
-        let core = fresh_core();
-        let err = core.enforce_storage_budget("app-launch").unwrap_err();
-        assert!(
-            matches!(err, Error::NotImplemented("enforce_storage_budget")),
             "got {err:?}"
         );
     }

@@ -11,6 +11,9 @@
 //!   wrap `K_asset` under a hierarchy root, and assemble the
 //!   [`crate::formats::media_descriptor::MediaDescriptor`] the rest
 //!   of the system persists.
+//! * [`thumbnail`] — Phase-2 thumbnail generator: decode → resize →
+//!   re-encode as PNG so the timeline can render a low-fidelity
+//!   preview before / instead of the original.
 //! * [`upload`] — drive [`crate::transport::TransportClient`] through
 //!   the `init → chunk(s) → commit` sequence with server-side Merkle
 //!   verification and a resume path that skips already-uploaded
@@ -38,4 +41,5 @@ pub mod download;
 pub mod processor;
 pub mod routing;
 pub mod sinks;
+pub mod thumbnail;
 pub mod upload;

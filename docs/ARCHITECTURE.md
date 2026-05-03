@@ -482,12 +482,25 @@ the standard library and chosen primitives.
 > via `TransportClient` and the configured `MediaBlobSink`
 > based on `is_thumbnail` and `MediaBlobReference::storage_sink`).
 >
-> The remaining higher-level modules
-> (`archive`, `backup`, `offload`, `restore`, `models`,
-> `transport`, `scheduler`) are Phase-0 placeholders and are
-> filled in across Phases 3 – 7. `transport` is partially
-> populated by Phase 1 (`DeliveryClient` / `TransportClient`
-> traits, `NoopTransportClient`, `MockDeliveryClient`).
+> The remaining higher-level modules (`backup`, `restore`,
+> `models`, `transport`, `scheduler`) are Phase-0 placeholders
+> and are filled in across Phases 3 – 7. `transport` is
+> partially populated by Phase 1 (`DeliveryClient` /
+> `TransportClient` traits, `NoopTransportClient`,
+> `MockDeliveryClient`).
+>
+> The Phase 3 modules `archive` and `offload` are no longer
+> placeholders: `archive::event_journal` (append-only mutation
+> log feeding the segment builder), `archive::segment_builder`
+> (CBOR → zstd → XChaCha20-Poly1305 sealed segments under
+> `K_archive_segment(segment_id)`), and
+> `offload::{budget, scoring, eviction, hydration}` (storage
+> budget enforcer, eviction scoring per PROPOSAL §5.4, eviction
+> planner / executor, P0..P5 hydration priority queue) all
+> landed alongside `CoreImpl::hydrate_message` and
+> `CoreImpl::enforce_storage_budget`. The remote archive fetch
+> path (manifest reader / segment download / replay) is queued
+> for the next Phase 3 milestone.
 
 ---
 
@@ -829,6 +842,16 @@ flowchart LR
     Wrapped_backup --> Backup
 ```
 
+> Phase 3 inserts the `K_archive_epoch(epoch_id)` indirection
+> between `K_archive_root` and the per-segment / per-manifest
+> keys. `crypto::key_hierarchy` exposes
+> `derive_archive_epoch_key`, `derive_archive_segment_key`,
+> `derive_archive_manifest_key`, and the AES-256-KW pair
+> `wrap_epoch_key` / `unwrap_epoch_key` so the orchestration
+> layer can rotate epochs (default cadence: monthly, matching
+> `time_bucket`) and still recover prior-epoch segment / manifest
+> keys from the wrapped form persisted in the manifest chain.
+
 ZK Object Fabric backups use Pattern C, derived deterministically
 from the plaintext + tenant ID. The Rust path must produce
 bit-identical output to the Go SDK at
@@ -909,6 +932,29 @@ sequenceDiagram
     end
     Off-->>Sys: "OffloadResult { freed_bytes, evicted_count }"
 ```
+
+> Phase 3 implementation:
+>
+> * Storage usage probing and pressure-level computation live in
+>   `offload::budget` (`StorageBudget`, `StorageUsage`,
+>   `BudgetAssessment`, `PressureLevel::{None, Warning, Critical,
+>   Extreme}`, `StorageBudgetEnforcer::assess`).
+> * Per-candidate scoring lives in `offload::scoring`
+>   (`ContentKind::weight`, 30-day half-life recency decay,
+>   16 MiB-normalised size bonus, `compute_eviction_score`).
+>   Pinned candidates short-circuit to `f64::NEG_INFINITY`.
+> * Plan / execute live in `offload::eviction` (`plan_eviction`
+>   filters pinned + not-archived candidates, sorts by score
+>   descending, accumulates until `target_bytes`;
+>   `execute_eviction` issues the state-machine demotion against
+>   `media_asset`).
+> * `offload::hydration::HydrationQueue` drives the rehydration
+>   side: a deduplicating priority queue ordered by
+>   `HydrationReason` (P0..P5) with FIFO tiebreaker, plus
+>   `enqueue_prefetch_window` for viewport adjacency.
+> * `CoreImpl::enforce_storage_budget` wires the budget enforcer
+>   in. The candidate-collection query that drives a non-trivial
+>   plan is queued for the next milestone.
 
 ### 8.3 Rehydration
 
