@@ -41,13 +41,14 @@ use crate::config::KChatCoreConfig;
 use crate::crypto::aead::BlobClass;
 use crate::local_store::db::LocalStoreDb;
 use crate::local_store::schema::{
-    Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
+    BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
 };
 use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
 use crate::media::processor::process_media;
 use crate::media::thumbnail::{ThumbnailGenerator, DEFAULT_MAX_DIMENSION};
 use crate::message::processor::{
-    IngestResult, IngestedMessage, MessagePersister, MessageProcessor, ProcessorError,
+    encode_event_payload, IngestResult, IngestedMessage, MessagePersister, MessageProcessor,
+    ProcessorError,
 };
 use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
 use crate::offload::eviction::{execute_eviction, plan_eviction};
@@ -599,6 +600,26 @@ impl KChatCore for CoreImpl {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
+            // Append a backup_event_journal entry so the Phase 4
+            // backup drainer sees this media message during
+            // incremental backups. Same `event_type` ('outbox_pending')
+            // and CBOR shape as the send_text path's
+            // `MessagePersister::persist_outbox_entry_inner`
+            // (`crates/core/src/message/processor.rs:496-503`).
+            let payload = encode_event_payload(
+                &skel.message_id,
+                &skel.conversation_id,
+                &skel.sender_id,
+                skel.created_at_ms,
+            );
+            db.insert_backup_event(&BackupEventJournalEntry {
+                event_seq: 0,
+                event_type: "outbox_pending".into(),
+                payload,
+                created_at_ms: skel.created_at_ms,
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
             Ok(SendMediaResult {
                 client_message_id: ClientMessageId(message_id),
                 asset_id,
@@ -1104,6 +1125,48 @@ mod tests {
         let hits = core.search(q, SearchScope::LocalOnly).expect("search");
         assert_eq!(hits.len(), 1, "caption FTS row missing? hits={hits:?}");
         assert_eq!(hits[0].message_id, mid);
+    }
+
+    #[test]
+    fn send_media_writes_backup_event_journal_entry() {
+        // Bug guard: send_media must mirror send_text and append
+        // a `backup_event_journal` row so the Phase 4 backup
+        // drainer sees the media message. Without this, media
+        // messages are silently excluded from incremental backups.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            // Single 'outbox_pending' row whose CBOR payload's
+            // first text field equals message_id.
+            let conn = db.connection();
+            let row: (String, Vec<u8>) = conn
+                .query_row(
+                    "SELECT event_type, payload FROM backup_event_journal
+                       ORDER BY event_seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("journal row");
+            assert_eq!(row.0, "outbox_pending");
+            // CBOR text strings of length n (n < 24) are tagged
+            // as 0x60 | n. The message_id UUID renders to 36
+            // bytes, so the payload starts with [0x84 (array-4),
+            // 0x78 (text-uint8-len), 0x24 (36)] then the bytes.
+            let mid_str = mid.to_string();
+            assert!(
+                row.1
+                    .windows(mid_str.len())
+                    .any(|w| w == mid_str.as_bytes()),
+                "payload missing message_id: {:?}",
+                row.1
+            );
+        });
     }
 
     #[test]

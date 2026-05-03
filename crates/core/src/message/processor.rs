@@ -794,7 +794,7 @@ fn encode_delete_event_payload(message_id: &str, scope: &str) -> Vec<u8> {
 /// CBOR array. Used as the payload for the
 /// `"message_received"` / `"outbox_pending"` / `"outbox_sent"`
 /// event-journal entries.
-fn encode_event_payload(
+pub(crate) fn encode_event_payload(
     message_id: &str,
     conversation_id: &str,
     sender_id: &str,

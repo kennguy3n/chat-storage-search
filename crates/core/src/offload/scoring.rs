@@ -70,8 +70,17 @@ pub const CONTENT_KIND_WEIGHTS: [(ContentKind, f64); 6] = [
 ];
 
 /// One candidate the eviction planner considers.
+///
+/// Eviction is per-asset, not per-message: a single message can
+/// own multiple `media_asset` rows (the original plus a thumbnail,
+/// or several attachments) and each is evicted independently.
+/// `asset_id` is what [`super::eviction::execute_eviction`] keys
+/// the `UPDATE` on; `message_id` is kept for scoring / observability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictionCandidate {
+    /// `media_asset.asset_id` — the row the eviction UPDATE will
+    /// match on.
+    pub asset_id: Uuid,
     /// Owning message.
     pub message_id: Uuid,
     /// Owning conversation.
@@ -118,6 +127,7 @@ mod tests {
 
     fn candidate(kind: ContentKind, bytes: u64, last_accessed_ms: i64) -> EvictionCandidate {
         EvictionCandidate {
+            asset_id: Uuid::now_v7(),
             message_id: Uuid::now_v7(),
             conversation_id: Uuid::now_v7(),
             content_kind: kind,

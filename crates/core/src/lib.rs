@@ -342,8 +342,9 @@ pub struct OffloadResult {
     /// Total plaintext bytes the eviction sweep freed from the
     /// local store.
     pub freed_bytes: u64,
-    /// Number of `media_asset` / `message_body` rows the eviction
-    /// sweep demoted.
+    /// Number of `media_asset` rows the eviction sweep demoted.
+    /// Eviction is per-asset (one row per `asset_id`) — see
+    /// `crate::offload::eviction::execute_eviction`.
     pub evicted_count: u32,
 }
 
