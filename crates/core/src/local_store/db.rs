@@ -395,6 +395,24 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Transition the `archive_state` of every message in
+    /// `message_ids` to `new_state`.
+    ///
+    /// The transition is validated through
+    /// [`ArchiveState::try_transition`] for every row before any
+    /// `UPDATE` runs — an illegal predecessor on any single row
+    /// rejects the whole batch with [`DbError::InvalidState`] and
+    /// touches nothing. Returns the number of rows actually
+    /// updated (rows whose `message_id` was not present are
+    /// silently skipped).
+    pub fn update_archive_state(
+        &self,
+        message_ids: &[String],
+        new_state: ArchiveState,
+    ) -> DbResult<usize> {
+        update_archive_state(&self.conn, message_ids, new_state)
+    }
+
     /// Insert a row into `media_asset`.
     ///
     /// `docs/PROPOSAL.md §3.2` (`media_asset` columns) and §5.7
@@ -901,6 +919,71 @@ impl LocalStoreDb {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions over `&Connection`
+// ---------------------------------------------------------------------------
+
+/// `&Connection`-keyed sibling of
+/// [`LocalStoreDb::update_archive_state`]. Exposed so the archive
+/// orchestration layer can drive transitions inside an existing
+/// SAVEPOINT without re-borrowing the [`LocalStoreDb`] wrapper.
+///
+/// The set of valid transitions is enforced through
+/// [`ArchiveState::try_transition`]: the linear chain
+/// `not_archived → archive_pending → archive_uploaded →
+/// archive_verified → archive_compacted`. Skipping a state
+/// (e.g. `not_archived → archive_verified`) returns
+/// [`DbError::InvalidState`] and rolls back nothing because the
+/// validation pass runs before any UPDATE.
+pub fn update_archive_state(
+    conn: &Connection,
+    message_ids: &[String],
+    new_state: ArchiveState,
+) -> DbResult<usize> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    // Materialise the IN-clause placeholders. Repeating `?,?,?,…`
+    // is the simplest way that handles arbitrary batch sizes.
+    let placeholders: Vec<&str> = message_ids.iter().map(|_| "?").collect();
+    let in_list = placeholders.join(",");
+
+    // 1) Validate every existing row's predecessor.
+    let select_sql = format!(
+        "SELECT message_id, archive_state FROM message_skeleton WHERE message_id IN ({in_list})",
+    );
+    let mut stmt = conn.prepare(&select_sql)?;
+    let row_iter = stmt.query_map(rusqlite::params_from_iter(message_ids.iter()), |row| {
+        let mid: String = row.get(0)?;
+        let state_str: String = row.get(1)?;
+        Ok((mid, state_str))
+    })?;
+    for row in row_iter {
+        let (mid, state_str) = row?;
+        let from = state_str
+            .parse::<ArchiveState>()
+            .map_err(|e| DbError::InvalidState(format!("{mid}: {e}")))?;
+        ArchiveState::try_transition(from, new_state).map_err(|e| {
+            DbError::InvalidState(format!(
+                "{mid}: archive_state {from} → {new_state} rejected ({e})",
+            ))
+        })?;
+    }
+    drop(stmt);
+
+    // 2) Apply.
+    let update_sql =
+        format!("UPDATE message_skeleton SET archive_state = ? WHERE message_id IN ({in_list})",);
+    let mut update_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(message_ids.len() + 1);
+    let new_state_str = new_state.to_string();
+    update_params.push(&new_state_str);
+    for id in message_ids {
+        update_params.push(id);
+    }
+    let updated = conn.execute(&update_sql, rusqlite::params_from_iter(update_params))?;
+    Ok(updated)
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,5 +2027,73 @@ mod tests {
         let n = db.delete_conversation("c-empty").unwrap();
         assert_eq!(n, 1);
         assert!(db.get_conversation("c-empty").unwrap().is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // update_archive_state — Task 6
+    // ---------------------------------------------------------------
+
+    fn read_archive_state(db: &LocalStoreDb, mid: &str) -> ArchiveState {
+        db.get_message_skeleton(mid)
+            .unwrap()
+            .expect("skeleton")
+            .archive_state
+    }
+
+    #[test]
+    fn archive_state_transitions_through_lifecycle() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m1", "c1", "x");
+
+        // not_archived → archive_pending
+        let n = db
+            .update_archive_state(&["m1".into()], ArchiveState::ArchivePending)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(read_archive_state(&db, "m1"), ArchiveState::ArchivePending);
+
+        // archive_pending → archive_uploaded
+        db.update_archive_state(&["m1".into()], ArchiveState::ArchiveUploaded)
+            .unwrap();
+        assert_eq!(read_archive_state(&db, "m1"), ArchiveState::ArchiveUploaded);
+
+        // archive_uploaded → archive_verified
+        db.update_archive_state(&["m1".into()], ArchiveState::ArchiveVerified)
+            .unwrap();
+        assert_eq!(read_archive_state(&db, "m1"), ArchiveState::ArchiveVerified);
+    }
+
+    #[test]
+    fn invalid_archive_transition_rejected() {
+        let db = fresh_db();
+        seed_skeleton_with_body(&db, "m1", "c1", "x");
+        // Skipping straight from not_archived → archive_verified
+        // is illegal.
+        let err = db
+            .update_archive_state(&["m1".into()], ArchiveState::ArchiveVerified)
+            .unwrap_err();
+        assert!(matches!(err, DbError::InvalidState(_)), "got {err:?}");
+        // The row must be untouched.
+        assert_eq!(read_archive_state(&db, "m1"), ArchiveState::NotArchived);
+    }
+
+    #[test]
+    fn batch_update_archive_state() {
+        let db = fresh_db();
+        // `seed_skeleton_with_body` re-inserts the conversation
+        // every call, so each message rides its own conversation
+        // row to avoid the UNIQUE constraint on
+        // conversation.conversation_id.
+        seed_skeleton_with_body(&db, "m1", "c-batch-1", "x");
+        seed_skeleton_with_body(&db, "m2", "c-batch-2", "y");
+        seed_skeleton_with_body(&db, "m3", "c-batch-3", "z");
+        let ids = vec!["m1".into(), "m2".into(), "m3".into()];
+        let n = db
+            .update_archive_state(&ids, ArchiveState::ArchivePending)
+            .unwrap();
+        assert_eq!(n, 3);
+        for mid in ["m1", "m2", "m3"] {
+            assert_eq!(read_archive_state(&db, mid), ArchiveState::ArchivePending);
+        }
     }
 }

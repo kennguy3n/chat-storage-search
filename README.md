@@ -9,11 +9,14 @@
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
 > Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
-> Media Encryption and Blob Service — `In progress | ~70%`.**
-> **Phase 3 — Personal Archive and Offload — `In progress | ~15%`
-> (foundation: archive event journal, archive segment builder,
-> epoch-rotated archive keys, offload budget / scoring / eviction /
-> hydration, `CoreImpl::hydrate_message`,
+> Media Encryption and Blob Service — `In progress | ~80%`.**
+> **Phase 3 — Personal Archive and Offload — `In progress | ~35%`
+> (foundation: archive event journal wired into `MessagePersister`,
+> archive segment builder, archive manifest chain builder, archive
+> segment upload orchestration, archive state machine transitions,
+> epoch-rotated archive keys, offload budget / scoring / eviction
+> with pinned-chat exclusion / hydration priority queue wired into
+> `CoreImpl::hydrate_message`, batch-by-bucket prefetch,
 > `CoreImpl::enforce_storage_budget`).**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
@@ -217,10 +220,13 @@ chat-storage-search/
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-        archive/                            # Phase 3 foundation: event journal + segment builder
+        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + prefetch
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
           segment_builder.rs                # SegmentBuildRequest / BuiltSegment / ArchiveSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305)
+          manifest_builder.rs               # ArchiveManifestBuilder: genesis → gen N chain, BLAKE3 manifest hash, Ed25519 signature, AEAD-seal under K_archive_manifest
+          upload.rs                         # upload_archive_segment over TransportClient + persist_segment_map_row
+          prefetch.rs                       # batch_prefetch_bucket: one transport hop per (conversation_id, time_bucket)
         backup/                             # placeholder (Phase 4)
         media/                              # Phase 2: chunker + processor + upload + download + cache + routing + thumbnail
           mod.rs
@@ -249,6 +255,8 @@ chat-storage-search/
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
+        epoch_key_derivation.rs             # Phase 3: K_archive_epoch determinism / rotation / wrap-unwrap / cross-epoch decrypt / info-string vectors
+        archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
         media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)

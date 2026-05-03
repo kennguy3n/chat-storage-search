@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~70%`). Phase 3 — Personal Archive and Offload (`In progress | ~15%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~80%`). Phase 3 — Personal Archive and Offload (`In progress | ~35%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -607,7 +607,7 @@ Notes:
 
 ## Phase 2: Media Encryption and Blob Service
 
-**Status**: `In progress | ~70%`
+**Status**: `In progress | ~80%`
 
 **Goal**: Chunked encrypted media upload / download, thumbnailing,
 local media cache.
@@ -684,28 +684,48 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~15%`
+**Status**: `In progress | ~35%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
 
 Checklist:
 
-- [~] Archive event journal. (`crates/core/src/archive/event_journal.rs`
+- [x] Archive event journal. (`crates/core/src/archive/event_journal.rs`
       with `archive_event_journal` + `archive_event_cursor` tables;
       reader/writer API plus `read_unsegmented` to feed the segment
-      builder.)
+      builder. Wired into `MessagePersister` so every persist /
+      edit / delete and `CoreImpl::send_media` writes a matching
+      `ArchiveEvent` inside the same SAVEPOINT as the
+      `backup_event_journal` row.)
 - [~] Archive segment builder (per-conversation / per-time-bucket).
       (`crates/core/src/archive/segment_builder.rs`: CBOR encode →
       zstd compress → XChaCha20-Poly1305 seal under
       `K_archive_segment`, BLAKE3 plaintext root, default monthly
       `time_bucket` helper.)
-- [ ] Archive manifest chain (generation N+1, `previous_manifest_hash`,
-      Ed25519 signature).
-- [ ] Encrypted segment upload to backend blob service.
-- [ ] Whole-object Merkle-root verification after upload.
-- [ ] Archive state machine (`not_archived` → `archive_pending` →
+- [~] Archive manifest chain (generation N+1, `previous_manifest_hash`,
+      Ed25519 signature). (`crates/core/src/archive/manifest_builder.rs`:
+      genesis → gen N chain, BLAKE3 over canonical-CBOR signing
+      payload, Ed25519 signature, AEAD-seal under
+      `K_archive_manifest` derived from the active epoch key.)
+- [~] Encrypted segment upload to backend blob service.
+      (`crates/core/src/archive/upload.rs::upload_archive_segment`:
+      computes ciphertext-side BLAKE3 Merkle root, drives
+      `TransportClient::init_blob_upload → upload_chunk →
+      commit_blob`, asserts the commit response's Merkle root
+      matches, and `persist_segment_map_row` records the
+      result in `archive_segment_map` with `state =
+      'archive_uploaded'`.)
+- [~] Whole-object Merkle-root verification after upload.
+      (`upload_archive_segment` rejects a mismatched
+      `commit_blob` Merkle root before any state-machine
+      transition.)
+- [~] Archive state machine (`not_archived` → `archive_pending` →
       `archive_uploaded` → `archive_verified` → `archive_compacted`).
+      (`local_store::db::update_archive_state`: validates every
+      row's predecessor via `ArchiveState::try_transition` before
+      issuing the batch UPDATE; rejects illegal jumps such as
+      `not_archived → archive_verified`.)
 - [~] Storage budget enforcement (`enforceStorageBudget`).
       (`crates/core/src/offload/budget.rs` with `StorageBudget`,
       `StorageUsage`, `BudgetAssessment`, `PressureLevel` and a
@@ -720,18 +740,35 @@ Checklist:
 - [~] Eviction priority order (video → documents → images → voice →
       thumbnails → cold text bodies). (`CONTENT_KIND_WEIGHTS` in
       `offload::scoring` plus `plan_eviction` in
-      `offload::eviction` sort candidates accordingly.)
-- [~] Pinned-chat / pinned-message exclusion.
-      (`compute_eviction_score` short-circuits to
-      `f64::NEG_INFINITY` for pinned candidates and `plan_eviction`
-      filters them out before scoring.)
+      `offload::eviction` sort candidates accordingly. The matching
+      `collect_eviction_candidates` query joins `media_asset`,
+      `message_skeleton`, and `conversation` and is wired into
+      `CoreImpl::enforce_storage_budget` — it returns rows with
+      `archive_state = archive_verified`, `pinned = 0`,
+      `media_state = 'original_local'`, and
+      `created_at_ms < now - min_offload_age_ms`.)
+- [x] Pinned-chat / pinned-message exclusion.
+      (`compute_eviction_score` returns `f64::MIN` for any
+      candidate flagged `pinned = true` so a stray pinned row that
+      slips past `collect_eviction_candidates` still cannot be
+      evicted, and the SQL filter `conversation.pinned = 0` is the
+      first guard.)
 - [ ] Timeline-skeleton rehydration (no scroll-jump).
 - [ ] Lazy media rehydration on tap.
-- [ ] Prefetch window (viewport ± 100–150 messages).
-- [~] Hydration priority queue (P0–P5).
+- [~] Prefetch window (viewport ± 100–150 messages).
+      (`HydrationQueue::enqueue_prefetch_window` plus
+      `CoreImpl::enqueue_prefetch_window` widen a viewport into
+      P3 prefetch enqueues.)
+- [x] Hydration priority queue (P0–P5).
       (`crates/core/src/offload/hydration.rs`: deduplicating priority
       queue keyed on `HydrationReason` with FIFO tiebreaker, plus
-      `enqueue_prefetch_window` for viewport adjacency.)
+      `enqueue_prefetch_window` for viewport adjacency. Wired into
+      `CoreImpl::hydrate_message` — every hydrate call enqueues a
+      request mapped through `parse_hydration_reason`
+      (`search_result_tap` → P0, `media_fullscreen` → P1,
+      `visible_viewport` → P2, `prefetch` / `adjacent_prefetch` →
+      P3, `background_restore` → P4, `idle_fill` /
+      `opportunistic_fill` → P5; unknown reasons collapse to P5).)
 - [~] Epoch-rotated archive key derivation: `K_archive_root` →
       `K_archive_epoch(epoch_id)` → `K_archive_segment` /
       `K_archive_manifest`. HKDF info =
@@ -744,7 +781,7 @@ Checklist:
       epoch keys wrapped under `K_archive_root` and recorded in
       the archive manifest chain. Optional epoch-key deletion
       for forward secrecy.
-- [~] Epoch key derivation test vectors (Rust): deterministic
+- [x] Epoch key derivation test vectors (Rust): deterministic
       derivation, epoch rotation, wrapped-key round-trip,
       cross-epoch segment decrypt after manifest-chain unwrap.
       (`epoch_key_derivation_is_deterministic`,
@@ -752,7 +789,14 @@ Checklist:
       `epoch_key_wrap_unwrap_round_trip`,
       `segment_key_from_epoch_is_deterministic`,
       `cross_epoch_segment_decrypt` in
-      `crypto::key_hierarchy::tests`.)
+      `crypto::key_hierarchy::tests`, plus the dedicated
+      integration test surface at
+      `crates/core/tests/epoch_key_derivation.rs`:
+      `deterministic_epoch_derivation`,
+      `different_epochs_produce_different_keys`,
+      `epoch_key_wrap_unwrap_round_trip`,
+      `cross_epoch_segment_decrypt`,
+      `epoch_key_info_string_matches_spec`.)
 - [ ] ZK Object Fabric as optional archive backend: S3-compatible
       transport adapter for archive segment upload / download /
       manifest storage. Configured via `archive_backend = "zkof"`
@@ -760,10 +804,14 @@ Checklist:
 - [ ] Archive backend routing: transport client routes archive
       operations to KChat backend or ZKOF based on configuration.
       Manifest index stored as a well-known S3 key when using ZKOF.
-- [ ] Batch-by-bucket prefetch: on any archive segment miss, fetch
+- [~] Batch-by-bucket prefetch: on any archive segment miss, fetch
       all segments for the `(conversation_id, time_bucket)` pair.
       Reduces per-segment access-pattern metadata to per-bucket
-      granularity.
+      granularity. (`crates/core/src/archive/prefetch.rs::batch_prefetch_bucket`
+      queries `archive_segment_map` for the pair and streams every
+      matching segment through `TransportClient::fetch_archive_segment`,
+      returning `PrefetchedSegment { segment_id, blob_id,
+      storage_backend, ciphertext }` per row.)
 - [ ] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.
@@ -798,6 +846,73 @@ Notes:
   `enforce_storage_budget` is wired against the budget enforcer
   but does not yet harvest candidate rows from the local store
   (queued for the next milestone).
+- 2026-05-03 (Phase-2 finishing pass + Phase-3 foundation): ten
+  follow-on changes landed in the same day:
+  1. **Archive event journal wired into `MessagePersister`**:
+     every `persist_ingested_message` /
+     `persist_outbox_entry` / `edit_message` /
+     `delete_for_me` / `delete_for_everyone` /
+     `CoreImpl::send_media` now writes a matching
+     `ArchiveEvent` inside the existing SAVEPOINT alongside
+     the `BackupEvent`.
+  2. **Eviction candidate collection query**:
+     `offload::eviction::collect_eviction_candidates` joins
+     `media_asset` × `message_skeleton` × `conversation`,
+     filters by `archive_state = archive_verified`,
+     `pinned = 0`, `media_state = 'original_local'`, and
+     min-offload-age, and is wired into
+     `CoreImpl::enforce_storage_budget` (replaces the
+     previous `Vec::new()` placeholder).
+  3. **Pinned-chat exclusion guard in `compute_eviction_score`**:
+     a `pinned` candidate scores `f64::MIN` so the scoring
+     path is also pin-safe even if a pinned row leaks past the
+     SQL filter.
+  4. **Archive manifest chain builder**
+     (`archive::manifest_builder`): genesis (gen 0,
+     `previous_manifest_hash = [0; 32]`) → gen N chain,
+     BLAKE3 over canonical-CBOR signing payload, Ed25519
+     signature, AEAD-seal under `K_archive_manifest` derived
+     from the epoch key, with negative tests for
+     wrong-key-fails-open.
+  5. **Archive segment upload orchestration**
+     (`archive::upload::upload_archive_segment` +
+     `persist_segment_map_row`): drives `init_blob_upload →
+     upload_chunk → commit_blob` against the
+     `TransportClient` trait, verifies the commit response's
+     ciphertext-side BLAKE3 Merkle root, and inserts the
+     resulting row into `archive_segment_map` with
+     `state = 'archive_uploaded'`.
+  6. **Archive state machine transitions**
+     (`local_store::db::update_archive_state`): batch UPDATE
+     gated by `ArchiveState::try_transition`; rejects illegal
+     jumps such as `not_archived → archive_verified` and
+     never partial-writes.
+  7. **Epoch key derivation test vectors**
+     (`crates/core/tests/epoch_key_derivation.rs`): the five
+     PROPOSAL §2.1 vectors —
+     `deterministic_epoch_derivation`,
+     `different_epochs_produce_different_keys`,
+     `epoch_key_wrap_unwrap_round_trip`,
+     `cross_epoch_segment_decrypt`, and
+     `epoch_key_info_string_matches_spec`.
+  8. **Hydration priority queue wiring**
+     (`CoreImpl::hydrate_message`,
+     `CoreImpl::enqueue_prefetch_window`): `hydration_queue:
+     Mutex<HydrationQueue>` field with `parse_hydration_reason`
+     mapping reason strings to P0–P5; `hydrate_message`
+     enqueues against the resolved priority while still
+     serving local bodies inline.
+  9. **Batch-by-bucket prefetch**
+     (`archive::prefetch::batch_prefetch_bucket`): one
+     transport hop per `(conversation_id, time_bucket)` so
+     the storage backend's access log only sees per-bucket
+     granularity per PROPOSAL §5.6.
+  10. **End-to-end archive integration test**
+      (`crates/core/tests/archive_pipeline.rs`): seed → ingest
+      → archive journal → group by bucket → build segment →
+      decrypt → re-derive key hierarchy → second-bucket
+      segment → cursor advance, all in one
+      `archive_pipeline_end_to_end` walk.
 
 ---
 

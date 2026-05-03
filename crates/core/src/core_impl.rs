@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use zeroize::Zeroizing;
 
+use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal, ArchiveEventType};
 use crate::config::KChatCoreConfig;
 use crate::crypto::aead::BlobClass;
 use crate::local_store::db::LocalStoreDb;
@@ -51,15 +52,21 @@ use crate::message::processor::{
     ProcessorError,
 };
 use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
-use crate::offload::eviction::{execute_eviction, plan_eviction};
+use crate::offload::eviction::{collect_eviction_candidates, execute_eviction, plan_eviction};
+use crate::offload::hydration::{HydrationQueue, HydrationRequest};
 use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::query_engine::QueryEngine;
 use crate::transport::{DeliveryClient, RawDeliveryMessage};
 use crate::{
     BackupResult, BackupSource, ClientMessageId, DeliveryCursor, DeviceRegistration, Error,
-    HydratedMessage, KChatCore, MessageView, OffloadResult, RestoreResult, Result, SearchQuery,
-    SearchResult, SearchScope, SendMediaResult,
+    HydratedMessage, HydrationReason, KChatCore, MessageView, OffloadResult, RestoreResult, Result,
+    SearchQuery, SearchResult, SearchScope, SendMediaResult,
 };
+
+/// Default capacity hint for [`CoreImpl::hydration_queue`]. The
+/// queue grows beyond this on demand — `HydrationQueue::new`
+/// only sizes the backing `Vec`.
+const DEFAULT_HYDRATION_QUEUE_CAPACITY: usize = 256;
 
 // ---------------------------------------------------------------------------
 // CoreImpl
@@ -85,6 +92,11 @@ pub struct CoreImpl {
     /// [`CoreImpl::with_transport`] / [`CoreImpl::set_delivery_client`]
     /// for how callers wire one in.
     delivery_client: Mutex<Option<Box<dyn DeliveryClient>>>,
+    /// Phase-3 hydration priority queue. `hydrate_message`
+    /// enqueues a request before serving from local storage so
+    /// the orchestration layer can later pop pending fetches in
+    /// priority order (`docs/PROPOSAL.md §5.5`).
+    hydration_queue: Mutex<HydrationQueue>,
 }
 
 impl std::fmt::Debug for CoreImpl {
@@ -111,6 +123,7 @@ impl CoreImpl {
             db: Mutex::new(db),
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
+            hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
         })
     }
 
@@ -123,6 +136,7 @@ impl CoreImpl {
             db: Mutex::new(db),
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
+            hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
         })
     }
 
@@ -147,6 +161,52 @@ impl CoreImpl {
             .delivery_client
             .lock()
             .expect("delivery client mutex poisoned") = Some(client);
+    }
+
+    /// Number of pending hydration requests in the priority queue.
+    /// Test-only inspector.
+    #[cfg(test)]
+    fn hydration_queue_len(&self) -> usize {
+        self.hydration_queue
+            .lock()
+            .expect("hydration queue poisoned")
+            .len()
+    }
+
+    /// Drain the hydration queue into priority order. Test-only
+    /// inspector — production callers should pop with
+    /// [`HydrationQueue::dequeue`] inside a worker loop.
+    #[cfg(test)]
+    fn hydration_queue_drain(&self) -> Vec<HydrationRequest> {
+        let mut queue = self
+            .hydration_queue
+            .lock()
+            .expect("hydration queue poisoned");
+        let mut out = Vec::with_capacity(queue.len());
+        while let Some(r) = queue.dequeue() {
+            out.push(r);
+        }
+        out
+    }
+
+    /// Enqueue P3 prefetches for `visible_ids` and the surrounding
+    /// adjacent-window. The window size is the slice the caller
+    /// already widened — typical UI values are 5..50. See
+    /// [`HydrationQueue::enqueue_prefetch_window`].
+    pub fn enqueue_prefetch_window(
+        &self,
+        visible_ids: &[Uuid],
+        conversation_id: Uuid,
+        window_size: usize,
+    ) -> Result<()> {
+        let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
+        queue.enqueue_prefetch_window(
+            visible_ids,
+            conversation_id,
+            window_size,
+            now_ms_for_send_media(),
+        );
+        Ok(())
     }
 
     /// Persist a slice of MLS-decrypted messages into the local
@@ -615,10 +675,28 @@ impl KChatCore for CoreImpl {
             db.insert_backup_event(&BackupEventJournalEntry {
                 event_seq: 0,
                 event_type: "outbox_pending".into(),
-                payload,
+                payload: payload.clone(),
                 created_at_ms: skel.created_at_ms,
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Mirror the media send into the Phase-3 archive event
+            // journal so the segment builder pulls the asset into
+            // its next `MessageDelta` segment alongside any text
+            // messages from the same time bucket. The write rides
+            // inside the open `SAVEPOINT send_media;`.
+            ArchiveEventJournal::new()
+                .write_event(
+                    conn,
+                    &ArchiveEvent {
+                        event_type: ArchiveEventType::MediaReceived,
+                        conversation_id,
+                        message_id: Some(message_id),
+                        payload,
+                        created_at_ms: skel.created_at_ms,
+                    },
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
             Ok(SendMediaResult {
                 client_message_id: ClientMessageId(message_id),
@@ -639,7 +717,7 @@ impl KChatCore for CoreImpl {
         result
     }
 
-    fn hydrate_message(&self, message_id: Uuid, _reason: &str) -> Result<HydratedMessage> {
+    fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage> {
         // Phase-3 foundation: serve from local storage when a body is
         // already present, otherwise return the skeleton with
         // `is_cold = true`. The remote archive fetch path is still
@@ -663,6 +741,23 @@ impl KChatCore for CoreImpl {
             BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
         );
         let text_content = body.as_ref().and_then(|b| b.text_content.clone());
+
+        // Enqueue a hydration request regardless of whether the
+        // body is local — when the orchestration layer drains the
+        // queue it will skip already-served messages, but the
+        // queue still needs a record of the access for telemetry
+        // and adjacent prefetch.
+        if let Some(conv) = conversation_id {
+            let priority = parse_hydration_reason(reason);
+            let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
+            queue.enqueue(HydrationRequest {
+                message_id,
+                conversation_id: conv,
+                reason: priority,
+                requested_at_ms: now_ms_for_send_media(),
+            });
+        }
+
         Ok(HydratedMessage {
             message_id: message_id_uuid,
             conversation_id,
@@ -698,7 +793,15 @@ impl KChatCore for CoreImpl {
         // `(-headroom).max(0)` would only produce a non-zero target
         // for Extreme pressure.
         let target_bytes = assessment.eviction_target_bytes();
-        let plan = plan_eviction(Vec::new(), target_bytes, now_ms_for_send_media());
+        let now_ms = now_ms_for_send_media();
+        // `MIN_OFFLOAD_AGE_MS`: keep media less than 24 h old
+        // resident locally so the typical
+        // "scroll back to yesterday" pattern does not trigger an
+        // immediate refetch from cold storage. Phase 5 will lift
+        // this into a per-tenant configurable knob.
+        const MIN_OFFLOAD_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+        let candidates = collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms)?;
+        let plan = plan_eviction(candidates, target_bytes, now_ms);
         let result = execute_eviction(db.connection(), &plan)?;
         Ok(OffloadResult {
             freed_bytes: result.freed_bytes,
@@ -715,6 +818,24 @@ impl KChatCore for CoreImpl {
 
 fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
     Error::Storage("local store mutex poisoned".to_string())
+}
+
+/// Map a UI-supplied reason string to a [`HydrationReason`].
+///
+/// `docs/PROPOSAL.md §5.5` defines the priority ladder. Unknown
+/// strings collapse to `OpportunisticFill` (P5), the lowest
+/// priority — that way a stale or typo'd reason never starves a
+/// real P0 search-result tap behind it.
+fn parse_hydration_reason(reason: &str) -> HydrationReason {
+    match reason {
+        "search_result_tap" => HydrationReason::SearchResultTap,
+        "media_fullscreen" | "media_full_screen" => HydrationReason::MediaFullScreen,
+        "visible_viewport" => HydrationReason::VisibleViewport,
+        "prefetch" | "adjacent_prefetch" => HydrationReason::AdjacentPrefetch,
+        "background_restore" => HydrationReason::BackgroundRestore,
+        "idle_fill" | "opportunistic_fill" => HydrationReason::OpportunisticFill,
+        _ => HydrationReason::OpportunisticFill,
+    }
 }
 
 /// Wall-clock millisecond timestamp.
@@ -1166,6 +1287,34 @@ mod tests {
                 "payload missing message_id: {:?}",
                 row.1
             );
+        });
+    }
+
+    #[test]
+    fn send_media_writes_archive_event() {
+        // Phase-3 mirror of `send_media_writes_backup_event_journal_entry`:
+        // the same SAVEPOINT must also append a `media_received`
+        // row to `archive_event_journal` so the segment builder
+        // pulls the media asset into the next archive segment.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM archive_event_journal
+                       WHERE event_type = 'media_received'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
         });
     }
 
@@ -2156,5 +2305,60 @@ mod tests {
             matches!(err, Error::NotImplemented("register_device")),
             "got {err:?}",
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Task 8 — HydrationQueue wiring
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn hydrate_message_maps_reason_to_priority() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = core.send_text(conv, "hi", None).expect("send");
+
+        // Drive a sequence of reasons through `hydrate_message`
+        // and assert each one lands at the expected priority. We
+        // re-enqueue against the same message id, so the queue
+        // dedupes / upgrades — that's the documented contract
+        // (a "search_result_tap" must beat a stale "prefetch").
+        for (reason, expected) in [
+            ("idle_fill", HydrationReason::OpportunisticFill),
+            ("prefetch", HydrationReason::AdjacentPrefetch),
+            ("search_result_tap", HydrationReason::SearchResultTap),
+        ] {
+            let _ = core.hydrate_message(mid.0, reason).expect("hydrate");
+            let drained = core.hydration_queue_drain();
+            assert_eq!(drained.len(), 1, "reason={reason}");
+            assert_eq!(drained[0].reason, expected, "reason={reason}");
+        }
+
+        // Unknown reasons collapse to OpportunisticFill (P5).
+        core.hydrate_message(mid.0, "unmapped-reason").unwrap();
+        let drained = core.hydration_queue_drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, HydrationReason::OpportunisticFill);
+    }
+
+    #[test]
+    fn prefetch_window_enqueues_messages() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Synthesize 10 message-ids — these don't need to exist in
+        // the local store, the prefetch queue is purely an
+        // intent-tracking surface.
+        let visible: Vec<Uuid> = (0..10).map(|_| Uuid::now_v7()).collect();
+        core.enqueue_prefetch_window(&visible, conv, 50)
+            .expect("enqueue prefetch window");
+
+        assert_eq!(core.hydration_queue_len(), 10);
+        let drained = core.hydration_queue_drain();
+        for r in &drained {
+            assert_eq!(r.reason, HydrationReason::AdjacentPrefetch);
+            assert_eq!(r.conversation_id, conv);
+        }
     }
 }
