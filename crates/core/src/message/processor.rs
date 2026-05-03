@@ -25,10 +25,10 @@ use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal, ArchiveEv
 use crate::formats::media_descriptor::MediaDescriptor;
 use crate::local_store::db::{DbError, LocalStoreDb};
 use crate::local_store::schema::{
-    BackupEventJournalEntry, MessageBody, MessageKind, MessageSkeleton,
+    BackupEventJournalEntry, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
 };
 use crate::local_store::state_machines::{
-    ArchiveState, BackupState, BodyState, StateTransitionError,
+    ArchiveState, BackupState, BodyState, MediaState, StateTransitionError,
 };
 use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::ClientMessageId;
@@ -340,6 +340,17 @@ impl<'a> MessagePersister<'a> {
             ));
         };
 
+        // Task 9 (`docs/PROPOSAL.md §5.7`): a message arriving with
+        // a `MediaDescriptor` carries the *thumbnail* + the
+        // backend-side metadata for the original. The original
+        // bytes haven't been pulled yet, so the row lands in
+        // `MediaState::ThumbnailOnly` and the orchestration layer
+        // hands the user a tap-to-rehydrate flow (Task 5).
+        let initial_media_state = if matches!(kind, MessageKind::Media) {
+            Some(MediaState::ThumbnailOnly)
+        } else {
+            None
+        };
         let skel = MessageSkeleton {
             message_id: msg.message_id.to_string(),
             conversation_id: msg.conversation_id.to_string(),
@@ -348,7 +359,7 @@ impl<'a> MessagePersister<'a> {
             received_at_ms: now_ms(),
             kind,
             body_state: BodyState::LocalPlainAvailable,
-            media_state: None,
+            media_state: initial_media_state,
             archive_state: ArchiveState::NotArchived,
             backup_state: BackupState::NotBackedUp,
             reply_to: msg.reply_to.map(|u| u.to_string()),
@@ -356,6 +367,31 @@ impl<'a> MessagePersister<'a> {
             deleted_at_ms: None,
         };
         self.db.insert_message_skeleton(&skel)?;
+
+        // For each descriptor attached to the inbound MLS payload,
+        // land a `media_asset` row. Defaults to the
+        // `kchat_backend` storage sink when the sender did not set
+        // one — matches `docs/PROPOSAL.md §5.7`'s "default sink"
+        // policy.
+        for desc in &msg.media_descriptors {
+            let asset = MediaAsset {
+                asset_id: desc.asset_id.to_string(),
+                message_id: skel.message_id.clone(),
+                mime_type: desc.mime_type.clone(),
+                bytes_total: desc.bytes_total as i64,
+                bytes_local: 0,
+                media_state: MediaState::ThumbnailOnly,
+                wrapped_k_asset: desc.wrapped_k_asset.clone(),
+                chunk_count: desc.chunk_count as i32,
+                merkle_root: desc.merkle_root.to_vec(),
+                blob_id: desc.blob_id.to_string(),
+                storage_sink: desc
+                    .storage_sink
+                    .clone()
+                    .unwrap_or_else(|| "kchat_backend".to_string()),
+            };
+            self.db.insert_media_asset(&asset)?;
+        }
 
         if let Some(text) = &msg.text_content {
             let body = MessageBody {
@@ -1241,6 +1277,127 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fts_count, 1);
+    }
+
+    fn sample_descriptor(seed: u8) -> MediaDescriptor {
+        MediaDescriptor {
+            asset_id: Uuid::now_v7(),
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1_000_000 + u64::from(seed),
+            chunk_count: 4,
+            merkle_root: [seed; 32],
+            blob_id: Uuid::now_v7(),
+            wrapped_k_asset: vec![seed; 40],
+            storage_sink: None,
+        }
+    }
+
+    #[test]
+    fn persist_ingested_message_with_media_descriptor_writes_media_asset() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let desc = sample_descriptor(0x7A);
+        let asset_id = desc.asset_id.to_string();
+        let blob_id = desc.blob_id.to_string();
+        let bytes_total = desc.bytes_total;
+        let chunk_count = desc.chunk_count;
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: None,
+            media_descriptors: vec![desc],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+
+        let mid = msg.message_id.to_string();
+        let skel = db.get_message_skeleton(&mid).unwrap().expect("skeleton");
+        assert_eq!(skel.kind, MessageKind::Media);
+        assert_eq!(skel.media_state, Some(MediaState::ThumbnailOnly));
+
+        let asset = db.get_media_asset(&asset_id).unwrap().expect("asset row");
+        assert_eq!(asset.message_id, mid);
+        assert_eq!(asset.media_state, MediaState::ThumbnailOnly);
+        assert_eq!(asset.bytes_total, bytes_total as i64);
+        assert_eq!(asset.chunk_count, chunk_count as i32);
+        assert_eq!(asset.blob_id, blob_id);
+        assert_eq!(asset.storage_sink, "kchat_backend", "default sink");
+    }
+
+    #[test]
+    fn persist_ingested_message_without_descriptor_writes_no_media_asset() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: Some("just text".into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT count(*) FROM media_asset", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn persist_ingested_message_with_descriptor_storage_sink_override() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mut desc = sample_descriptor(0x33);
+        desc.storage_sink = Some("zk_object_fabric".into());
+        let asset_id = desc.asset_id.to_string();
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1,
+            text_content: None,
+            media_descriptors: vec![desc],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+        let asset = db.get_media_asset(&asset_id).unwrap().expect("asset");
+        assert_eq!(asset.storage_sink, "zk_object_fabric");
+    }
+
+    #[test]
+    fn persist_ingested_message_with_descriptor_is_idempotent() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let desc = sample_descriptor(0x09);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1,
+            text_content: None,
+            media_descriptors: vec![desc],
+            reply_to: None,
+        };
+        p.persist_ingested_message(&msg).expect("persist");
+        let err = p.persist_ingested_message(&msg).unwrap_err();
+        assert!(matches!(err, ProcessorError::DuplicateMessage));
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT count(*) FROM media_asset", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "second insert must roll back the asset");
     }
 
     #[test]

@@ -96,6 +96,7 @@ fn build_archive_manifest(generation: u64, previous_manifest_hash: [u8; 32]) -> 
         search_index_shards: vec![shard_ref(0x70)],
         media_references: vec![media_ref(0x80)],
         tombstones: vec![tombstone(0x90)],
+        wrapped_prior_epoch_keys: vec![],
         merkle_root: [0x66; 32],
         manifest_signature: Vec::new(),
     }

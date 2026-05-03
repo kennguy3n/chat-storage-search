@@ -1172,6 +1172,69 @@ Notes:
 
 ## Changelog
 
+### 2026-05-03 — Phase-2 / Phase-3 cross-cutting batch of 10 (this PR)
+
+Lands the remaining Phase-2 / Phase-3 task surface as a single
+cross-cutting batch. Highlights:
+
+**Phase 2 / Phase 3:**
+
+1. **`storage_backend` plumbing on `archive_segment_map`** —
+   `local_store::state_machines::StorageBackend` is the typed
+   enum (`KchatBackend`, `ZkObjectFabric`) wired through
+   `LocalStoreDb::{get,update}_segment_storage_backend`. Round-trip
+   insert / read / update unit tests guard the column.
+2. **Archive segment download + decrypt pipeline** —
+   `archive::download::{download_archive_segment,
+   decrypt_archive_segment, decode_archive_segment_payload,
+   fetch_and_decrypt_segment}` mirrors the inverse of
+   `segment_builder` (XChaCha20-Poly1305 open + zstd decompress +
+   CBOR decode). 10 unit tests cover round-trip, wrong-key,
+   tampered ciphertext, and transport-error paths.
+3. **Epoch key lifecycle wired into `CoreImpl`** —
+   `archive::epoch_keys::EpochKeyManager` is now installed at the
+   `CoreImpl` layer via `with_current_epoch_key` /
+   `rotate_archive_epoch` / `unwrap_prior_epoch_key` /
+   `delete_epoch_key`. `ArchiveManifestBuilder` carries a
+   `wrapped_prior_epoch_keys: Vec<WrappedEpochKeyRef>` slot in
+   the signed manifest, with integration tests covering rotation
+   + wrap-unwrap round-trip + zeroize-on-delete.
+4. **Timeline-skeleton rehydration on scroll-back** —
+   `CoreImpl::rehydrate_timeline_skeletons` calls
+   `batch_prefetch_bucket`, decrypts each segment via the new
+   `archive::download` pipeline, and lands archive-only stub
+   skeletons (`BodyState::RemoteArchiveOnly`) through
+   `LocalStoreDb::upsert_skeleton_from_archive` (`INSERT OR
+   IGNORE` so existing local rows always win). Integration tests
+   cover happy-path landing, INSERT OR IGNORE preservation,
+   empty-bucket no-op, and wrong-key error propagation.
+5. **Lazy media rehydration on tap** —
+   `LocalStoreDb::get_media_asset_by_message` resolves an asset
+   row from a `message_id`, and `CoreImpl::rehydrate_media_for_message`
+   wraps `media::download::rehydrate_media_asset` so the on-tap
+   UI flow can resolve the right asset by message-key. The
+   `hydrate_message` worker enqueue now escalates to
+   `HydrationReason::MediaFullScreen` whenever the message has an
+   evicted media asset, ensuring tap latency beats opportunistic
+   prefetch.
+6. **`MediaDescriptor` propagation through MLS ingest** —
+   `MessagePersister::persist_ingested_message` now writes a
+   `media_asset` row (state = `ThumbnailOnly`) for every attached
+   `MediaDescriptor`, defaults `storage_sink` to `kchat_backend`
+   when the sender did not set one, and rolls back atomically
+   under the existing `SAVEPOINT persist_ingest`. 4 new unit
+   tests cover writes, no-op without descriptor, sink override,
+   and SAVEPOINT-backed idempotency.
+
+Already-landed in earlier PRs and re-verified: tiered eviction
+policy (`PressureLevel`-gated), dummy request padding
+(`PrivacyLevel::High`), ZK Object Fabric `MediaBlobSink`, and
+archive backend routing (KChat / ZKOF dispatch). All tests in
+those modules continue to pass.
+
+Test surface lands at 691 unit tests + integration suites, all
+green: `cargo test --workspace` passes end-to-end.
+
 ### 2026-05-03 — Phase-2 / Phase-3 follow-on batch of 10
 
 Closes the remaining Phase-2 thumbnail item and pushes Phase-3 from

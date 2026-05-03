@@ -227,12 +227,13 @@ chat-storage-search/
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
           query_engine.rs                   # FTS + sender/date/conv/kind structured filters
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + prefetch + epoch keys + routing + privacy padding
+        archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
           segment_builder.rs                # SegmentBuildRequest / BuiltSegment / ArchiveSegmentBuilder (CBOR → zstd → XChaCha20-Poly1305)
-          manifest_builder.rs               # ArchiveManifestBuilder: genesis → gen N chain, BLAKE3 manifest hash, Ed25519 signature, AEAD-seal under K_archive_manifest
+          manifest_builder.rs               # ArchiveManifestBuilder: genesis → gen N chain, BLAKE3 manifest hash, Ed25519 signature, AEAD-seal under K_archive_manifest, wrapped_prior_epoch_keys carry-through
           upload.rs                         # upload_archive_segment over TransportClient + persist_segment_map_row
+          download.rs                       # download_archive_segment / decrypt_archive_segment / decode_archive_segment_payload / fetch_and_decrypt_segment (XChaCha20-Poly1305 open + zstd decompress + CBOR decode)
           prefetch.rs                       # batch_prefetch_bucket / batch_prefetch_bucket_with_padding: one transport hop per (conversation_id, time_bucket)
           epoch_keys.rs                     # EpochKeyManager: current epoch in Zeroizing<[u8; 32]>, prior keys wrapped via AES-256-KW, rotate / unwrap_prior_epoch_key / delete_epoch_key
           routing.rs                        # route_archive_upload / route_archive_download / route_manifest_upload (KChat backend ↔ ZK Object Fabric)

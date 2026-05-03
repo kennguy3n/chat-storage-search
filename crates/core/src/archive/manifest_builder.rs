@@ -32,8 +32,8 @@ use crate::crypto::aead::xchacha20_poly1305::{seal, NONCE_LEN};
 use crate::crypto::CryptoError;
 use crate::formats::manifest::{
     compute_archive_manifest_hash, sign_archive_manifest, ArchiveManifest, ManifestMediaRef,
-    ManifestSegmentRef, ManifestShardRef, Tombstone, ARCHIVE_MANIFEST_MAGIC, GENESIS_PREVIOUS_HASH,
-    MANIFEST_VERSION,
+    ManifestSegmentRef, ManifestShardRef, Tombstone, WrappedEpochKeyRef, ARCHIVE_MANIFEST_MAGIC,
+    GENESIS_PREVIOUS_HASH, MANIFEST_VERSION,
 };
 use crate::Error;
 
@@ -72,6 +72,20 @@ pub struct ManifestBuildRequest<'a> {
     pub media_references: Vec<ManifestMediaRef>,
     /// Tombstones committed under this manifest.
     pub tombstones: Vec<Tombstone>,
+    /// Wrapped prior epoch keys carried into this manifest.
+    ///
+    /// `docs/PROPOSAL.md §2.1` (cross-epoch decryption): every
+    /// retired epoch's key bytes are wrapped under
+    /// `K_archive_root` (AES-256-KW) and recorded in the next
+    /// archive manifest so future restore paths can unwrap and
+    /// open prior-epoch segments. The orchestrator pulls these
+    /// from
+    /// [`crate::archive::epoch_keys::EpochKeyManager::take_pending_wrapped_prior_keys`]
+    /// each time it cuts a manifest. Empty `Vec` is the typical
+    /// case (no rotation since the last manifest); the field
+    /// rides through unchanged via `#[serde(default)]` on
+    /// [`ArchiveManifest::wrapped_prior_epoch_keys`].
+    pub wrapped_prior_epoch_keys: Vec<WrappedEpochKeyRef>,
     /// Optional previous manifest in the chain. `None` produces a
     /// genesis manifest.
     pub previous: Option<&'a ArchiveManifest>,
@@ -125,6 +139,7 @@ pub fn build_archive_manifest(
         search_index_shards: request.search_index_shards,
         media_references: request.media_references,
         tombstones: request.tombstones,
+        wrapped_prior_epoch_keys: request.wrapped_prior_epoch_keys,
         merkle_root,
         manifest_signature: Vec::new(),
     };
@@ -250,6 +265,7 @@ mod tests {
             search_index_shards: vec![],
             media_references: vec![],
             tombstones: vec![],
+            wrapped_prior_epoch_keys: vec![],
             previous: None,
         };
         let sealed = build_archive_manifest(req, &fake_signing_key(), &k_manifest()).unwrap();
@@ -278,6 +294,7 @@ mod tests {
                 search_index_shards: vec![],
                 media_references: vec![],
                 tombstones: vec![],
+                wrapped_prior_epoch_keys: vec![],
                 previous: None,
             },
             &key,
@@ -293,6 +310,10 @@ mod tests {
                 search_index_shards: vec![],
                 media_references: vec![],
                 tombstones: vec![],
+                wrapped_prior_epoch_keys: vec![WrappedEpochKeyRef {
+                    epoch_id: "2026-04".into(),
+                    wrapped_key: vec![0xAA; 40],
+                }],
                 previous: Some(&gen0.manifest),
             },
             &key,
@@ -319,6 +340,7 @@ mod tests {
                 search_index_shards: vec![],
                 media_references: vec![],
                 tombstones: vec![],
+                wrapped_prior_epoch_keys: vec![],
                 previous: None,
             },
             &key,
@@ -343,6 +365,7 @@ mod tests {
                 search_index_shards: vec![],
                 media_references: vec![],
                 tombstones: vec![],
+                wrapped_prior_epoch_keys: vec![],
                 previous: None,
             },
             &fake_signing_key(),

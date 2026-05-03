@@ -113,6 +113,31 @@ pub struct Tombstone {
     pub deleted_at_ms: i64,
 }
 
+/// Reference to a *retired* archive epoch key, wrapped under
+/// `K_archive_root` (AES-256-KW) and recorded in the archive
+/// manifest chain.
+///
+/// `docs/PROPOSAL.md §2.1` describes the cross-epoch decryption
+/// recipe: every retired epoch's key bytes are re-wrapped under
+/// `K_archive_root` whenever the active epoch rotates and stored
+/// in the *next* manifest. The restore path unwraps them on demand
+/// to open archive segments sealed under a previous epoch.
+///
+/// Empty / never-rotated archives keep this list empty. Forward-
+/// secrecy deletes (see
+/// [`crate::archive::epoch_keys::EpochKeyManager::delete_epoch_key`])
+/// drop the corresponding `WrappedEpochKeyRef` from every future
+/// manifest, making the prior-epoch segments un-decryptable for
+/// good.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WrappedEpochKeyRef {
+    /// Epoch identifier the wrapped key belongs to (e.g. `"2026-05"`).
+    pub epoch_id: String,
+    /// AES-256-KW ciphertext over the 32-byte epoch key.
+    #[serde(with = "serde_bytes")]
+    pub wrapped_key: Vec<u8>,
+}
+
 // --- BackupManifest ---------------------------------------------------------
 
 /// Backup manifest frame (`docs/PROPOSAL.md §6.3`).
@@ -217,6 +242,15 @@ pub struct ArchiveManifest {
 
     /// Tombstones recorded under this manifest.
     pub tombstones: Vec<Tombstone>,
+
+    /// Wrapped prior epoch keys (cross-epoch decryption chain).
+    /// Empty on the genesis manifest and on manifests cut without
+    /// an epoch rotation since the previous one.
+    ///
+    /// The field is `#[serde(default)]` so manifests written before
+    /// this column existed deserialize cleanly with an empty list.
+    #[serde(default)]
+    pub wrapped_prior_epoch_keys: Vec<WrappedEpochKeyRef>,
 
     /// 32-byte BLAKE3 over the manifest's reference fields.
     #[serde(with = "serde_bytes_array")]
@@ -490,6 +524,7 @@ mod tests {
             search_index_shards: vec![sample_shard_ref()],
             media_references: vec![sample_media_ref()],
             tombstones: vec![sample_tombstone()],
+            wrapped_prior_epoch_keys: vec![],
             merkle_root: [0x22; 32],
             manifest_signature: Vec::new(),
         }

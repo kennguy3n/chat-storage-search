@@ -316,6 +316,7 @@ mod tests {
                 search_index_shards: vec![],
                 media_references: vec![],
                 tombstones: vec![],
+                wrapped_prior_epoch_keys: vec![],
                 merkle_root: [0u8; 32],
                 manifest_signature: vec![],
             },

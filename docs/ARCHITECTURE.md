@@ -520,6 +520,13 @@ the standard library and chosen primitives.
 > either the `TransportClient` or a `ZkofArchiveAdapter` based
 > on `KChatCoreConfig::archive_backend`; the ZKOF adapter is
 > backed by an `S3Client` trait with a `NoopS3Client` stub),
+> `archive::download::{download_archive_segment,
+> decrypt_archive_segment, decode_archive_segment_payload,
+> fetch_and_decrypt_segment}` (mirrors the inverse of
+> `segment_builder` — XChaCha20-Poly1305 open + zstd decompress
+> + CBOR decode — and is consumed by
+> `CoreImpl::rehydrate_timeline_skeletons` to land archive-only
+> stub skeletons on scroll-back),
 > `archive::privacy::{should_pad, compute_padding_count,
 > generate_dummy_segment_id, pad_with_dummy_requests}`
 > (privacy-padding helpers consumed by the prefetch path),

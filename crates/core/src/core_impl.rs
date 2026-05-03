@@ -37,14 +37,17 @@ use uuid::Uuid;
 
 use zeroize::Zeroizing;
 
+use crate::archive::epoch_keys::EpochKeyManager;
 use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal, ArchiveEventType};
 use crate::config::KChatCoreConfig;
 use crate::crypto::aead::BlobClass;
+use crate::crypto::key_hierarchy::{KeyMaterial, KEY_LEN};
+use crate::formats::manifest::WrappedEpochKeyRef;
 use crate::local_store::db::LocalStoreDb;
 use crate::local_store::schema::{
     BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
 };
-use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 use crate::media::processor::process_media;
 use crate::media::thumbnail::{ThumbnailGenerator, DEFAULT_MAX_DIMENSION};
 use crate::message::processor::{
@@ -58,7 +61,7 @@ use crate::offload::eviction::{
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
 use crate::search::fuzzy_search::FuzzySearchEngine;
 use crate::search::query_engine::QueryEngine;
-use crate::transport::{DeliveryClient, RawDeliveryMessage};
+use crate::transport::{DeliveryClient, RawDeliveryMessage, TransportClient};
 use crate::{
     BackupResult, BackupSource, ClientMessageId, DeliveryCursor, DeviceRegistration, Error,
     HydratedMessage, HydrationReason, KChatCore, MessageView, OffloadResult, RestoreResult, Result,
@@ -99,6 +102,15 @@ pub struct CoreImpl {
     /// the orchestration layer can later pop pending fetches in
     /// priority order (`docs/PROPOSAL.md §5.5`).
     hydration_queue: Mutex<HydrationQueue>,
+    /// Phase-3 epoch key lifecycle (`docs/PROPOSAL.md §2.1`). The
+    /// manager is `None` until [`CoreImpl::install_epoch_key_manager`]
+    /// is called — typically after the device unlocks
+    /// `K_archive_root` from the platform keystore. The
+    /// orchestration layer consults this slot every time it needs
+    /// the active epoch key (segment seal, manifest seal) and
+    /// every time a manifest is cut (to harvest the
+    /// wrapped-prior-epoch-keys list).
+    current_epoch: Mutex<Option<EpochKeyManager>>,
 }
 
 impl std::fmt::Debug for CoreImpl {
@@ -126,6 +138,7 @@ impl CoreImpl {
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
+            current_epoch: Mutex::new(None),
         })
     }
 
@@ -143,6 +156,7 @@ impl CoreImpl {
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
+            current_epoch: Mutex::new(None),
         })
     }
 
@@ -195,6 +209,130 @@ impl CoreImpl {
         out
     }
 
+    // ----------------------------------------------------------------
+    // Epoch key lifecycle (`docs/PROPOSAL.md §2.1`)
+    // ----------------------------------------------------------------
+
+    /// Bootstrap a fresh [`EpochKeyManager`] for the supplied
+    /// `K_archive_root` and `epoch_id` and install it as the
+    /// active manager. Replaces any previously installed manager
+    /// — callers usually call this once at unlock time.
+    ///
+    /// `docs/PROPOSAL.md §2.1`: `K_archive_root` is the long-lived
+    /// device-keystore wrap that the platform decrypts on unlock.
+    /// The manager owns the **derived** epoch key in a `Zeroizing`
+    /// buffer; the root never leaves the caller's stack.
+    pub fn install_epoch_key_manager(
+        &self,
+        k_archive_root: &KeyMaterial,
+        epoch_id: &str,
+    ) -> Result<()> {
+        let manager = EpochKeyManager::new(k_archive_root, epoch_id)?;
+        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
+        *slot = Some(manager);
+        Ok(())
+    }
+
+    /// Whether an epoch key manager is currently installed.
+    pub fn has_epoch_key_manager(&self) -> bool {
+        let slot = self
+            .current_epoch
+            .lock()
+            .expect("current_epoch mutex poisoned");
+        slot.is_some()
+    }
+
+    /// Snapshot of the currently active epoch identifier (if any).
+    pub fn current_epoch_id(&self) -> Result<Option<String>> {
+        let slot = self.current_epoch.lock().map_err(poisoned)?;
+        Ok(slot.as_ref().map(|m| m.current_epoch_id().to_string()))
+    }
+
+    /// Borrow the bytes of the current epoch key into the supplied
+    /// closure. The closure runs with the [`EpochKeyManager`]
+    /// mutex held — keep its body short and side-effect free, and
+    /// **never** hand the byte slice out of the closure.
+    ///
+    /// Returns `Error::Storage` when no manager is installed.
+    pub fn with_current_epoch_key<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&[u8; KEY_LEN]) -> T,
+    {
+        let slot = self.current_epoch.lock().map_err(poisoned)?;
+        let mgr = slot
+            .as_ref()
+            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        Ok(f(mgr.current_epoch_key()))
+    }
+
+    /// Rotate the active epoch under `K_archive_root`, retiring the
+    /// outgoing epoch key by AES-256-KW wrapping it under
+    /// `K_archive_root` and returning the wrapped bytes paired with
+    /// the outgoing epoch id. The returned [`WrappedEpochKeyRef`]
+    /// is intended to be funneled into the next archive manifest's
+    /// `wrapped_prior_epoch_keys` slot.
+    ///
+    /// Returns `Error::Storage` when no manager is installed.
+    pub fn rotate_archive_epoch(
+        &self,
+        k_archive_root: &KeyMaterial,
+        new_epoch_id: &str,
+    ) -> Result<WrappedEpochKeyRef> {
+        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
+        let mgr = slot
+            .as_mut()
+            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let outgoing_id = mgr.current_epoch_id().to_string();
+        mgr.rotate_epoch(k_archive_root, new_epoch_id)?;
+        let wrapped = mgr
+            .wrapped_prior_epoch_key(&outgoing_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Storage("rotate_archive_epoch: outgoing key not retired".into())
+            })?;
+        Ok(WrappedEpochKeyRef {
+            epoch_id: outgoing_id,
+            wrapped_key: wrapped,
+        })
+    }
+
+    /// Recover a prior-epoch key from its wrapped manifest entry.
+    /// Wraps [`EpochKeyManager::unwrap_prior_epoch_key`]; the
+    /// returned bytes belong to the caller and should be wrapped in
+    /// a `Zeroizing` buffer at the call site.
+    pub fn recover_epoch_key(
+        &self,
+        epoch_id: &str,
+        k_archive_root: &KeyMaterial,
+    ) -> Result<[u8; KEY_LEN]> {
+        let slot = self.current_epoch.lock().map_err(poisoned)?;
+        let mgr = slot
+            .as_ref()
+            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        mgr.unwrap_prior_epoch_key(epoch_id, k_archive_root)
+    }
+
+    /// Forward-secrecy delete of a retired epoch key. Returns
+    /// `true` if a key was actually removed from the manager.
+    pub fn delete_archive_epoch_key(&self, epoch_id: &str) -> Result<bool> {
+        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
+        let mgr = slot
+            .as_mut()
+            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        Ok(mgr.delete_epoch_key(epoch_id))
+    }
+
+    /// Snapshot of every retired epoch's wrapped key, ready to drop
+    /// into the next manifest's
+    /// [`crate::archive::manifest_builder::ManifestBuildRequest::wrapped_prior_epoch_keys`].
+    pub fn wrapped_prior_epoch_keys_for_manifest(&self) -> Result<Vec<WrappedEpochKeyRef>> {
+        let slot = self.current_epoch.lock().map_err(poisoned)?;
+        let mgr = slot
+            .as_ref()
+            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        Ok(mgr.wrapped_prior_epoch_keys_for_manifest())
+    }
+
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
     /// adjacent-window. The window size is the slice the caller
     /// already widened — typical UI values are 5..50. See
@@ -213,6 +351,146 @@ impl CoreImpl {
             now_ms_for_send_media(),
         );
         Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Timeline-skeleton rehydration on scroll-back
+    // (Task 4 — `docs/PROPOSAL.md §5.1`)
+    // ----------------------------------------------------------------
+
+    /// Rehydrate every [`MessageSkeleton`] for `(conversation_id,
+    /// time_bucket)` from the personal archive into the local
+    /// store, returning the freshly-inserted skeletons.
+    ///
+    /// `docs/PROPOSAL.md §5.1` — when the user scrolls back past
+    /// the local-store horizon the orchestration layer pulls the
+    /// matching archive segment(s) for the bucket via
+    /// [`crate::archive::prefetch::batch_prefetch_bucket`],
+    /// decrypts each blob with
+    /// [`crate::archive::download::decrypt_archive_segment`]
+    /// (Task 3), and lands a stub skeleton row in the local
+    /// store. Bodies remain remote-only ([`BodyState::RemoteArchiveOnly`])
+    /// so a tap on a row triggers
+    /// [`Self::hydrate_message`] on demand.
+    ///
+    /// `k_archive_epoch` is the epoch key currently sealing the
+    /// segments — typically pulled out of
+    /// [`Self::with_current_epoch_key`] once the device unlocks
+    /// `K_archive_root`. Cross-epoch buckets are the caller's job
+    /// — supply the correct epoch key for the bucket you are
+    /// rehydrating.
+    ///
+    /// The function never overwrites an existing local skeleton —
+    /// see [`LocalStoreDb::upsert_skeleton_from_archive`]. The
+    /// returned `Vec` lists *only* the rows that landed for the
+    /// first time, in `archive_segment_map` traversal order.
+    pub fn rehydrate_timeline_skeletons<F>(
+        &self,
+        transport: &dyn TransportClient,
+        conversation_id: Uuid,
+        time_bucket: &str,
+        mut key_for_segment: F,
+    ) -> Result<Vec<MessageSkeleton>>
+    where
+        F: FnMut(&str) -> Result<[u8; 32]>,
+    {
+        let segments = {
+            let db = self.db.lock().map_err(poisoned)?;
+            crate::archive::prefetch::batch_prefetch_bucket(
+                db.connection(),
+                transport,
+                conversation_id,
+                time_bucket,
+            )?
+        };
+
+        let mut inserted: Vec<MessageSkeleton> = Vec::new();
+        let received_at_ms = now_ms_for_send_media();
+        for segment in segments {
+            let k_bytes = key_for_segment(&segment.segment_id)?;
+            let plaintext_cbor =
+                crate::archive::download::decrypt_archive_segment(&segment.ciphertext, &k_bytes)?;
+            let payload =
+                crate::archive::download::decode_archive_segment_payload(&plaintext_cbor)?;
+
+            // Drop into the DB lock once per segment so the worker
+            // doesn't starve out-of-band reads while we land a
+            // potentially long event list.
+            let db = self.db.lock().map_err(poisoned)?;
+            for event in payload.events {
+                let Some(message_id) = event.message_id else {
+                    continue;
+                };
+                if event.conversation_id != conversation_id {
+                    continue;
+                }
+                let stub = MessageSkeleton {
+                    message_id: message_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sender_id: String::new(),
+                    created_at_ms: event.created_at_ms,
+                    received_at_ms,
+                    kind: MessageKind::Text,
+                    body_state: BodyState::RemoteArchiveOnly,
+                    media_state: None,
+                    archive_state: ArchiveState::ArchiveUploaded,
+                    backup_state: BackupState::NotBackedUp,
+                    reply_to: None,
+                    edited_at_ms: None,
+                    deleted_at_ms: None,
+                };
+                let landed = db
+                    .upsert_skeleton_from_archive(&stub)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                if landed {
+                    inserted.push(stub);
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    // ----------------------------------------------------------------
+    // Lazy media rehydration on tap (Task 5 — `docs/PROPOSAL.md §5.5`)
+    // ----------------------------------------------------------------
+
+    /// Rehydrate the media blob attached to `message_id` from the
+    /// configured sink, transitioning the asset's
+    /// [`MediaState`] from `Evicted` (or `RemoteOriginal`) to
+    /// `OriginalLocal` once the bytes land on disk.
+    ///
+    /// Wraps [`crate::media::download::rehydrate_media_asset`] but
+    /// resolves the `asset_id` from the message-key by calling
+    /// [`LocalStoreDb::get_media_asset_by_message`] — the public
+    /// API for the on-tap UI flow described in
+    /// `docs/PROPOSAL.md §5.2`.
+    ///
+    /// Returns `Ok(Some(plaintext))` when a download was issued,
+    /// `Ok(None)` when no media row is attached to `message_id`.
+    /// Already-local assets surface as `Error::Storage`, mirroring
+    /// the underlying [`crate::media::download::rehydrate_media_asset`]
+    /// state-machine guard.
+    pub fn rehydrate_media_for_message(
+        &self,
+        transport: &dyn TransportClient,
+        message_id: Uuid,
+        wrapping_key: &[u8; KEY_LEN],
+    ) -> Result<Option<Vec<u8>>> {
+        let mid = message_id.to_string();
+        let db = self.db.lock().map_err(poisoned)?;
+        let Some(asset) = db
+            .get_media_asset_by_message(&mid)
+            .map_err(|e| Error::Storage(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let plaintext = crate::media::download::rehydrate_media_asset(
+            &db,
+            &asset.asset_id,
+            transport,
+            wrapping_key,
+        )?;
+        Ok(Some(plaintext))
     }
 
     /// Persist a slice of MLS-decrypted messages into the local
@@ -807,13 +1085,37 @@ impl KChatCore for CoreImpl {
         );
         let text_content = body.as_ref().and_then(|b| b.text_content.clone());
 
+        // Detect whether an evicted media asset is attached. We
+        // surface this so the worker can lazily re-download the
+        // blob when the user taps the row (Task 5 — Phase 3
+        // §5.5). The lookup is cheap (`media_asset` carries an
+        // index on `message_id`) and the enqueue happens
+        // unconditionally below.
+        let has_evicted_media = db
+            .get_media_asset_by_message(&skeleton.message_id)
+            .map(|opt| {
+                opt.map(|a| matches!(a.media_state, MediaState::Evicted))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
         // Enqueue a hydration request regardless of whether the
         // body is local — when the orchestration layer drains the
         // queue it will skip already-served messages, but the
         // queue still needs a record of the access for telemetry
-        // and adjacent prefetch.
+        // and adjacent prefetch. When evicted media is attached we
+        // bump the priority to [`HydrationReason::MediaFullScreen`]
+        // so the worker pulls the bytes ahead of opportunistic
+        // skeleton fetches.
         if let Some(conv) = conversation_id {
-            let priority = parse_hydration_reason(reason);
+            let mut priority = parse_hydration_reason(reason);
+            // Variant order maps to P0..P5 — *smaller* `Ord` means
+            // *higher* priority. Escalate to MediaFullScreen
+            // whenever the caller asked for something lower-priority
+            // than P1 (MediaFullScreen).
+            if has_evicted_media && priority > HydrationReason::MediaFullScreen {
+                priority = HydrationReason::MediaFullScreen;
+            }
             let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
             queue.enqueue(HydrationRequest {
                 message_id,
@@ -2604,5 +2906,593 @@ mod tests {
             engine.search_fuzzy("dogs", 5).unwrap().is_empty(),
             "fuzzy index must roll back: \"dogs\" tokens evicted post-rollback"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Epoch key manager wiring (Task 2 — `docs/PROPOSAL.md §2.1`)
+    // ----------------------------------------------------------------
+
+    fn fresh_archive_root() -> KeyMaterial {
+        let mut bytes = [0u8; KEY_LEN];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(13);
+        }
+        KeyMaterial::from_bytes(bytes)
+    }
+
+    #[test]
+    fn install_epoch_key_manager_replaces_active_manager() {
+        let core = fresh_core();
+        let root = fresh_archive_root();
+        assert!(!core.has_epoch_key_manager());
+        core.install_epoch_key_manager(&root, "2026-05").unwrap();
+        assert!(core.has_epoch_key_manager());
+        assert_eq!(
+            core.current_epoch_id().unwrap(),
+            Some("2026-05".to_string())
+        );
+
+        // Re-install replaces the manager with a fresh one.
+        core.install_epoch_key_manager(&root, "2026-06").unwrap();
+        assert_eq!(
+            core.current_epoch_id().unwrap(),
+            Some("2026-06".to_string())
+        );
+    }
+
+    #[test]
+    fn epoch_lifecycle_methods_error_without_installed_manager() {
+        let core = fresh_core();
+        let root = fresh_archive_root();
+        let err = core.rotate_archive_epoch(&root, "2026-05").unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        let err = core.recover_epoch_key("2026-04", &root).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        let err = core.delete_archive_epoch_key("2026-04").unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        let err = core.wrapped_prior_epoch_keys_for_manifest().unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        let err = core.with_current_epoch_key(|_| ()).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        assert_eq!(core.current_epoch_id().unwrap(), None);
+    }
+
+    #[test]
+    fn rotate_archive_epoch_returns_wrapped_prior_key_for_manifest() {
+        let core = fresh_core();
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-05").unwrap();
+
+        // Snapshot the active key so we can verify the rotation
+        // produces a *different* one.
+        let before = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let wrapped = core.rotate_archive_epoch(&root, "2026-06").unwrap();
+        assert_eq!(wrapped.epoch_id, "2026-05");
+        assert!(!wrapped.wrapped_key.is_empty());
+
+        let after = core.with_current_epoch_key(|k| *k).unwrap();
+        assert_ne!(before, after, "rotation must derive a fresh key");
+        assert_eq!(
+            core.current_epoch_id().unwrap(),
+            Some("2026-06".to_string())
+        );
+
+        // Manifest harvest reports the wrapped prior key.
+        let prior = core.wrapped_prior_epoch_keys_for_manifest().unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].epoch_id, "2026-05");
+        assert_eq!(prior[0].wrapped_key, wrapped.wrapped_key);
+
+        // Recovery round-trips the original epoch key bytes.
+        let recovered = core.recover_epoch_key("2026-05", &root).unwrap();
+        assert_eq!(recovered, before);
+    }
+
+    #[test]
+    fn delete_archive_epoch_key_zeroizes_prior_entry() {
+        let core = fresh_core();
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-05").unwrap();
+        core.rotate_archive_epoch(&root, "2026-06").unwrap();
+        assert_eq!(
+            core.wrapped_prior_epoch_keys_for_manifest().unwrap().len(),
+            1
+        );
+        assert!(core.delete_archive_epoch_key("2026-05").unwrap());
+        assert!(core
+            .wrapped_prior_epoch_keys_for_manifest()
+            .unwrap()
+            .is_empty());
+        let err = core.recover_epoch_key("2026-05", &root).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+    }
+
+    // ----------------------------------------------------------------
+    // Timeline skeleton rehydration (Task 4) test scaffolding
+    // ----------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::ops::Range;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Debug, Default)]
+    struct FixtureTransport {
+        responses: StdMutex<HashMap<String, Vec<u8>>>,
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl FixtureTransport {
+        fn install(&self, segment_id: &str, bytes: Vec<u8>) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(segment_id.to_string(), bytes);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::transport::TransportClient for FixtureTransport {
+        fn fetch_messages(
+            &self,
+            _conversation_id: &str,
+            _after_cursor: Option<&str>,
+        ) -> crate::transport::TransportResult<crate::transport::FetchMessagesResponse> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn init_blob_upload(
+            &self,
+            _size: u64,
+            _blob_class: BlobClass,
+            _expected_merkle_root: [u8; 32],
+        ) -> crate::transport::TransportResult<crate::transport::BlobUploadHandle> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn upload_chunk(
+            &self,
+            _blob_id: &str,
+            _chunk_idx: u32,
+            _ciphertext: &[u8],
+            _sha256: [u8; 32],
+        ) -> crate::transport::TransportResult<crate::transport::ChunkReceipt> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn commit_blob(
+            &self,
+            _blob_id: &str,
+        ) -> crate::transport::TransportResult<crate::transport::CommitBlobResponse> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_blob_range(
+            &self,
+            _blob_id: &str,
+            _range: Range<u64>,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_archive_manifests(
+            &self,
+            _after_generation: Option<u64>,
+        ) -> crate::transport::TransportResult<Vec<crate::transport::EncryptedManifest>> {
+            Err(Error::NotImplemented("transport"))
+        }
+
+        fn fetch_archive_segment(
+            &self,
+            segment_id: &str,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            self.calls.lock().unwrap().push(segment_id.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .get(segment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Storage(format!(
+                        "FixtureTransport: no canned response for {segment_id}"
+                    ))
+                })
+        }
+
+        fn fetch_index_shards(
+            &self,
+            _conversation_hash: &str,
+            _bucket: &str,
+            _shard_type: &str,
+        ) -> crate::transport::TransportResult<Vec<u8>> {
+            Err(Error::NotImplemented("transport"))
+        }
+    }
+
+    /// Build a sealed segment under `key_bytes` for the supplied
+    /// events and seed `archive_segment_map` + the fixture
+    /// transport. Returns the segment's UUID for assertions.
+    fn seal_and_seed_segment(
+        core: &CoreImpl,
+        transport: &FixtureTransport,
+        key_bytes: &[u8; 32],
+        conv: Uuid,
+        bucket: &str,
+        events: Vec<crate::archive::event_journal::ArchiveEvent>,
+    ) -> Uuid {
+        use crate::archive::download::encode_archive_segment_blob;
+        use crate::archive::segment_builder::{ArchiveSegmentBuilder, SegmentBuildRequest};
+
+        let request = SegmentBuildRequest {
+            conversation_id: conv,
+            time_bucket: bucket.into(),
+            events,
+        };
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(request, key_bytes)
+            .unwrap();
+
+        let blob = encode_archive_segment_blob(
+            &built.segment_id,
+            &built.merkle_root,
+            &built.nonce,
+            &built.ciphertext,
+        );
+        transport.install(&built.segment_id.to_string(), blob);
+
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "INSERT INTO archive_segment_map(
+                        segment_id, conversation_id, time_bucket,
+                        segment_type, blob_id, storage_backend,
+                        merkle_root, state
+                     ) VALUES (?1, ?2, ?3, 'message_delta', ?4,
+                              'kchat_backend', ?5, 'archive_uploaded')",
+                    rusqlite::params![
+                        built.segment_id.to_string(),
+                        conv.to_string(),
+                        bucket,
+                        format!("blob-{}", built.segment_id),
+                        built.merkle_root.as_slice(),
+                    ],
+                )
+                .unwrap();
+        });
+        built.segment_id
+    }
+
+    fn make_event(
+        conv: Uuid,
+        message_id: Uuid,
+        ms: i64,
+    ) -> crate::archive::event_journal::ArchiveEvent {
+        crate::archive::event_journal::ArchiveEvent {
+            event_type: crate::archive::event_journal::ArchiveEventType::MessageReceived,
+            conversation_id: conv,
+            message_id: Some(message_id),
+            payload: vec![0xDE, 0xAD],
+            created_at_ms: ms,
+        }
+    }
+
+    #[test]
+    fn rehydrate_timeline_skeletons_lands_archive_only_rows() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, m1, 100), make_event(conv, m2, 200)],
+        );
+
+        let inserted = core
+            .rehydrate_timeline_skeletons(&transport, conv, "2026-04", |_segment_id| {
+                Ok(epoch_bytes)
+            })
+            .expect("rehydrate");
+        assert_eq!(inserted.len(), 2, "two new skeletons");
+        let landed_ids: Vec<&str> = inserted.iter().map(|s| s.message_id.as_str()).collect();
+        assert!(landed_ids.contains(&m1.to_string().as_str()));
+        assert!(landed_ids.contains(&m2.to_string().as_str()));
+
+        core.with_db(|db| {
+            let s1 = db.get_message_skeleton(&m1.to_string()).unwrap().unwrap();
+            assert_eq!(s1.body_state, BodyState::RemoteArchiveOnly);
+            assert_eq!(s1.archive_state, ArchiveState::ArchiveUploaded);
+        });
+        // Transport was hit exactly once for the segment.
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[test]
+    fn rehydrate_timeline_skeletons_skips_existing_local_rows() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let local_id = Uuid::now_v7();
+        // Pre-seed a local row with a body that the archive view
+        // must not stomp.
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: local_id.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "user-1".into(),
+                created_at_ms: 50,
+                received_at_ms: 60,
+                kind: MessageKind::Text,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: None,
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+        });
+
+        let new_id = Uuid::now_v7();
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![
+                make_event(conv, local_id, 100),
+                make_event(conv, new_id, 200),
+            ],
+        );
+
+        let inserted = core
+            .rehydrate_timeline_skeletons(&transport, conv, "2026-04", |_| Ok(epoch_bytes))
+            .expect("rehydrate");
+        assert_eq!(inserted.len(), 1, "only the brand-new id should land");
+        assert_eq!(inserted[0].message_id, new_id.to_string());
+
+        core.with_db(|db| {
+            let local = db
+                .get_message_skeleton(&local_id.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                local.body_state,
+                BodyState::LocalPlainAvailable,
+                "local skeleton survives rehydration"
+            );
+        });
+    }
+
+    #[test]
+    fn rehydrate_timeline_skeletons_no_segments_is_noop() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let transport = FixtureTransport::default();
+        let inserted = core
+            .rehydrate_timeline_skeletons(&transport, conv, "2026-04", |_| Ok(epoch_bytes))
+            .expect("rehydrate");
+        assert!(inserted.is_empty());
+        assert!(transport.calls().is_empty());
+    }
+
+    #[test]
+    fn rehydrate_timeline_skeletons_propagates_wrong_key_failure() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            "2026-04",
+            vec![make_event(conv, Uuid::now_v7(), 100)],
+        );
+        let wrong_key = [0u8; 32];
+        let err = core
+            .rehydrate_timeline_skeletons(&transport, conv, "2026-04", |_| Ok(wrong_key))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Crypto(_) | Error::Storage(_)),
+            "expected crypto/storage failure, got {err:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Lazy media rehydration on tap — Task 5
+    // ----------------------------------------------------------------
+
+    fn seed_media_asset(
+        core: &CoreImpl,
+        conv: &Uuid,
+        message_id: &Uuid,
+        media_state: MediaState,
+    ) -> String {
+        let asset_id = format!("asset-{}", message_id);
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: message_id.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "u-sender".into(),
+                created_at_ms: 100,
+                received_at_ms: 110,
+                kind: MessageKind::Media,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: Some(media_state),
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+            db.insert_message_body(&MessageBody {
+                message_id: message_id.to_string(),
+                text_content: Some("caption".into()),
+                detected_language: None,
+                rich_meta: None,
+            })
+            .unwrap();
+            db.insert_media_asset(&MediaAsset {
+                asset_id: asset_id.clone(),
+                message_id: message_id.to_string(),
+                mime_type: "image/png".into(),
+                bytes_total: 1024,
+                bytes_local: 0,
+                media_state,
+                wrapped_k_asset: vec![0u8; 40],
+                chunk_count: 1,
+                merkle_root: vec![0u8; 32],
+                blob_id: format!("blob-{}", message_id),
+                storage_sink: "kchat_backend".into(),
+            })
+            .unwrap();
+        });
+        asset_id
+    }
+
+    #[test]
+    fn rehydrate_media_for_message_returns_none_when_no_asset() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        // Insert a text-only skeleton (no media row).
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "u".into(),
+                created_at_ms: 1,
+                received_at_ms: 2,
+                kind: MessageKind::Text,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: None,
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+        });
+
+        let transport = FixtureTransport::default();
+        let wrapping = [0x77u8; 32];
+        let got = core
+            .rehydrate_media_for_message(&transport, mid, &wrapping)
+            .expect("rehydrate");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn hydrate_message_escalates_priority_for_evicted_media() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let _asset_id = seed_media_asset(&core, &conv, &mid, MediaState::Evicted);
+
+        // Caller-supplied reason is "prefetch" (P3); the evicted
+        // media flag must escalate the enqueued reason to
+        // MediaFullScreen (P1).
+        let _ = core
+            .hydrate_message(mid, "prefetch")
+            .expect("hydrate_message");
+
+        let mut queue = core.hydration_queue.lock().unwrap();
+        let mut found = false;
+        while let Some(req) = queue.dequeue() {
+            if req.message_id == mid && req.reason == HydrationReason::MediaFullScreen {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected an escalated MediaFullScreen entry");
+    }
+
+    #[test]
+    fn hydrate_message_keeps_priority_when_media_is_already_local() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let _asset_id = seed_media_asset(&core, &conv, &mid, MediaState::OriginalLocal);
+
+        let _ = core
+            .hydrate_message(mid, "prefetch")
+            .expect("hydrate_message");
+
+        let mut queue = core.hydration_queue.lock().unwrap();
+        let mut found = false;
+        while let Some(req) = queue.dequeue() {
+            if req.message_id == mid {
+                assert_eq!(
+                    req.reason,
+                    HydrationReason::AdjacentPrefetch,
+                    "non-evicted media must keep the caller-supplied priority"
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected an enqueued hydration request");
+    }
+
+    #[test]
+    fn manifest_builder_carries_wrapped_prior_epoch_keys_after_rotation() {
+        use crate::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
+        use ed25519_dalek::SigningKey;
+
+        let core = fresh_core();
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-05").unwrap();
+        let _ = core.rotate_archive_epoch(&root, "2026-06").unwrap();
+
+        let signing_key = SigningKey::from_bytes(&[0x55; 32]);
+        let k_manifest = [0x77u8; 32];
+        let prior = core.wrapped_prior_epoch_keys_for_manifest().unwrap();
+        let req = ManifestBuildRequest {
+            segments: &[],
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            wrapped_prior_epoch_keys: prior.clone(),
+            previous: None,
+        };
+        let sealed =
+            build_archive_manifest(req, &signing_key, &k_manifest).expect("build manifest");
+        assert_eq!(sealed.manifest.wrapped_prior_epoch_keys, prior);
+        assert!(!sealed.manifest.wrapped_prior_epoch_keys.is_empty());
     }
 }
