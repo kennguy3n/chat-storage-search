@@ -80,13 +80,19 @@ pub enum BridgeError {
 
 impl From<kchat_core::Error> for BridgeError {
     fn from(e: kchat_core::Error) -> Self {
-        let (category, message) = match &e {
-            kchat_core::Error::Crypto(_) => ("crypto", e.to_string()),
-            kchat_core::Error::Storage(_) => ("storage", e.to_string()),
-            kchat_core::Error::Search(_) => ("search", e.to_string()),
-            kchat_core::Error::Message(_) => ("message", e.to_string()),
-            kchat_core::Error::Transport(_) => ("transport", e.to_string()),
-            kchat_core::Error::NotImplemented(_) => ("not_implemented", e.to_string()),
+        // Destructure the inner value rather than calling
+        // `e.to_string()` on the whole variant — each
+        // `kchat_core::Error::*` Display impl already prefixes
+        // the category (e.g. `"transport: foo"`), so reusing it
+        // here would produce a doubled prefix
+        // (`"core: transport: transport: foo"`).
+        let (category, message) = match e {
+            kchat_core::Error::Crypto(inner) => ("crypto", inner.to_string()),
+            kchat_core::Error::Storage(s) => ("storage", s),
+            kchat_core::Error::Search(s) => ("search", s),
+            kchat_core::Error::Message(s) => ("message", s),
+            kchat_core::Error::Transport(s) => ("transport", s),
+            kchat_core::Error::NotImplemented(m) => ("not_implemented", m.to_string()),
         };
         BridgeError::Core {
             category: category.to_string(),
@@ -950,6 +956,67 @@ mod tests {
         match err {
             BridgeError::Core { category, .. } => assert_eq!(category, "transport"),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Pins the `From<kchat_core::Error> for BridgeError`
+    /// conversion: each variant unwraps the inner value into the
+    /// `message` field rather than reusing
+    /// `kchat_core::Error::Display`, which already prefixes the
+    /// category. Without this the JNI exception thrown to Kotlin
+    /// would carry a doubled prefix (e.g.
+    /// `"core: transport: transport: …"`).
+    #[test]
+    fn bridge_error_from_core_does_not_double_prefix() {
+        let cases: [(kchat_core::Error, &str, &str); 5] = [
+            (
+                kchat_core::Error::Storage("missing row".into()),
+                "storage",
+                "missing row",
+            ),
+            (
+                kchat_core::Error::Search("bad lex".into()),
+                "search",
+                "bad lex",
+            ),
+            (
+                kchat_core::Error::Message("bad outbox".into()),
+                "message",
+                "bad outbox",
+            ),
+            (
+                kchat_core::Error::Transport("no delivery client configured".into()),
+                "transport",
+                "no delivery client configured",
+            ),
+            (
+                kchat_core::Error::NotImplemented("register_device"),
+                "not_implemented",
+                "register_device",
+            ),
+        ];
+        for (input, want_cat, want_msg) in cases {
+            let bridge_err: BridgeError = input.into();
+            match &bridge_err {
+                BridgeError::Core { category, message } => {
+                    assert_eq!(category, want_cat, "category for {bridge_err:?}");
+                    assert!(
+                        !message.starts_with(&format!("{want_cat}:")),
+                        "message must not carry a doubled `{want_cat}:` prefix, got {message:?}",
+                    );
+                    assert!(
+                        message.contains(want_msg),
+                        "message {message:?} should contain inner {want_msg:?}",
+                    );
+                }
+                other => panic!("expected BridgeError::Core, got {other:?}"),
+            }
+            let display = bridge_err.to_string();
+            let doubled = format!("core: {want_cat}: {want_cat}:");
+            assert!(
+                !display.contains(&doubled),
+                "Display {display:?} carries doubled prefix {doubled:?}",
+            );
         }
     }
 }
