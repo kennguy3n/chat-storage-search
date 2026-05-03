@@ -30,6 +30,8 @@ use crate::crypto::aead::BlobClass;
 use crate::crypto::key_hierarchy::KEY_LEN;
 use crate::crypto::key_wrap::wrap_key;
 use crate::formats::media_descriptor::MediaDescriptor;
+use crate::local_store::db::LocalStoreDb;
+use crate::local_store::state_machines::MediaState;
 use crate::media::chunker::{chunk_and_encrypt, SealedChunk, DEFAULT_CHUNK_SIZE};
 use crate::Error;
 
@@ -54,6 +56,14 @@ pub struct MediaProcessResult {
     /// drop. The wrapped form is also stored on
     /// [`MediaDescriptor::wrapped_k_asset`].
     pub k_asset_raw: Zeroizing<[u8; KEY_LEN]>,
+    /// Initial [`MediaState`] the caller should persist into
+    /// `media_asset.media_state` for this asset. `process_media`
+    /// always returns [`MediaState::ThumbnailOnly`] — the original
+    /// has been chunked + AEAD-sealed in memory but not yet
+    /// uploaded; the upload pipeline transitions it onward through
+    /// the legal-transitions matrix in
+    /// [`MediaState::try_transition`].
+    pub initial_media_state: MediaState,
 }
 
 /// Run the full chunk-encrypt + key-wrap + descriptor pipeline for a
@@ -111,7 +121,89 @@ pub fn process_media(
         descriptor,
         sealed_chunks: chunked.sealed_chunks,
         k_asset_raw: k_asset_buf,
+        initial_media_state: MediaState::ThumbnailOnly,
     })
+}
+
+/// Apply a [`MediaState`] transition to the `media_asset` row for
+/// `asset_id`, going through [`MediaState::try_transition`] before
+/// the SQL UPDATE.
+///
+/// `from` is the state the caller believes the asset is currently
+/// in; the helper verifies it matches the persisted `media_state`
+/// before applying the transition. This catches racing callers that
+/// would otherwise silently overwrite each other's state changes.
+///
+/// Returns:
+///
+/// * [`Error::Storage`] when no asset row matches `asset_id`.
+/// * [`Error::Storage`] when the persisted `media_state` does not
+///   match the caller-provided `from` (concurrent transition).
+/// * [`Error::Storage`] when `(from, to)` is not a legal pair per
+///   [`MediaState::try_transition`].
+pub fn transition_media_state(
+    db: &LocalStoreDb,
+    asset_id: &str,
+    from: MediaState,
+    to: MediaState,
+) -> Result<(), Error> {
+    MediaState::try_transition(from, to)
+        .map_err(|e| Error::Storage(format!("media_state transition: {e}")))?;
+    let asset = db
+        .get_media_asset(asset_id)
+        .map_err(|e| Error::Storage(format!("media_state lookup: {e}")))?
+        .ok_or_else(|| {
+            Error::Storage(format!(
+                "transition_media_state: no media_asset row for asset_id {asset_id:?}"
+            ))
+        })?;
+    if asset.media_state != from {
+        return Err(Error::Storage(format!(
+            "transition_media_state: expected media_state = {from} for {asset_id:?}, found {}",
+            asset.media_state
+        )));
+    }
+    let rows = db
+        .update_media_state(asset_id, to)
+        .map_err(|e| Error::Storage(format!("media_state update: {e}")))?;
+    if rows == 0 {
+        return Err(Error::Storage(format!(
+            "transition_media_state: update affected 0 rows for asset_id {asset_id:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Wire `media_state = OriginalLocal` after a successful download.
+///
+/// Convenience over [`transition_media_state`] for the
+/// `RemoteOriginal → DownloadInProgress → OriginalLocal` (or
+/// `Evicted → DownloadInProgress → OriginalLocal`) tail. The caller
+/// is expected to have already applied the
+/// `→ DownloadInProgress` transition before fetching ciphertext;
+/// this helper closes out the second half.
+pub fn mark_downloaded(db: &LocalStoreDb, asset_id: &str) -> Result<(), Error> {
+    transition_media_state(
+        db,
+        asset_id,
+        MediaState::DownloadInProgress,
+        MediaState::OriginalLocal,
+    )
+}
+
+/// Wire `media_state = Evicted` after the eviction pipeline removes
+/// the on-disk plaintext for an asset. Mirrors the
+/// `OriginalLocal → Evicted` transition in
+/// [`MediaState::try_transition`].
+pub fn mark_evicted(db: &LocalStoreDb, asset_id: &str) -> Result<(), Error> {
+    transition_media_state(db, asset_id, MediaState::OriginalLocal, MediaState::Evicted)
+}
+
+/// Wire `media_state = Deleted` after a delete-for-everyone or local
+/// delete-cascade for an asset. Only legal from `OriginalLocal` per
+/// [`MediaState::try_transition`].
+pub fn mark_deleted(db: &LocalStoreDb, asset_id: &str) -> Result<(), Error> {
+    transition_media_state(db, asset_id, MediaState::OriginalLocal, MediaState::Deleted)
 }
 
 #[cfg(test)]
@@ -210,5 +302,168 @@ mod tests {
         );
         // The plaintext BLAKE3 root *does* match (K_asset-independent).
         assert_eq!(a.descriptor.merkle_root, b.descriptor.merkle_root);
+    }
+
+    // -----------------------------------------------------------------
+    // State-machine integration
+    // -----------------------------------------------------------------
+
+    use crate::local_store::schema::{Conversation, MediaAsset, MessageKind, MessageSkeleton};
+    use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+
+    fn fresh_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[7u8; 32]).unwrap()
+    }
+
+    fn seed_asset(db: &LocalStoreDb, asset_id: &str, state: MediaState) {
+        let conv = Conversation {
+            conversation_id: "c-state".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        let _ = db.insert_conversation(&conv);
+        let skel = MessageSkeleton {
+            message_id: format!("m-{asset_id}"),
+            conversation_id: "c-state".into(),
+            sender_id: "s".into(),
+            created_at_ms: 1,
+            received_at_ms: 1,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(state),
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let _ = db.insert_message_skeleton(&skel);
+        db.insert_media_asset(&MediaAsset {
+            asset_id: asset_id.into(),
+            message_id: format!("m-{asset_id}"),
+            mime_type: "image/png".into(),
+            bytes_total: 64,
+            bytes_local: 64,
+            media_state: state,
+            wrapped_k_asset: vec![0u8; 40],
+            chunk_count: 1,
+            merkle_root: vec![0u8; 32],
+            blob_id: format!("blob-{asset_id}"),
+            storage_sink: "kchat_backend".into(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn process_media_returns_thumbnail_only_initial_state() {
+        let wrapping = fixed_wrapping_key();
+        let res = process_media(b"hi", "image/png", &wrapping, BlobClass::Media, false).unwrap();
+        assert_eq!(res.initial_media_state, MediaState::ThumbnailOnly);
+    }
+
+    #[test]
+    fn transition_media_state_legal_succeeds() {
+        let db = fresh_db();
+        seed_asset(&db, "a-1", MediaState::ThumbnailOnly);
+        transition_media_state(
+            &db,
+            "a-1",
+            MediaState::ThumbnailOnly,
+            MediaState::RemoteOriginal,
+        )
+        .unwrap();
+        let row = db.get_media_asset("a-1").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::RemoteOriginal);
+    }
+
+    #[test]
+    fn transition_media_state_illegal_errors() {
+        let db = fresh_db();
+        seed_asset(&db, "a-2", MediaState::ThumbnailOnly);
+        // ThumbnailOnly → Deleted is not in the legal set.
+        let err =
+            transition_media_state(&db, "a-2", MediaState::ThumbnailOnly, MediaState::Deleted)
+                .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("transition"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+        // The DB row must not have changed.
+        let row = db.get_media_asset("a-2").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::ThumbnailOnly);
+    }
+
+    #[test]
+    fn transition_media_state_persists_in_db() {
+        let db = fresh_db();
+        seed_asset(&db, "a-3", MediaState::DownloadInProgress);
+        transition_media_state(
+            &db,
+            "a-3",
+            MediaState::DownloadInProgress,
+            MediaState::OriginalLocal,
+        )
+        .unwrap();
+        let row = db.get_media_asset("a-3").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::OriginalLocal);
+    }
+
+    #[test]
+    fn transition_media_state_missing_asset_errors() {
+        let db = fresh_db();
+        let err = transition_media_state(
+            &db,
+            "never-seen",
+            MediaState::ThumbnailOnly,
+            MediaState::OriginalLocal,
+        )
+        .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("no media_asset row"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_media_state_wrong_from_errors() {
+        let db = fresh_db();
+        seed_asset(&db, "a-5", MediaState::ThumbnailOnly);
+        let err =
+            transition_media_state(&db, "a-5", MediaState::OriginalLocal, MediaState::Evicted)
+                .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("expected media_state"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_downloaded_closes_out_download_in_progress() {
+        let db = fresh_db();
+        seed_asset(&db, "a-6", MediaState::DownloadInProgress);
+        mark_downloaded(&db, "a-6").unwrap();
+        let row = db.get_media_asset("a-6").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::OriginalLocal);
+    }
+
+    #[test]
+    fn mark_evicted_transitions_original_local() {
+        let db = fresh_db();
+        seed_asset(&db, "a-7", MediaState::OriginalLocal);
+        mark_evicted(&db, "a-7").unwrap();
+        let row = db.get_media_asset("a-7").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::Evicted);
+    }
+
+    #[test]
+    fn mark_deleted_transitions_original_local() {
+        let db = fresh_db();
+        seed_asset(&db, "a-8", MediaState::OriginalLocal);
+        mark_deleted(&db, "a-8").unwrap();
+        let row = db.get_media_asset("a-8").unwrap().unwrap();
+        assert_eq!(row.media_state, MediaState::Deleted);
     }
 }

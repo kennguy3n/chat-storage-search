@@ -9,7 +9,7 @@
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
 > Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
-> Media Encryption and Blob Service — `In progress | ~30%`.**
+> Media Encryption and Blob Service — `In progress | ~55%`.**
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -125,11 +125,17 @@
 > bindings.
 >
 > Landed in Phase 2 so far: the chunked-media pipeline
-> (`media::chunker`, `media::processor`, `media::upload`) and the
+> (`media::chunker`, `media::processor`, `media::upload`,
+> `media::download`), the local media cache (`media::cache`),
+> multilingual filename / caption handling (`media::caption`), the
+> upload / download routing layer (`media::routing`), and the
 > tiered-media routing surface (`media::sinks::MediaBlobSink`,
 > `NoopMediaBlobSink`, `StorageSink` / `ArchiveBackend` enums on
 > `KChatCoreConfig`, `storage_sink` field on `MediaDescriptor`,
-> `storage_sink` column on `media_asset`).
+> `storage_sink` column on `media_asset`). The `media_state`
+> machine (`thumbnail_only` → `original_local` → `evicted` /
+> `deleted`) is wired through `media::processor::transition_media_state`
+> + `LocalStoreDb::update_media_state`.
 > `media::chunker::chunk_and_encrypt` splits a plaintext blob into
 > XChaCha20-Poly1305-sealed `SealedChunk`s under a per-chunk
 > `KCHAT_BLOB_CHUNK_V1` AAD (PROPOSAL.md §8.3) bound to the
@@ -208,11 +214,15 @@ chat-storage-search/
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
         archive/                            # placeholder (Phase 3)
         backup/                             # placeholder (Phase 4)
-        media/                              # Phase 2: chunker + processor + upload + sinks landed
+        media/                              # Phase 2: chunker + processor + upload + download + cache + routing
           mod.rs
           chunker.rs                        # chunk + AEAD-seal, size-class padding, verify_and_decrypt
-          processor.rs                      # process_media: random K_asset + chunk + wrap + descriptor
+          processor.rs                      # process_media: random K_asset + chunk + wrap + descriptor + state-machine helpers
           upload.rs                         # upload_chunked_media + resume_upload over TransportClient
+          download.rs                       # download_chunked_media + download_single_chunk
+          cache.rs                          # MediaCache: LRU eviction with configurable byte budget
+          caption.rs                        # NFC normalization, filename sanitization, multilingual captions
+          routing.rs                        # route_media_upload / route_media_download (sink dispatch)
           sinks/                            # MediaBlobSink trait + NoopMediaBlobSink (PROPOSAL.md §5.7)
             mod.rs
         models/                             # placeholder (Phase 6)

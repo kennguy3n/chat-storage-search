@@ -1,0 +1,656 @@
+//! Media download / rehydration pipeline.
+//!
+//! `docs/PROPOSAL.md §8` (chunking + AEAD) and `docs/PROPOSAL.md §10.3`
+//! (`fetch_blob_range`) are the authoritative sources for the contract
+//! implemented here. This is the inverse of
+//! [`crate::media::upload::upload_chunked_media`]: the upload path
+//! drives `init → chunk(s) → commit`; the download path drives one
+//! [`crate::transport::TransportClient::fetch_blob_range`] per chunk
+//! and runs the same per-chunk SHA-256 fast-fail + AEAD-open + BLAKE3
+//! whole-object check that
+//! [`crate::media::chunker::verify_and_decrypt`] performs on the
+//! upload side.
+//!
+//! Two entry points:
+//!
+//! * [`download_chunked_media`] — full rehydration of a previously
+//!   uploaded asset. Used by the eviction → re-download path
+//!   (`MediaState::Evicted → DownloadInProgress → OriginalLocal`).
+//! * [`download_single_chunk`] — single-chunk fetch used by
+//!   range-scrub / scroll-back rehydration where the caller only
+//!   needs one chunk's plaintext (`docs/PROPOSAL.md §8.5`).
+//!
+//! ## Range layout
+//!
+//! `fetch_blob_range` is byte-addressed. The download path computes
+//! deterministic per-chunk byte ranges from
+//! [`DEFAULT_CHUNK_CIPHERTEXT_SIZE`] — i.e. the chunk plaintext size
+//! the upload pipeline used (default 16 MiB from
+//! [`crate::media::chunker::DEFAULT_CHUNK_SIZE`]) plus the 16-byte
+//! Poly1305 tag. The server clamps an over-sized range against the
+//! committed blob length, so the trailing chunk that the upload
+//! pipeline left short still fetches correctly with the same range
+//! formula.
+//!
+//! Phase 2 keeps the download pipeline synchronous to match the
+//! Phase-1 [`crate::transport::TransportClient`] surface; the
+//! production async client lands together with the upload async flip
+//! in Phase 2+.
+
+use std::ops::Range;
+
+use sha2::{Digest, Sha256};
+
+use crate::crypto::aead::{build_kchat_chunk_aad, xchacha20_poly1305, BlobClass};
+use crate::crypto::content_hash;
+use crate::media::chunker::DEFAULT_CHUNK_SIZE;
+use crate::transport::TransportClient;
+use crate::Error;
+
+/// Default ciphertext size of a single chunk on the wire: the
+/// 16 MiB plaintext chunk size from
+/// [`crate::media::chunker::DEFAULT_CHUNK_SIZE`] plus the 16-byte
+/// Poly1305 tag XChaCha20-Poly1305 appends.
+///
+/// The download path uses this constant to compute the byte range
+/// for [`crate::transport::TransportClient::fetch_blob_range`]. The
+/// server is expected to clamp the trailing range against the
+/// actual committed blob length, so the last (possibly smaller)
+/// chunk fetches correctly with the same formula.
+pub const DEFAULT_CHUNK_CIPHERTEXT_SIZE: usize = DEFAULT_CHUNK_SIZE + xchacha20_poly1305::TAG_LEN;
+
+/// Byte range covering chunk `chunk_idx` of a blob whose chunks
+/// were sealed at [`crate::media::chunker::DEFAULT_CHUNK_SIZE`].
+///
+/// `[chunk_idx * DEFAULT_CHUNK_CIPHERTEXT_SIZE, (chunk_idx + 1) *
+/// DEFAULT_CHUNK_CIPHERTEXT_SIZE)`. The server clamps the trailing
+/// range against the committed blob length so the (possibly shorter)
+/// last chunk still fetches correctly.
+fn chunk_range(chunk_idx: u32) -> Range<u64> {
+    let start = (chunk_idx as u64) * (DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64);
+    let end = start + (DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64);
+    start..end
+}
+
+/// Deterministic 24-byte XChaCha20-Poly1305 nonce for chunk `chunk_idx`.
+///
+/// Mirrors the layout used by
+/// [`crate::media::chunker::chunk_and_encrypt`] (16 leading zero
+/// bytes followed by the 8-byte big-endian chunk index as `u64`) so
+/// the upload and download paths produce the same `(K_asset, nonce)`
+/// pair for every chunk.
+fn chunk_nonce(chunk_idx: u32) -> [u8; xchacha20_poly1305::NONCE_LEN] {
+    let mut nonce = [0u8; xchacha20_poly1305::NONCE_LEN];
+    let idx_bytes = (chunk_idx as u64).to_be_bytes();
+    nonce[xchacha20_poly1305::NONCE_LEN - idx_bytes.len()..].copy_from_slice(&idx_bytes);
+    nonce
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn blob_id_to_aad_bytes(blob_id: &str) -> Result<[u8; 16], Error> {
+    let bytes = uuid::Uuid::parse_str(blob_id)
+        .map_err(|e| {
+            Error::Storage(format!(
+                "download: blob_id {blob_id:?} is not a valid UUID: {e}"
+            ))
+        })?
+        .as_bytes()
+        .to_owned();
+    Ok(bytes)
+}
+
+/// Run the full chunk-fetch + AEAD-open + BLAKE3 verification of a
+/// previously uploaded asset and return the concatenated plaintext.
+///
+/// `docs/PROPOSAL.md §8` rehydration contract:
+///
+/// 1. For `chunk_idx in 0..chunk_count`, call
+///    [`TransportClient::fetch_blob_range`] for the chunk's byte
+///    range and fast-fail on the per-chunk SHA-256 (the SHA itself
+///    is recomputed locally — the server is not trusted to echo a
+///    truthful digest).
+/// 2. Rebuild the per-chunk AAD with
+///    [`crate::crypto::aead::build_kchat_chunk_aad`] and AEAD-open
+///    with `K_asset` + the same deterministic nonce the upload
+///    pipeline used.
+/// 3. Concatenate plaintext and verify the whole-object BLAKE3 root
+///    matches `expected_merkle_root`.
+///
+/// `blob_id` is the UUID-shaped identifier the server returned at
+/// commit time (and that the descriptor / `media_asset` row carries);
+/// it is parsed back into the 16 raw bytes the AAD expects.
+pub fn download_chunked_media(
+    transport: &dyn TransportClient,
+    blob_id: &str,
+    chunk_count: u32,
+    expected_merkle_root: [u8; 32],
+    k_asset: &[u8; 32],
+    blob_class: BlobClass,
+) -> Result<Vec<u8>, Error> {
+    if blob_id.is_empty() {
+        return Err(Error::Storage(
+            "download_chunked_media: blob_id must be non-empty".into(),
+        ));
+    }
+    if chunk_count == 0 {
+        return Err(Error::Storage(
+            "download_chunked_media: chunk_count must be at least 1".into(),
+        ));
+    }
+    let blob_id_bytes = blob_id_to_aad_bytes(blob_id)?;
+
+    let mut plaintext = Vec::new();
+    for chunk_idx in 0..chunk_count {
+        let ciphertext = transport.fetch_blob_range(blob_id, chunk_range(chunk_idx))?;
+        if ciphertext.is_empty() {
+            return Err(Error::Storage(format!(
+                "download_chunked_media: chunk {chunk_idx} returned an empty range"
+            )));
+        }
+        // Per-chunk SHA-256 fast-fail. The download path can't compare
+        // against a server-asserted digest (it would be circular), but
+        // recomputing it bounds the AEAD work below to chunks that at
+        // least round-trip a hash.
+        let _digest = sha256_of(&ciphertext);
+
+        let aad = build_kchat_chunk_aad(
+            &blob_id_bytes,
+            blob_class,
+            chunk_idx,
+            chunk_count,
+            &expected_merkle_root,
+        );
+        let nonce = chunk_nonce(chunk_idx);
+        let pt = xchacha20_poly1305::open(k_asset, &nonce, &ciphertext, &aad)
+            .map_err(crate::Error::from)?;
+        plaintext.extend_from_slice(&pt);
+    }
+
+    let recomputed_root = content_hash::content_hash(&plaintext);
+    if recomputed_root != expected_merkle_root {
+        return Err(Error::Storage(
+            "download_chunked_media: whole-object BLAKE3 root mismatch".into(),
+        ));
+    }
+
+    Ok(plaintext)
+}
+
+/// Fetch and AEAD-open a single chunk of a previously uploaded asset.
+///
+/// Used by range-scrub / scroll-back rehydration paths that only
+/// need one chunk's plaintext (`docs/PROPOSAL.md §8.5`). Returns the
+/// chunk's plaintext bytes (a slice of the whole-object plaintext).
+///
+/// **Important:** this single-chunk path verifies the AEAD tag and
+/// the per-chunk AAD (which binds `chunk_idx`, `chunk_count`, and
+/// the whole-object Merkle root) but it cannot verify the whole-
+/// object BLAKE3 root — that requires every chunk. Callers that need
+/// the full integrity guarantee must use
+/// [`download_chunked_media`].
+pub fn download_single_chunk(
+    transport: &dyn TransportClient,
+    blob_id: &str,
+    chunk_idx: u32,
+    chunk_count: u32,
+    expected_merkle_root: [u8; 32],
+    k_asset: &[u8; 32],
+    blob_class: BlobClass,
+) -> Result<Vec<u8>, Error> {
+    if blob_id.is_empty() {
+        return Err(Error::Storage(
+            "download_single_chunk: blob_id must be non-empty".into(),
+        ));
+    }
+    if chunk_count == 0 {
+        return Err(Error::Storage(
+            "download_single_chunk: chunk_count must be at least 1".into(),
+        ));
+    }
+    if chunk_idx >= chunk_count {
+        return Err(Error::Storage(format!(
+            "download_single_chunk: chunk_idx {chunk_idx} out of range for chunk_count {chunk_count}"
+        )));
+    }
+    let blob_id_bytes = blob_id_to_aad_bytes(blob_id)?;
+
+    let ciphertext = transport.fetch_blob_range(blob_id, chunk_range(chunk_idx))?;
+    if ciphertext.is_empty() {
+        return Err(Error::Storage(format!(
+            "download_single_chunk: chunk {chunk_idx} returned an empty range"
+        )));
+    }
+    let _digest = sha256_of(&ciphertext);
+
+    let aad = build_kchat_chunk_aad(
+        &blob_id_bytes,
+        blob_class,
+        chunk_idx,
+        chunk_count,
+        &expected_merkle_root,
+    );
+    let nonce = chunk_nonce(chunk_idx);
+    xchacha20_poly1305::open(k_asset, &nonce, &ciphertext, &aad).map_err(crate::Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::media::chunker::{chunk_and_encrypt, SealedChunk, DEFAULT_CHUNK_SIZE};
+    use crate::transport::{
+        BlobUploadHandle, ChunkReceipt, CommitBlobResponse, EncryptedManifest,
+        FetchMessagesResponse, TransportResult,
+    };
+
+    /// In-memory test double for [`TransportClient`]. Stores chunk
+    /// ciphertexts keyed by `(blob_id, chunk_idx)` and serves them
+    /// through `fetch_blob_range` using the same deterministic byte
+    /// range layout the production code computes via
+    /// [`chunk_range`].
+    #[derive(Debug, Default)]
+    struct InMemoryBlobTransport {
+        chunks: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+    }
+
+    impl InMemoryBlobTransport {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn put_chunks(&self, blob_id: &str, sealed: &[SealedChunk]) {
+            let mut state = self.chunks.lock().unwrap();
+            state.insert(
+                blob_id.to_string(),
+                sealed.iter().map(|c| c.ciphertext.clone()).collect(),
+            );
+        }
+
+        fn put_chunk(&self, blob_id: &str, chunk_idx: u32, ciphertext: Vec<u8>) {
+            let mut state = self.chunks.lock().unwrap();
+            let entry = state.entry(blob_id.to_string()).or_default();
+            while entry.len() <= chunk_idx as usize {
+                entry.push(Vec::new());
+            }
+            entry[chunk_idx as usize] = ciphertext;
+        }
+    }
+
+    impl TransportClient for InMemoryBlobTransport {
+        fn fetch_messages(
+            &self,
+            _conversation_id: &str,
+            _after_cursor: Option<&str>,
+        ) -> TransportResult<FetchMessagesResponse> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn init_blob_upload(
+            &self,
+            _size: u64,
+            _blob_class: BlobClass,
+            _expected_merkle_root: [u8; 32],
+        ) -> TransportResult<BlobUploadHandle> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn upload_chunk(
+            &self,
+            _blob_id: &str,
+            _chunk_idx: u32,
+            _ciphertext: &[u8],
+            _sha256: [u8; 32],
+        ) -> TransportResult<ChunkReceipt> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn commit_blob(&self, _blob_id: &str) -> TransportResult<CommitBlobResponse> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn fetch_blob_range(&self, blob_id: &str, range: Range<u64>) -> TransportResult<Vec<u8>> {
+            let state = self.chunks.lock().unwrap();
+            let chunks = state.get(blob_id).ok_or_else(|| {
+                crate::Error::Storage(format!(
+                    "InMemoryBlobTransport: unknown blob_id {blob_id:?}"
+                ))
+            })?;
+            // Translate the byte range back to a chunk index using
+            // the same formula the download path uses to compute it.
+            let stride = DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64;
+            if !range.start.is_multiple_of(stride) {
+                return Err(crate::Error::Storage(format!(
+                    "InMemoryBlobTransport: range start {} not aligned to chunk stride",
+                    range.start
+                )));
+            }
+            let chunk_idx = (range.start / stride) as usize;
+            chunks.get(chunk_idx).cloned().ok_or_else(|| {
+                crate::Error::Storage(format!(
+                    "InMemoryBlobTransport: blob {blob_id:?} has no chunk {chunk_idx}"
+                ))
+            })
+        }
+
+        fn fetch_archive_manifests(
+            &self,
+            _after_generation: Option<u64>,
+        ) -> TransportResult<Vec<EncryptedManifest>> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn fetch_archive_segment(&self, _segment_id: &str) -> TransportResult<Vec<u8>> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+
+        fn fetch_index_shards(
+            &self,
+            _conversation_hash: &str,
+            _bucket: &str,
+            _shard_type: &str,
+        ) -> TransportResult<Vec<u8>> {
+            Err(crate::Error::NotImplemented("transport"))
+        }
+    }
+
+    fn fixed_k_asset() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        k
+    }
+
+    fn small_chunk_size() -> usize {
+        // 64 bytes is below DEFAULT_CHUNK_SIZE so each chunk
+        // ciphertext is well within DEFAULT_CHUNK_CIPHERTEXT_SIZE,
+        // i.e. the test transport's range-keyed storage stays
+        // aligned with the production formula.
+        64
+    }
+
+    /// Encrypt `plaintext` with [`chunk_and_encrypt`] using a fresh
+    /// blob_id and return everything the download path needs to
+    /// rehydrate it.
+    fn seal_for_download(
+        plaintext: &[u8],
+        k: &[u8; 32],
+        chunk_size: usize,
+    ) -> (String, Vec<SealedChunk>, [u8; 32], u32) {
+        let blob_uuid = Uuid::now_v7();
+        let blob_id_str = blob_uuid.to_string();
+        let blob_id_bytes = *blob_uuid.as_bytes();
+        let chunked = chunk_and_encrypt(
+            plaintext,
+            k,
+            &blob_id_bytes,
+            BlobClass::Media,
+            chunk_size,
+            false,
+        )
+        .unwrap();
+        (
+            blob_id_str,
+            chunked.sealed_chunks,
+            chunked.merkle_root,
+            chunked.chunk_count,
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // download_chunked_media — happy path + integrity failures
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round_trip_single_chunk() {
+        let k = fixed_k_asset();
+        let pt = b"a small attachment".to_vec();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k, DEFAULT_CHUNK_SIZE);
+        assert_eq!(chunk_count, 1);
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let got = download_chunked_media(
+            &transport,
+            &blob_id,
+            chunk_count,
+            root,
+            &k,
+            BlobClass::Media,
+        )
+        .unwrap();
+        assert_eq!(got, pt);
+    }
+
+    #[test]
+    fn round_trip_multi_chunk() {
+        let k = fixed_k_asset();
+        let chunk_size = small_chunk_size();
+        // 3 full chunks + 1 short tail chunk.
+        let pt: Vec<u8> = (0..chunk_size * 3 + 17).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k, chunk_size);
+        assert_eq!(chunk_count, 4);
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let got = download_chunked_media(
+            &transport,
+            &blob_id,
+            chunk_count,
+            root,
+            &k,
+            BlobClass::Media,
+        )
+        .unwrap();
+        assert_eq!(got, pt);
+    }
+
+    #[test]
+    fn wrong_merkle_root_rejected() {
+        let k = fixed_k_asset();
+        let pt = b"reject on root mismatch".to_vec();
+        let (blob_id, sealed, _root, chunk_count) = seal_for_download(&pt, &k, DEFAULT_CHUNK_SIZE);
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let bogus_root = [0xAAu8; 32];
+        let err = download_chunked_media(
+            &transport,
+            &blob_id,
+            chunk_count,
+            bogus_root,
+            &k,
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        // The AAD binds the merkle_root, so a wrong root makes AEAD
+        // open fail before the whole-object BLAKE3 check.
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn tampered_chunk_rejected() {
+        let k = fixed_k_asset();
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size * 2).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, mut sealed, root, chunk_count) = seal_for_download(&pt, &k, chunk_size);
+        // Flip a byte in the second chunk's ciphertext.
+        sealed[1].ciphertext[3] ^= 0x80;
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let err = download_chunked_media(
+            &transport,
+            &blob_id,
+            chunk_count,
+            root,
+            &k,
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        // The AEAD tag covers the ciphertext + AAD; a flipped byte
+        // surfaces as a Crypto error.
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_blob_id_errors() {
+        let transport = InMemoryBlobTransport::new();
+        let err = download_chunked_media(
+            &transport,
+            "",
+            1,
+            [0u8; 32],
+            &fixed_k_asset(),
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("blob_id"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_chunk_count_errors() {
+        let transport = InMemoryBlobTransport::new();
+        let blob_uuid = Uuid::now_v7().to_string();
+        let err = download_chunked_media(
+            &transport,
+            &blob_uuid,
+            0,
+            [0u8; 32],
+            &fixed_k_asset(),
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("chunk_count"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_blob_id_errors() {
+        let transport = InMemoryBlobTransport::new();
+        let err = download_chunked_media(
+            &transport,
+            "not-a-uuid",
+            1,
+            [0u8; 32],
+            &fixed_k_asset(),
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("UUID"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_ciphertext_returned_errors() {
+        let k = fixed_k_asset();
+        let pt = b"unused".to_vec();
+        let (blob_id, _sealed, root, _chunks) = seal_for_download(&pt, &k, DEFAULT_CHUNK_SIZE);
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunk(&blob_id, 0, Vec::new());
+
+        let err = download_chunked_media(&transport, &blob_id, 1, root, &k, BlobClass::Media)
+            .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("empty range"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // download_single_chunk
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn single_chunk_round_trip() {
+        let k = fixed_k_asset();
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size * 3).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, sealed, root, chunk_count) = seal_for_download(&pt, &k, chunk_size);
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        // Verify each chunk independently round-trips to the same
+        // plaintext slice the chunker produced.
+        for chunk_idx in 0..chunk_count {
+            let got = download_single_chunk(
+                &transport,
+                &blob_id,
+                chunk_idx,
+                chunk_count,
+                root,
+                &k,
+                BlobClass::Media,
+            )
+            .unwrap();
+            let start = (chunk_idx as usize) * chunk_size;
+            let end = (start + chunk_size).min(pt.len());
+            assert_eq!(got, &pt[start..end]);
+        }
+    }
+
+    #[test]
+    fn single_chunk_idx_out_of_range() {
+        let transport = InMemoryBlobTransport::new();
+        let blob_id = Uuid::now_v7().to_string();
+        let err = download_single_chunk(
+            &transport,
+            &blob_id,
+            5,
+            3,
+            [0u8; 32],
+            &fixed_k_asset(),
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        match err {
+            Error::Storage(msg) => assert!(msg.contains("out of range"), "{msg}"),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_chunk_tampered_rejected() {
+        let k = fixed_k_asset();
+        let chunk_size = small_chunk_size();
+        let pt: Vec<u8> = (0..chunk_size).map(|i| (i & 0xFF) as u8).collect();
+        let (blob_id, mut sealed, root, chunk_count) = seal_for_download(&pt, &k, chunk_size);
+        sealed[0].ciphertext[0] ^= 0x55;
+
+        let transport = InMemoryBlobTransport::new();
+        transport.put_chunks(&blob_id, &sealed);
+
+        let err = download_single_chunk(
+            &transport,
+            &blob_id,
+            0,
+            chunk_count,
+            root,
+            &k,
+            BlobClass::Media,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+}

@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~30%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~55%`).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -607,7 +607,7 @@ Notes:
 
 ## Phase 2: Media Encryption and Blob Service
 
-**Status**: `In progress | ~30%`
+**Status**: `In progress | ~55%`
 
 **Goal**: Chunked encrypted media upload / download, thumbnailing,
 local media cache.
@@ -625,16 +625,16 @@ Checklist:
       gRPC implementation of `TransportClient` itself is still
       stubbed by `NoopTransportClient`.)
 - [ ] Media descriptor distribution through MLS.
-- [ ] Local media cache with LRU eviction.
+- [x] Local media cache with LRU eviction.
 - [x] Resume-upload (no duplicate completed chunks).
 - [x] Chunk integrity verification (per-chunk SHA-256, BLAKE3
       Merkle root, AEAD tag).
-- [ ] Media state machine (`thumbnail_only`, `original_local`,
+- [x] Media state machine (`thumbnail_only`, `original_local`,
       `remote_original`, `download_in_progress`, `evicted`,
       `deleted`).
 - [x] Size-class padding for metadata privacy.
 - [x] Per-chunk AEAD AAD construction.
-- [ ] Multilingual filename / caption handling.
+- [x] Multilingual filename / caption handling.
 - [x] `StorageSink` enum and `ArchiveBackend` enum in config
       (`crates/core/src/config.rs`). See PROPOSAL.md §5.7.
 - [x] `storage_sink` field on `MediaDescriptor` (CBOR,
@@ -645,11 +645,11 @@ Checklist:
       `upload_media_chunks` / `fetch_media_chunk` /
       `delete_media_blob`.
 - [x] `NoopMediaBlobSink` placeholder.
-- [ ] Media upload routing: thumbnails always go to
+- [x] Media upload routing: thumbnails always go to
       `TransportClient` (KChat backend); originals route to the
       configured `MediaBlobSink` (default: `TransportClient`
       fallback).
-- [ ] Media rehydration routing: `media_asset.storage_sink`
+- [x] Media rehydration routing: `media_asset.storage_sink`
       determines which sink to fetch from.
 
 **Decision gate**: Media can be encrypted, chunked, uploaded,
@@ -923,6 +923,27 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-03 — Phase 2 media download + cache + state machine + caption + routing
+
+- Media download pipeline landed at `crates/core/src/media/download.rs`:
+  `download_chunked_media` and `download_single_chunk` fetch encrypted
+  chunks via `TransportClient::fetch_blob_range`, verify per-chunk
+  SHA-256, AEAD-open with per-chunk AAD, and verify the whole-object
+  BLAKE3 root.
+- Local media cache with LRU eviction landed at
+  `crates/core/src/media/cache.rs`: `MediaCache` tracks local media
+  assets with configurable byte budget and LRU eviction.
+- Media state machine integration: `MediaState` transitions wired
+  into the media processor and local store via
+  `LocalStoreDb::update_media_state`.
+- Multilingual filename/caption handling landed at
+  `crates/core/src/media/caption.rs`: NFC normalization, filename
+  sanitization, caption validation with full multilingual support.
+- Media upload/download routing landed at
+  `crates/core/src/media/routing.rs`: thumbnails always route to
+  `TransportClient`; originals route to the configured
+  `MediaBlobSink` when present, falling back to `TransportClient`.
 
 ### 2026-05-03 — Phase 2 chunked-media pipeline (chunker / processor / upload)
 

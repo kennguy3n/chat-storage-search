@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    BackupEventJournalEntry, Conversation, MessageBody, MessageKind, MessageSkeleton, TimelineRow,
-    SCHEMA_SQL,
+    BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
+    TimelineRow, SCHEMA_SQL,
 };
 use super::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 
@@ -393,6 +393,95 @@ impl LocalStoreDb {
             params![new_state.to_string(), message_id],
         )?;
         Ok(())
+    }
+
+    /// Insert a row into `media_asset`.
+    ///
+    /// `docs/PROPOSAL.md §3.2` (`media_asset` columns) and §5.7
+    /// (tiered media storage) define the row's shape. The caller is
+    /// responsible for funneling the
+    /// [`crate::media::processor::MediaProcessResult::descriptor`]
+    /// together with the chosen
+    /// [`crate::media::sinks::MediaBlobReference`] into a
+    /// [`MediaAsset`] before insert.
+    pub fn insert_media_asset(&self, asset: &MediaAsset) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO media_asset(
+                asset_id, message_id, mime_type, bytes_total, bytes_local,
+                media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                storage_sink
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                asset.asset_id,
+                asset.message_id,
+                asset.mime_type,
+                asset.bytes_total,
+                asset.bytes_local,
+                asset.media_state.to_string(),
+                asset.wrapped_k_asset,
+                asset.chunk_count,
+                asset.merkle_root,
+                asset.blob_id,
+                asset.storage_sink,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a single `media_asset` row by `asset_id`.
+    pub fn get_media_asset(&self, asset_id: &str) -> DbResult<Option<MediaAsset>> {
+        self.conn
+            .query_row(
+                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                        storage_sink
+                   FROM media_asset
+                  WHERE asset_id = ?1",
+                params![asset_id],
+                |row| {
+                    let media_state: String = row.get(5)?;
+                    let media_state = media_state.parse::<MediaState>().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                        )
+                    })?;
+                    Ok(MediaAsset {
+                        asset_id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        bytes_total: row.get(3)?,
+                        bytes_local: row.get(4)?,
+                        media_state,
+                        wrapped_k_asset: row.get(6)?,
+                        chunk_count: row.get(7)?,
+                        merkle_root: row.get(8)?,
+                        blob_id: row.get(9)?,
+                        storage_sink: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    /// Update `media_asset.media_state` for `asset_id`. Returns the
+    /// number of rows updated (0 when no asset matches).
+    ///
+    /// Mirrors [`Self::update_body_state`] but for the media
+    /// lifecycle state machine in
+    /// [`crate::local_store::state_machines::MediaState`]
+    /// (`docs/ARCHITECTURE.md §5`). Higher-level callers should go
+    /// through [`crate::media::processor::transition_media_state`]
+    /// instead — that helper enforces the legal-transitions matrix
+    /// before reaching the SQL UPDATE.
+    pub fn update_media_state(&self, asset_id: &str, new_state: MediaState) -> DbResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE media_asset SET media_state = ?1 WHERE asset_id = ?2",
+            params![new_state.to_string(), asset_id],
+        )?;
+        Ok(rows)
     }
 
     /// Replace `message_body.text_content` for `message_id`.
@@ -1083,6 +1172,83 @@ mod tests {
         db.update_body_state("m", BodyState::DeletedForMe).unwrap();
         let back = db.get_message_skeleton("m").unwrap().unwrap();
         assert_eq!(back.body_state, BodyState::DeletedForMe);
+    }
+
+    fn seed_media_asset(db: &LocalStoreDb, message_id: &str, asset_id: &str) -> MediaAsset {
+        let conv = Conversation {
+            conversation_id: "c-media".into(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        // Inserting the same conversation twice would violate the
+        // PK; ignore the second-call error so callers can seed
+        // multiple assets in one test.
+        let _ = db.insert_conversation(&conv);
+        let skel = MessageSkeleton {
+            message_id: message_id.into(),
+            conversation_id: "c-media".into(),
+            sender_id: "s".into(),
+            created_at_ms: 1,
+            received_at_ms: 1,
+            kind: MessageKind::Media,
+            body_state: BodyState::LocalPlainAvailable,
+            media_state: Some(MediaState::ThumbnailOnly),
+            archive_state: ArchiveState::NotArchived,
+            backup_state: BackupState::NotBackedUp,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        let _ = db.insert_message_skeleton(&skel);
+        let asset = MediaAsset {
+            asset_id: asset_id.into(),
+            message_id: message_id.into(),
+            mime_type: "image/png".into(),
+            bytes_total: 100,
+            bytes_local: 100,
+            media_state: MediaState::ThumbnailOnly,
+            wrapped_k_asset: vec![0u8; 40],
+            chunk_count: 1,
+            merkle_root: vec![0u8; 32],
+            blob_id: format!("blob-{asset_id}"),
+            storage_sink: "kchat_backend".into(),
+        };
+        db.insert_media_asset(&asset).unwrap();
+        asset
+    }
+
+    #[test]
+    fn insert_and_get_media_asset_round_trip() {
+        let db = fresh_db();
+        let asset = seed_media_asset(&db, "m-media", "asset-1");
+        let back = db.get_media_asset("asset-1").unwrap().unwrap();
+        assert_eq!(back, asset);
+    }
+
+    #[test]
+    fn get_media_asset_missing_returns_none() {
+        let db = fresh_db();
+        assert!(db.get_media_asset("never-seen").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_media_state_returns_rows_affected() {
+        let db = fresh_db();
+        seed_media_asset(&db, "m-media", "asset-state");
+        let rows = db
+            .update_media_state("asset-state", MediaState::OriginalLocal)
+            .unwrap();
+        assert_eq!(rows, 1);
+        let back = db.get_media_asset("asset-state").unwrap().unwrap();
+        assert_eq!(back.media_state, MediaState::OriginalLocal);
+
+        let rows = db
+            .update_media_state("never-seen", MediaState::Deleted)
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
