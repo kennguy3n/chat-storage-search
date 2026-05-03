@@ -44,13 +44,25 @@ pub enum ArchiveBackend {
 /// thumbnails, and key wraps. The variants are intentionally a
 /// superset: `KChatBackend` is the Phase-1 default, the user-cloud
 /// variants land in Phase 3 and may grow inner fields then.
+///
+/// The serialized variant tags (`"kchat_backend"`, `"i_cloud"`,
+/// `"google_drive"`, `"zk_object_fabric"`) are pinned via explicit
+/// `#[serde(rename = "...")]` attributes so they always match the
+/// `media_asset.storage_sink` SQL column default and the
+/// canonical-values doc on
+/// [`crate::media::sinks::MediaBlobReference::storage_sink`]. Do
+/// **not** rely on `rename_all = "snake_case"` here — `KChatBackend`
+/// would split at the `K` / `C` boundary and serialize as
+/// `"k_chat_backend"`, which would silently mismatch the SQL
+/// default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum StorageSink {
     /// Default: media uploads flow through `TransportClient` to the
     /// KChat backend's blob service.
+    #[serde(rename = "kchat_backend")]
     KChatBackend,
     /// iCloud (CloudKit file storage). Implementation lands in Phase 3.
+    #[serde(rename = "i_cloud")]
     ICloud {
         /// CloudKit container path (or platform-specific equivalent)
         /// where media blobs are stored.
@@ -58,11 +70,13 @@ pub enum StorageSink {
     },
     /// Google Drive (Drive API via platform bridge). Implementation
     /// lands in Phase 3.
+    #[serde(rename = "google_drive")]
     GoogleDrive {
         /// Drive folder ID where media blobs are stored.
         folder_id: String,
     },
     /// ZK Object Fabric (S3 API). Implementation lands in Phase 3.
+    #[serde(rename = "zk_object_fabric")]
     ZkObjectFabric {
         /// S3 bucket name media blobs are uploaded to.
         bucket: String,
@@ -153,6 +167,53 @@ mod tests {
             serde_json::to_string(&ArchiveBackend::Zkof).unwrap(),
             "\"zkof\""
         );
+    }
+
+    #[test]
+    fn storage_sink_canonical_strings_match_storage_sink_column() {
+        // The `storage_sink` tag has to match the `media_asset.storage_sink`
+        // SQL default (`'kchat_backend'`) and the canonical values listed
+        // in the `MediaBlobReference::storage_sink` doc — `kchat_backend`,
+        // `i_cloud`, `google_drive`, `zk_object_fabric`. Pin all four so a
+        // future re-introduction of `rename_all = "snake_case"` (which
+        // would split `KChatBackend` at the K/C boundary and emit
+        // `"k_chat_backend"`) is caught by CI.
+        let pinned: &[(StorageSink, &str)] = &[
+            (StorageSink::KChatBackend, "kchat_backend"),
+            (
+                StorageSink::ICloud {
+                    container_path: "iCloud.com.kchat.media".to_string(),
+                },
+                "i_cloud",
+            ),
+            (
+                StorageSink::GoogleDrive {
+                    folder_id: "1A2B3C".to_string(),
+                },
+                "google_drive",
+            ),
+            (
+                StorageSink::ZkObjectFabric {
+                    bucket: "kchat-media".to_string(),
+                },
+                "zk_object_fabric",
+            ),
+        ];
+        for (variant, tag) in pinned {
+            // Use serde_cbor's diagnostic-shaped representation: the
+            // top-level CBOR map for an externally-tagged variant is
+            // `{ "<tag>": <inner> }` for variants with payload, and a
+            // bare string for unit variants. We only need to confirm
+            // the tag substring appears, which works for both shapes.
+            let json = serde_json::to_string(variant).unwrap();
+            assert!(
+                json.contains(&format!("\"{tag}\"")),
+                "expected serialized {variant:?} to contain tag {tag:?}, got {json}"
+            );
+            // And the round-trip must still reproduce the original.
+            let back: StorageSink = serde_json::from_str(&json).unwrap();
+            assert_eq!(*variant, back);
+        }
     }
 
     #[test]
