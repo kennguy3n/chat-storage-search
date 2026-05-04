@@ -139,11 +139,12 @@ pub struct BuiltSegment {
     pub conversation_id: Uuid,
     /// Time bucket the request supplied.
     pub time_bucket: String,
-    /// Always [`SegmentType::MessageDelta`] today (events bucketed
-    /// per-conversation are delta-style by definition). Reserved
-    /// for the orchestration layer to pick a different
-    /// `SegmentType` for skeletons / search indexes / media-key
-    /// deltas.
+    /// Variant of [`SegmentType`] this segment encodes.
+    /// Propagated verbatim from
+    /// [`SegmentBuildRequest::segment_type`] so callers can
+    /// inspect the variant without re-decrypting the payload.
+    /// Possible values today: [`SegmentType::MessageDelta`],
+    /// [`SegmentType::TimelineSkeleton`], [`SegmentType::Checkpoint`].
     pub segment_type: SegmentType,
     /// 24-byte XChaCha20-Poly1305 nonce sealing `ciphertext`.
     pub nonce: [u8; NONCE_LEN],
