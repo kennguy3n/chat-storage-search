@@ -3555,8 +3555,10 @@ impl KChatCore for CoreImpl {
         // picks them up. The new `deferred` flag tells the
         // caller the upload step was skipped.
         if !self.is_online() {
-            let mut result = BackupResult::default();
-            result.deferred = true;
+            let result = BackupResult {
+                deferred: true,
+                ..BackupResult::default()
+            };
             trace.insert_metadata("deferred", "true");
             trace.finish();
             self.record_perf_trace(trace);
@@ -3564,8 +3566,8 @@ impl KChatCore for CoreImpl {
         }
         let (mut result, _sealed) = self.run_incremental_backup_inner(reason)?;
         result.deferred = false;
-        trace.insert_metadata("segments_built", &result.segments_built.to_string());
-        trace.insert_metadata("events_segmented", &result.events_segmented.to_string());
+        trace.insert_metadata("segments_built", result.segments_built.to_string());
+        trace.insert_metadata("events_segmented", result.events_segmented.to_string());
         trace.finish();
         self.record_perf_trace(trace);
         Ok(result)

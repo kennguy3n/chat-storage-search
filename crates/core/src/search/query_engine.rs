@@ -807,7 +807,7 @@ impl<'a> QueryEngine<'a> {
     ///    descending `created_at_ms`, ascending `message_id`.
     pub fn rerank_with_semantic(
         &self,
-        results: &mut Vec<SearchResult>,
+        results: &mut [SearchResult],
         query_embedding: &[f32],
         model_version: Option<&str>,
         scope: &SearchScope,
