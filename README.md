@@ -53,17 +53,25 @@
 > (Argon2id + AES-256-KW + serde envelope) including the
 > `DeviceTransferEnvelope` zeroize fix).**
 > **Phase 5 — Search (Fuzzy + Encrypted Shards) —
-> `In progress | ~85%`** (cold-bucket fan-out: a
+> `In progress | ~92%`** (cold-bucket fan-out: a
 > `ColdShardSource` trait (`search::query_engine`) resolves cold
 > `(conversation_id, time_bucket)` pairs and decrypts shards via
 > `search::shard_builder::{restore_text_search_shard,
 > restore_fuzzy_search_shard}`;
 > `QueryEngine::execute_search_with_cold_source` merges cold +
 > local hits, marks `is_cold = true`, and reranks under the
-> shared formula. Script-aware fuzzy matching with per-script
-> overlap floors (`search::tokenizer::fuzzy_min_overlap`),
-> mixed-language fan-out via `segment_by_script`, full ranking
-> formula (`BM25_WEIGHT × FUZZY_WEIGHT × RECENCY_WEIGHT ×
+> shared formula. Concrete `TransportColdShardSource` adapter at
+> `search::cold_shard_source` bridges `TransportClient` +
+> `ShardKeyRegistry` into the trait, with a `GracefulCold`
+> wrapper for transport-error degradation. Encrypted shard
+> *upload* pipeline lives at `CoreImpl::upload_search_shards`
+> (build → seal → CBOR → `TransportClient::upload_index_shard`
+> → `UploadedSearchShards` receipt with per-shard
+> `(shard_id, doc_count, ciphertext_sha256)`). Script-aware
+> fuzzy matching with per-script overlap floors
+> (`search::tokenizer::fuzzy_min_overlap`), mixed-language
+> fan-out via `segment_by_script`, full ranking formula
+> (`BM25_WEIGHT × FUZZY_WEIGHT × RECENCY_WEIGHT ×
 > CONTENT_KIND_WEIGHTS` with a 30-day half-life recency decay),
 > batch-by-bucket `search::shard_prefetch::batch_prefetch_shards`
 > over all four `IndexType` variants in deterministic
@@ -72,20 +80,19 @@
 > `crates/core/benches/phase5_benchmarks.rs` plus a CI smoke
 > test at `tests/phase5_latency_smoke.rs`. The on-device
 > p95 ≤ 1.5 s gate moves to the Phase-5 device-matrix run.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~20%`**
+> **Phase 7 — Desktop + Optimization — `In progress | ~25%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
-> coverage; 7 of 8 failure scenarios passing in
+> coverage; **all 8 of 8** failure scenarios passing in
 > `tests/failure_scenarios.rs` — chunk upload interrupted then
 > resumed, SHA-256 fast-fail on tampered ciphertext, tampered
 > descriptor `merkle_root`, wrong `K_backup_segment`, wrong
 > manifest signing key, manifest chain break with expected /
 > actual hashes (plus deepest-link variant), MLS-removed
 > device, missing search shard graceful degrade, low-storage
-> resumable error during restore. The remaining `manifest
-> upload interrupted mid-write` scenario and the rest of the
-> phase — desktop integration, ML EP tuning, large-scale
-> testing — are unchanged.)
+> resumable error during restore, manifest upload interrupted
+> mid-write retries without chain break. Desktop integration,
+> ML EP tuning, and large-scale testing remain.)
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -290,6 +297,7 @@ chat-storage-search/
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
           shard_builder.rs                  # build_text_search_shard / build_fuzzy_search_shard / restore_text_search_shard / restore_fuzzy_search_shard (encrypted search shards for Phase 4 backup / restore)
           shard_prefetch.rs                 # batch_prefetch_shards / batch_prefetch_shards_with_padding: one batch per (conversation_hash, bucket) over [Text, Fuzzy, Vector, Media] — coarsens metadata signal (Phase 5)
+          cold_shard_source.rs              # TransportColdShardSource (TransportClient + ShardKeyRegistry → ColdShardSource) + GracefulCold wrapper (Phase 5)
         archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding + compaction
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
@@ -353,7 +361,7 @@ chat-storage-search/
         archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
         backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test; search-shard restore round-trip
         backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
-        failure_scenarios.rs                # Phase 7 failure-test suite (7 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage
+        failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage; manifest upload interrupted mid-write retries without chain break
         cold_shard_search.rs                # Phase 5: encrypted shard fetch via ColdShardSource → on-device decrypt → FTS5 + fuzzy → merge with local hits → SearchScope::IncludeCold marks is_cold = true
         mixed_language_query.rs             # Phase 5: segment_by_script fan-out across Latin × CJK / Cyrillic × Latin / pure-CJK fuzzy fallback / mixed-script promotion / unrelated-row exclusion
         phase5_latency_smoke.rs             # Phase 5: cold-shard decrypt + search smoke test (asserts < 5 s on debug-build CI; on-device p95 ≤ 1.5 s gate runs in the device-matrix bench)

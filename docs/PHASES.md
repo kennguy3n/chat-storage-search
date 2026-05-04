@@ -905,7 +905,9 @@ Checklist:
       (Latin×CJK, Cyrillic×Latin, pure-CJK on non-ICU,
       mixed-script promotion, unrelated-row exclusion).)_
 - [~] Latency budget: encrypted shard fetch + decrypt + local
-      search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
+      search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket
+      (criterion benches + 5s debug-CI smoke landed; on-device
+      p95 gate queued for the device-matrix run).
       _(criterion bench at
       `crates/core/benches/phase5_benchmarks.rs` measures
       `text_only_one_month`, `fuzzy_only_one_month`, and
@@ -1038,20 +1040,24 @@ Checklist:
 - [ ] Media blob sink stress test: 10K+ media files across mixed
       sinks (KChat backend + iCloud + Google Drive + ZKOF in the
       same account); verify rehydration from each.
-- [~] **Failure test suite**, all passing:
+- [x] **Failure test suite**, all passing:
   - [x] chunk upload interrupted mid-stream
         _(`crates/core/tests/failure_scenarios.rs::chunk_upload_interrupted_then_resumed_succeeds`:
         `MockTransportClient` returns `Error::Transport("connection reset")`
         after 2 of 5 chunks; `upload_chunked_media` surfaces the error and
         `resume_upload` skips the completed chunks before driving the rest
         through `commit_blob`.)_
-  - [ ] manifest upload interrupted mid-write
-        _(queued; the upload path lives at
-        `archive::upload::upload_archive_segment` and the
-        equivalent backup path at
-        `CoreImpl::run_incremental_backup_inner`. Both already
-        treat manifest writes as the last commit step, but a
-        dedicated mid-write interruption test is still pending.)_
+  - [x] manifest upload interrupted mid-write
+        _(`crates/core/tests/failure_scenarios.rs::manifest_upload_interrupted_mid_write_retries_without_chain_break`:
+        a programmable `BackupSink` returns
+        `Error::Transport("connection reset")` on the first
+        `upload_backup_manifest` call. The test asserts the error
+        variant, retries against a healthy sink, verifies the
+        retry uploaded byte-for-byte identical bytes, and re-runs
+        `verify_manifest_chain` to prove the gen 0 → gen 1 chain
+        still validates after the retry — no duplicate
+        generation, no chain break, no leftover sink state from
+        the failed attempt.)_
   - [x] wrong backup key on restore
         _(`crates/core/tests/failure_scenarios.rs::wrong_backup_segment_key_fails_aead_open`
         bit-flips `K_backup_segment` and asserts `Error::Crypto`;

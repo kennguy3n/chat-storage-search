@@ -2,8 +2,8 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~95%`). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~85%`). Phase 7 — Desktop + Optimization (`In progress | ~20%`, failure-test suite + production-scale archive compaction landed).
-- **Last updated**: 2026-05-03
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~96%`). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~92%`, cold-shard transport adapter + upload pipeline landed). Phase 7 — Desktop + Optimization (`In progress | ~25%`, failure-test suite extended with `manifest_upload_interrupted_mid_write`).
+- **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -1651,6 +1651,97 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-04 — Phase 3 / 5 / 7 wrap-up batch (this PR)
+
+Builds on PR #30 + #31 (the previous 10-task batches). Drives
+Phase 5 from `~85%` to `~92%` by wiring a concrete
+`TransportColdShardSource` adapter on top of the `ColdShardSource`
+trait, exposing a `MockTransportClient` from the public transport
+module, growing the `TransportClient` trait with a default-impl
+`upload_index_shard(...)` method, and landing the encrypted
+search-shard upload pipeline as `CoreImpl::upload_search_shards`.
+Drives Phase 7 from `~20%` to `~25%` by adding the
+`manifest_upload_interrupted_mid_write` failure scenario to
+`tests/failure_scenarios.rs`. Drives Phase 3 from `~95%` to
+`~96%` by adding round-trip tests for the
+`SegmentType::TimelineSkeleton` + `SegmentType::Checkpoint`
+variants of `ArchiveSegmentBuilder::build_segment`, plus a
+regression test that the builder rejects backup-only segment
+types up front. All changes ship with unit + integration tests;
+`cargo test --workspace` passes, `cargo fmt --all -- --check` is
+clean, and `cargo clippy --all-targets --all-features -- -D
+warnings` is clean.
+
+1. **Cold-result hydration adapter — `TransportColdShardSource`**
+   (`crates/core/src/search/cold_shard_source.rs` *new*,
+   `crates/core/src/search/mod.rs`,
+   `crates/core/src/search/shard_builder.rs`):
+   The orchestration layer can now wire a `TransportClient` and
+   a `ShardKeyRegistry` directly into `QueryEngine` via the
+   adapter, which translates a plaintext `conversation_id` into
+   the keyed `conversation_id_hash`, calls
+   `TransportClient::fetch_index_shards`, and decrypts the
+   returned shard back into `Vec<FtsRow>` / `Vec<FuzzyRow>`. A
+   `GracefulCold` wrapper swallows transport / storage errors so
+   the engine can fall back to local results without a panic
+   (Phase-7 graceful-degradation requirement). Five
+   self-contained tests cover the round-trip, missing-shard, and
+   missing-key paths.
+
+2. **Encrypted shard upload pipeline — `CoreImpl::upload_search_shards`**
+   (`crates/core/src/core_impl.rs`):
+   New orchestration entry point that takes
+   `(conversation_id, time_bucket, fts_rows, fuzzy_rows, k_text,
+   k_fuzzy, conversation_hash_key)`, builds + seals each shard
+   with the existing `build_text_search_shard` /
+   `build_fuzzy_search_shard` helpers, CBOR-encodes the
+   `SearchIndexShard` frame, and ferries it to the configured
+   `TransportClient::upload_index_shard`. Returns an
+   `UploadedSearchShards` receipt with per-shard
+   `(shard_id, doc_count, ciphertext_len, ciphertext_sha256)` so
+   callers can record the upload in their own `search_shard_map`
+   ledger. Three tests cover the round-trip via
+   `MockTransportClient`, the empty-bucket short-circuit, and
+   transport-failure propagation + retry.
+
+3. **`TransportClient` trait — `upload_index_shard` + public `MockTransportClient`**
+   (`crates/core/src/transport/mod.rs`):
+   New default-impl `upload_index_shard(conversation_hash,
+   bucket, shard_type, ciphertext)` method returning
+   `Error::NotImplemented("transport_upload_index_shard")` so
+   existing implementations stay source-compatible. The
+   `MockTransportClient` test double has graduated from
+   `#[cfg(test)]` to a regular public type so integration tests
+   in other crates can pre-stage / fail-inject shard responses
+   without re-implementing the harness. Cross-wires successful
+   uploads into the fetch path so round-trip tests can stay
+   inside one transport instance.
+
+4. **Phase-7 failure test — `manifest_upload_interrupted_mid_write`**
+   (`crates/core/tests/failure_scenarios.rs`):
+   New failure scenario covering the orchestration-layer mode
+   where `BackupSink::upload_backup_manifest` fails with a
+   transient `Error::Transport` part-way through the write. The
+   test asserts the error variant, retries the upload against a
+   healthy sink, verifies the retry uploaded byte-for-byte
+   identical bytes, and re-runs `verify_manifest_chain` to prove
+   the chain integrity is intact (no duplicate generation, no
+   chain break).
+
+5. **Phase-3 archive segment builder — `TimelineSkeleton` +
+   `Checkpoint` round-trip + reject-backup-variant tests**
+   (`crates/core/src/archive/segment_builder.rs`):
+   Three new tests exercising
+   `SegmentBuildRequest { segment_type:
+   SegmentType::TimelineSkeleton, .. }` /
+   `Checkpoint` round-trips through
+   `decrypt_segment`, asserting that `BuiltSegment::segment_type`
+   echoes the request rather than silently falling back to
+   `MessageDelta` (regression for the doc-comment fix in PR #31),
+   and a regression test that `build_segment(...)` rejects
+   `SegmentType::Events` (backup-only variant) up front via the
+   `is_archive_segment()` guard.
 
 ### 2026-05-03 — Phase 3 / 5 / 7 batch of 10 (this PR)
 

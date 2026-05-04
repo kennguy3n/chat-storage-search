@@ -10,6 +10,7 @@
 //! [`ScriptClass`]: tokenizer::ScriptClass
 //! [`FuzzyGranularity`]: tokenizer::FuzzyGranularity
 
+pub mod cold_shard_source;
 pub mod fuzzy_search;
 pub mod query_engine;
 pub mod shard_builder;

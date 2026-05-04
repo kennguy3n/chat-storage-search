@@ -155,7 +155,15 @@ fn build_shard_aad(
     aad
 }
 
-fn keyed_conversation_id_hash(
+/// BLAKE3-keyed-hash of a conversation id under
+/// `conversation_hash_key`.
+///
+/// Stable across runs given the same inputs — the cold-shard
+/// transport pipeline uses this to translate a plaintext
+/// `conversation_id` into the opaque
+/// `conversation_id_hash` the backend stores its shards under
+/// (`docs/PROPOSAL.md §7.8`).
+pub fn keyed_conversation_id_hash(
     conversation_id: &str,
     conversation_hash_key: &KeyMaterial,
 ) -> Vec<u8> {

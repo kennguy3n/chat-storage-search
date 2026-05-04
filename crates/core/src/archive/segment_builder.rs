@@ -436,6 +436,64 @@ mod tests {
     }
 
     #[test]
+    fn build_segment_round_trips_timeline_skeleton_variant() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest {
+            conversation_id: conv,
+            time_bucket: "2026-04".into(),
+            events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::TimelineSkeleton,
+        };
+        let k = [0x44; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .expect("build");
+        // Regression: the BuiltSegment must echo the request's
+        // segment_type, not silently fall back to MessageDelta.
+        assert_eq!(built.segment_type, SegmentType::TimelineSkeleton);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+    }
+
+    #[test]
+    fn build_segment_round_trips_checkpoint_variant() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest {
+            conversation_id: conv,
+            time_bucket: "2026-04".into(),
+            events: vec![event_at(conv, 7, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::Checkpoint,
+        };
+        let k = [0x55; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .expect("build");
+        assert_eq!(built.segment_type, SegmentType::Checkpoint);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+        assert_eq!(payload.time_bucket, "2026-04");
+    }
+
+    #[test]
+    fn build_segment_rejects_backup_segment_type() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest {
+            conversation_id: conv,
+            time_bucket: "2026-04".into(),
+            events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::Events,
+        };
+        let err = ArchiveSegmentBuilder::new()
+            .build_segment(req, &[0; 32])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not an archive segment type"),
+            "expected reject-on-backup-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn wrong_key_fails_to_decrypt() {
         let conv = Uuid::now_v7();
         let req = SegmentBuildRequest {
