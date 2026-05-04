@@ -258,6 +258,13 @@ fn chunk_range(chunk_idx: u32) -> Range<u64> {
 pub struct ZkObjectFabricSink {
     s3: Arc<dyn S3Client>,
     config: ZkFabricSinkConfig,
+    /// Phase 7 (2026-05-04 batch 10 — Task 10) — optional
+    /// dedup-analytics probe. When set, every successful
+    /// `upload_media_chunks` records a
+    /// [`crate::transport::dedup_analytics::DedupEvent::ObjectUploaded`]
+    /// and every successful `delete_media_blob` records an
+    /// [`crate::transport::dedup_analytics::DedupEvent::ObjectDeleted`].
+    dedup_analytics: Option<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
 }
 
 impl ZkObjectFabricSink {
@@ -267,7 +274,22 @@ impl ZkObjectFabricSink {
     /// failure on misconfigured tenants.
     pub fn new(s3: Arc<dyn S3Client>, config: ZkFabricSinkConfig) -> Result<Self, Error> {
         config.validate()?;
-        Ok(Self { s3, config })
+        Ok(Self {
+            s3,
+            config,
+            dedup_analytics: None,
+        })
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): builder helper
+    /// that attaches a dedup-analytics probe. Returns `self` for
+    /// fluent construction.
+    pub fn with_dedup_analytics(
+        mut self,
+        probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+    ) -> Self {
+        self.dedup_analytics = Some(probe);
+        self
     }
 
     /// Bucket name this sink targets.
@@ -309,7 +331,16 @@ impl MediaBlobSink for ZkObjectFabricSink {
         }
 
         let key = asset_key(asset_id);
+        let blob_size = blob.len() as u64;
         self.s3.put_object(&self.config.bucket, &key, &blob)?;
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                    size_bytes: blob_size,
+                    was_deduped: false,
+                },
+            );
+        }
 
         Ok(MediaBlobReference {
             blob_id: asset_id.to_string(),
@@ -353,7 +384,13 @@ impl MediaBlobSink for ZkObjectFabricSink {
             None => blob_ref.blob_id.clone(),
         };
         self.s3
-            .delete_object(&self.config.bucket, &asset_key(&asset_id))
+            .delete_object(&self.config.bucket, &asset_key(&asset_id))?;
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectDeleted { size_bytes: 0 },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -716,5 +753,34 @@ mod tests {
             .upload_media_chunks("asset-trait", BlobClass::Media, &[&[7, 8, 9]], [0; 32])
             .unwrap();
         assert_eq!(blob_ref.storage_sink, ZK_OBJECT_FABRIC_SINK_TAG);
+    }
+
+    #[test]
+    fn upload_media_chunks_records_dedup_event() {
+        use crate::transport::dedup_analytics::DedupAnalytics;
+        let s3 = Arc::new(InMemoryS3::default());
+        let probe = Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        let sink = ZkObjectFabricSink::new(s3, fresh_config())
+            .unwrap()
+            .with_dedup_analytics(probe.clone());
+        sink.upload_media_chunks(
+            "asset-dedup",
+            BlobClass::Media,
+            &[&[1, 2, 3, 4, 5]],
+            [0u8; 32],
+        )
+        .unwrap();
+        let stats = probe.query_dedup_ratio("tenant-x").unwrap();
+        assert_eq!(stats.total_objects, 1);
+        assert_eq!(stats.total_bytes, 5);
+        let recent = probe.recent_events();
+        assert_eq!(recent.len(), 1);
+        assert!(matches!(
+            recent[0],
+            crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                size_bytes: 5,
+                was_deduped: false
+            }
+        ));
     }
 }

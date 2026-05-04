@@ -133,6 +133,58 @@ impl StorageSavings {
     }
 }
 
+/// One dedup-related event captured at the ZKOF sink boundary.
+/// Phase 7 (2026-05-04 batch 10 — Task 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DedupEvent {
+    /// An object was uploaded to the ZK Object Fabric. When
+    /// `was_deduped` is `true`, Pattern C convergent encryption
+    /// short-circuited the upload (the object hash already
+    /// existed in the ContentIndex). When `false`, the upload
+    /// added a new unique object.
+    ObjectUploaded {
+        /// Plaintext-equivalent byte length of the uploaded
+        /// object.
+        size_bytes: u64,
+        /// `true` → Pattern C cache hit (no new bytes uploaded).
+        was_deduped: bool,
+    },
+    /// An object reference was deleted. `size_bytes` is the
+    /// plaintext-equivalent byte length of the reference (not
+    /// the underlying unique object — multiple references can
+    /// share the same unique blob).
+    ObjectDeleted {
+        /// Plaintext-equivalent byte length of the deleted
+        /// reference.
+        size_bytes: u64,
+    },
+}
+
+impl DedupEvent {
+    /// Plaintext-equivalent byte length of the event regardless
+    /// of variant. Used by the dashboard to aggregate uploads
+    /// and deletes into a single bytes-touched figure.
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            Self::ObjectUploaded { size_bytes, .. } => *size_bytes,
+            Self::ObjectDeleted { size_bytes } => *size_bytes,
+        }
+    }
+}
+
+/// One frame of the dedup dashboard surfaced through
+/// [`crate::core_impl::CoreImpl::get_dedup_dashboard`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DedupDashboard {
+    /// Server-side dedup snapshot.
+    pub stats: DedupStats,
+    /// Server-side savings snapshot.
+    pub savings: StorageSavings,
+    /// Most recent `DedupEvent` records the local probe captured
+    /// (capped at the probe's configured ring size).
+    pub recent_events: Vec<DedupEvent>,
+}
+
 /// Read-only telemetry probe for the upstream ZK Object Fabric
 /// ContentIndex.
 ///
@@ -152,6 +204,24 @@ pub trait DedupAnalytics: Send + Sync + std::fmt::Debug {
     /// tenant. Same privacy contract as
     /// [`Self::query_dedup_ratio`].
     fn query_storage_savings(&self, tenant_id: &str) -> Result<StorageSavings>;
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): record one
+    /// dedup-related event. The default implementation no-ops so
+    /// existing probes (notably [`NoopDedupAnalytics`]) keep
+    /// compiling. The [`InProcessDedupAnalytics`] /
+    /// [`ZkofDedupAnalytics`] implementations override this to
+    /// store the event in their ring buffer.
+    fn record_event(&self, _event: DedupEvent) -> Result<()> {
+        Ok(())
+    }
+
+    /// Snapshot of the events most recently passed to
+    /// [`Self::record_event`]. Default impl returns an empty
+    /// vec so callers can safely consume the surface even when
+    /// no probe is installed.
+    fn recent_events(&self) -> Vec<DedupEvent> {
+        Vec::new()
+    }
 }
 
 /// `DedupAnalytics` placeholder used before any production probe
@@ -203,6 +273,210 @@ impl DedupAnalytics for FixedDedupAnalytics {
 
     fn query_storage_savings(&self, _tenant_id: &str) -> Result<StorageSavings> {
         Ok(self.savings.clone())
+    }
+}
+
+/// Phase 7 (2026-05-04 batch 10 — Task 10) — in-process probe
+/// that aggregates [`DedupEvent`] records emitted by the backup
+/// and media sinks into a [`DedupStats`] / [`StorageSavings`]
+/// snapshot.
+///
+/// `query_dedup_ratio` / `query_storage_savings` derive their
+/// counts from the recorded events, so this probe never reaches
+/// out to the network. Production deployments swap this for a
+/// `ZkofDedupAnalytics` that talks to the live ContentIndex; the
+/// in-process probe is the production fallback when the
+/// ContentIndex is unreachable.
+#[derive(Debug, Default)]
+pub struct InProcessDedupAnalytics {
+    inner: std::sync::Mutex<InProcessState>,
+    /// Maximum number of recent events retained in the ring
+    /// buffer. Defaults to 512.
+    pub recent_capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct InProcessState {
+    total_objects: u64,
+    unique_objects: u64,
+    total_bytes: u64,
+    unique_bytes: u64,
+    last_updated_ms: i64,
+    recent: std::collections::VecDeque<DedupEvent>,
+}
+
+impl InProcessDedupAnalytics {
+    /// Construct a fresh probe with the default ring-buffer
+    /// capacity (512 events).
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(InProcessState::default()),
+            recent_capacity: 512,
+        }
+    }
+
+    /// Construct a probe with a custom ring-buffer capacity.
+    pub fn with_capacity(recent_capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(InProcessState::default()),
+            recent_capacity: recent_capacity.max(1),
+        }
+    }
+}
+
+impl DedupAnalytics for InProcessDedupAnalytics {
+    fn query_dedup_ratio(&self, _tenant_id: &str) -> Result<DedupStats> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| crate::Error::Storage("dedup analytics poisoned".into()))?;
+        Ok(DedupStats::from_counts(
+            g.total_objects,
+            g.unique_objects,
+            g.total_bytes,
+            g.unique_bytes,
+        ))
+    }
+
+    fn query_storage_savings(&self, _tenant_id: &str) -> Result<StorageSavings> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| crate::Error::Storage("dedup analytics poisoned".into()))?;
+        Ok(StorageSavings::from_counts(
+            g.total_objects,
+            g.unique_objects,
+            g.total_bytes,
+            g.unique_bytes,
+            g.last_updated_ms,
+        ))
+    }
+
+    fn record_event(&self, event: DedupEvent) -> Result<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| crate::Error::Storage("dedup analytics poisoned".into()))?;
+        match &event {
+            DedupEvent::ObjectUploaded {
+                size_bytes,
+                was_deduped,
+            } => {
+                g.total_objects = g.total_objects.saturating_add(1);
+                g.total_bytes = g.total_bytes.saturating_add(*size_bytes);
+                if !was_deduped {
+                    g.unique_objects = g.unique_objects.saturating_add(1);
+                    g.unique_bytes = g.unique_bytes.saturating_add(*size_bytes);
+                }
+            }
+            DedupEvent::ObjectDeleted { size_bytes } => {
+                g.total_objects = g.total_objects.saturating_sub(1);
+                g.total_bytes = g.total_bytes.saturating_sub(*size_bytes);
+            }
+        }
+        if g.recent.len() >= self.recent_capacity {
+            g.recent.pop_front();
+        }
+        g.recent.push_back(event);
+        Ok(())
+    }
+
+    fn recent_events(&self) -> Vec<DedupEvent> {
+        self.inner
+            .lock()
+            .map(|g| g.recent.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Phase 7 (2026-05-04 batch 10 — Task 10) — ZK Object Fabric
+/// dedup-analytics probe that wraps a live `S3Client` and reads
+/// the upstream `metadata/content_index/stats` snapshot.
+///
+/// The probe is layered on top of an [`InProcessDedupAnalytics`]
+/// so it can surface the local recent-events ring even when the
+/// ContentIndex is unreachable. `query_dedup_ratio` /
+/// `query_storage_savings` first attempt to read the upstream
+/// snapshot, then fall back to the in-process aggregate.
+#[derive(Debug)]
+pub struct ZkofDedupAnalytics {
+    client: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
+    bucket: String,
+    fallback: InProcessDedupAnalytics,
+    /// Maximum byte length of the ContentIndex snapshot the
+    /// probe is willing to fetch. Defaults to 64 KiB — large
+    /// enough for any plausible JSON / CBOR snapshot.
+    pub max_snapshot_bytes: u64,
+}
+
+impl ZkofDedupAnalytics {
+    /// Construct a probe against the supplied ZKOF bucket.
+    pub fn new(
+        client: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
+        bucket: String,
+    ) -> Self {
+        Self {
+            client,
+            bucket,
+            fallback: InProcessDedupAnalytics::new(),
+            max_snapshot_bytes: 64 * 1024,
+        }
+    }
+
+    /// ContentIndex snapshot key. Stored as a constant so the
+    /// orchestration layer and the test harness agree on the
+    /// upstream key shape.
+    pub fn snapshot_key() -> &'static str {
+        "metadata/content_index/stats"
+    }
+
+    fn parse_stats(bytes: &[u8]) -> Result<DedupStats> {
+        let parsed: DedupStats = serde_cbor::from_slice(bytes)
+            .map_err(|e| crate::Error::Storage(format!("dedup snapshot parse: {e}")))?;
+        Ok(parsed)
+    }
+
+    fn fetch_snapshot(&self) -> Result<Vec<u8>> {
+        self.client
+            .get_object_range(
+                &self.bucket,
+                Self::snapshot_key(),
+                0..self.max_snapshot_bytes,
+            )
+            .map_err(|e| crate::Error::Storage(format!("dedup snapshot fetch: {e}")))
+    }
+}
+
+impl DedupAnalytics for ZkofDedupAnalytics {
+    fn query_dedup_ratio(&self, tenant_id: &str) -> Result<DedupStats> {
+        match self.fetch_snapshot() {
+            Ok(bytes) => Self::parse_stats(&bytes),
+            Err(_) => self.fallback.query_dedup_ratio(tenant_id),
+        }
+    }
+
+    fn query_storage_savings(&self, tenant_id: &str) -> Result<StorageSavings> {
+        match self.fetch_snapshot() {
+            Ok(bytes) => {
+                let stats = Self::parse_stats(&bytes)?;
+                Ok(StorageSavings::from_counts(
+                    stats.total_objects,
+                    stats.unique_objects,
+                    stats.total_bytes,
+                    stats.unique_bytes,
+                    0,
+                ))
+            }
+            Err(_) => self.fallback.query_storage_savings(tenant_id),
+        }
+    }
+
+    fn record_event(&self, event: DedupEvent) -> Result<()> {
+        self.fallback.record_event(event)
+    }
+
+    fn recent_events(&self) -> Vec<DedupEvent> {
+        self.fallback.recent_events()
     }
 }
 
@@ -286,5 +560,211 @@ mod tests {
             Arc::new(FixedDedupAnalytics::new(stats.clone(), savings.clone()));
         assert_eq!(probe.query_dedup_ratio("tenant-x").unwrap(), stats);
         assert_eq!(probe.query_storage_savings("tenant-x").unwrap(), savings);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 10 tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn noop_dedup_analytics_record_event_does_not_panic() {
+        // The default `record_event` impl on the trait must be
+        // a no-op for `NoopDedupAnalytics` — recording into a
+        // probe that hasn't been wired up should never crash.
+        let probe: Arc<dyn DedupAnalytics> = Arc::new(NoopDedupAnalytics::new());
+        probe
+            .record_event(DedupEvent::ObjectUploaded {
+                size_bytes: 1024,
+                was_deduped: false,
+            })
+            .expect("record_event noop");
+        assert!(probe.recent_events().is_empty());
+    }
+
+    #[test]
+    fn in_process_dedup_analytics_aggregates_uploads_and_deletes() {
+        let probe = InProcessDedupAnalytics::new();
+        probe
+            .record_event(DedupEvent::ObjectUploaded {
+                size_bytes: 100,
+                was_deduped: false,
+            })
+            .unwrap();
+        probe
+            .record_event(DedupEvent::ObjectUploaded {
+                size_bytes: 100,
+                was_deduped: true,
+            })
+            .unwrap();
+        probe
+            .record_event(DedupEvent::ObjectUploaded {
+                size_bytes: 50,
+                was_deduped: false,
+            })
+            .unwrap();
+        let stats = probe.query_dedup_ratio("tenant-1").unwrap();
+        assert_eq!(stats.total_objects, 3);
+        assert_eq!(stats.unique_objects, 2);
+        assert_eq!(stats.total_bytes, 250);
+        assert_eq!(stats.unique_bytes, 150);
+        // 1 - 150/250 = 0.4 → 40%
+        assert!((stats.dedup_ratio_percent - 40.0).abs() < 1e-6);
+
+        let savings = probe.query_storage_savings("tenant-1").unwrap();
+        assert_eq!(savings.bytes_saved, 100);
+        assert_eq!(savings.objects_deduped, 1);
+    }
+
+    #[test]
+    fn in_process_dedup_analytics_recent_events_capped_at_capacity() {
+        let probe = InProcessDedupAnalytics::with_capacity(2);
+        for size in [10, 20, 30] {
+            probe
+                .record_event(DedupEvent::ObjectUploaded {
+                    size_bytes: size,
+                    was_deduped: false,
+                })
+                .unwrap();
+        }
+        let recent = probe.recent_events();
+        assert_eq!(recent.len(), 2);
+        // Oldest event should have been evicted.
+        assert!(matches!(
+            recent[0],
+            DedupEvent::ObjectUploaded { size_bytes: 20, .. }
+        ));
+        assert!(matches!(
+            recent[1],
+            DedupEvent::ObjectUploaded { size_bytes: 30, .. }
+        ));
+    }
+
+    #[test]
+    fn dedup_event_size_bytes_extracts_payload() {
+        assert_eq!(
+            DedupEvent::ObjectUploaded {
+                size_bytes: 42,
+                was_deduped: false
+            }
+            .size_bytes(),
+            42
+        );
+        assert_eq!(DedupEvent::ObjectDeleted { size_bytes: 9 }.size_bytes(), 9);
+    }
+
+    #[test]
+    fn dedup_dashboard_round_trips_through_serde_json() {
+        let dashboard = DedupDashboard {
+            stats: DedupStats::from_counts(10, 4, 1000, 400),
+            savings: StorageSavings::from_counts(10, 4, 1000, 400, 1_700_000_000_000),
+            recent_events: vec![
+                DedupEvent::ObjectUploaded {
+                    size_bytes: 100,
+                    was_deduped: false,
+                },
+                DedupEvent::ObjectDeleted { size_bytes: 100 },
+            ],
+        };
+        let json = serde_json::to_string(&dashboard).unwrap();
+        let back: DedupDashboard = serde_json::from_str(&json).unwrap();
+        assert_eq!(dashboard, back);
+    }
+
+    /// Mock S3Client returning a pre-baked CBOR-encoded
+    /// `DedupStats` for `metadata/content_index/stats` and an
+    /// `Error::NotFound` for everything else.
+    #[derive(Debug)]
+    struct MockSnapshotS3 {
+        snapshot: Vec<u8>,
+    }
+    impl crate::media::sinks::zk_fabric::S3Client for MockSnapshotS3 {
+        fn put_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _bytes: &[u8],
+        ) -> std::result::Result<(), crate::Error> {
+            Ok(())
+        }
+        fn get_object_range(
+            &self,
+            _bucket: &str,
+            key: &str,
+            _range: std::ops::Range<u64>,
+        ) -> std::result::Result<Vec<u8>, crate::Error> {
+            if key == ZkofDedupAnalytics::snapshot_key() {
+                Ok(self.snapshot.clone())
+            } else {
+                Err(crate::Error::Storage("not found".into()))
+            }
+        }
+        fn delete_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> std::result::Result<(), crate::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn zkof_dedup_analytics_query_stats_parses_cbor_snapshot() {
+        let upstream = DedupStats::from_counts(100, 60, 1024, 614);
+        let bytes = serde_cbor::to_vec(&upstream).unwrap();
+        let s3 = Arc::new(MockSnapshotS3 { snapshot: bytes });
+        let probe = ZkofDedupAnalytics::new(s3, "tenant-bucket".into());
+        let got = probe.query_dedup_ratio("tenant-1").unwrap();
+        assert_eq!(got, upstream);
+    }
+
+    #[test]
+    fn zkof_dedup_analytics_query_savings_computes_savings() {
+        let upstream = DedupStats::from_counts(100, 60, 1024, 614);
+        let bytes = serde_cbor::to_vec(&upstream).unwrap();
+        let s3 = Arc::new(MockSnapshotS3 { snapshot: bytes });
+        let probe = ZkofDedupAnalytics::new(s3, "tenant-bucket".into());
+        let savings = probe.query_storage_savings("tenant-1").unwrap();
+        // 1024 - 614 = 410 bytes_saved
+        assert_eq!(savings.bytes_saved, 410);
+        assert_eq!(savings.objects_deduped, 40);
+    }
+
+    #[test]
+    fn zkof_dedup_analytics_falls_back_to_local_when_s3_unavailable() {
+        #[derive(Debug)]
+        struct FailingS3;
+        impl crate::media::sinks::zk_fabric::S3Client for FailingS3 {
+            fn put_object(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+            ) -> std::result::Result<(), crate::Error> {
+                Err(crate::Error::Storage("offline".into()))
+            }
+            fn get_object_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: std::ops::Range<u64>,
+            ) -> std::result::Result<Vec<u8>, crate::Error> {
+                Err(crate::Error::Storage("offline".into()))
+            }
+            fn delete_object(&self, _: &str, _: &str) -> std::result::Result<(), crate::Error> {
+                Err(crate::Error::Storage("offline".into()))
+            }
+        }
+        let probe = ZkofDedupAnalytics::new(Arc::new(FailingS3), "tenant-bucket".into());
+        // Seed local fallback with a known event.
+        probe
+            .record_event(DedupEvent::ObjectUploaded {
+                size_bytes: 50,
+                was_deduped: false,
+            })
+            .unwrap();
+        let stats = probe.query_dedup_ratio("tenant-1").unwrap();
+        assert_eq!(stats.total_objects, 1);
+        assert_eq!(stats.unique_bytes, 50);
+        assert_eq!(probe.recent_events().len(), 1);
     }
 }

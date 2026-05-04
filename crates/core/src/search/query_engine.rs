@@ -374,6 +374,142 @@ fn cold_source_fetch_bloom_with_cache(
     Ok(result)
 }
 
+/// Phase 8 (2026-05-04 batch 10) — Task 1: prefetched payload
+/// for one cold bucket.
+///
+/// The parallel fetch path materializes one
+/// [`BucketPrefetch`] per `(conversation_id, time_bucket)` pair
+/// **before** running the merge loop, so the (mostly
+/// transport-bound) decrypt/fetch step can be parallelized with
+/// `std::thread::scope` while the (mostly compute-bound) merge
+/// step stays single-threaded against the shared
+/// `HashMap<String, SearchResult>` accumulator. `bloom` mirrors
+/// the in-loop bloom probe: `Ok(Some(filter))` means the bucket
+/// fetched a bloom shard, `Ok(None)` means no shard was
+/// returned (graceful degradation), and `Err(_)` means the
+/// transport hard-errored on bloom — the merge loop treats
+/// `Err` as "no shard" so a single broken bucket cannot poison
+/// the whole search. `text` / `fuzzy` are also `Result` so the
+/// merge loop can `?`-propagate hard transport errors that the
+/// fail-open layer above already let through.
+struct BucketPrefetch {
+    /// Source `conversation_id` — kept for diagnostics / future
+    /// fail-open logging hooks even though the merge loop reads
+    /// the conversation id off the per-row `FtsRow` instead.
+    #[allow(dead_code)]
+    conv: String,
+    /// Source `time_bucket` — see [`Self::conv`].
+    #[allow(dead_code)]
+    bucket: String,
+    bloom: Result<Option<BloomFilter>, Error>,
+    text: Result<Vec<FtsRow>, Error>,
+    fuzzy: Result<Vec<FuzzyRow>, Error>,
+}
+
+/// Phase 8 (2026-05-04 batch 10) — Task 1: parallel-fetch the
+/// `(bloom, text, fuzzy)` shard triple for every supplied
+/// `(conversation_id, time_bucket)` pair.
+///
+/// Spawns up to `concurrency` worker threads via
+/// `std::thread::scope` and feeds them a shared
+/// [`std::sync::atomic::AtomicUsize`] cursor over the bucket
+/// list. Each worker repeatedly:
+///
+/// 1. Atomically increments the cursor to claim a bucket index,
+/// 2. Fetches the bloom shard (with the supplied `shard_cache`),
+/// 3. If `require_bloom_shards` is set and the probe failed,
+///    skips the bucket (`text` / `fuzzy` left as `Ok(empty)`),
+/// 4. Otherwise fetches the text + fuzzy shards.
+///
+/// Errors are surfaced per-bucket — a transport failure on one
+/// bucket does not abort the others. The merge loop in
+/// [`QueryEngine::execute_search_with_cold_source_full`] is
+/// what ultimately re-runs the per-bucket bloom check before
+/// touching the rows.
+///
+/// Output order is **stable**: the returned vector mirrors the
+/// input `buckets` order, so the merge loop sees the same
+/// fan-out the sequential path would have produced — modulo
+/// the parallel transport calls.
+fn parallel_fetch_buckets(
+    cold_source: &(dyn ColdShardSource + Send + Sync),
+    shard_cache: Option<&Mutex<ShardCache>>,
+    buckets: &[(String, String)],
+    require_bloom_shards: bool,
+    q_words: &[String],
+    concurrency: usize,
+) -> Vec<BucketPrefetch> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let n = buckets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Pre-allocate one slot per bucket so workers can write
+    // their result by index without coordinating.
+    let slots: Vec<Mutex<Option<BucketPrefetch>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = concurrency.max(1).min(n);
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let cursor_ref = &cursor;
+            let slots_ref = &slots;
+            let buckets_ref = buckets;
+            let cs = cold_source;
+            let sc = shard_cache;
+            let q_words_ref = q_words;
+            s.spawn(move || loop {
+                let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let (conv, bucket) = &buckets_ref[i];
+                let bloom = cold_source_fetch_bloom_with_cache(cs, sc, conv, bucket);
+                // Bloom pre-check: when `require_bloom_shards` is
+                // set and the probe missed (`Err` or `Ok(None)`),
+                // OR when a non-empty `q_words` produces zero
+                // bloom hits, the bucket cannot match and we
+                // skip the (much larger) text + fuzzy fetches.
+                // Mirrors the in-loop check in
+                // `execute_search_with_cold_source_full` so the
+                // parallel and sequential paths take the same
+                // shortcut.
+                let bloom_rejects = if require_bloom_shards && !matches!(bloom, Ok(Some(_))) {
+                    true
+                } else if let Ok(Some(filter)) = &bloom {
+                    !q_words_ref.is_empty() && !q_words_ref.iter().any(|w| filter.maybe_contains(w))
+                } else {
+                    false
+                };
+                let (text, fuzzy) = if bloom_rejects {
+                    (Ok(Vec::new()), Ok(Vec::new()))
+                } else {
+                    (
+                        cold_source_fetch_text_with_cache(cs, sc, conv, bucket),
+                        cold_source_fetch_fuzzy_with_cache(cs, sc, conv, bucket),
+                    )
+                };
+                let prefetch = BucketPrefetch {
+                    conv: conv.clone(),
+                    bucket: bucket.clone(),
+                    bloom,
+                    text,
+                    fuzzy,
+                };
+                if let Ok(mut guard) = slots_ref[i].lock() {
+                    *guard = Some(prefetch);
+                }
+            });
+        }
+    });
+
+    slots
+        .into_iter()
+        .filter_map(|m| m.into_inner().ok().flatten())
+        .collect()
+}
+
 /// Convert a (year, month, day) tuple to days since 1970-01-01
 /// using Howard Hinnant's `days_from_civil` algorithm. Avoids a
 /// chrono dependency in the search crate.
@@ -761,105 +897,15 @@ impl<'a> QueryEngine<'a> {
             let fuzzy_rows =
                 cold_source_fetch_fuzzy_with_cache(cold_source, shard_cache, &conv, &bucket)?;
 
-            // Build a metadata lookup so fuzzy-only hits can
-            // synthesise a SearchResult without re-fetching
-            // skeletons.
-            let mut meta_by_id: HashMap<String, &FtsRow> = HashMap::new();
-            for row in &fts_rows {
-                meta_by_id.insert(row.message_id.clone(), row);
-            }
-
-            for row in &fts_rows {
-                if !sender_filter_matches(query, &row.sender_id) {
-                    continue;
-                }
-                if !date_filter_matches(query, row.created_at_ms) {
-                    continue;
-                }
-                let lower = row.text_content.to_lowercase();
-                let mut matched = 0usize;
-                for w in &q_words {
-                    if lower.contains(w) {
-                        matched += 1;
-                    }
-                }
-                if matched == 0 {
-                    continue;
-                }
-                let bm25_like = matched as f64;
-                let rank = bm25_like * BM25_WEIGHT;
-                merge_cold_hit(
-                    &mut by_id,
-                    &row.message_id,
-                    &row.conversation_id,
-                    &row.sender_id,
-                    row.created_at_ms,
-                    rank,
-                );
-            }
-
-            if q_count_fuzzy > 0.0 {
-                // counts[message_id][script] = matched (token,
-                // script) pairs from this bucket's fuzzy shard.
-                let mut counts: HashMap<String, HashMap<ScriptClass, u32>> = HashMap::new();
-                for fr in &fuzzy_rows {
-                    let class = ScriptClass::from_iso_15924(&fr.script);
-                    let Some(set) = q_by_script.get(&class) else {
-                        continue;
-                    };
-                    if !set.contains(&fr.token) {
-                        continue;
-                    }
-                    *counts
-                        .entry(fr.message_id.clone())
-                        .or_default()
-                        .entry(class)
-                        .or_insert(0) += 1;
-                }
-                for (mid, per_script) in counts {
-                    let Some(info) = meta_by_id.get(&mid) else {
-                        continue;
-                    };
-                    if !sender_filter_matches(query, &info.sender_id) {
-                        continue;
-                    }
-                    if !date_filter_matches(query, info.created_at_ms) {
-                        continue;
-                    }
-                    // Per-script gating mirrors
-                    // FuzzySearchEngine::search_fuzzy: a row passes
-                    // when at least one script's overlap fraction
-                    // clears the per-script threshold. Total
-                    // matched across all scripts feeds the rank.
-                    let mut total_matched: u32 = 0;
-                    let mut accepted = false;
-                    for (script, q_set) in &q_by_script {
-                        let m = per_script.get(script).copied().unwrap_or(0);
-                        let q_n = q_set.len() as u32;
-                        if q_n == 0 {
-                            continue;
-                        }
-                        let frac = f64::from(m) / f64::from(q_n);
-                        if frac >= fuzzy_min_overlap(*script) {
-                            accepted = true;
-                        }
-                        total_matched += m;
-                    }
-                    if !accepted {
-                        continue;
-                    }
-                    let score = f64::from(total_matched) / q_count_fuzzy;
-                    let rank = score * FUZZY_WEIGHT;
-                    merge_cold_hit(
-                        &mut by_id,
-                        &mid,
-                        &info.conversation_id,
-                        &info.sender_id,
-                        info.created_at_ms,
-                        rank,
-                    );
-                }
-            }
+            merge_bucket_rows_into_by_id(
+                &mut by_id,
+                query,
+                &fts_rows,
+                &fuzzy_rows,
+                &q_words,
+                &q_by_script,
+                q_count_fuzzy,
+            );
         }
 
         let mut out: Vec<SearchResult> = by_id.into_values().collect();
@@ -880,6 +926,386 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.message_id.cmp(&b.message_id))
         });
         out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Phase 8 (2026-05-04 batch 10) — Task 1: parallel-fetch
+    /// twin of
+    /// [`Self::execute_search_with_cold_source_full`].
+    ///
+    /// Identical contract to the sequential entry point, except
+    /// the per-bucket `(bloom, text, fuzzy)` fetches are issued
+    /// in parallel through a [`std::thread::scope`] worker pool
+    /// of at most `concurrency` threads. The merge step itself
+    /// stays single-threaded — the parallelism is in the
+    /// (transport-bound) shard fetch / decrypt path, which
+    /// `docs/PROPOSAL.md §7.5` calls out as the hot critical
+    /// section in the multi-bucket fan-out. Setting
+    /// `concurrency = 1` collapses the path back to the
+    /// sequential loop while still threading the same code path.
+    ///
+    /// The trait bound is `Send + Sync` so the source can be
+    /// shared across worker threads. Implementations that hold
+    /// `RefCell` / non-`Sync` interior state (e.g.
+    /// [`crate::search::cold_shard_source::GracefulCold`]) must
+    /// continue to use the sequential entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_search_with_cold_source_full_parallel(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        cold_source: &(dyn ColdShardSource + Send + Sync),
+        policy: &TenantSearchPolicy,
+        shard_cache: Option<&Mutex<ShardCache>>,
+        limit: usize,
+        concurrency: usize,
+    ) -> Result<Vec<SearchResult>, Error> {
+        // Reuse every short-circuit and bucket-resolution branch
+        // from the sequential method up through the bucket list.
+        // This keeps the two paths' behaviour aligned (same
+        // `LocalOnly` short-circuit, same `allow_global_search`
+        // gate, same target_set / date pruning / policy cap)
+        // and limits the parallel-specific code to the
+        // fetch + merge fan-out.
+        let local = self
+            .execute_search_with_limit(query, scope, limit)
+            .map_err(|e| Error::Search(e.to_string()))?;
+        if !matches!(scope, SearchScope::IncludeCold) {
+            return Ok(local);
+        }
+        let trimmed = query.query_string.trim();
+        if trimmed.is_empty() {
+            return Ok(local);
+        }
+        if let Some(kind) = query.content_kind {
+            if !matches!(kind, ContentKind::Text | ContentKind::Any) {
+                return Ok(local);
+            }
+        }
+        let effective_target = query.effective_target();
+        let is_global_target = matches!(effective_target, SearchTarget::Global);
+        if is_global_target && !policy.allow_global_search {
+            return Ok(local);
+        }
+
+        let buckets = cold_source.cold_buckets()?;
+        if buckets.is_empty() {
+            return Ok(local);
+        }
+        let conv_filter = query.conversation_filter.map(|c| c.to_string());
+        #[allow(clippy::manual_unwrap_or_default)]
+        let target_set: Option<HashSet<String>> =
+            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+                Ok(opt) => opt,
+                Err(_) => None,
+            };
+        let buckets: Vec<(String, String)> = buckets
+            .into_iter()
+            .filter(|(c, _)| conv_filter.as_deref().is_none_or(|cf| cf == c.as_str()))
+            .filter(|(c, _)| {
+                target_set
+                    .as_ref()
+                    .is_none_or(|set| set.contains(c.as_str()))
+            })
+            .filter(|(_, bucket)| {
+                bucket_overlaps_date_range(bucket.as_str(), query.date_from, query.date_to)
+            })
+            .collect();
+        if buckets.is_empty() {
+            return Ok(local);
+        }
+        let buckets: Vec<(String, String)> = buckets
+            .into_iter()
+            .take(policy.max_cold_buckets_per_search)
+            .collect();
+
+        let mut by_id: HashMap<String, SearchResult> = HashMap::new();
+        for r in local {
+            by_id.insert(r.message_id.to_string(), r);
+        }
+        let local_ids: HashSet<String> = by_id.keys().cloned().collect();
+
+        let q_words = lowercase_word_set(trimmed);
+        let q_tokens = FuzzyTokenizer::generate_tokens(trimmed);
+        let mut q_by_script: HashMap<ScriptClass, HashSet<String>> = HashMap::new();
+        for t in &q_tokens {
+            q_by_script
+                .entry(t.script)
+                .or_default()
+                .insert(t.token.clone());
+        }
+        let q_count_fuzzy: f64 = q_by_script.values().map(|s| s.len()).sum::<usize>() as f64;
+
+        // Parallel fetch — `parallel_fetch_buckets` honors the
+        // bloom pre-check internally so a bucket the bloom
+        // rejects costs only the bloom round-trip, never the
+        // full text/fuzzy fetch.
+        let prefetched = parallel_fetch_buckets(
+            cold_source,
+            shard_cache,
+            &buckets,
+            policy.require_bloom_shards,
+            &q_words,
+            concurrency,
+        );
+
+        for entry in prefetched {
+            // Re-apply the bloom gating policy at the merge
+            // boundary so the parallel and sequential paths
+            // produce byte-for-byte identical `by_id` updates.
+            // `parallel_fetch_buckets` already short-circuited
+            // the text/fuzzy fetches when the bloom rejected,
+            // so this loop just refuses to merge the empty
+            // result through the rest of the pipeline. A
+            // transport error on bloom is fail-open: we treat
+            // it as "no shard available" and let the
+            // text/fuzzy results decide the bucket.
+            if policy.require_bloom_shards && !matches!(entry.bloom, Ok(Some(_))) {
+                continue;
+            }
+            if let Ok(Some(filter)) = &entry.bloom {
+                if !q_words.is_empty() && !q_words.iter().any(|w| filter.maybe_contains(w)) {
+                    continue;
+                }
+            }
+            // Per-bucket fail-open on the text/fuzzy fetches:
+            // a single broken bucket (404, decrypt failure,
+            // …) is logged at the cold-source layer (graceful
+            // wrappers swallow soft errors) but still yields
+            // an `Err` here for hard failures. Skip the bucket
+            // rather than aborting the whole search.
+            let (Ok(fts_rows), Ok(fuzzy_rows)) = (entry.text, entry.fuzzy) else {
+                continue;
+            };
+            merge_bucket_rows_into_by_id(
+                &mut by_id,
+                query,
+                &fts_rows,
+                &fuzzy_rows,
+                &q_words,
+                &q_by_script,
+                q_count_fuzzy,
+            );
+        }
+
+        let mut out: Vec<SearchResult> = by_id.into_values().collect();
+        self.apply_cold_recency_weight(&mut out, &local_ids);
+        out.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Phase 8 (2026-05-04 batch 10) — Task 2: streaming
+    /// search variant.
+    ///
+    /// Drives the same bucket fan-out as
+    /// [`Self::execute_search_with_cold_source_full`] but emits
+    /// a [`crate::SearchEvent`] callback after each state
+    /// change (local results, each cold bucket, final
+    /// completion). The callback is invoked synchronously on
+    /// the calling thread between (sequential) fetches — there
+    /// is no implicit threading here. Wire callers can
+    /// re-dispatch from the callback as needed.
+    ///
+    /// `SearchScope::LocalOnly` searches emit
+    /// [`SearchEvent::LocalResults`] followed immediately by
+    /// [`SearchEvent::SearchComplete`] (no cold events) so the
+    /// UI can keep one listener regardless of scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_search_streaming<F: FnMut(crate::SearchEvent)>(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        cold_source: &dyn ColdShardSource,
+        policy: &TenantSearchPolicy,
+        shard_cache: Option<&Mutex<ShardCache>>,
+        limit: usize,
+        mut emit: F,
+    ) -> Result<Vec<SearchResult>, Error> {
+        let local = self
+            .execute_search_with_limit(query, scope, limit)
+            .map_err(|e| Error::Search(e.to_string()))?;
+        emit(crate::SearchEvent::LocalResults(local.clone()));
+
+        // Replicate every short-circuit branch from the
+        // sequential cold path so LocalOnly / empty / non-text
+        // / Global+!allow searches still emit a SearchComplete.
+        let cold_disabled = !matches!(scope, SearchScope::IncludeCold);
+        let trimmed = query.query_string.trim();
+        let kind_blocks_cold = matches!(query.content_kind, Some(k)
+            if !matches!(k, ContentKind::Text | ContentKind::Any));
+        let global_blocked =
+            matches!(query.effective_target(), SearchTarget::Global) && !policy.allow_global_search;
+
+        if cold_disabled || trimmed.is_empty() || kind_blocks_cold || global_blocked {
+            emit(crate::SearchEvent::SearchComplete {
+                total_results: local.clone(),
+                cold_buckets_fetched: 0,
+                cold_buckets_skipped: 0,
+            });
+            return Ok(local);
+        }
+
+        let buckets = cold_source.cold_buckets()?;
+        let conv_filter = query.conversation_filter.map(|c| c.to_string());
+        #[allow(clippy::manual_unwrap_or_default)]
+        let target_set: Option<HashSet<String>> =
+            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+                Ok(opt) => opt,
+                Err(_) => None,
+            };
+        let buckets: Vec<(String, String)> = buckets
+            .into_iter()
+            .filter(|(c, _)| conv_filter.as_deref().is_none_or(|cf| cf == c.as_str()))
+            .filter(|(c, _)| {
+                target_set
+                    .as_ref()
+                    .is_none_or(|set| set.contains(c.as_str()))
+            })
+            .filter(|(_, bucket)| {
+                bucket_overlaps_date_range(bucket.as_str(), query.date_from, query.date_to)
+            })
+            .take(policy.max_cold_buckets_per_search)
+            .collect();
+
+        if buckets.is_empty() {
+            emit(crate::SearchEvent::SearchComplete {
+                total_results: local.clone(),
+                cold_buckets_fetched: 0,
+                cold_buckets_skipped: 0,
+            });
+            return Ok(local);
+        }
+
+        let mut by_id: HashMap<String, SearchResult> = HashMap::new();
+        for r in local.iter() {
+            by_id.insert(r.message_id.to_string(), r.clone());
+        }
+        let local_ids: HashSet<String> = by_id.keys().cloned().collect();
+
+        let q_words = lowercase_word_set(trimmed);
+        let q_tokens = FuzzyTokenizer::generate_tokens(trimmed);
+        let mut q_by_script: HashMap<ScriptClass, HashSet<String>> = HashMap::new();
+        for t in &q_tokens {
+            q_by_script
+                .entry(t.script)
+                .or_default()
+                .insert(t.token.clone());
+        }
+        let q_count_fuzzy: f64 = q_by_script.values().map(|s| s.len()).sum::<usize>() as f64;
+
+        let mut fetched: usize = 0;
+        let mut skipped: usize = 0;
+
+        for (conv, bucket) in buckets {
+            // Snapshot the current message-id set so we can
+            // compute the per-bucket delta after the merge.
+            let pre_ids: HashSet<String> = by_id.keys().cloned().collect();
+
+            let bloom =
+                cold_source_fetch_bloom_with_cache(cold_source, shard_cache, &conv, &bucket);
+            if policy.require_bloom_shards && !matches!(bloom, Ok(Some(_))) {
+                skipped += 1;
+                emit(crate::SearchEvent::ColdBucketComplete {
+                    conversation_id: conv,
+                    time_bucket: bucket,
+                    new_hits: Vec::new(),
+                });
+                continue;
+            }
+            if let Ok(Some(filter)) = &bloom {
+                if !q_words.is_empty() && !q_words.iter().any(|w| filter.maybe_contains(w)) {
+                    skipped += 1;
+                    emit(crate::SearchEvent::ColdBucketComplete {
+                        conversation_id: conv,
+                        time_bucket: bucket,
+                        new_hits: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+
+            let fts_rows =
+                match cold_source_fetch_text_with_cache(cold_source, shard_cache, &conv, &bucket) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Per-bucket fail-open mirror: skip
+                        // this bucket and emit an empty delta
+                        // so downstream listeners still see a
+                        // bucket-complete event.
+                        skipped += 1;
+                        emit(crate::SearchEvent::ColdBucketComplete {
+                            conversation_id: conv,
+                            time_bucket: bucket,
+                            new_hits: Vec::new(),
+                        });
+                        continue;
+                    }
+                };
+            let fuzzy_rows = match cold_source_fetch_fuzzy_with_cache(
+                cold_source,
+                shard_cache,
+                &conv,
+                &bucket,
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    emit(crate::SearchEvent::ColdBucketComplete {
+                        conversation_id: conv,
+                        time_bucket: bucket,
+                        new_hits: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+
+            merge_bucket_rows_into_by_id(
+                &mut by_id,
+                query,
+                &fts_rows,
+                &fuzzy_rows,
+                &q_words,
+                &q_by_script,
+                q_count_fuzzy,
+            );
+            fetched += 1;
+
+            // Compute the delta — every message_id that wasn't
+            // in `pre_ids` was newly introduced by this bucket.
+            let new_hits: Vec<SearchResult> = by_id
+                .iter()
+                .filter(|(k, _)| !pre_ids.contains(*k))
+                .map(|(_, v)| v.clone())
+                .collect();
+            emit(crate::SearchEvent::ColdBucketComplete {
+                conversation_id: conv,
+                time_bucket: bucket,
+                new_hits,
+            });
+        }
+
+        let mut out: Vec<SearchResult> = by_id.into_values().collect();
+        self.apply_cold_recency_weight(&mut out, &local_ids);
+        out.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        out.truncate(limit);
+        emit(crate::SearchEvent::SearchComplete {
+            total_results: out.clone(),
+            cold_buckets_fetched: fetched,
+            cold_buckets_skipped: skipped,
+        });
         Ok(out)
     }
 
@@ -1896,6 +2322,124 @@ fn date_filter_matches(query: &SearchQuery, created_at_ms: i64) -> bool {
 /// already local, so the row must not enter the cold-only
 /// re-weighting path nor be enqueued for hydration. Otherwise we
 /// synthesize a fresh row with `is_cold = true`.
+/// Phase 8 (2026-05-04 batch 10) — Task 1: shared merge helper
+/// for one bucket's `(fts_rows, fuzzy_rows)` payload.
+///
+/// Both the sequential and parallel cold fan-out paths funnel
+/// through this function so the per-bucket scoring rules (BM25,
+/// fuzzy per-script overlap, sender / date filter, fuzzy-only
+/// metadata lookup) live in exactly one place. Output is
+/// merged into `by_id` via [`merge_cold_hit`], which dedupes
+/// against the local-result set.
+fn merge_bucket_rows_into_by_id(
+    by_id: &mut HashMap<String, SearchResult>,
+    query: &SearchQuery,
+    fts_rows: &[FtsRow],
+    fuzzy_rows: &[FuzzyRow],
+    q_words: &[String],
+    q_by_script: &HashMap<ScriptClass, HashSet<String>>,
+    q_count_fuzzy: f64,
+) {
+    // Build a metadata lookup so fuzzy-only hits can synthesise
+    // a SearchResult without re-fetching skeletons.
+    let mut meta_by_id: HashMap<String, &FtsRow> = HashMap::new();
+    for row in fts_rows {
+        meta_by_id.insert(row.message_id.clone(), row);
+    }
+
+    for row in fts_rows {
+        if !sender_filter_matches(query, &row.sender_id) {
+            continue;
+        }
+        if !date_filter_matches(query, row.created_at_ms) {
+            continue;
+        }
+        let lower = row.text_content.to_lowercase();
+        let mut matched = 0usize;
+        for w in q_words {
+            if lower.contains(w) {
+                matched += 1;
+            }
+        }
+        if matched == 0 {
+            continue;
+        }
+        let bm25_like = matched as f64;
+        let rank = bm25_like * BM25_WEIGHT;
+        merge_cold_hit(
+            by_id,
+            &row.message_id,
+            &row.conversation_id,
+            &row.sender_id,
+            row.created_at_ms,
+            rank,
+        );
+    }
+
+    if q_count_fuzzy <= 0.0 {
+        return;
+    }
+    // counts[message_id][script] = matched (token, script) pairs
+    // from this bucket's fuzzy shard.
+    let mut counts: HashMap<String, HashMap<ScriptClass, u32>> = HashMap::new();
+    for fr in fuzzy_rows {
+        let class = ScriptClass::from_iso_15924(&fr.script);
+        let Some(set) = q_by_script.get(&class) else {
+            continue;
+        };
+        if !set.contains(&fr.token) {
+            continue;
+        }
+        *counts
+            .entry(fr.message_id.clone())
+            .or_default()
+            .entry(class)
+            .or_insert(0) += 1;
+    }
+    for (mid, per_script) in counts {
+        let Some(info) = meta_by_id.get(&mid) else {
+            continue;
+        };
+        if !sender_filter_matches(query, &info.sender_id) {
+            continue;
+        }
+        if !date_filter_matches(query, info.created_at_ms) {
+            continue;
+        }
+        // Per-script gating mirrors FuzzySearchEngine::search_fuzzy:
+        // a row passes when at least one script's overlap fraction
+        // clears the per-script threshold. Total matched across
+        // all scripts feeds the rank.
+        let mut total_matched: u32 = 0;
+        let mut accepted = false;
+        for (script, q_set) in q_by_script {
+            let m = per_script.get(script).copied().unwrap_or(0);
+            let q_n = q_set.len() as u32;
+            if q_n == 0 {
+                continue;
+            }
+            let frac = f64::from(m) / f64::from(q_n);
+            if frac >= fuzzy_min_overlap(*script) {
+                accepted = true;
+            }
+            total_matched += m;
+        }
+        if !accepted {
+            continue;
+        }
+        let score = f64::from(total_matched) / q_count_fuzzy;
+        let rank = score * FUZZY_WEIGHT;
+        merge_cold_hit(
+            by_id,
+            &mid,
+            &info.conversation_id,
+            &info.sender_id,
+            info.created_at_ms,
+            rank,
+        );
+    }
+}
+
 fn merge_cold_hit(
     by_id: &mut HashMap<String, SearchResult>,
     message_id: &str,
@@ -4631,5 +5175,502 @@ mod phase8_target_tests {
             after_first,
             "repeated search must not refetch text shard"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 10) — Task 1 parallel-fetch tests.
+    // -----------------------------------------------------------------
+
+    /// `Send + Sync` cold source for the parallel-fetch tests.
+    /// Uses [`std::sync::atomic::AtomicUsize`] counters and a
+    /// [`std::sync::Mutex`]-guarded "max concurrent" gauge so
+    /// the tests can assert on real concurrency behaviour.
+    struct CountingParallelSource {
+        buckets: Vec<(String, String)>,
+        text: HashMap<(String, String), Vec<FtsRow>>,
+        fuzzy: HashMap<(String, String), Vec<FuzzyRow>>,
+        text_calls: std::sync::atomic::AtomicUsize,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak_in_flight: std::sync::atomic::AtomicUsize,
+        fail_buckets: HashSet<(String, String)>,
+        fetch_delay_ms: u64,
+    }
+    impl CountingParallelSource {
+        fn new() -> Self {
+            Self {
+                buckets: Vec::new(),
+                text: HashMap::new(),
+                fuzzy: HashMap::new(),
+                text_calls: std::sync::atomic::AtomicUsize::new(0),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                fail_buckets: HashSet::new(),
+                fetch_delay_ms: 0,
+            }
+        }
+        fn with_delay_ms(mut self, ms: u64) -> Self {
+            self.fetch_delay_ms = ms;
+            self
+        }
+        fn with_text(mut self, conv: &str, bucket: &str, rows: Vec<FtsRow>) -> Self {
+            let key = (conv.to_string(), bucket.to_string());
+            if !self.buckets.contains(&key) {
+                self.buckets.push(key.clone());
+            }
+            self.text.insert(key, rows);
+            self
+        }
+        fn fail_for(mut self, conv: &str, bucket: &str) -> Self {
+            let key = (conv.to_string(), bucket.to_string());
+            if !self.buckets.contains(&key) {
+                self.buckets.push(key.clone());
+            }
+            self.fail_buckets.insert(key);
+            self
+        }
+        fn enter(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            // Update peak_in_flight to the running maximum.
+            self.peak_in_flight.fetch_max(now, SeqCst);
+        }
+        fn leave(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.in_flight.fetch_sub(1, SeqCst);
+        }
+    }
+    impl ColdShardSource for CountingParallelSource {
+        fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
+            Ok(self.buckets.clone())
+        }
+        fn fetch_text_rows(&self, conv: &str, bucket: &str) -> Result<Vec<FtsRow>, Error> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.enter();
+            self.text_calls.fetch_add(1, SeqCst);
+            let key = (conv.to_string(), bucket.to_string());
+            if self.fetch_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.fetch_delay_ms));
+            }
+            let res = if self.fail_buckets.contains(&key) {
+                Err(Error::Search("simulated text failure".into()))
+            } else {
+                Ok(self.text.get(&key).cloned().unwrap_or_default())
+            };
+            self.leave();
+            res
+        }
+        fn fetch_fuzzy_rows(&self, conv: &str, bucket: &str) -> Result<Vec<FuzzyRow>, Error> {
+            self.enter();
+            let key = (conv.to_string(), bucket.to_string());
+            let out = self.fuzzy.get(&key).cloned().unwrap_or_default();
+            self.leave();
+            Ok(out)
+        }
+    }
+
+    fn parallel_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[0xC1; 32]).unwrap()
+    }
+
+    fn make_fts_row(message_id: Uuid, conv: Uuid, text: &str, ms: i64) -> FtsRow {
+        FtsRow {
+            message_id: message_id.to_string(),
+            conversation_id: conv.to_string(),
+            sender_id: "alice".into(),
+            created_at_ms: ms,
+            text_content: text.into(),
+        }
+    }
+
+    #[test]
+    fn parallel_fetch_returns_same_results_as_sequential() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let mut source_seq = CountingParallelSource::new();
+        let mut source_par = CountingParallelSource::new();
+        for i in 0..10 {
+            let mid = Uuid::now_v7();
+            let bucket = format!("2026-{:02}", (i % 12) + 1);
+            let row = make_fts_row(mid, conv, "lighthouse beacon shines", 1_700_000_000_000 + i);
+            source_seq = source_seq.with_text(&conv.to_string(), &bucket, vec![row.clone()]);
+            source_par = source_par.with_text(&conv.to_string(), &bucket, vec![row]);
+        }
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let seq = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source_seq,
+                &policy,
+                None,
+                200,
+            )
+            .unwrap();
+        let par = engine
+            .execute_search_with_cold_source_full_parallel(
+                &q,
+                &SearchScope::IncludeCold,
+                &source_par,
+                &policy,
+                None,
+                200,
+                4,
+            )
+            .unwrap();
+        let seq_ids: Vec<String> = seq.iter().map(|r| r.message_id.to_string()).collect();
+        let par_ids: Vec<String> = par.iter().map(|r| r.message_id.to_string()).collect();
+        assert_eq!(seq_ids, par_ids);
+        assert_eq!(seq.len(), par.len());
+    }
+
+    #[test]
+    fn parallel_fetch_respects_concurrency_limit() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let mut source = CountingParallelSource::new().with_delay_ms(20);
+        for i in 0..8 {
+            let mid = Uuid::now_v7();
+            let bucket = format!("2026-{:02}", (i % 12) + 1);
+            let row = make_fts_row(mid, conv, "alpha", 1_700_000_000_000 + i);
+            source = source.with_text(&conv.to_string(), &bucket, vec![row]);
+        }
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let _ = engine
+            .execute_search_with_cold_source_full_parallel(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                3,
+            )
+            .unwrap();
+        let peak = source
+            .peak_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "peak_in_flight = {peak}, expected ≤ 3 (concurrency limit)"
+        );
+    }
+
+    #[test]
+    fn parallel_fetch_survives_single_bucket_error() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let conv_str = conv.to_string();
+        let good_mid = Uuid::now_v7();
+        let source = CountingParallelSource::new()
+            .with_text(
+                &conv_str,
+                "2026-01",
+                vec![make_fts_row(
+                    good_mid,
+                    conv,
+                    "alpha beta",
+                    1_700_000_000_000,
+                )],
+            )
+            .with_text(&conv_str, "2026-02", vec![])
+            .fail_for(&conv_str, "2026-02");
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let res = engine
+            .execute_search_with_cold_source_full_parallel(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                4,
+            )
+            .unwrap();
+        // The "good" bucket's hit must still surface even
+        // though the other bucket hard-errored.
+        let ids: Vec<String> = res.iter().map(|r| r.message_id.to_string()).collect();
+        assert!(
+            ids.iter().any(|id| id == &good_mid.to_string()),
+            "expected good_mid in results: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_fetch_empty_buckets_returns_empty() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let source = CountingParallelSource::new();
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let res = engine
+            .execute_search_with_cold_source_full_parallel(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                4,
+            )
+            .unwrap();
+        assert!(res.is_empty());
+        assert_eq!(
+            source.text_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn parallel_fetch_local_only_skips_cold_source() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let conv_str = conv.to_string();
+        let source = CountingParallelSource::new().with_text(
+            &conv_str,
+            "2026-01",
+            vec![make_fts_row(
+                Uuid::now_v7(),
+                conv,
+                "alpha",
+                1_700_000_000_000,
+            )],
+        );
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let _ = engine
+            .execute_search_with_cold_source_full_parallel(
+                &q,
+                &SearchScope::LocalOnly,
+                &source,
+                &policy,
+                None,
+                200,
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            source.text_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "LocalOnly must never invoke the cold source"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 10) — Task 2 streaming-search tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn streaming_search_emits_local_results_first() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let conv_str = conv.to_string();
+        let source = CountingParallelSource::new().with_text(
+            &conv_str,
+            "2026-01",
+            vec![FtsRow {
+                message_id: Uuid::now_v7().to_string(),
+                conversation_id: conv_str.clone(),
+                sender_id: "alice".into(),
+                created_at_ms: 1_700_000_000_000,
+                text_content: "alpha".into(),
+            }],
+        );
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let _ = engine
+            .execute_search_streaming(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                |e| events.push(e),
+            )
+            .unwrap();
+        assert!(
+            matches!(events.first(), Some(crate::SearchEvent::LocalResults(_))),
+            "first event must be LocalResults, got: {events:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_search_emits_search_complete_last() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let source = CountingParallelSource::new();
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let _ = engine
+            .execute_search_streaming(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                |e| events.push(e),
+            )
+            .unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(crate::SearchEvent::SearchComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_search_emits_cold_bucket_complete_per_bucket() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let conv_str = conv.to_string();
+        let mut source = CountingParallelSource::new();
+        for bucket in ["2026-01", "2026-02", "2026-03"] {
+            let mid = Uuid::now_v7();
+            source = source.with_text(
+                &conv_str,
+                bucket,
+                vec![FtsRow {
+                    message_id: mid.to_string(),
+                    conversation_id: conv_str.clone(),
+                    sender_id: "alice".into(),
+                    created_at_ms: 1_700_000_000_000,
+                    text_content: "alpha".into(),
+                }],
+            );
+        }
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let _ = engine
+            .execute_search_streaming(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                |e| events.push(e),
+            )
+            .unwrap();
+        let bucket_events = events
+            .iter()
+            .filter(|e| matches!(e, crate::SearchEvent::ColdBucketComplete { .. }))
+            .count();
+        assert_eq!(bucket_events, 3, "got: {events:?}");
+    }
+
+    #[test]
+    fn streaming_search_local_only_skips_cold_events() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7();
+        let conv_str = conv.to_string();
+        let source = CountingParallelSource::new().with_text(
+            &conv_str,
+            "2026-01",
+            vec![FtsRow {
+                message_id: Uuid::now_v7().to_string(),
+                conversation_id: conv_str.clone(),
+                sender_id: "alice".into(),
+                created_at_ms: 1_700_000_000_000,
+                text_content: "alpha".into(),
+            }],
+        );
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let _ = engine
+            .execute_search_streaming(
+                &q,
+                &SearchScope::LocalOnly,
+                &source,
+                &policy,
+                None,
+                200,
+                |e| events.push(e),
+            )
+            .unwrap();
+        // LocalOnly should emit ONLY LocalResults + SearchComplete.
+        assert_eq!(events.len(), 2, "got: {events:?}");
+        assert!(matches!(events[0], crate::SearchEvent::LocalResults(_)));
+        assert!(matches!(
+            events[1],
+            crate::SearchEvent::SearchComplete { .. }
+        ));
+    }
+
+    #[test]
+    fn streaming_search_no_cold_buckets_emits_complete_immediately() {
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let source = CountingParallelSource::new();
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let _ = engine
+            .execute_search_streaming(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+                |e| events.push(e),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2, "got: {events:?}");
+        assert!(matches!(events[0], crate::SearchEvent::LocalResults(_)));
+        match &events[1] {
+            crate::SearchEvent::SearchComplete {
+                cold_buckets_fetched,
+                cold_buckets_skipped,
+                ..
+            } => {
+                assert_eq!(*cold_buckets_fetched, 0);
+                assert_eq!(*cold_buckets_skipped, 0);
+            }
+            other => panic!("expected SearchComplete, got: {other:?}"),
+        }
     }
 }

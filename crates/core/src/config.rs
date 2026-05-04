@@ -145,6 +145,77 @@ pub struct KChatCoreConfig {
     /// [`TenantSearchPolicy::default`] (which allows everything
     /// the legacy Phase-1..Phase-7 search engine allowed).
     pub tenant_search_policies: HashMap<String, TenantSearchPolicy>,
+    /// Phase 8 (2026-05-04 batch 10) — maximum number of cold
+    /// shard fetches the orchestration layer is allowed to
+    /// issue **in parallel** for a single search. Defaults to
+    /// `4`. Setting this to `1` collapses the parallel path
+    /// back to a sequential loop. The parallel fan-out lives
+    /// in
+    /// [`crate::search::query_engine::QueryEngine::execute_search_with_cold_source_parallel`]
+    /// and is gated on the [`crate::search::query_engine::ColdShardSource`]
+    /// implementation being `Send + Sync` — the legacy entry
+    /// point is preserved unchanged for sources that are not.
+    pub max_cold_fetch_concurrency: usize,
+    /// Phase 7 (2026-05-04 batch 10 — Task 9) — when set to
+    /// `Some((source, target))`, the eviction path automatically
+    /// queues a one-off [`crate::scheduler::OneOffTask::MediaMigration`]
+    /// after a successful eviction pass. `None` (the default)
+    /// disables auto-scheduling — callers can still drive
+    /// migrations manually via
+    /// [`crate::core_impl::CoreImpl::schedule_media_migration`].
+    ///
+    /// `(source, target)` are storage-sink tags as used by
+    /// [`crate::media::migration::plan_media_migration`] (e.g.
+    /// `("local", "user-cloud")`).
+    pub auto_migrate_after_eviction: Option<(String, String)>,
+}
+
+/// Phase 5 (2026-05-04 batch 10) — per-platform p95 latency
+/// budgets for cold-shard search.
+///
+/// `docs/PROPOSAL.md §7.5` pins the cold-shard decrypt + search
+/// p95 budget at 1.5 s and gives a per-device target matrix:
+/// flagship phones get a tighter budget, mid-range Android sees
+/// a looser one, desktops are tighter still. The
+/// [`DeviceMatrixConfig`] surface lets a caller pick the right
+/// budget for the host device when running the on-device
+/// latency gates added in Phase 5 batch 10.
+///
+/// Values are nanoseconds — same unit as
+/// [`crate::perf::PerfTrace::duration_ns`] and
+/// [`crate::perf::PerfBudget::p95_budget_ns`] — so a
+/// [`DeviceMatrixConfig`] can be plugged directly into
+/// [`crate::perf::check_budgets`] without conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMatrixConfig {
+    /// p95 budget for an iOS flagship (A15+ / M-class). Default:
+    /// `1_000_000_000` (1.0 s).
+    pub ios_flagship_p95_ns: u64,
+    /// p95 budget for an older iOS device (≤A13). Default:
+    /// `1_500_000_000` (1.5 s) — matches the headline PROPOSAL
+    /// §7.5 budget.
+    pub ios_older_p95_ns: u64,
+    /// p95 budget for an Android flagship (Snapdragon 8 Gen-class).
+    /// Default: `1_200_000_000` (1.2 s).
+    pub android_flagship_p95_ns: u64,
+    /// p95 budget for an Android mid-range device. Default:
+    /// `2_000_000_000` (2.0 s).
+    pub android_midrange_p95_ns: u64,
+    /// p95 budget for a desktop host (macOS / Windows / Linux).
+    /// Default: `800_000_000` (0.8 s).
+    pub desktop_p95_ns: u64,
+}
+
+impl Default for DeviceMatrixConfig {
+    fn default() -> Self {
+        Self {
+            ios_flagship_p95_ns: 1_000_000_000,
+            ios_older_p95_ns: 1_500_000_000,
+            android_flagship_p95_ns: 1_200_000_000,
+            android_midrange_p95_ns: 2_000_000_000,
+            desktop_p95_ns: 800_000_000,
+        }
+    }
 }
 
 /// Phase 8 (2026-05-04 batch 6) — per-tenant search policy.
@@ -219,7 +290,18 @@ impl KChatCoreConfig {
             media_blob_sink: None,
             privacy_level: PrivacyLevel::default(),
             tenant_search_policies: HashMap::new(),
+            max_cold_fetch_concurrency: 4,
+            auto_migrate_after_eviction: None,
         }
+    }
+
+    /// Override the cold-shard parallel fetch concurrency
+    /// (Phase 8 batch 10). Builder-style mirror of
+    /// [`KChatCoreConfig::with_tenant_search_policy`].
+    #[must_use]
+    pub fn with_max_cold_fetch_concurrency(mut self, n: usize) -> Self {
+        self.max_cold_fetch_concurrency = n.max(1);
+        self
     }
 
     /// Register / override the [`TenantSearchPolicy`] for a tenant.
@@ -451,5 +533,34 @@ mod tests {
         assert!(!p.allow_global_search);
         assert_eq!(p.max_cold_buckets_per_search, 10);
         assert!(p.require_bloom_shards);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5 (2026-05-04 batch 10) — DeviceMatrixConfig.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn device_matrix_config_default_budgets() {
+        let m = DeviceMatrixConfig::default();
+        // Pinned to PROPOSAL.md §7.5 device matrix.
+        assert_eq!(m.ios_flagship_p95_ns, 1_000_000_000);
+        assert_eq!(m.ios_older_p95_ns, 1_500_000_000);
+        assert_eq!(m.android_flagship_p95_ns, 1_200_000_000);
+        assert_eq!(m.android_midrange_p95_ns, 2_000_000_000);
+        assert_eq!(m.desktop_p95_ns, 800_000_000);
+    }
+
+    #[test]
+    fn device_matrix_config_serde_round_trip() {
+        let m = DeviceMatrixConfig {
+            ios_flagship_p95_ns: 950_000_000,
+            ios_older_p95_ns: 1_400_000_000,
+            android_flagship_p95_ns: 1_100_000_000,
+            android_midrange_p95_ns: 1_900_000_000,
+            desktop_p95_ns: 700_000_000,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: DeviceMatrixConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, back);
     }
 }

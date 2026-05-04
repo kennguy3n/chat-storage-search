@@ -80,6 +80,13 @@ pub struct ZkofBackupSink {
     s3: Arc<dyn S3Client>,
     config: ZkFabricSinkConfig,
     tenant_id: String,
+    /// Phase 7 (2026-05-04 batch 10 — Task 10) — optional
+    /// dedup-analytics probe. When set, every successful
+    /// `upload_backup_segment` / `upload_backup_manifest` records
+    /// a [`DedupEvent::ObjectUploaded`] into the probe. The flag
+    /// is `None` by default so the legacy upload path is
+    /// behaviorally unchanged.
+    dedup_analytics: Option<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
 }
 
 impl ZkofBackupSink {
@@ -104,7 +111,21 @@ impl ZkofBackupSink {
             s3,
             config,
             tenant_id,
+            dedup_analytics: None,
         })
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): builder helper
+    /// that attaches a dedup-analytics probe. Returns `self` for
+    /// fluent construction. When set, every successful upload
+    /// records a [`crate::transport::dedup_analytics::DedupEvent::ObjectUploaded`]
+    /// into the probe.
+    pub fn with_dedup_analytics(
+        mut self,
+        probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+    ) -> Self {
+        self.dedup_analytics = Some(probe);
+        self
     }
 
     /// Bucket name this sink targets.
@@ -146,14 +167,42 @@ impl ZkofBackupSink {
 impl BackupSink for ZkofBackupSink {
     fn upload_backup_segment(&self, segment_id: &str, ciphertext: &[u8]) -> crate::Result<()> {
         let sealed = self.pattern_c_seal(ciphertext)?;
+        let size_bytes = ciphertext.len() as u64;
         self.s3
-            .put_object(&self.config.bucket, &segment_key(segment_id), &sealed)
+            .put_object(&self.config.bucket, &segment_key(segment_id), &sealed)?;
+        // Phase 7 (2026-05-04 batch 10 — Task 10): record the
+        // upload into the dedup-analytics probe if installed. We
+        // cannot tell from the S3 PutObject response whether the
+        // convergent ciphertext already existed (there is no
+        // `If-None-Match` semantics in the legacy `put_object`
+        // surface), so we conservatively report `was_deduped=false`
+        // — production deployments swap in an S3 client that
+        // checks `HEAD` first and reports the cache hit.
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                    size_bytes,
+                    was_deduped: false,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn upload_backup_manifest(&self, manifest_id: &str, sealed: &[u8]) -> crate::Result<()> {
         let convergent = self.pattern_c_seal(sealed)?;
+        let size_bytes = sealed.len() as u64;
         self.s3
-            .put_object(&self.config.bucket, &manifest_key(manifest_id), &convergent)
+            .put_object(&self.config.bucket, &manifest_key(manifest_id), &convergent)?;
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                    size_bytes,
+                    was_deduped: false,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn fetch_backup_manifest(&self, manifest_id: &str) -> crate::Result<Vec<u8>> {
@@ -374,5 +423,22 @@ mod tests {
             matches!(&err, Error::Storage(msg) if msg.contains("pattern C open")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn upload_backup_segment_records_dedup_event() {
+        use crate::transport::dedup_analytics::DedupAnalytics;
+        let s3 = Arc::new(InMemoryS3::new());
+        let probe = Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        let sink = ZkofBackupSink::new(s3, fresh_config(), "tenant-test")
+            .unwrap()
+            .with_dedup_analytics(probe.clone());
+        sink.upload_backup_segment("seg-1", b"hello").unwrap();
+        sink.upload_backup_manifest("man-1", b"world").unwrap();
+        let stats = probe.query_dedup_ratio("tenant-test").unwrap();
+        assert_eq!(stats.total_objects, 2);
+        assert_eq!(stats.total_bytes, 10);
+        let recent = probe.recent_events();
+        assert_eq!(recent.len(), 2);
     }
 }

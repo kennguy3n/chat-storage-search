@@ -89,19 +89,27 @@ goes through the FFI bridge for the host platform.
 
 > **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
 > (~95%); Phase 3 in flight (~97%); Phase 4 in flight (~90%);
-> Phase 5 in flight (~95%, cold-shard fetch + restore + p95
-> latency gate landed); Phase 6 in flight (~80%, ML inference
-> seams for XLM-R / MobileCLIP-S2 / Whisper /
-> DocumentExtractor / VideoKeyframeSampler + on-device
-> reranker with raw `semantic_score` + INT4 quantization
-> selection + INT4 encode/decode codec + criterion bench
-> scaffold); Phase 7 in flight (~45%, failure suite at 8 of 8 +
-> offline detector + perf collector + large-scale ingest /
-> storage-budget / backup-restore scaffold + 100k-message
-> stress test + macOS / Windows native integration scaffolds —
-> Spotlight / Windows Search bridges, scheduler bridges,
-> `WindowsMlConfig` CPU-only contract); Phase 8 in flight
-> (~90%, multi-scope / multi-tenant search foundation —
+> Phase 5 in flight (~98%, cold-shard fetch + restore + p95
+> latency gate across multilingual / large-bucket / multi-shard
+> scenarios + per-platform `DeviceMatrixConfig` budgets);
+> Phase 6 in flight (~92%, ML inference seams for XLM-R /
+> MobileCLIP-S2 / Whisper / DocumentExtractor /
+> VideoKeyframeSampler + on-device reranker with raw
+> `semantic_score` + INT4 quantization selection + INT4
+> encode/decode codec + criterion bench scaffold + desktop
+> ONNX EP wiring — `create_xlmr_session_with_ep` /
+> `create_mobileclip_session_with_ep` + `EpFallbackChain` +
+> `DesktopMlEpSelector::create_desktop_session`); Phase 7 in
+> flight (~80%, failure suite at 8 of 8 + offline detector +
+> perf p95 dashboard with `PerfSummary` / `PerfBudget` +
+> hot-path coverage spanning `hydrate_message`,
+> `run_incremental_backup`, `compact_archive`,
+> `restore_from_backup` + Spotlight / Windows Search Rust API
+> surface complete + EP benchmark capture-cache-auto-selection
+> + media migration auto-scheduled after eviction +
+> `ZkofDedupAnalytics` real wiring with backup / media sinks
+> recording `DedupEvent`s); Phase 8 in flight
+> (~98%, multi-scope / multi-tenant search foundation —
 > conversation hierarchy columns + indexes,
 > `archive_segment_map.tenant_id`, `SearchTarget` enum + scope
 > resolver wired through `QueryEngine`, `IndexType::Bloom`
@@ -123,9 +131,12 @@ goes through the FFI bridge for the host platform.
 > `target` on `SearchQuery`), Phase 8 latency benchmarks at
 > `crates/core/benches/phase8_benchmarks.rs`, and Phase 8
 > integration tests at
-> `crates/core/tests/phase8_multi_scope_search.rs`; the two
-> remaining unchecked items — parallel bucket fetch and
-> progressive / streaming search results — are deferred; see
+> `crates/core/tests/phase8_multi_scope_search.rs`; this batch
+> closes the last two items — parallel bucket fetch via
+> `std::thread::scope` over `KChatCoreConfig::max_cold_fetch_concurrency`
+> chunks, and the progressive `SearchEvent::{LocalResults,
+> ColdBucketComplete, SearchComplete}` streaming API surfaced
+> through iOS / Android `SearchEventListener` callbacks; see
 > PHASES.md Phase 8).** Updates vs.
 > the original target structure below:
 >

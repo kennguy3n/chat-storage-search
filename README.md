@@ -53,7 +53,7 @@
 > (Argon2id + AES-256-KW + serde envelope) including the
 > `DeviceTransferEnvelope` zeroize fix).**
 > **Phase 5 — Search (Fuzzy + Encrypted Shards) —
-> `In progress | ~95%`** (cold-bucket fan-out: a
+> `In progress | ~98%`** (cold-bucket fan-out: a
 > `ColdShardSource` trait (`search::query_engine`) resolves cold
 > `(conversation_id, time_bucket)` pairs and decrypts shards via
 > `search::shard_builder::{restore_text_search_shard,
@@ -102,7 +102,7 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
-> **Phase 6 — Media and Semantic Search — `In progress | ~85%`**
+> **Phase 6 — Media and Semantic Search — `In progress | ~92%`**
 > (ONNX Runtime session lifecycle in
 > `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
 > seam — `TextEmbedder` trait + `NoopTextEmbedder` /
@@ -166,7 +166,7 @@
 > Items still open: real platform-bridge attach for Whisper /
 > MobileCLIP / XLM-R sessions, desktop EP tuning, and the
 > INT4-vs-INT8 multilingual relevance benchmark.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~65%`**
+> **Phase 7 — Desktop + Optimization — `In progress | ~80%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -233,7 +233,7 @@
 > writer / reader). Real platform-bridge attach (DirectML EP,
 > Spotlight indexing, `NSBackgroundActivityScheduler` callback)
 > remains.)
-> **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~90%`**
+> **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~98%`**
 > (Phase 8 batch 6 lands ten tasks: bucket-level date pruning
 > (`bucket_overlaps_date_range`), bloom-filter pre-check in the
 > cold fan-out (`ColdShardSource::fetch_bloom_shard`), an
@@ -258,9 +258,18 @@
 > enum + optional `target` field), Phase 8 latency benchmarks
 > (`crates/core/benches/phase8_benchmarks.rs`), and Phase 8
 > integration tests
-> (`crates/core/tests/phase8_multi_scope_search.rs`). Items still
-> open: parallel bucket fetch and progressive / streaming search
-> results.)
+> (`crates/core/tests/phase8_multi_scope_search.rs`).
+> **Parallel bucket fetch + streaming search** (this batch):
+> `KChatCoreConfig::max_cold_fetch_concurrency` (default 4)
+> plus `execute_search_with_cold_source_full_parallel` use
+> `std::thread::scope` to fan cold-bucket fetches over a
+> bounded thread pool with fail-open per-bucket error
+> handling. `SearchEvent::{LocalResults,
+> ColdBucketComplete, SearchComplete}` plus
+> `execute_search_streaming` / `CoreImpl::search_streaming`
+> emit events as each cold bucket completes, exposed
+> through iOS / Android `SearchEventListener` callback
+> interfaces.)
 >
 > (Phase 8 schema foundation: `conversation` table now carries
 > `conversation_type` (`dm` / `group` / `channel`), `scope`

@@ -44,7 +44,83 @@ use std::time::{Duration, Instant};
 
 use crate::Error;
 
-use super::{BackgroundScheduler, TaskType};
+use super::{BackgroundScheduler, OneOffTask, TaskConstraints, TaskType};
+
+/// Phase 7 (2026-05-04 batch 10) — Task 9: device-state probe
+/// the in-process scheduler consults before draining a one-off
+/// task. Production callers wire this into a platform battery /
+/// network monitor; tests pass a hand-rolled `bool` snapshot.
+pub trait ResourceProbe {
+    /// Whether the current device state satisfies every flag
+    /// set on `constraints`. Default impl checks the trait's
+    /// per-method bools below.
+    fn satisfies(&self, constraints: &TaskConstraints) -> bool {
+        if constraints.require_wifi && !self.has_wifi() {
+            return false;
+        }
+        if constraints.require_charging && !self.is_charging() {
+            return false;
+        }
+        if constraints.require_idle && !self.is_idle() {
+            return false;
+        }
+        true
+    }
+    /// Whether the device is on Wi-Fi (or equivalent un-metered
+    /// network).
+    fn has_wifi(&self) -> bool;
+    /// Whether the device is charging.
+    fn is_charging(&self) -> bool;
+    /// Whether the device is idle (screen off / no foreground
+    /// app).
+    fn is_idle(&self) -> bool;
+}
+
+/// Test/desktop-default [`ResourceProbe`] that reports a fixed
+/// snapshot of the device state. Useful for unit tests that
+/// want to drive the scheduler through synthetic
+/// "WiFi=off, charging=on" combinations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StaticResourceProbe {
+    /// Reported by [`ResourceProbe::has_wifi`].
+    pub has_wifi: bool,
+    /// Reported by [`ResourceProbe::is_charging`].
+    pub is_charging: bool,
+    /// Reported by [`ResourceProbe::is_idle`].
+    pub is_idle: bool,
+}
+
+impl StaticResourceProbe {
+    /// "Everything available" — the maximally permissive probe.
+    pub fn all_available() -> Self {
+        Self {
+            has_wifi: true,
+            is_charging: true,
+            is_idle: true,
+        }
+    }
+
+    /// "Nothing available" — every constraint will be denied.
+    pub fn none_available() -> Self {
+        Self {
+            has_wifi: false,
+            is_charging: false,
+            is_idle: false,
+        }
+    }
+}
+
+impl ResourceProbe for StaticResourceProbe {
+    fn has_wifi(&self) -> bool {
+        self.has_wifi
+    }
+    fn is_charging(&self) -> bool {
+        self.is_charging
+    }
+    fn is_idle(&self) -> bool {
+        self.is_idle
+    }
+}
 
 /// Boxed closure invoked by the in-process worker once per
 /// scheduled tick. Handlers MUST be `Send + Sync` so the same
@@ -88,7 +164,26 @@ struct WorkerHandle {
 pub struct InProcessScheduler {
     handlers: Mutex<HashMap<TaskType, Arc<dyn TaskHandler>>>,
     workers: Mutex<HashMap<TaskType, WorkerHandle>>,
+    /// Phase 7 (2026-05-04 batch 10) — Task 9 one-shot queue.
+    /// Each entry is the `(task, constraints)` pair the
+    /// orchestrator enqueued; `run_pending_one_off_tasks` drains
+    /// this queue and invokes the registered one-off handler.
+    one_offs: Mutex<Vec<(OneOffTask, TaskConstraints)>>,
+    /// Optional handler invoked once per drained entry. Wired
+    /// in by `CoreImpl::install_in_process_scheduler` on the
+    /// orchestration side.
+    one_off_handler: Mutex<Option<Arc<OneOffTaskHandler>>>,
 }
+
+/// Phase 7 (2026-05-04 batch 10) — Task 9 one-off task handler.
+///
+/// Invoked from `run_pending_one_off_tasks` for each task whose
+/// constraints are currently satisfied. Returns `Ok(())` on
+/// success or an [`Error`] on failure (the scheduler logs and
+/// drops the task — retry-on-failure is the platform bridge's
+/// responsibility).
+pub type OneOffTaskHandler =
+    dyn Fn(&OneOffTask, &TaskConstraints) -> Result<(), Error> + Send + Sync;
 
 impl std::fmt::Debug for InProcessScheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,7 +207,67 @@ impl InProcessScheduler {
         Self {
             handlers: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
+            one_offs: Mutex::new(Vec::new()),
+            one_off_handler: Mutex::new(None),
         }
+    }
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 9: install the
+    /// one-off task handler. The orchestration layer wires
+    /// `CoreImpl::execute_media_migration` /
+    /// `CoreImpl::warm_shard_cache` through this hook.
+    pub fn set_one_off_handler<F>(&self, handler: F)
+    where
+        F: Fn(&OneOffTask, &TaskConstraints) -> Result<(), Error> + Send + Sync + 'static,
+    {
+        if let Ok(mut h) = self.one_off_handler.lock() {
+            *h = Some(Arc::new(handler));
+        }
+    }
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 9: number of one-off
+    /// tasks currently waiting in the queue.
+    pub fn pending_one_off_count(&self) -> usize {
+        self.one_offs.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 9: drain every
+    /// queued one-off task whose constraints are satisfied
+    /// against `probe`, invoke the registered handler, and
+    /// return the number of tasks executed. Tasks whose
+    /// constraints are *not* met stay in the queue.
+    ///
+    /// `probe` reports the current device state. The scheduler
+    /// uses it to decide whether each task's
+    /// [`TaskConstraints::require_wifi`] /
+    /// [`TaskConstraints::require_charging`] /
+    /// [`TaskConstraints::require_idle`] are satisfied.
+    pub fn run_pending_one_off_tasks<P: ResourceProbe>(&self, probe: &P) -> Result<usize, Error> {
+        let handler = match self.one_off_handler.lock() {
+            Ok(g) => g.as_ref().map(Arc::clone),
+            Err(_) => return Err(Error::Storage("scheduler mutex poisoned".into())),
+        };
+        let drained: Vec<(OneOffTask, TaskConstraints)> = {
+            let mut q = self
+                .one_offs
+                .lock()
+                .map_err(|_| Error::Storage("scheduler mutex poisoned".into()))?;
+            // Partition: keep the deferred tasks, drain the
+            // ready ones.
+            let (ready, deferred): (Vec<_>, Vec<_>) =
+                q.drain(..).partition(|(_, c)| probe.satisfies(c));
+            *q = deferred;
+            ready
+        };
+        let count = drained.len();
+        if let Some(h) = handler {
+            for (task, constraints) in &drained {
+                // Errors from one task don't poison the rest of
+                // the drain.
+                let _ = h(task, constraints);
+            }
+        }
+        Ok(count)
     }
 
     /// Register a [`TaskHandler`] for the supplied `TaskType`.
@@ -295,6 +450,19 @@ impl BackgroundScheduler for InProcessScheduler {
             .map_err(|_| Error::Storage("scheduler mutex poisoned".into()))?;
         let pending = workers.keys().any(|t| t.default_task_id() == task_id);
         Ok(pending)
+    }
+
+    fn schedule_one_off_task(
+        &self,
+        task: OneOffTask,
+        constraints: TaskConstraints,
+    ) -> Result<(), Error> {
+        let mut q = self
+            .one_offs
+            .lock()
+            .map_err(|_| Error::Storage("scheduler mutex poisoned".into()))?;
+        q.push((task, constraints));
+        Ok(())
     }
 }
 
@@ -503,5 +671,99 @@ mod tests {
         // No schedule_model_warmup method; just verify the
         // handler was registered without panicking.
         assert!(!s.is_task_pending_kind(TaskType::ModelWarmup));
+    }
+
+    // ---------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 9 one-off scheduling.
+    // ---------------------------------------------------------
+
+    use super::super::{MediaMigrationPlanSnapshot, OneOffTask, TaskConstraints};
+
+    fn fake_migration_task() -> OneOffTask {
+        OneOffTask::MediaMigration {
+            plan: MediaMigrationPlanSnapshot {
+                source_sink: "kchat_backend".into(),
+                target_sink: "zk_object_fabric".into(),
+                item_count: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn schedule_one_off_task_enqueues_into_pending_queue() {
+        let s = InProcessScheduler::new();
+        assert_eq!(s.pending_one_off_count(), 0);
+        s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
+            .unwrap();
+        assert_eq!(s.pending_one_off_count(), 1);
+    }
+
+    #[test]
+    fn run_pending_one_off_tasks_executes_and_drains_when_constraints_met() {
+        let s = InProcessScheduler::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let r = Arc::clone(&runs);
+        s.set_one_off_handler(move |_task, _c| {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
+            .unwrap();
+        let n = s
+            .run_pending_one_off_tasks(&StaticResourceProbe::all_available())
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(s.pending_one_off_count(), 0);
+    }
+
+    #[test]
+    fn run_pending_one_off_tasks_respects_wifi_constraint() {
+        let s = InProcessScheduler::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let r = Arc::clone(&runs);
+        s.set_one_off_handler(move |_t, _c| {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
+            .unwrap();
+        // No Wi-Fi → task must remain queued.
+        let probe = StaticResourceProbe {
+            has_wifi: false,
+            is_charging: true,
+            is_idle: false,
+        };
+        let n = s.run_pending_one_off_tasks(&probe).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(s.pending_one_off_count(), 1);
+    }
+
+    #[test]
+    fn run_pending_one_off_tasks_respects_charging_constraint() {
+        let s = InProcessScheduler::new();
+        s.set_one_off_handler(|_t, _c| Ok(()));
+        s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
+            .unwrap();
+        let probe = StaticResourceProbe {
+            has_wifi: true,
+            is_charging: false,
+            is_idle: false,
+        };
+        let n = s.run_pending_one_off_tasks(&probe).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(s.pending_one_off_count(), 1);
+    }
+
+    #[test]
+    fn task_constraints_default_is_unrestrictive() {
+        let c = TaskConstraints::default();
+        assert!(!c.require_wifi);
+        assert!(!c.require_charging);
+        assert!(!c.require_idle);
+        assert_eq!(c.max_retry_count, 3);
+        // Even an empty probe satisfies the default.
+        assert!(StaticResourceProbe::none_available().satisfies(&c));
     }
 }

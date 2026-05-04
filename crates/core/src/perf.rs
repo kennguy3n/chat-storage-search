@@ -180,6 +180,175 @@ impl PerfCollector for InMemoryPerfCollector {
     }
 }
 
+/// Phase 7 (2026-05-04 batch 10) — aggregated summary over a
+/// set of [`PerfTrace`]s for a single operation.
+///
+/// Percentiles are computed via the nearest-rank method with a
+/// 1-based index — for `count = 100` traces, `p95_ns` is the
+/// 95th-smallest duration. This matches the convention used
+/// downstream in `docs/PROPOSAL.md §7.5` and the criterion
+/// benchmarks under `crates/core/benches/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerfSummary {
+    /// Operation name (`PerfTrace::operation`).
+    pub operation: String,
+    /// Number of traces aggregated.
+    pub count: usize,
+    /// 50th percentile duration in nanoseconds.
+    pub p50_ns: u64,
+    /// 95th percentile duration in nanoseconds.
+    pub p95_ns: u64,
+    /// 99th percentile duration in nanoseconds.
+    pub p99_ns: u64,
+    /// Slowest single duration in nanoseconds.
+    pub max_ns: u64,
+    /// Total duration in nanoseconds (sum of every span). Useful
+    /// for back-of-envelope "% of wall-clock" plots.
+    pub total_ns: u64,
+}
+
+/// Phase 7 (2026-05-04 batch 10) — per-operation p95 budget.
+///
+/// Plug into [`check_budgets`] alongside a `Vec<PerfSummary>`
+/// to detect operations whose measured p95 exceeds the
+/// configured ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerfBudget {
+    /// Operation name to match against
+    /// [`PerfSummary::operation`].
+    pub operation: String,
+    /// Maximum allowed p95 duration in nanoseconds.
+    pub p95_budget_ns: u64,
+}
+
+impl PerfBudget {
+    /// Convenience constructor.
+    pub fn new(operation: impl Into<String>, p95_budget_ns: u64) -> Self {
+        Self {
+            operation: operation.into(),
+            p95_budget_ns,
+        }
+    }
+}
+
+/// One detected violation: the named operation's p95 exceeds
+/// the configured budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetViolation {
+    /// Operation that exceeded its budget.
+    pub operation: String,
+    /// Measured p95 duration in nanoseconds.
+    pub measured_p95_ns: u64,
+    /// Configured p95 budget in nanoseconds.
+    pub budget_p95_ns: u64,
+}
+
+impl BudgetViolation {
+    /// `measured - budget` (saturating). Useful for "how much
+    /// over budget were we" plots.
+    pub fn overshoot_ns(&self) -> u64 {
+        self.measured_p95_ns.saturating_sub(self.budget_p95_ns)
+    }
+}
+
+/// Compute the nearest-rank percentile for `pct` ∈ `[0, 100]`
+/// from a sorted slice of durations.
+fn nearest_rank_percentile(sorted: &[u64], pct: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let n = sorted.len();
+    // Nearest-rank with a 1-based index. `idx` is the 1-based
+    // position of the percentile; we clamp into `[1, n]` and
+    // subtract 1 to convert to a 0-based slice index.
+    let idx = ((pct / 100.0) * n as f64).ceil() as usize;
+    let idx = idx.clamp(1, n) - 1;
+    sorted[idx]
+}
+
+/// Build a [`PerfSummary`] from the supplied trace vector. The
+/// caller is responsible for filtering to a single
+/// `operation` — the summary just blindly aggregates whatever
+/// it is handed.
+pub fn summarize_traces(operation: &str, traces: &[PerfTrace]) -> Option<PerfSummary> {
+    if traces.is_empty() {
+        return None;
+    }
+    let mut durations: Vec<u64> = traces.iter().map(|t| t.duration_ns()).collect();
+    durations.sort_unstable();
+    let total_ns: u64 = durations
+        .iter()
+        .copied()
+        .fold(0u64, |a, b| a.saturating_add(b));
+    let p50 = nearest_rank_percentile(&durations, 50.0);
+    let p95 = nearest_rank_percentile(&durations, 95.0);
+    let p99 = nearest_rank_percentile(&durations, 99.0);
+    let max_ns = *durations.last().unwrap_or(&0);
+    Some(PerfSummary {
+        operation: operation.to_string(),
+        count: traces.len(),
+        p50_ns: p50,
+        p95_ns: p95,
+        p99_ns: p99,
+        max_ns,
+        total_ns,
+    })
+}
+
+impl InMemoryPerfCollector {
+    /// Compute one [`PerfSummary`] per distinct operation seen
+    /// by this collector. Operations with zero traces are
+    /// skipped. Output is sorted by operation name for stable
+    /// comparison in tests.
+    pub fn summarize(&self) -> Vec<PerfSummary> {
+        use std::collections::BTreeMap;
+        let snap = self.snapshot();
+        let mut grouped: BTreeMap<String, Vec<PerfTrace>> = BTreeMap::new();
+        for t in snap {
+            grouped.entry(t.operation.clone()).or_default().push(t);
+        }
+        grouped
+            .into_iter()
+            .filter_map(|(op, traces)| summarize_traces(&op, &traces))
+            .collect()
+    }
+
+    /// Compute the [`PerfSummary`] for a specific operation, if
+    /// any traces have been recorded for it.
+    pub fn summarize_operation(&self, op: &str) -> Option<PerfSummary> {
+        let snap = self.snapshot();
+        let filtered: Vec<PerfTrace> = snap.into_iter().filter(|t| t.operation == op).collect();
+        summarize_traces(op, &filtered)
+    }
+}
+
+/// Compare [`PerfSummary`]s against [`PerfBudget`]s and return
+/// every operation whose measured p95 exceeds its budget. A
+/// summary with no matching budget is skipped (no opinion); a
+/// budget with no matching summary is also skipped (the
+/// operation simply has not been exercised yet).
+pub fn check_budgets(summaries: &[PerfSummary], budgets: &[PerfBudget]) -> Vec<BudgetViolation> {
+    let mut out: Vec<BudgetViolation> = Vec::new();
+    for b in budgets {
+        for s in summaries {
+            if s.operation != b.operation {
+                continue;
+            }
+            if s.p95_ns > b.p95_budget_ns {
+                out.push(BudgetViolation {
+                    operation: s.operation.clone(),
+                    measured_p95_ns: s.p95_ns,
+                    budget_p95_ns: b.p95_budget_ns,
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +412,109 @@ mod tests {
         t.finish();
         dynref.record(t);
         assert_eq!(dynref.snapshot().len(), 1);
+    }
+
+    /// Build a synthetic trace with a fixed duration in
+    /// nanoseconds. Bypasses the wall-clock to keep the
+    /// percentile assertions deterministic.
+    fn synthetic_trace(op: &str, duration_ns: u64) -> PerfTrace {
+        PerfTrace {
+            operation: op.to_string(),
+            start_ns: 0,
+            end_ns: duration_ns,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn perf_summary_empty_returns_none() {
+        let c = InMemoryPerfCollector::new();
+        assert!(c.summarize().is_empty());
+        assert!(c.summarize_operation("nope").is_none());
+        assert!(summarize_traces("nope", &[]).is_none());
+    }
+
+    #[test]
+    fn perf_summary_computes_correct_p95() {
+        let c = InMemoryPerfCollector::new();
+        // 100 traces with durations 1..=100 ns. With
+        // nearest-rank, p95 = 95th-smallest = 95 ns.
+        for i in 1..=100u64 {
+            c.record(synthetic_trace("op", i));
+        }
+        let s = c.summarize_operation("op").expect("100 traces summarize");
+        assert_eq!(s.count, 100);
+        assert_eq!(s.p50_ns, 50);
+        assert_eq!(s.p95_ns, 95);
+        assert_eq!(s.p99_ns, 99);
+        assert_eq!(s.max_ns, 100);
+        assert_eq!(s.total_ns, (1..=100u64).sum::<u64>());
+    }
+
+    #[test]
+    fn perf_summary_groups_by_operation() {
+        let c = InMemoryPerfCollector::new();
+        c.record(synthetic_trace("ingest", 10));
+        c.record(synthetic_trace("ingest", 20));
+        c.record(synthetic_trace("search", 100));
+        let summaries = c.summarize();
+        assert_eq!(summaries.len(), 2);
+        // BTreeMap iteration → sorted by op name.
+        assert_eq!(summaries[0].operation, "ingest");
+        assert_eq!(summaries[0].count, 2);
+        assert_eq!(summaries[1].operation, "search");
+        assert_eq!(summaries[1].count, 1);
+    }
+
+    #[test]
+    fn perf_summary_single_trace() {
+        let c = InMemoryPerfCollector::new();
+        c.record(synthetic_trace("solo", 42));
+        let s = c.summarize_operation("solo").unwrap();
+        assert_eq!(s.p50_ns, 42);
+        assert_eq!(s.p95_ns, 42);
+        assert_eq!(s.p99_ns, 42);
+        assert_eq!(s.max_ns, 42);
+        assert_eq!(s.total_ns, 42);
+    }
+
+    #[test]
+    fn perf_budget_violation_detected() {
+        let c = InMemoryPerfCollector::new();
+        for i in 1..=100u64 {
+            c.record(synthetic_trace("hot_path", i * 1_000_000));
+        }
+        let summaries = c.summarize();
+        let budgets = vec![PerfBudget::new("hot_path", 50_000_000)];
+        let violations = check_budgets(&summaries, &budgets);
+        assert_eq!(violations.len(), 1);
+        let v = &violations[0];
+        assert_eq!(v.operation, "hot_path");
+        assert_eq!(v.measured_p95_ns, 95_000_000);
+        assert_eq!(v.budget_p95_ns, 50_000_000);
+        assert_eq!(v.overshoot_ns(), 45_000_000);
+    }
+
+    #[test]
+    fn perf_budget_all_pass() {
+        let c = InMemoryPerfCollector::new();
+        for i in 1..=10u64 {
+            c.record(synthetic_trace("fast", i));
+        }
+        let summaries = c.summarize();
+        let budgets = vec![PerfBudget::new("fast", 1_000_000)];
+        let violations = check_budgets(&summaries, &budgets);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn perf_budget_no_match_skipped() {
+        // Operation "alpha" has summaries; "beta" has a
+        // budget but no traces. No violations.
+        let c = InMemoryPerfCollector::new();
+        c.record(synthetic_trace("alpha", 100));
+        let summaries = c.summarize();
+        let budgets = vec![PerfBudget::new("beta", 1)];
+        assert!(check_budgets(&summaries, &budgets).is_empty());
     }
 }

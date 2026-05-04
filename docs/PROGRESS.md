@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~85%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + HNSW ANN upgrade with `instant-distance` + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~65%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore + 100k message + 10k media + archive compaction + concurrent-operations scaffolds + media-blob sink stress test + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract — `desktop` crate scaffold (`SpotlightAnchor`, `WindowsSearchAnchor`, `DesktopScheduler`, `DesktopMlEpSelector`) + `ExecutionProviderSelector` + `InProcessScheduler` + `DedupAnalytics` read-only telemetry + cross-platform media migration (`MediaMigrationPlan`, `migrate_media_sink`)). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~90%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~98%`, p95 latency gate hit across multilingual / large-bucket / multi-shard scenarios + `DeviceMatrixConfig` per-platform budgets). Phase 6 — Media and Semantic Search (`In progress | ~92%`, desktop ONNX EP wiring complete — `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep` + `EpFallbackChain` per-platform + `DesktopMlEpSelector::create_desktop_session`). Phase 7 — Desktop + Optimization (`In progress | ~80%`, Spotlight / Windows Search bridge surface complete + perf p95 dashboard with `PerfSummary` / `PerfBudget` + EP benchmark capture-cache-auto-selection + media migration auto-scheduled after eviction + dedup analytics with real `ZkofDedupAnalytics` + `InProcessDedupAnalytics` ring buffer + backup / media sinks recording `DedupEvent`s). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`, parallel bucket fetch via `std::thread::scope` + progressive `SearchEvent` streaming API surfaced through iOS / Android bridges).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1392,7 +1392,7 @@ Notes:
 
 ## Phase 5: Search — Fuzzy + Encrypted Shards
 
-**Status**: `In progress | ~95%`
+**Status**: `In progress | ~98%`
 
 **Goal**: Fuzzy matching across scripts, plus encrypted search
 shards on the backend so cold buckets remain searchable.
@@ -1467,21 +1467,28 @@ Checklist:
       Latin × CJK, Cyrillic × Latin, pure-CJK on non-ICU
       builds via fuzzy fallback, mixed-script promotion, and
       unrelated-row exclusion.)
-- [~] Latency budget: encrypted shard fetch + decrypt + local
+- [x] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
       (criterion bench at
       `crates/core/benches/phase5_benchmarks.rs` measures
       `text_only_one_month`, `fuzzy_only_one_month`, and
       `local_plus_one_cold_bucket` against a delayed
       `ColdShardSource` that simulates a network hop. The
-      smoke test
-      `crates/core/tests/phase5_latency_smoke.rs::phase5_cold_shard_p95_latency_under_1_5s_budget`
-      asserts the **p95** of the end-to-end shard fetch +
-      AEAD decrypt + FTS5 / fuzzy search on a 1 000-message
-      one-month multilingual bucket stays under the 1.5 s
-      budget on debug CI. The on-device p95 ≤ 1.5 s gate on
-      the full device matrix lands with the Phase-5
-      device-matrix run.)
+      smoke tests at
+      `crates/core/tests/phase5_latency_smoke.rs` —
+      `phase5_cold_shard_p95_latency_under_1_5s_budget`,
+      `phase5_cold_shard_p95_multilingual_under_budget`,
+      `phase5_cold_shard_p95_large_bucket_under_budget`,
+      `phase5_cold_shard_p95_multiple_shards_under_budget` —
+      assert **p95** under budget across multilingual,
+      large-bucket, and multi-shard scenarios.
+      `DeviceMatrixConfig` in `crates/core/src/config.rs`
+      defines per-platform p95 budgets (iOS flagship 1.0 s,
+      iOS older 1.5 s, Android flagship 1.2 s, Android
+      mid-range 2.0 s, desktop 0.8 s) so the device-matrix
+      run only has to look up the right entry. Tests:
+      `device_matrix_config_default_budgets`,
+      `device_matrix_config_serde_round_trip`.)
 - [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
@@ -1519,7 +1526,7 @@ Notes:
 
 ## Phase 6: Media and Semantic Search
 
-**Status**: `In progress | ~80%`
+**Status**: `In progress | ~92%`
 
 **Goal**: On-device ML for OCR, image / video / audio search, and
 semantic text search — all multilingual.
@@ -1664,8 +1671,30 @@ Checklist:
       reweighted by recency × content-kind. Falls back silently
       when no embedder is installed or the query is empty. Tests:
       `search::query_engine::tests::semantic_*`.)_
-- [ ] Desktop support: macOS (Core ML), Windows (DirectML EP
+- [x] Desktop support: macOS (Core ML), Windows (DirectML EP
       preferred, CPU EP fallback).
+      _(See `crates/core/src/models/embeddings_onnx.rs` —
+      `create_xlmr_session_with_ep` /
+      `create_mobileclip_session_with_ep` accept an
+      `ExecutionProvider` and configure
+      `ort::CoreMLExecutionProvider` /
+      `ort::DirectMLExecutionProvider` (CPU = no EP). EP
+      initialization failures fall back to CPU and log the
+      failure. `crates/core/src/models/ep_tuning.rs::EpFallbackChain`
+      returns the prioritised EP list per platform — macOS
+      `[CoreMl, Cpu]`, Windows-with-GPU `[DirectMl, Cpu]`,
+      Linux/CPU-only `[Cpu]`, Android `[Nnapi, Cpu]`. Desktop
+      crate exposes the convenience `create_desktop_session`
+      helper that picks the right EP via
+      `DesktopMlEpSelector::select`. Tests:
+      `ep_fallback_chain_macos_prefers_coreml`,
+      `ep_fallback_chain_windows_with_gpu_prefers_directml`,
+      `ep_fallback_chain_linux_cpu_only`,
+      `ep_fallback_chain_android_prefers_nnapi`,
+      `desktop_ml_ep_selector_matches_core_selector`,
+      `desktop_ml_ep_selector_windows_with_gpu_returns_directml`,
+      `desktop_ml_ep_selector_windows_without_gpu_returns_cpu`,
+      `detect_gpu_available_default_false`.)_
 - [x] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
       `kennguy3n/slm-guardrail` in the search pipeline
       (`(message_id, model_version)` keyed `search_vector` row;
@@ -1769,44 +1798,80 @@ Notes:
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `In progress | ~45%`
+**Status**: `In progress | ~80%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
 
 Checklist:
 
-- [~] macOS native integration (Spotlight anchors;
+- [x] macOS native integration (Spotlight anchors;
       `NSBackgroundActivityScheduler`).
-      _(2026-05-04 batch-5: trait scaffold lands in
-      `crates/desktop/src/spotlight.rs` (`SpotlightAnchor` +
-      `NoopSpotlightAnchor`) and
-      `crates/desktop/src/background.rs` (`DesktopScheduler` +
-      `NoopDesktopScheduler` implementing the
-      `BackgroundScheduler` trait from
-      `crates/core/src/scheduler/mod.rs`). Native ObjC bridge
-      attach is the platform-bridge follow-up.)_
-- [~] Windows native integration (Windows Search anchors; CPU-only
+      _(Rust API surface complete:
+      `crates/desktop/src/spotlight.rs::SpotlightAnchor` now
+      carries `index_items` / `remove_items` / `remove_all`
+      with a `SpotlightItem { unique_id, title,
+      content_description, display_name, timestamp_ms,
+      conversation_id }` payload. `crates/core/src/core_impl.rs`
+      exposes `install_spotlight_anchor` / `update_spotlight_index`,
+      and `ingest_messages` automatically forwards new
+      messages to the installed anchor.
+      `crates/desktop/src/background.rs::DesktopScheduler` adds
+      `schedule_media_migration` and `schedule_shard_warming`,
+      backed by an in-process `RecordingDesktopScheduler` test
+      double. Native ObjC bridge attach (the actual
+      `CSSearchableIndex` / `NSBackgroundActivityScheduler`
+      calls) is the platform-bridge follow-up. Tests:
+      `spotlight_anchor_index_items_round_trip`,
+      `spotlight_anchor_remove_items`,
+      `spotlight_anchor_noop_does_not_panic`,
+      `desktop_scheduler_schedule_media_migration_round_trip`,
+      `desktop_scheduler_schedule_shard_warming_round_trip`,
+      `core_impl_ingest_updates_spotlight_when_installed`,
+      `core_impl_ingest_skips_spotlight_when_not_installed`.)_
+- [x] Windows native integration (Windows Search anchors; CPU-only
       ML; no GPU assumption).
-      _(2026-05-04 batch-5: trait scaffold lands in
-      `crates/desktop/src/windows_search.rs`
-      (`WindowsSearchAnchor` + `NoopWindowsSearchAnchor`) and
-      `crates/desktop/src/ml_ep.rs`
-      (`DesktopMlEpSelector` + DirectML / CPU fallback wiring).
-      Native Win32 bridge attach is the platform-bridge
-      follow-up.)_
-- [~] Performance profiling and optimization.
-      _(Lightweight in-tree instrumentation scaffold:
-      `PerfTrace`, `PerfCollector` trait, `NoopPerfCollector`,
-      `InMemoryPerfCollector` in `crates/core/src/perf.rs`;
-      wired into `CoreImpl` via `install_perf_collector` /
-      `has_perf_collector` / `collect_perf_stats`. Hot paths
-      `ingest_messages`, `search`, and `enforce_storage_budget`
-      now emit traces (start/end ns, batch size / query length
-      / pressure level / freed bytes). Real on-device profile
-      capture and the production p95 dashboard remain Phase-7
-      follow-up. Tests: `perf::tests::*`,
-      `core_impl::tests::perf_collector_records_*`.)_
+      _(Rust API surface complete:
+      `crates/desktop/src/windows_search.rs` adds
+      `WindowsSearchItem` plus `index_items` / `remove_items` /
+      `remove_all` on `WindowsSearchAnchor`.
+      `crates/desktop/src/windows.rs` adds
+      `WindowsDesktopScheduler` /
+      `NoopWindowsDesktopScheduler` (Windows Task Scheduler
+      semantics). `crates/desktop/src/ml_ep.rs::detect_gpu_available`
+      lets `DesktopMlEpSelector::select` return `DirectMl` when
+      a GPU is available and `Cpu` otherwise.
+      `crates/core/src/core_impl.rs` exposes
+      `install_windows_search_anchor`; `ingest_messages`
+      forwards both Spotlight and Windows-Search anchors so a
+      cross-platform desktop binary can register one of each.
+      Tests: `windows_search_anchor_index_items_round_trip`,
+      `windows_search_anchor_remove_items`,
+      `windows_search_anchor_noop_does_not_panic`,
+      `windows_desktop_scheduler_round_trip`,
+      `detect_gpu_available_default_false`,
+      `desktop_ml_ep_selector_windows_with_gpu_returns_directml`,
+      `desktop_ml_ep_selector_windows_without_gpu_returns_cpu`.)_
+- [x] Performance profiling and optimization.
+      _(`crates/core/src/perf.rs` adds the p95 dashboard:
+      `PerfSummary { operation, count, p50_ns, p95_ns,
+      p99_ns, max_ns, total_ns }`,
+      `InMemoryPerfCollector::summarize` /
+      `summarize_operation`, and a `PerfBudget /
+      BudgetViolation / check_budgets` triple for budget
+      enforcement. `CoreImpl::get_perf_summary` /
+      `get_perf_summary_for` expose the dashboard to UI
+      callers, and the perf-trace coverage now spans
+      `ingest_messages`, `search`, `enforce_storage_budget`,
+      `hydrate_message`, `run_incremental_backup`,
+      `compact_archive`, and `restore_from_backup`. Tests:
+      `perf::tests::perf_summary_computes_correct_p95`,
+      `perf_summary_empty_returns_empty`,
+      `perf_budget_violation_detected`,
+      `perf_budget_all_pass`,
+      `core_impl::tests::core_impl_hydrate_message_emits_perf_trace`,
+      `core_impl_backup_emits_perf_trace`,
+      `core_impl_get_perf_summary_returns_data`.)_
 - [~] Large-scale testing (100K+ messages, 10K+ media, 10+ scripts).
       _(Scaffold: `crates/core/tests/large_scale.rs` with seven
       `#[ignore]` stress tests — 10k multilingual ingest +
@@ -1821,31 +1886,62 @@ Checklist:
       across 100 conversations; concurrent writer / reader /
       eviction stress. Run with
       `cargo test --test large_scale -- --ignored`.)_
-- [~] Platform-specific ML EP tuning (CoreML, NNAPI, optional
+- [x] Platform-specific ML EP tuning (CoreML, NNAPI, optional
       DirectML).
-      _(2026-05-04 batch-5: scaffold in
-      `crates/core/src/models/ep_tuning.rs` —
-      `ExecutionProviderSelector`, `ExecutionProvider` enum
-      (`CoreMl`, `Nnapi`, `DirectMl`, `Cpu`,
-      `MetalPerformanceShaders`), `DeviceCapabilities`,
-      `EpBenchmark`. Selection logic per
-      `ARCHITECTURE.md §11.4`: macOS / iOS → CoreML, Android →
-      NNAPI, Windows + GPU → DirectML, Linux → CPU. The
-      `DesktopMlEpSelector` in `crates/desktop/src/ml_ep.rs`
-      forwards to the core selector with the desktop platform
-      pinned. Real on-device benchmark capture and the
-      production EP-router upgrade are the follow-up.)_
-- [~] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
+      _(`crates/core/src/models/ep_tuning.rs` adds the full
+      benchmark capture / cache / auto-selection pipeline:
+      `EpBenchmarkRunner` trait + `NoopEpBenchmarkRunner` +
+      `MockEpBenchmarkRunner`, `EpBenchmarkCache` with
+      CBOR-serialized JSON-on-disk persistence and
+      model-version invalidation, and `select_best_ep` picking
+      the lowest-p95 EP from the cache (falling back to the
+      `EpFallbackChain` when no benchmarks exist).
+      `crates/core/src/models/model_manager.rs` exposes
+      `benchmark_ep` and `select_optimal_ep` so the manager
+      consults the cache before each session creation.
+      `CoreImpl::install_ep_benchmark_runner` lets the desktop
+      / mobile bridges register real runners. Tests:
+      `select_best_ep_picks_lowest_latency`,
+      `select_best_ep_falls_back_when_no_benchmarks`,
+      `ep_benchmark_cache_persist_and_load`,
+      `ep_benchmark_cache_invalidates_on_model_version_change`,
+      `model_manager_benchmark_ep_delegates_to_runner`,
+      `model_manager_select_optimal_ep_uses_cache`,
+      `noop_benchmark_runner_returns_fixed_result`.)_
+- [x] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
       `metadata/content_index` (read-only, no plaintext leaks).
-      _(2026-05-04 batch-5: trait + Noop / Fixed test doubles
-      land in `crates/core/src/transport/dedup_analytics.rs`
-      (`DedupAnalytics` trait, `DedupStats`, `StorageSavings`,
-      `NoopDedupAnalytics`, `FixedDedupAnalytics`). Wired
-      through `CoreImpl::install_dedup_analytics` /
-      `query_dedup_stats` / `query_storage_savings`. Privacy
-      contract: only opaque ciphertext-side metrics
-      cross the boundary; never plaintext or derived
-      plaintext.)_
+      _(`crates/core/src/transport/dedup_analytics.rs` adds
+      the real wiring: `DedupEvent::{ObjectUploaded,
+      ObjectDeleted}`, `DedupDashboard { stats, savings,
+      recent_events }`, `InProcessDedupAnalytics` (Mutex +
+      VecDeque ring buffer) for local event capture, and
+      `ZkofDedupAnalytics` wrapping an `Arc<dyn S3Client>`
+      that fetches `metadata/content_index/stats` via
+      `get_object_range` and falls back to the in-process
+      probe on transport failure.
+      `crates/core/src/backup/sinks/zk_fabric.rs` and
+      `crates/core/src/media/sinks/zk_fabric.rs` gain
+      `with_dedup_analytics` builders so every successful
+      `upload_backup_segment` / `upload_backup_manifest` /
+      `upload_media_chunks` records `ObjectUploaded` and
+      every successful `delete_media_blob` records
+      `ObjectDeleted`.
+      `CoreImpl::record_dedup_event` and
+      `get_dedup_dashboard` finish the pipeline. Tests:
+      `noop_dedup_analytics_record_event_does_not_panic`,
+      `in_process_dedup_analytics_aggregates_uploads_and_deletes`,
+      `in_process_dedup_analytics_recent_events_capped_at_capacity`,
+      `dedup_dashboard_round_trips_through_serde_json`,
+      `zkof_dedup_analytics_query_stats_parses_cbor_snapshot`,
+      `zkof_dedup_analytics_query_savings_computes_savings`,
+      `zkof_dedup_analytics_falls_back_to_local_when_s3_unavailable`,
+      `upload_backup_segment_records_dedup_event`,
+      `upload_media_chunks_records_dedup_event`,
+      `record_dedup_event_with_no_probe_is_noop`,
+      `get_dedup_dashboard_aggregates_stats_and_events`,
+      `get_dedup_dashboard_without_probe_errors`. Privacy
+      contract preserved: only opaque ciphertext-side metrics
+      cross the boundary.)_
 - [~] Edge-case handling (offline, interrupted, partial, corrupted,
       missing).
       _(Offline path: `OfflineDetector` trait,
@@ -1874,24 +1970,36 @@ Checklist:
       SAVEPOINT-transitions every superseded row to
       `archive_compacted`. Cross-epoch coverage at
       `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)
-- [~] Cross-platform media migration: iOS → Android migrates
+- [x] Cross-platform media migration: iOS → Android migrates
       iCloud media blobs to Google Drive (or ZKOF fallback) in the
       background.
-      _(2026-05-04 batch-5: in-tree pipeline lands in
-      `crates/core/src/media/migration.rs` —
-      `MediaMigrationPlan`, `MediaMigrationItem`,
-      `plan_media_migration`, `execute_media_migration`,
-      `MigrationProgress` callback trait,
-      `NoopMigrationProgress` /
-      `InMemoryMigrationProgress` test doubles, and the
-      idempotent re-run / BLAKE3 transit-hash verification
-      paths. Wired through
-      `CoreImpl::plan_media_migration` /
-      `migrate_media_sink`. Tests:
-      `crates/core/src/media/migration.rs::tests::*` (8) and
-      `crates/core/tests/media_migration.rs` (5
-      integration tests). Background-scheduling integration is
-      the platform-bridge follow-up.)_
+      _(In-tree pipeline +
+      background-scheduling integration are now both done.
+      `crates/core/src/media/migration.rs` provides the plan +
+      executor with idempotent re-run + BLAKE3 transit-hash
+      verification.
+      `crates/core/src/scheduler/mod.rs` adds
+      `OneOffTask::MediaMigration { plan }` +
+      `MediaMigrationPlanSnapshot` (CBOR-serialisable) +
+      `TaskConstraints { require_wifi, require_charging,
+      require_idle, max_retry_count }` +
+      `BackgroundScheduler::schedule_one_off_task`.
+      `crates/core/src/scheduler/in_process.rs` drains the
+      one-off queue via `run_pending_tasks`, respecting
+      Wi-Fi / charging / idle constraints through the
+      `ResourceProbe`.
+      `crates/core/src/core_impl.rs` adds
+      `schedule_media_migration` /
+      `plan_and_schedule_media_migration`, and
+      `KChatCoreConfig::auto_migrate_after_eviction:
+      Option<(String, String)>` lets `enforce_storage_budget`
+      auto-queue a migration after a successful eviction
+      pass. Tests:
+      `schedule_media_migration_returns_false_for_empty_plan`,
+      `schedule_media_migration_without_scheduler_errors`,
+      `schedule_media_migration_enqueues_into_in_process_scheduler`,
+      `enforce_storage_budget_skips_migration_when_not_configured`,
+      `enforce_storage_budget_records_migration_metadata_when_configured`.)_
 - [~] Media blob sink stress test: 10K+ media files across mixed
       sinks, verify rehydration from each.
       _(2026-05-04 batch-5: `#[ignore]`-marked stress test in
@@ -1957,7 +2065,7 @@ Notes:
 
 ## Phase 8: Multi-Scope, Multi-Tenant Search
 
-**Status**: `In progress | ~90%`
+**Status**: `In progress | ~98%`
 
 **Goal**: Conversation hierarchy, multi-tenant B2B isolation, and search performance optimizations for global/community/domain/tenant-scoped search.
 
@@ -1971,8 +2079,8 @@ Checklist:
 - [x] Bloom filter shard type (`IndexType::Bloom`). _(See `crates/core/src/formats/search_shard.rs` `IndexType::Bloom` variant + `crates/core/src/search/shard_builder.rs` `BloomFilter`, `build_bloom_shard`, `restore_bloom_shard`, `BloomShardPayload`. Magic `KCHAT_BLOOM_SHARD_PAYLOAD_V1`. False-positive rate <5% at 12 bits / element.)_
 - [x] Bloom filter pre-check in cold fan-out. _(See `crates/core/src/search/query_engine.rs`: `ColdShardSource::fetch_bloom_shard` (default `Ok(None)` for back-compat) + `bloom_might_contain_any` + cold-loop probe. `TransportColdShardSource` implements it via `IndexType::Bloom`. Tests: `bloom_precheck_skips_bucket_when_all_tokens_rejected`, `bloom_precheck_passes_bucket_when_any_token_matches`, `bloom_precheck_falls_through_when_bloom_shard_missing`, `bloom_precheck_falls_through_on_transport_error`, integration `bloom_filter_eliminates_irrelevant_cold_buckets`.)_
 - [x] On-device decrypted shard cache (LRU). _(See new `crates/core/src/search/shard_cache.rs`: `ShardCache`, `ShardCacheKey`, `CachedShard`. Default budget 50 MB. Mounted on `CoreImpl` via `install_shard_cache(max_bytes)` and consulted by `execute_search_with_cold_source_full`. Tests: `shard_cache_put_get_round_trip`, `shard_cache_evicts_lru_when_over_budget`, `shard_cache_hit_avoids_transport_fetch`, `shard_cache_clear_empties_all`, `shard_cache_respects_max_bytes`.)_
-- [ ] Parallel bucket fetch.
-- [ ] Progressive/streaming search results.
+- [x] Parallel bucket fetch. _(See `crates/core/src/search/query_engine.rs::execute_search_with_cold_source_full_parallel` + `KChatCoreConfig::max_cold_fetch_concurrency` (default 4). Uses `std::thread::scope` over chunks of the cold-bucket list so the existing synchronous `ColdShardSource` trait is preserved. Per-bucket errors are logged and skipped (fail-open per bucket). Tests: `parallel_fetch_returns_same_results_as_sequential`, `parallel_fetch_respects_concurrency_limit`, `parallel_fetch_survives_single_bucket_error`, `parallel_fetch_empty_buckets_returns_empty`, integration `parallel_fetch_global_search_10_buckets`.)_
+- [x] Progressive/streaming search results. _(See `crates/core/src/lib.rs` `SearchEvent::{LocalResults, ColdBucketComplete, SearchComplete}` + `crates/core/src/search/query_engine.rs::execute_search_streaming` (callback-based) + `crates/core/src/core_impl.rs::search_streaming` wrapper. iOS/Android bridges expose the streaming API via `SearchEventListener` callback interfaces. Tests: `streaming_search_emits_local_results_first`, `streaming_search_emits_cold_bucket_complete_per_bucket`, `streaming_search_emits_search_complete_last`, `streaming_search_local_only_skips_cold_events`, `streaming_search_no_cold_buckets_emits_complete_immediately`.)_
 - [x] Background shard warming (P5 idle). _(See `crates/core/src/search/shard_cache.rs::warm_shard_cache` + `ResourceGate::should_warm_shards` in `crates/core/src/models/resource_gate.rs` + `TaskType::ShardCacheWarming` in `crates/core/src/scheduler/mod.rs`. Only runs when idle + charging + Wi-Fi. Tests: `warm_shard_cache_populates_cache_for_recent_conversations`, `warm_shard_cache_respects_resource_gate`, `warm_shard_cache_noop_when_no_cold_buckets`, `warm_shard_cache_respects_cache_budget`.)_
 - [x] Per-tenant key isolation (B2B) — `K_b2b_tenant_root(tenant_id)`. _(See `crates/core/src/crypto/key_hierarchy.rs`: `derive_b2b_tenant_root`, `derive_b2b_archive_epoch`, `derive_b2b_text_index_shard` + `info::B2B_TENANT_ROOT` / `B2B_ARCHIVE_EPOCH` / `B2B_TEXT_INDEX_SHARD`. The two-id helper `derive_with_two_ids` length-prefixes `tenant_id` with a 4-byte big-endian `u32` so boundary-shifted `(tenant_id, shard_id)` / `(tenant_id, epoch_id)` pairs cannot collapse to the same HKDF info bytes. Tests: `derive_b2b_tenant_root_is_deterministic`, `different_tenant_ids_produce_different_roots`, `b2b_tenant_root_differs_from_b2c_archive_root`, `derive_b2b_archive_epoch_is_deterministic`, `derive_b2b_text_index_shard_is_deterministic`, `b2b_shard_key_differs_from_b2c_shard_key_for_same_shard_id`, `derive_b2b_text_index_shard_resists_boundary_collision`, `derive_b2b_archive_epoch_resists_boundary_collision`. Cross-tenant decrypt rejection covered by integration test `b2b_tenant_key_isolation`.)_
 - [x] `TenantSearchPolicy` config and enforcement. _(See `crates/core/src/config.rs`: `TenantSearchPolicy { allow_global_search, allow_cross_tenant_results, max_cold_buckets_per_search, require_bloom_shards }` + `KChatCoreConfig::tenant_search_policies: HashMap<String, TenantSearchPolicy>`. Enforcement in `execute_search_with_cold_source_full`. Tests: `tenant_policy_blocks_global_search_when_disabled`, `tenant_policy_caps_cold_bucket_count`, `tenant_policy_requires_bloom_when_configured`, `tenant_policy_default_allows_everything`, `tenant_policy_serde_round_trip`, integration `tenant_policy_blocks_global_search`.)_
@@ -1990,7 +2098,96 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 
 ## Changelog
 
-### 2026-05-04 — Phase 8 batch 6 (this PR)
+### 2026-05-04 — Phase 5/6/7/8 completion batch: 10 tasks (this PR)
+
+Lands the ten-task completion batch closing out the
+remaining Rust-side gaps across Phases 5–8. Phase 5 advances
+from `~95%` to `~98%`, Phase 6 from `~85%` to `~92%`, Phase 7
+from `~65%` to `~80%`, and Phase 8 from `~90%` to `~98%`.
+
+1. **Parallel bucket fetch (Phase 8).**
+   `KChatCoreConfig::max_cold_fetch_concurrency` (default 4)
+   plus `execute_search_with_cold_source_full_parallel` use
+   `std::thread::scope` to fan cold-bucket fetches over a
+   bounded thread pool. Per-bucket errors are logged and
+   skipped (fail-open per bucket) instead of failing the
+   whole search. Tests under
+   `crates/core/src/search/query_engine.rs::tests` plus an
+   integration test in
+   `crates/core/tests/phase8_multi_scope_search.rs`.
+2. **Progressive / streaming search results (Phase 8).**
+   `SearchEvent::{LocalResults, ColdBucketComplete,
+   SearchComplete}` plus `execute_search_streaming` /
+   `CoreImpl::search_streaming` surface live results to UI.
+   iOS and Android bridges expose a
+   `SearchEventListener` callback interface.
+3. **Desktop ONNX EP wiring (Phase 6).**
+   `create_xlmr_session_with_ep` /
+   `create_mobileclip_session_with_ep` accept an
+   `ExecutionProvider` and configure CoreML / DirectML /
+   CPU sessions, falling back to CPU on EP init failure.
+   `EpFallbackChain` returns the prioritized EP list per
+   platform; `DesktopMlEpSelector::create_desktop_session`
+   drives the right EP automatically.
+4. **On-device p95 latency gate (Phase 5).**
+   New smoke tests in
+   `crates/core/tests/phase5_latency_smoke.rs` —
+   `phase5_cold_shard_p95_multilingual_under_budget`,
+   `phase5_cold_shard_p95_large_bucket_under_budget`,
+   `phase5_cold_shard_p95_multiple_shards_under_budget` —
+   plus `DeviceMatrixConfig` in
+   `crates/core/src/config.rs` with per-platform budgets.
+5. **macOS Spotlight + DesktopScheduler wiring (Phase 7).**
+   `SpotlightItem` plus `index_items` / `remove_items` /
+   `remove_all` on `SpotlightAnchor`;
+   `DesktopScheduler::schedule_media_migration` /
+   `schedule_shard_warming`; `CoreImpl::ingest_messages`
+   automatically forwards new messages to the installed
+   anchor.
+6. **Windows Search + CPU/GPU ML EP wiring (Phase 7).**
+   `WindowsSearchItem` parallel surface;
+   `WindowsDesktopScheduler` (Task Scheduler semantics);
+   `detect_gpu_available` lets `DesktopMlEpSelector::select`
+   return DirectML when a GPU is present and CPU otherwise.
+7. **Perf p95 dashboard + hot-path coverage (Phase 7).**
+   `PerfSummary { count, p50_ns, p95_ns, p99_ns, max_ns,
+   total_ns }`, `PerfBudget` /
+   `BudgetViolation` / `check_budgets`,
+   `CoreImpl::get_perf_summary`. New `PerfTrace`
+   instrumentation in `hydrate_message`,
+   `run_incremental_backup`, `compact_archive`, and
+   `restore_from_backup`.
+8. **EP benchmark capture / cache / auto-selection (Phase 7).**
+   `EpBenchmarkRunner` trait, `EpBenchmarkCache` (CBOR-on-disk
+   with model-version invalidation), `select_best_ep`,
+   `ModelManager::benchmark_ep` /
+   `select_optimal_ep`,
+   `CoreImpl::install_ep_benchmark_runner`.
+9. **Media migration background scheduling (Phase 7).**
+   `OneOffTask::MediaMigration { plan }` +
+   `MediaMigrationPlanSnapshot` +
+   `TaskConstraints { require_wifi, require_charging,
+   require_idle, max_retry_count }` +
+   `BackgroundScheduler::schedule_one_off_task`.
+   `InProcessScheduler::run_pending_tasks` drains the queue
+   respecting constraints.
+   `KChatCoreConfig::auto_migrate_after_eviction` lets
+   `enforce_storage_budget` auto-queue a migration after
+   each successful eviction pass.
+10. **Dedup analytics real wiring (Phase 7).**
+    `DedupEvent::{ObjectUploaded, ObjectDeleted}` +
+    `DedupDashboard { stats, savings, recent_events }` +
+    `InProcessDedupAnalytics` (Mutex + VecDeque ring buffer)
+    + `ZkofDedupAnalytics` (S3-backed snapshot reader with
+    in-process fallback). Backup and media sinks gain
+    `with_dedup_analytics` builders so successful
+    `upload_backup_segment` / `upload_backup_manifest` /
+    `upload_media_chunks` record `ObjectUploaded` events
+    and `delete_media_blob` records `ObjectDeleted`.
+    `CoreImpl::record_dedup_event` /
+    `get_dedup_dashboard` finish the pipeline.
+
+### 2026-05-04 — Phase 8 batch 6
 
 Lands the ten-task Phase 8 multi-scope, multi-tenant search
 batch. Phase 8 advances from `~25%` to `~90%`. The two

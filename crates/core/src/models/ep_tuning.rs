@@ -346,6 +346,285 @@ impl EpSelector for NoopEpSelector {
     }
 }
 
+/// Phase 6 (2026-05-04 batch 10) — Task 3: prioritized list of
+/// execution providers to try when constructing an ONNX session.
+///
+/// `docs/ARCHITECTURE.md §11.4` calls for the desktop / mobile
+/// model bridges to attempt their preferred accelerator EP
+/// first, then *fall back* to CPU on EP-initialization failure.
+/// [`ExecutionProviderSelector::select_ep`] only returns the
+/// preferred EP — it does not encode the fallback ladder. This
+/// type does.
+///
+/// ## Per-platform chains
+///
+/// * **macOS / iOS**: `[CoreMl, Cpu]` when an accelerator is
+///   present, otherwise `[Cpu]`.
+/// * **Android**: `[Nnapi, Cpu]` when an accelerator is present,
+///   otherwise `[Cpu]`.
+/// * **Windows**: `[DirectMl, Cpu]` when a GPU is present,
+///   otherwise `[Cpu]`.
+/// * **Linux / Unknown**: `[Cpu]`.
+///
+/// The chain is always non-empty — the last entry is always
+/// [`ExecutionProvider::Cpu`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpFallbackChain {
+    eps: Vec<ExecutionProvider>,
+}
+
+impl EpFallbackChain {
+    /// Build the fallback chain for the supplied platform /
+    /// capabilities pair.
+    pub fn for_platform(platform: Platform, capabilities: &DeviceCapabilities) -> Self {
+        let selector = ExecutionProviderSelector::new();
+        let preferred = selector.select_ep(platform, capabilities);
+        let mut eps = Vec::new();
+        if preferred != ExecutionProvider::Cpu {
+            eps.push(preferred);
+        }
+        eps.push(ExecutionProvider::Cpu);
+        Self { eps }
+    }
+
+    /// Iterate over the chain in priority order (most-preferred
+    /// EP first, CPU last).
+    pub fn as_slice(&self) -> &[ExecutionProvider] {
+        &self.eps
+    }
+
+    /// Most-preferred EP — always equal to
+    /// `as_slice().first().unwrap()`.
+    pub fn primary(&self) -> ExecutionProvider {
+        self.eps[0]
+    }
+
+    /// Final fallback EP — always
+    /// [`ExecutionProvider::Cpu`].
+    pub fn cpu_fallback(&self) -> ExecutionProvider {
+        *self.eps.last().expect("chain is non-empty by construction")
+    }
+}
+
+// ---------------------------------------------------------------
+// Phase 7 (2026-05-04 batch 10) — Task 8: on-device EP benchmark
+// capture + persistent cache + auto-selection.
+// ---------------------------------------------------------------
+
+/// Object-safe trait the orchestration layer calls into to
+/// measure how a model performs under a particular execution
+/// provider. Production implementations spin up a real
+/// `ort::Session`; tests use [`NoopEpBenchmarkRunner`] or build
+/// a deterministic [`MockEpBenchmarkRunner`].
+pub trait EpBenchmarkRunner: Send + Sync + std::fmt::Debug {
+    /// Measure the supplied `(ep, model)` combination and return
+    /// the resulting [`EpBenchmark`]. Errors propagate so the
+    /// caller can fall back to the next EP in the chain when an
+    /// accelerator EP fails to initialize.
+    fn run_benchmark(
+        &self,
+        ep: ExecutionProvider,
+        model: &crate::models::model_manager::ModelArtifact,
+    ) -> std::result::Result<EpBenchmark, crate::Error>;
+}
+
+/// Noop benchmark runner — every call returns the same fixed
+/// benchmark. Useful when the platform bridge cannot run a real
+/// inference (CI, headless smoke tests).
+#[derive(Debug, Clone, Copy)]
+pub struct NoopEpBenchmarkRunner {
+    /// Latency reported in the synthetic benchmark.
+    pub median_latency_us: u64,
+    /// Sample count reported in the synthetic benchmark.
+    pub samples: u32,
+}
+
+impl Default for NoopEpBenchmarkRunner {
+    fn default() -> Self {
+        Self {
+            median_latency_us: 1_000,
+            samples: 1,
+        }
+    }
+}
+
+impl EpBenchmarkRunner for NoopEpBenchmarkRunner {
+    fn run_benchmark(
+        &self,
+        ep: ExecutionProvider,
+        _model: &crate::models::model_manager::ModelArtifact,
+    ) -> std::result::Result<EpBenchmark, crate::Error> {
+        Ok(EpBenchmark::new(
+            Platform::Unknown,
+            ep,
+            self.median_latency_us,
+            self.samples,
+        ))
+    }
+}
+
+/// Mock runner that returns hardcoded latencies per EP. Used by
+/// unit tests to drive [`select_best_ep`] without spinning up a
+/// real ONNX session.
+#[derive(Debug, Default, Clone)]
+pub struct MockEpBenchmarkRunner {
+    /// `(ep, latency_us)` pairs the runner reports verbatim.
+    pub latencies: std::collections::HashMap<ExecutionProvider, u64>,
+}
+
+impl MockEpBenchmarkRunner {
+    /// Construct an empty mock runner.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the synthetic latency for `ep`. Returns `self` so the
+    /// builder can be chained.
+    pub fn with_latency(mut self, ep: ExecutionProvider, latency_us: u64) -> Self {
+        self.latencies.insert(ep, latency_us);
+        self
+    }
+}
+
+impl EpBenchmarkRunner for MockEpBenchmarkRunner {
+    fn run_benchmark(
+        &self,
+        ep: ExecutionProvider,
+        _model: &crate::models::model_manager::ModelArtifact,
+    ) -> std::result::Result<EpBenchmark, crate::Error> {
+        let latency = self.latencies.get(&ep).copied().unwrap_or(10_000);
+        Ok(EpBenchmark::new(Platform::Unknown, ep, latency, 1))
+    }
+}
+
+/// Persistent cache of `(ep, model_id) → EpBenchmark` mappings.
+///
+/// Production callers persist the cache to a JSON file on disk so
+/// the auto-selection decision survives process restarts.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EpBenchmarkCache {
+    /// Optional model-version stamp the cache is valid for. When
+    /// the orchestration layer rotates the underlying model
+    /// artifact, [`Self::invalidate_for_model_version_change`]
+    /// drops every entry whose stored version no longer matches.
+    pub model_version: Option<String>,
+    /// `(ep, model_id) → EpBenchmark` map. The map is keyed by
+    /// `(EP, model_id)` because the same EP can have very
+    /// different latency profiles for different models.
+    pub entries: Vec<EpBenchmarkCacheEntry>,
+}
+
+/// One cached benchmark entry — `(ep, model_id, benchmark)`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EpBenchmarkCacheEntry {
+    /// EP the entry was recorded under.
+    pub ep: ExecutionProvider,
+    /// Model id the entry was recorded for.
+    pub model_id: String,
+    /// Recorded benchmark.
+    pub benchmark: EpBenchmark,
+}
+
+impl EpBenchmarkCache {
+    /// Construct an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert (or replace) the benchmark for `(ep, model_id)`.
+    pub fn insert(&mut self, ep: ExecutionProvider, model_id: &str, benchmark: EpBenchmark) {
+        self.entries
+            .retain(|e| !(e.ep == ep && e.model_id == model_id));
+        self.entries.push(EpBenchmarkCacheEntry {
+            ep,
+            model_id: model_id.to_string(),
+            benchmark,
+        });
+    }
+
+    /// Lookup the benchmark for `(ep, model_id)`.
+    pub fn get(&self, ep: ExecutionProvider, model_id: &str) -> Option<&EpBenchmark> {
+        self.entries
+            .iter()
+            .find(|e| e.ep == ep && e.model_id == model_id)
+            .map(|e| &e.benchmark)
+    }
+
+    /// Every cached benchmark for the supplied `model_id`.
+    pub fn benchmarks_for_model(&self, model_id: &str) -> Vec<EpBenchmark> {
+        self.entries
+            .iter()
+            .filter(|e| e.model_id == model_id)
+            .map(|e| e.benchmark.clone())
+            .collect()
+    }
+
+    /// Persist the cache to `path` as CBOR. CBOR is used (not
+    /// JSON) because the core crate already depends on
+    /// `serde_cbor` and CBOR survives schema evolution slightly
+    /// more gracefully for this kind of typed cache.
+    pub fn persist_to_path(&self, path: &std::path::Path) -> std::result::Result<(), crate::Error> {
+        let bytes = serde_cbor::to_vec(self)
+            .map_err(|e| crate::Error::Storage(format!("ep-cache serialize: {e}")))?;
+        std::fs::write(path, bytes)
+            .map_err(|e| crate::Error::Storage(format!("ep-cache write {}: {e}", path.display())))
+    }
+
+    /// Load a cache from `path`. A missing file resolves to an
+    /// empty cache.
+    pub fn load_from_path(path: &std::path::Path) -> std::result::Result<Self, crate::Error> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|e| crate::Error::Storage(format!("ep-cache read {}: {e}", path.display())))?;
+        serde_cbor::from_slice(&bytes)
+            .map_err(|e| crate::Error::Storage(format!("ep-cache parse: {e}")))
+    }
+
+    /// Drop every entry whose `model_version` does not match
+    /// `current`. Updates [`Self::model_version`] to `current`
+    /// after the prune.
+    pub fn invalidate_for_model_version_change(&mut self, current: &str) {
+        if self.model_version.as_deref() != Some(current) {
+            self.entries.clear();
+            self.model_version = Some(current.to_string());
+        }
+    }
+}
+
+/// Pick the EP with the lowest median latency from `benchmarks`.
+/// Falls back to the first entry of `fallback_chain` if no
+/// benchmark is provided. The returned EP is guaranteed to be
+/// present in `fallback_chain` when the chain is non-empty.
+pub fn select_best_ep(
+    benchmarks: &[EpBenchmark],
+    fallback_chain: &[ExecutionProvider],
+) -> ExecutionProvider {
+    // Restrict candidates to EPs the platform actually supports
+    // (anything in the fallback chain).
+    let chain_set: std::collections::HashSet<ExecutionProvider> =
+        fallback_chain.iter().copied().collect();
+    let mut best: Option<&EpBenchmark> = None;
+    for b in benchmarks {
+        if !chain_set.contains(&b.ep) {
+            continue;
+        }
+        match best {
+            None => best = Some(b),
+            Some(cur) if b.median_latency_us < cur.median_latency_us => best = Some(b),
+            _ => {}
+        }
+    }
+    if let Some(b) = best {
+        return b.ep;
+    }
+    fallback_chain
+        .first()
+        .copied()
+        .unwrap_or(ExecutionProvider::Cpu)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +800,238 @@ mod tests {
         let json = serde_json::to_string(&caps).unwrap();
         let back: DeviceCapabilities = serde_json::from_str(&json).unwrap();
         assert_eq!(caps, back);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 6 (2026-05-04 batch 10) — Task 3 EpFallbackChain.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn ep_fallback_chain_macos_prefers_coreml() {
+        let chain = EpFallbackChain::for_platform(
+            Platform::MacOs,
+            &DeviceCapabilities::apple_silicon_mac(),
+        );
+        assert_eq!(
+            chain.as_slice(),
+            &[ExecutionProvider::CoreMl, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn ep_fallback_chain_ios_prefers_coreml() {
+        let chain =
+            EpFallbackChain::for_platform(Platform::Ios, &DeviceCapabilities::apple_silicon_ios());
+        assert_eq!(
+            chain.as_slice(),
+            &[ExecutionProvider::CoreMl, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn ep_fallback_chain_windows_with_gpu_prefers_directml() {
+        let chain = EpFallbackChain::for_platform(
+            Platform::Windows,
+            &DeviceCapabilities::windows_with_gpu("nvidia"),
+        );
+        assert_eq!(
+            chain.as_slice(),
+            &[ExecutionProvider::DirectMl, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn ep_fallback_chain_linux_cpu_only() {
+        let chain = EpFallbackChain::for_platform(
+            Platform::Linux,
+            &DeviceCapabilities::cpu_only(Platform::Linux, Arch::X86_64),
+        );
+        assert_eq!(chain.as_slice(), &[ExecutionProvider::Cpu]);
+    }
+
+    #[test]
+    fn ep_fallback_chain_android_prefers_nnapi() {
+        let chain = EpFallbackChain::for_platform(
+            Platform::Android,
+            &DeviceCapabilities::android_with_npu(),
+        );
+        assert_eq!(
+            chain.as_slice(),
+            &[ExecutionProvider::Nnapi, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn ep_fallback_chain_no_accel_is_cpu_only() {
+        let chain = EpFallbackChain::for_platform(Platform::MacOs, &no_accel());
+        assert_eq!(chain.as_slice(), &[ExecutionProvider::Cpu]);
+        assert_eq!(chain.primary(), ExecutionProvider::Cpu);
+        assert_eq!(chain.cpu_fallback(), ExecutionProvider::Cpu);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 8 EP-benchmark tests.
+    // -----------------------------------------------------------
+
+    fn make_bench(ep: ExecutionProvider, latency_us: u64) -> EpBenchmark {
+        EpBenchmark::new(Platform::Unknown, ep, latency_us, 5)
+    }
+
+    #[test]
+    fn select_best_ep_picks_lowest_latency() {
+        let benches = vec![
+            make_bench(ExecutionProvider::Cpu, 4_000),
+            make_bench(ExecutionProvider::CoreMl, 1_000),
+        ];
+        let chain = vec![ExecutionProvider::CoreMl, ExecutionProvider::Cpu];
+        assert_eq!(select_best_ep(&benches, &chain), ExecutionProvider::CoreMl);
+    }
+
+    #[test]
+    fn select_best_ep_falls_back_when_no_benchmarks() {
+        let chain = vec![ExecutionProvider::DirectMl, ExecutionProvider::Cpu];
+        assert_eq!(select_best_ep(&[], &chain), ExecutionProvider::DirectMl);
+    }
+
+    #[test]
+    fn select_best_ep_ignores_eps_outside_chain() {
+        // CoreML benchmark is fastest but the chain doesn't
+        // contain it (e.g. running on Linux). Result should be
+        // chain[0] = Cpu.
+        let benches = vec![make_bench(ExecutionProvider::CoreMl, 100)];
+        let chain = vec![ExecutionProvider::Cpu];
+        assert_eq!(select_best_ep(&benches, &chain), ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn ep_benchmark_cache_persist_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.cbor");
+        let mut cache = EpBenchmarkCache::new();
+        cache.insert(
+            ExecutionProvider::CoreMl,
+            "xlmr",
+            make_bench(ExecutionProvider::CoreMl, 1_500),
+        );
+        cache.persist_to_path(&path).unwrap();
+        let loaded = EpBenchmarkCache::load_from_path(&path).unwrap();
+        assert_eq!(cache, loaded);
+    }
+
+    #[test]
+    fn ep_benchmark_cache_load_missing_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.cbor");
+        let loaded = EpBenchmarkCache::load_from_path(&path).unwrap();
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn ep_benchmark_cache_invalidates_on_model_version_change() {
+        let mut cache = EpBenchmarkCache::new();
+        cache.model_version = Some("xlmr@v1".into());
+        cache.insert(
+            ExecutionProvider::CoreMl,
+            "xlmr",
+            make_bench(ExecutionProvider::CoreMl, 1_500),
+        );
+        cache.invalidate_for_model_version_change("xlmr@v2");
+        assert_eq!(cache.model_version.as_deref(), Some("xlmr@v2"));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn noop_benchmark_runner_returns_fixed_result() {
+        use crate::models::model_manager::{ModelArtifact, Quantization};
+        let runner = NoopEpBenchmarkRunner::default();
+        let artifact = ModelArtifact {
+            model_id: "xlmr".into(),
+            model_version: "xlmr@v1".into(),
+            file_path: std::path::PathBuf::from("/dev/null"),
+            size_bytes: 0,
+            quantization: Quantization::Int8,
+            sha256: [0u8; 32],
+        };
+        let bench = runner
+            .run_benchmark(ExecutionProvider::Cpu, &artifact)
+            .unwrap();
+        assert_eq!(bench.median_latency_us, 1_000);
+        assert_eq!(bench.ep, ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn mock_benchmark_runner_returns_configured_latency() {
+        use crate::models::model_manager::{ModelArtifact, Quantization};
+        let runner = MockEpBenchmarkRunner::new()
+            .with_latency(ExecutionProvider::CoreMl, 800)
+            .with_latency(ExecutionProvider::Cpu, 4_500);
+        let artifact = ModelArtifact {
+            model_id: "xlmr".into(),
+            model_version: "xlmr@v1".into(),
+            file_path: std::path::PathBuf::from("/dev/null"),
+            size_bytes: 0,
+            quantization: Quantization::Int8,
+            sha256: [0u8; 32],
+        };
+        let coreml = runner
+            .run_benchmark(ExecutionProvider::CoreMl, &artifact)
+            .unwrap();
+        assert_eq!(coreml.median_latency_us, 800);
+        let cpu = runner
+            .run_benchmark(ExecutionProvider::Cpu, &artifact)
+            .unwrap();
+        assert_eq!(cpu.median_latency_us, 4_500);
+    }
+
+    #[test]
+    fn model_manager_benchmark_ep_delegates_to_runner() {
+        use crate::models::model_manager::{
+            ModelArtifact, ModelManager, ModelManagerConfig, Quantization,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ModelManagerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..ModelManagerConfig::default()
+        };
+        let mgr = ModelManager::new(cfg);
+        let artifact = ModelArtifact {
+            model_id: "xlmr".into(),
+            model_version: "xlmr@v1".into(),
+            file_path: dir.path().join("xlmr.onnx"),
+            size_bytes: 0,
+            quantization: Quantization::Int8,
+            sha256: [0u8; 32],
+        };
+        mgr.register_model(artifact).unwrap();
+        let runner = MockEpBenchmarkRunner::new().with_latency(ExecutionProvider::Cpu, 4_200);
+        let bench = mgr
+            .benchmark_ep("xlmr", ExecutionProvider::Cpu, &runner)
+            .unwrap();
+        assert_eq!(bench.median_latency_us, 4_200);
+    }
+
+    #[test]
+    fn model_manager_select_optimal_ep_uses_cache() {
+        use crate::models::model_manager::{ModelManager, ModelManagerConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ModelManagerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..ModelManagerConfig::default()
+        };
+        let mgr = ModelManager::new(cfg);
+        let mut cache = EpBenchmarkCache::new();
+        cache.insert(
+            ExecutionProvider::CoreMl,
+            "xlmr",
+            make_bench(ExecutionProvider::CoreMl, 1_500),
+        );
+        cache.insert(
+            ExecutionProvider::Cpu,
+            "xlmr",
+            make_bench(ExecutionProvider::Cpu, 4_000),
+        );
+        let chain = vec![ExecutionProvider::CoreMl, ExecutionProvider::Cpu];
+        let best = mgr.select_optimal_ep("xlmr", &cache, &chain);
+        assert_eq!(best, ExecutionProvider::CoreMl);
     }
 }
