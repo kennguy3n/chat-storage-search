@@ -1082,7 +1082,7 @@ query engine reranks with the multiplicative formula
 
 ```
 rank_score = (BM25_WEIGHT × bm25 + FUZZY_WEIGHT × fuzzy)
-           × recency_weight(age_days)
+           × recency_factor(age_days)
            × content_kind_weight(kind)
 ```
 
@@ -1094,24 +1094,29 @@ The constants live in the same module:
 | ------------------------- | ----- | ------------------------------------------------------- |
 | `BM25_WEIGHT`             | `2.0` | Multiplier on the FTS5 BM25 score                       |
 | `FUZZY_WEIGHT`            | `1.0` | Multiplier on the fuzzy overlap score                   |
-| `RECENCY_WEIGHT`          | `0.5` | Floor on the recency multiplier                         |
+| `RECENCY_WEIGHT`          | `0.5` | Weight on the exponential term (also `1 - W = 0.5` is the asymptotic floor) |
 | `RECENCY_HALF_LIFE_DAYS`  | `30`  | `lambda = ln(2) / 30` — 30-day half-life decay          |
 | `TEXT_KIND_WEIGHT`        | `1.0` | Text messages keep their full BM25 + fuzzy contribution |
 | `MEDIA_KIND_WEIGHT`       | `0.8` | Media is 0.8× since thumbnails / captions are coarser   |
 
-The recency decay is a clamped exponential:
+The recency decay is a linear interpolation between the
+asymptotic floor `1 - RECENCY_WEIGHT = 0.5` and an exponential
+decay with a 30-day half-life:
 
 ```
-recency_weight = max(RECENCY_WEIGHT, exp(-ln(2) × age_days / 30))
+recency_factor = (1 - RECENCY_WEIGHT)
+               + RECENCY_WEIGHT × exp(-ln(2) × age_days / 30)
 ```
 
 so a message authored today scores at `1.0`, a 30-day-old message
-scores at `0.5`, and a six-month-old message floors at the
-constant rather than disappearing entirely. The same decay is
-applied to cold hits via `apply_cold_recency_weight`, so
-local-vs-cold relative ordering is symmetric — a cold hit on a
-recent message can still beat a local hit on an old one if the
-underlying BM25 / fuzzy contributions warrant it.
+scores at `0.75`, a 90-day-old message at ~`0.5625`, and any
+sufficiently-old message asymptotically approaches the
+`1 - RECENCY_WEIGHT = 0.5` floor rather than disappearing
+entirely. The same decay is applied to cold hits via
+`apply_cold_recency_weight`, so local-vs-cold relative ordering
+is symmetric — a cold hit on a recent message can still beat a
+local hit on an old one if the underlying BM25 / fuzzy
+contributions warrant it.
 
 In-module unit tests pin every direction of the formula:
 `ranking_recent_message_outranks_identical_old_message`,

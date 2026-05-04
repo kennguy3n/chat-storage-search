@@ -1451,8 +1451,9 @@ Checklist:
       from `apply_recency_and_kind_weight`.)
 - [x] Ranking formula implementation (PROPOSAL §7.5).
       (`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
-      `RECENCY_WEIGHT = 0.5` (30-day half-life via
-      `lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost
+      `RECENCY_WEIGHT = 0.5` (interpolation weight; asymptotic
+      floor `1 - W = 0.5`), `RECENCY_HALF_LIFE_DAYS = 30`
+      (`lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost
       text 1.0× and damp media 0.8×. In-module tests cover
       `ranking_recent_message_outranks_identical_old_message`,
       `ranking_exact_recent_beats_fuzzy_old`,
@@ -1701,10 +1702,16 @@ clean.
 
 3. **Full ranking formula (recency decay × content-kind
    weight)** (`crates/core/src/search/query_engine.rs`):
-   adds `RECENCY_WEIGHT = 0.5` (30-day half-life via
-   `lambda = ln(2) / 30`) and `CONTENT_KIND_WEIGHTS` (text
-   1.0×, media 0.8×) on top of the existing
-   `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0`.
+   adds `RECENCY_WEIGHT = 0.5` (linear-interpolation weight;
+   asymptotic floor `1 - W = 0.5`),
+   `RECENCY_HALF_LIFE_DAYS = 30` (`lambda = ln(2) / 30`),
+   and `CONTENT_KIND_WEIGHTS` (text 1.0×, media 0.8×) on top
+   of the existing `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0`.
+   The decay computes
+   `recency_factor = (1 - W) + W × exp(-λ × age_days)`, so a
+   message authored today scores 1.0, a 30-day-old message
+   0.75, and any sufficiently-old message asymptotically
+   approaches the 0.5 floor.
    `apply_recency_and_kind_weight` applies the multiplicative
    combination so a recent text hit always outranks an
    identical older one and an exact + recent hit always

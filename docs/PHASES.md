@@ -886,8 +886,9 @@ Checklist:
       formula.)_
 - [x] Ranking formula implementation (PROPOSAL §7.5).
       _(`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
-      `RECENCY_WEIGHT = 0.5` (30-day half-life via
-      `lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost text
+      `RECENCY_WEIGHT = 0.5` (interpolation weight; asymptotic
+      floor `1 - W = 0.5`), `RECENCY_HALF_LIFE_DAYS = 30`
+      (`lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost text
       1.0× and damp media 0.8× — see
       `crates/core/src/search/query_engine.rs` constants and
       `apply_recency_and_kind_weight`; in-module tests cover
