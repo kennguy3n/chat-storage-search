@@ -290,6 +290,7 @@ mod tests {
                     conversation_id: conv,
                     time_bucket: bucket.into(),
                     events: vec![event],
+                    segment_type: crate::formats::SegmentType::MessageDelta,
                 },
                 &[0x44; 32],
             )

@@ -60,7 +60,7 @@ use crate::offload::eviction::{
 };
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
 use crate::search::fuzzy_search::FuzzySearchEngine;
-use crate::search::query_engine::QueryEngine;
+use crate::search::query_engine::{ColdShardSource, QueryEngine};
 use crate::transport::{DeliveryClient, RawDeliveryMessage, TransportClient};
 use crate::{
     BackupResult, BackupSource, ClientMessageId, DeliveryCursor, DeviceRegistration, Error,
@@ -470,6 +470,39 @@ impl CoreImpl {
             self.enqueue_cold_results_for_hydration(&results);
         }
         Ok((results, cold_count))
+    }
+
+    /// Run a unified search with cold-bucket fan-out via
+    /// `cold_source` (Phase 5, Task 1).
+    ///
+    /// The orchestration layer (bridge crate / async runtime) is
+    /// expected to implement [`ColdShardSource`] by querying
+    /// `archive_segment_map` for the `(conversation_id, time_bucket)`
+    /// pairs whose bodies are offloaded but whose search shards live
+    /// on the backend, calling
+    /// [`crate::transport::TransportClient::fetch_index_shards`] for
+    /// each pair × `(text|fuzzy)` shard type, and decrypting each blob
+    /// with [`crate::search::shard_builder::restore_text_search_shard`]
+    /// or [`crate::search::shard_builder::restore_fuzzy_search_shard`].
+    ///
+    /// `CoreImpl::search` keeps the original behavior (local-only with
+    /// cold-flag marking) so callers that haven't wired up a shard
+    /// source still get the offline-first contract. The new method is
+    /// opt-in.
+    pub fn search_with_cold_source(
+        &self,
+        query: SearchQuery,
+        scope: SearchScope,
+        cold_source: &dyn ColdShardSource,
+    ) -> Result<Vec<SearchResult>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let engine = QueryEngine::new(&db);
+        let results = engine.execute_search_with_cold_source(&query, &scope, cold_source)?;
+        drop(db);
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.enqueue_cold_results_for_hydration(&results);
+        }
+        Ok(results)
     }
 
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
@@ -1574,11 +1607,11 @@ impl CoreImpl {
             None
         } else {
             let built = ArchiveSegmentBuilder::new().build_segment(
-                SegmentBuildRequest {
+                SegmentBuildRequest::message_delta(
                     conversation_id,
-                    time_bucket: time_bucket.to_string(),
-                    events: survivors,
-                },
+                    time_bucket.to_string(),
+                    survivors,
+                ),
                 k_compact_segment,
             )?;
             summary.bytes_after += built.ciphertext.len() as u64;
@@ -4105,6 +4138,7 @@ mod tests {
             conversation_id: conv,
             time_bucket: bucket.into(),
             events,
+            segment_type: crate::formats::SegmentType::MessageDelta,
         };
         let built = ArchiveSegmentBuilder::new()
             .build_segment(request, key_bytes)

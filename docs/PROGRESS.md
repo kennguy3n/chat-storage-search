@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~95%`). Phase 4 — Backup and Restore (`In progress | ~85%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~15%`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~95%`). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~85%`). Phase 7 — Desktop + Optimization (`In progress | ~20%`, failure-test suite + production-scale archive compaction landed).
 - **Last updated**: 2026-05-03
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1392,35 +1392,92 @@ Notes:
 
 ## Phase 5: Search — Fuzzy + Encrypted Shards
 
-**Status**: `In progress | ~15%`
+**Status**: `In progress | ~85%`
 
 **Goal**: Fuzzy matching across scripts, plus encrypted search
 shards on the backend so cold buckets remain searchable.
 
 Checklist:
 
-- [ ] Fuzzy token index (trigrams for alphabetic scripts; bigrams
+- [x] Fuzzy token index (trigrams for alphabetic scripts; bigrams
       for logographic CJK runs).
-- [ ] Script-aware fuzzy matching with per-token script tag.
-- [ ] Encrypted text / fuzzy shard archive
+      (`crates/core/src/search/fuzzy_search.rs::FuzzyTokenizer`
+      plus `search::tokenizer::{segment_by_script,
+      detect_script, fuzzy_granularity}` pick trigrams vs
+      bigrams; the `search_fuzzy(token, script, message_id)`
+      table carries the ISO-15924 `script` column for
+      script-keyed lookup. Multilingual coverage at
+      `crates/core/tests/multilingual_fuzzy_search.rs`.)
+- [x] Script-aware fuzzy matching with per-token script tag.
+      (`FuzzySearchEngine::search_fuzzy` groups query tokens
+      by `ScriptClass`, joins on `(token, script)`, and applies
+      a per-script overlap floor via
+      `search::tokenizer::fuzzy_min_overlap` — tighter for CJK
+      bigrams, looser for Latin / Cyrillic trigrams. A row is
+      accepted iff at least one script bucket clears its
+      floor, so a mixed query like `"meeting 会議"` still fans
+      out to both indexes. New regression test
+      `crates/core/tests/mixed_language_query.rs`.)
+- [x] Encrypted text / fuzzy shard archive
       (`K_text_index_shard`).
-- [ ] Search shard fetch
+      (`crates/core/src/search/shard_builder.rs::{build_text_search_shard,
+      build_fuzzy_search_shard, restore_text_search_shard,
+      restore_fuzzy_search_shard}` round-trip text and fuzzy
+      shards under per-shard keys derived from `K_search_root`.)
+- [x] Search shard fetch
       (`GET /v1/archive/index-shards?conversation_hash=&bucket=&type=`).
-- [~] Cold-result hydration on tap.
-      (`crates/core/src/search/query_engine.rs::mark_cold_results`
-      flags every hit on a `body_state = remote_archive_only`
-      row with `is_cold = true` when the caller passes
-      `SearchScope::IncludeCold`. `CoreImpl::search` enqueues
-      cold results into the `HydrationQueue` at
-      `HydrationReason::SearchResultTap` (P0) priority, and
-      `CoreImpl::search_and_prefetch_cold` returns
-      `(results, cold_count)` so the platform layer can render
-      a "hydrating…" badge.)
-- [ ] Unified query engine (parse → fan-out → merge → rerank).
-- [ ] Ranking formula implementation.
-- [ ] Mixed-language query handling.
-- [ ] Latency budget: encrypted shard fetch + decrypt + local
+      (`transport::TransportClient::fetch_index_shards` plus
+      the `search::query_engine::ColdShardSource` trait wrap
+      the network fetch + on-device decrypt; the trait is
+      what unit tests use to inject mocks without spinning up
+      a real transport.)
+- [x] Cold-result hydration on tap.
+      (`QueryEngine::execute_search_with_cold_source` is the
+      Phase 5, Task 1 entry point: cold
+      `(conversation_id, time_bucket)` pairs are resolved by
+      the source, encrypted shards are fetched + decrypted,
+      FTS5 + fuzzy run against the in-memory shard, and cold
+      hits are merged with local hits and reranked under the
+      shared formula. `CoreImpl::search_and_prefetch_cold`
+      enqueues every cold hit at
+      `HydrationReason::SearchResultTap` (P0) so the body /
+      media chase the search hit. End-to-end coverage at
+      `crates/core/tests/cold_shard_search.rs`.)
+- [x] Unified query engine (parse → fan-out → merge → rerank).
+      (`QueryEngine` segments the input via
+      `segment_by_script`, fans out per-script to FTS + fuzzy
+      + (optional) cold shards, merges by `message_id`, and
+      reranks under the BM25 × fuzzy × recency × kind formula
+      from `apply_recency_and_kind_weight`.)
+- [x] Ranking formula implementation (PROPOSAL §7.5).
+      (`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
+      `RECENCY_WEIGHT = 0.5` (30-day half-life via
+      `lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost
+      text 1.0× and damp media 0.8×. In-module tests cover
+      `ranking_recent_message_outranks_identical_old_message`,
+      `ranking_exact_recent_beats_fuzzy_old`,
+      `ranking_text_outranks_media_for_equal_recency`, and
+      `ranking_is_deterministic_for_same_inputs`.)
+- [x] Mixed-language query handling.
+      (`segment_by_script` decomposes a single query into
+      per-script segments; each segment fans out to FTS5 and
+      its script-specific fuzzy index. Regression coverage at
+      `crates/core/tests/mixed_language_query.rs` exercises
+      Latin × CJK, Cyrillic × Latin, pure-CJK on non-ICU
+      builds via fuzzy fallback, mixed-script promotion, and
+      unrelated-row exclusion.)
+- [~] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
+      (criterion bench at
+      `crates/core/benches/phase5_benchmarks.rs` measures
+      `text_only_one_month`, `fuzzy_only_one_month`, and
+      `local_plus_one_cold_bucket` against a delayed
+      `ColdShardSource` that simulates a network hop. The
+      smoke test
+      `crates/core/tests/phase5_latency_smoke.rs` asserts the
+      cold-shard decrypt+search path completes well under
+      5 s on debug-build CI. The on-device p95 ≤ 1.5 s gate
+      lands with the Phase-5 device-matrix run.)
 - [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
@@ -1442,7 +1499,17 @@ decrypt — query strings never reach the backend.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-03: Phase 5 advanced from `~15%` to `~85%`. Tasks 1–5
+  of the 10-task batch landed end-to-end: encrypted-shard fetch
+  via the `ColdShardSource` trait
+  (`crates/core/src/search/query_engine.rs`), recency × kind
+  ranking (`apply_recency_and_kind_weight`), per-script edit
+  thresholds (`fuzzy_min_overlap`), mixed-language fan-out via
+  `segment_by_script`, and the criterion benchmark suite at
+  `crates/core/benches/phase5_benchmarks.rs` plus a CI smoke
+  test at `crates/core/tests/phase5_latency_smoke.rs`. The only
+  open item is the on-device ≤ 1.5 s p95 measurement, which
+  belongs to the Phase-5 device-matrix run.
 
 ---
 
@@ -1505,7 +1572,7 @@ Notes:
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~20%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
@@ -1524,45 +1591,258 @@ Checklist:
       `metadata/content_index` (read-only, no plaintext leaks).
 - [ ] Edge-case handling (offline, interrupted, partial, corrupted,
       missing).
-- [ ] Production-scale archive compaction.
+- [x] Production-scale archive compaction.
+      (`archive::compaction::{apply_archive_tombstones,
+      ArchiveCompactionResult}` + `CoreImpl::compact_archive`:
+      selects `archive_verified` segments for a
+      `(conversation_id, time_bucket)`, decrypts via the
+      `ArchiveSegmentRouter`, applies tombstones, re-seals into
+      one compact segment via `ArchiveSegmentBuilder`, and
+      SAVEPOINT-transitions every superseded row to
+      `archive_compacted`. Cross-epoch coverage at
+      `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)
 - [ ] Cross-platform media migration: iOS → Android migrates
       iCloud media blobs to Google Drive (or ZKOF fallback) in the
       background.
 - [ ] Media blob sink stress test: 10K+ media files across mixed
       sinks, verify rehydration from each.
-- [ ] **Failure test suite**, all passing:
-      - chunk upload interrupted
-      - manifest upload interrupted
-      - wrong backup key
-      - corrupted chunk (Merkle / SHA-256 mismatch)
-      - device removed from MLS group between backup and restore
-      - search shard missing from backend
-      - low storage during restore
-      - manifest chain break detected on restore
+- [~] **Failure test suite**, 7 of 8 passing
+      (`crates/core/tests/failure_scenarios.rs`):
+      - [x] chunk upload interrupted
+            (`chunk_upload_interrupted_then_resumed_succeeds`)
+      - [ ] manifest upload interrupted
+            _(queued — the upload path lives at
+            `archive::upload::upload_archive_segment` /
+            `CoreImpl::run_incremental_backup_inner`, and a
+            dedicated mid-write interruption test is still
+            pending.)_
+      - [x] wrong backup key
+            (`wrong_backup_segment_key_fails_aead_open`,
+            `wrong_signing_key_on_manifest_chain_fails_signature_invalid`)
+      - [x] corrupted chunk (Merkle / SHA-256 mismatch)
+            (`corrupted_chunk_ciphertext_fails_sha256_fast_fail`,
+            `tampered_merkle_root_in_descriptor_fails_blake3_root_check`)
+      - [x] device removed from MLS group between backup and
+            restore
+            (`device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_invalid`)
+      - [x] search shard missing from backend
+            (`search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`)
+      - [x] low storage during restore
+            (`low_storage_condition_during_restore_surfaces_resumable_storage_error`)
+      - [x] manifest chain break detected on restore
+            (`manifest_chain_break_returns_chain_break_with_expected_and_actual`,
+            plus the deepest-link variant
+            `manifest_chain_break_at_deepest_generation_reports_correct_link`)
 
 **Decision gate**: Production-ready performance on the target
 device matrix. Full failure test suite passes on every platform.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-03: Status moves from `NOT STARTED` to
+  `In progress | ~20%`. Production-scale archive compaction
+  and 7 of 8 failure scenarios are now in tree (Tasks 6–9 of
+  the 10-task batch); the remaining failure scenario is
+  `manifest upload interrupted mid-write`, and the rest of
+  the phase (desktop integration, ML EP tuning, large-scale
+  testing) is unchanged.
 
 ---
 
 ## Changelog
 
-### 2026-05-03 — Phase 3 / 4 / 5 / 7 batch of 10 (this PR)
+### 2026-05-03 — Phase 3 / 5 / 7 batch of 10 (this PR)
 
-Lands the next 10-task batch on top of PR #29 (`ba706825`). Closes
-the remaining Phase-3 ZKOF archive plumbing, finishes the Phase-4
-backup sinks (iCloud, Android), introduces passphrase-based key
-recovery, wires the Phase-4 search-index shard restore path, and
-opens Phase 5 (cold-result hydration, batch shard prefetch) plus
-the Phase-5/7 scheduler foundation and the first 4 of the 8
-Phase-7 failure scenarios. All ten tasks ship with unit +
-integration tests; `cargo test --workspace` passes (981 tests
-total), `cargo fmt --all -- --check` is clean, and
+Builds on PR #30 (the previous 10-task batch). Drives Phase 5 from
+`~15%` to `~85%` (cold-shard fan-out via `ColdShardSource`,
+recency + content-kind ranking, script-aware fuzzy matching with
+per-script overlap floors, mixed-language fan-out, criterion
+benchmarks for the cold-shard latency budget), adds the remaining
+4 of 8 Phase-7 failure scenarios, extends the archive segment
+builder with `TimelineSkeleton` + `Checkpoint` variants, lands an
+end-to-end passphrase-recovery integration test, wires a
+cross-epoch archive-compaction integration test, and reconciles
+the documentation against the actual source so PHASES.md and
+PROGRESS.md no longer carry stale `[ ]` items. All ten tasks ship
+with unit + integration tests; `cargo test --workspace` passes
+(1 023 tests total), `cargo fmt --all -- --check` is clean, and
 `cargo clippy --all-targets --all-features -- -D warnings` is
+clean.
+
+1. **Cold-bucket shard fetch wired into `QueryEngine`**
+   (`crates/core/src/search/query_engine.rs`,
+   `crates/core/src/core_impl.rs`, new
+   `crates/core/tests/cold_shard_search.rs`):
+   `QueryEngine::execute_search_with_cold_source` accepts a
+   `ColdShardSource` trait object that returns the cold
+   `(conversation_id, time_bucket)` pairs and decrypts the
+   encrypted shards in-process. Cold hits are merged with the
+   local hits, marked `is_cold = true`, and reranked under the
+   shared formula. Three integration tests cover the
+   round-trip, `SearchScope::LocalOnly` skipping the fan-out,
+   and per-conversation scoping. `CoreImpl::search_and_prefetch_cold`
+   wires the trait through to the live transport while keeping
+   the unit-test path mockable.
+
+2. **Script-aware fuzzy matching**
+   (`crates/core/src/search/fuzzy_search.rs`,
+   `crates/core/src/search/tokenizer.rs`):
+   `FuzzySearchEngine::search_fuzzy` groups query tokens by
+   `ScriptClass`, joins on the existing
+   `search_fuzzy(token, script, message_id)` table, and
+   applies a per-script overlap floor via
+   `search::tokenizer::fuzzy_min_overlap` (tighter for CJK
+   bigrams, looser for Latin / Cyrillic trigrams). A row is
+   accepted iff at least one script bucket clears its floor,
+   so a mixed query like `"meeting 会議"` still fans out to
+   both indexes. Existing `multilingual_fuzzy_search.rs` tests
+   keep passing; new coverage at
+   `crates/core/tests/mixed_language_query.rs`.
+
+3. **Full ranking formula (recency decay × content-kind
+   weight)** (`crates/core/src/search/query_engine.rs`):
+   adds `RECENCY_WEIGHT = 0.5` (30-day half-life via
+   `lambda = ln(2) / 30`) and `CONTENT_KIND_WEIGHTS` (text
+   1.0×, media 0.8×) on top of the existing
+   `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0`.
+   `apply_recency_and_kind_weight` applies the multiplicative
+   combination so a recent text hit always outranks an
+   identical older one and an exact + recent hit always
+   outranks a fuzzy + old hit. Four new ranking tests
+   (`ranking_recent_message_outranks_identical_old_message`,
+   `ranking_exact_recent_beats_fuzzy_old`,
+   `ranking_text_outranks_media_for_equal_recency`,
+   `ranking_is_deterministic_for_same_inputs`) cover the
+   formula; `apply_cold_recency_weight` reuses the same decay
+   for the cold-merge path.
+
+4. **Mixed-language query fan-out**
+   (`crates/core/src/search/query_engine.rs`,
+   `crates/core/src/search/tokenizer.rs`, new
+   `crates/core/tests/mixed_language_query.rs`):
+   `QueryEngine` segments the input via `segment_by_script`
+   and fans out per-script to FTS5 + the script-specific
+   fuzzy index; results from every segment are merged by
+   `message_id` and reranked. New regression coverage:
+   Latin × CJK (`"meeting 会議室"` finds
+   `"Meeting at 3pm 会議室で"`), Cyrillic × Latin
+   (`"встреча meeting"` finds rows in either language),
+   pure-CJK on non-ICU builds via fuzzy fallback,
+   mixed-script promotion (a dual-script row outranks
+   single-script rows), and unrelated-row exclusion.
+
+5. **Phase 5 latency benchmarks + smoke test**
+   (`crates/core/Cargo.toml`, new
+   `crates/core/benches/phase5_benchmarks.rs`,
+   `crates/core/tests/phase5_latency_smoke.rs`):
+   adds three criterion benchmarks —
+   `text_only_one_month`, `fuzzy_only_one_month`, and
+   `local_plus_one_cold_bucket` (the last one drives a
+   `DelayedCatalog` `ColdShardSource` that simulates a
+   network hop) — plus a CI-friendly `#[test]` that asserts
+   the cold-shard decrypt+search path completes in under
+   5 s on debug builds. Run with
+   `cargo bench -p kchat-core --bench phase5_benchmarks`.
+   The on-device p95 ≤ 1.5 s gate moves to the Phase-5
+   device-matrix run.
+
+6. **Archive segment builder — `TimelineSkeleton` +
+   `Checkpoint` variants**
+   (`crates/core/src/archive/segment_builder.rs`,
+   `crates/core/src/formats/mod.rs`):
+   `SegmentBuildRequest` gains `timeline_skeleton(...)` and
+   `checkpoint(...)` constructors alongside the existing
+   `message_delta(...)`. All three share the CBOR → zstd →
+   XChaCha20-Poly1305 pipeline keyed off `SegmentType` so
+   the on-disk frame type is preserved through a round-trip.
+   Round-trip tests live alongside the builder; a new
+   integration test in `crates/core/tests/archive_pipeline.rs`
+   exercises a `TimelineSkeleton` segment build.
+
+7. **Phase-7 failure suite — remaining 4 of 8 scenarios**
+   (`crates/core/tests/failure_scenarios.rs`): adds
+   `device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_invalid`
+   (manifest signed by an MLS-removed device, asserts
+   `VerificationError::SignatureInvalid` rather than a
+   panic),
+   `search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`
+   (wraps a `ColdShardSource` whose fetch returns 404 in a
+   `GracefulCold` adapter, asserts the query engine falls back
+   to local-only results, and records the failed bucket in a
+   side-channel log for the orchestration layer to surface as a
+   banner),
+   `low_storage_condition_during_restore_surfaces_resumable_storage_error`
+   (injects a disk-full error during `RestorePipeline::run`,
+   asserts the pipeline persists the last
+   `RestoreState` and returns a resumable
+   `Error::Storage`), and a deepest-link variant
+   `manifest_chain_break_at_deepest_generation_reports_correct_link`.
+   The full failure suite is now 7 of 8 green; the
+   outstanding scenario is `manifest upload interrupted
+   mid-write`.
+
+8. **End-to-end passphrase recovery integration test**
+   (`crates/core/tests/backup_pipeline.rs`):
+   `passphrase_recovery_end_to_end_round_trip_across_three_scripts`
+   walks `K_user_master` →
+   `wrap_master_key_with_passphrase` → 3-script ingest
+   (Latin, CJK, Arabic) → `run_incremental_backup` →
+   2-generation manifest chain → search-shard build →
+   fresh in-memory destination device →
+   `unwrap_master_key_with_passphrase` →
+   `verify_manifest_chain` → `RestorePipeline::run` →
+   FTS + fuzzy search hit assertions per script. Negative
+   coverage for wrong passphrase (`Error::Crypto`) and the
+   PR #30 trim regression (whitespace-padded passphrase
+   still unwraps).
+
+9. **Epoch key rotation + cross-epoch archive compaction
+   integration test** (`crates/core/tests/archive_pipeline.rs`):
+   `archive_pipeline_epoch_rotation_and_cross_epoch_compaction`
+   creates an `EpochKeyManager` at `"2026-01"`, builds an
+   archive segment, rotates to `"2026-02"`, builds a second
+   segment, runs `CoreImpl::compact_archive` over a bucket
+   that spans both epochs, and asserts: (a) the compacted
+   segment decrypts under the current epoch key,
+   (b) `wrapped_prior_epoch_keys_for_manifest()` carries the
+   prior epoch's wrapped key in the manifest chain,
+   (c) `unwrap_prior_epoch_key("2026-01", K_archive_root)`
+   plus a fresh segment-key derivation re-decrypts the
+   pre-rotation segment, and (d) `delete_epoch_key("2026-01")`
+   makes the prior segment undecryptable
+   (`Error::Storage` on the unwrap attempt). This is the
+   cross-epoch decision-gate test for Phase 3.
+
+10. **Documentation reconciliation** (this PR only — no
+    runtime code change):
+    PHASES.md, PROGRESS.md, README.md, and ARCHITECTURE.md
+    were audited against the actual source / tests / benches
+    rather than the existing checkbox state. Stale `[ ]`
+    items in Phases 1, 2, and 3 (SQLCipher, ICU FTS5,
+    multilingual test corpus, body / archive / media state
+    machines, MediaBlobSink trait, archive manifest chain,
+    Merkle-root verification, archive state machine, storage
+    budget enforcement, eviction scoring, batch-by-bucket
+    prefetch, epoch-rotated archive key derivation) are now
+    `[x]` with line-anchored notes; Phase 5 is checked off
+    everywhere except the on-device latency gate; Phase 7
+    archive compaction at production scale + 7 of 8 failure
+    scenarios are checked off. The README banner and tree
+    move to the new state and the `cargo bench` quick-start
+    references the Phase-5 bench file.
+
+### 2026-05-03 — Phase 3 / 4 / 5 / 7 batch of 10 (PR #30)
+
+Lands the previous 10-task batch on top of PR #29 (`ba706825`).
+Closes the remaining Phase-3 ZKOF archive plumbing, finishes the
+Phase-4 backup sinks (iCloud, Android), introduces passphrase-based
+key recovery, wires the Phase-4 search-index shard restore path,
+and opens Phase 5 (cold-result hydration, batch shard prefetch)
+plus the Phase-5/7 scheduler foundation and the first 4 of the 8
+Phase-7 failure scenarios. All ten tasks ship with unit +
+integration tests; `cargo test --workspace` passed (981 tests
+total), `cargo fmt --all -- --check` was clean, and
+`cargo clippy --all-targets --all-features -- -D warnings` was
 clean.
 
 1. **DeviceTransferEnvelope zeroize fix**

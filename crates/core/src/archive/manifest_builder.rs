@@ -246,6 +246,7 @@ mod tests {
             conversation_id: conv,
             time_bucket: bucket.into(),
             events: vec![event],
+            segment_type: crate::formats::SegmentType::MessageDelta,
         };
         ArchiveSegmentBuilder::new()
             .build_segment(req, &[0x33; 32])

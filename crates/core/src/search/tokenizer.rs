@@ -211,6 +211,61 @@ pub enum ScriptClass {
     Unknown,
 }
 
+impl ScriptClass {
+    /// Map a [`ScriptClass`] to the four-letter ISO-15924 code used
+    /// as the wire form on `search_fuzzy.script` and on the
+    /// per-row tag inside encrypted fuzzy shards. The inverse is
+    /// [`Self::from_iso_15924`].
+    ///
+    /// `docs/PROPOSAL.md §3.2`.
+    #[must_use]
+    pub fn to_iso_15924(self) -> &'static str {
+        match self {
+            ScriptClass::Latn => "Latn",
+            ScriptClass::Cyrl => "Cyrl",
+            ScriptClass::Grek => "Grek",
+            ScriptClass::Hani => "Hani",
+            ScriptClass::Hira => "Hira",
+            ScriptClass::Kana => "Kana",
+            ScriptClass::Hang => "Hang",
+            ScriptClass::Arab => "Arab",
+            ScriptClass::Hebr => "Hebr",
+            ScriptClass::Deva => "Deva",
+            ScriptClass::Beng => "Beng",
+            ScriptClass::Thai => "Thai",
+            ScriptClass::Khmr => "Khmr",
+            ScriptClass::Laoo => "Laoo",
+            ScriptClass::Mymr => "Mymr",
+            ScriptClass::Unknown => "Zzzz",
+        }
+    }
+
+    /// Parse an ISO-15924 four-letter code back into a
+    /// [`ScriptClass`]. Unknown codes (including the Zzzz "uncoded
+    /// script" sentinel) collapse to [`ScriptClass::Unknown`].
+    #[must_use]
+    pub fn from_iso_15924(code: &str) -> ScriptClass {
+        match code {
+            "Latn" => ScriptClass::Latn,
+            "Cyrl" => ScriptClass::Cyrl,
+            "Grek" => ScriptClass::Grek,
+            "Hani" => ScriptClass::Hani,
+            "Hira" => ScriptClass::Hira,
+            "Kana" => ScriptClass::Kana,
+            "Hang" => ScriptClass::Hang,
+            "Arab" => ScriptClass::Arab,
+            "Hebr" => ScriptClass::Hebr,
+            "Deva" => ScriptClass::Deva,
+            "Beng" => ScriptClass::Beng,
+            "Thai" => ScriptClass::Thai,
+            "Khmr" => ScriptClass::Khmr,
+            "Laoo" => ScriptClass::Laoo,
+            "Mymr" => ScriptClass::Mymr,
+            _ => ScriptClass::Unknown,
+        }
+    }
+}
+
 /// Granularity of fuzzy tokens for a script class.
 ///
 /// `docs/PROPOSAL.md §3.4`:
@@ -229,6 +284,38 @@ pub enum FuzzyGranularity {
     Bigram,
     /// 3-character n-grams.
     Trigram,
+}
+
+/// Minimum per-script fuzzy overlap fraction required for a row
+/// to be accepted as a fuzzy match (Phase 5, Task 2).
+///
+/// `docs/PROPOSAL.md §3.4` makes the granularity decision purely
+/// a function of the script — bigrams for logographic CJK,
+/// trigrams elsewhere — but says nothing about thresholding. The
+/// rationale for tighter CJK gating:
+///
+/// * A bigram is a stronger signal than a trigram (fewer rare
+///   bigrams in CJK, so a single overlap is highly informative).
+///   Loose thresholding would surface unrelated rows.
+/// * A trigram in Latin / Cyrillic / ... is a weaker signal but a
+///   typo of a common 5-7 character word still preserves several
+///   trigrams; loose thresholding lets `meetng` find `meeting`.
+///
+/// Rationale for the specific numbers:
+///
+/// * Bigrams (CJK): require ≥ 0.5 of the per-script query bigrams.
+///   A two-bigram CJK query needs at least one to match — otherwise
+///   the row is dropped.
+/// * Trigrams (Latin etc.): require ≥ 1/3 of the per-script query
+///   trigrams. A 7-trigram word like "lighthouse" with two
+///   transposed trigrams (≈ 5 / 7 ≈ 0.71) clears the bar; an
+///   accidental 1 / 7 hit on a junk row does not.
+#[must_use]
+pub fn fuzzy_min_overlap(script: ScriptClass) -> f64 {
+    match fuzzy_granularity(script) {
+        FuzzyGranularity::Bigram => 0.5,
+        FuzzyGranularity::Trigram => 1.0 / 3.0,
+    }
 }
 
 /// Map a [`ScriptClass`] to its [`FuzzyGranularity`] per

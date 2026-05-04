@@ -493,6 +493,7 @@ mod tests {
                 sample_event(conv, 1, ArchiveEventType::MessageReceived),
                 sample_event(conv, 2, ArchiveEventType::MessageEdited),
             ],
+            segment_type: crate::formats::SegmentType::MessageDelta,
         };
         let built = ArchiveSegmentBuilder::new()
             .build_segment(req.clone(), k)
