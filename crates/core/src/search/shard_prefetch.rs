@@ -40,8 +40,13 @@ use crate::Error;
 /// [`batch_prefetch_shards`]. Stable so the test suite can pin
 /// the expected wire ordering, and so any caller that wants to
 /// drop into [`IndexType::all`] for a parallel join sees a
-/// predictable layout.
-const PREFETCH_ORDER: [IndexType; 4] = [
+/// predictable layout. Phase 8 prepends [`IndexType::Bloom`]:
+/// the bloom filter shard is fetched first so the prefetcher
+/// can short-circuit buckets whose filter rejects every query
+/// token before paying for the larger Text / Fuzzy / Vector /
+/// Media payloads.
+const PREFETCH_ORDER: [IndexType; 5] = [
+    IndexType::Bloom,
     IndexType::Text,
     IndexType::Fuzzy,
     IndexType::Vector,
@@ -53,6 +58,7 @@ const PREFETCH_ORDER: [IndexType; 4] = [
 /// [`crate::transport::TransportClient::fetch_index_shards`].
 fn shard_type_str(it: IndexType) -> &'static str {
     match it {
+        IndexType::Bloom => "bloom",
         IndexType::Text => "text",
         IndexType::Fuzzy => "fuzzy",
         IndexType::Vector => "vector",
@@ -273,37 +279,56 @@ mod tests {
     #[test]
     fn batch_prefetch_returns_every_seeded_shard_type() {
         let t = RecordingTransport::default();
+        t.seed("hash", "2026-04", "bloom", b"bloom-bytes".to_vec());
         t.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
         t.seed("hash", "2026-04", "fuzzy", b"fuzzy-bytes".to_vec());
         t.seed("hash", "2026-04", "vector", b"vector-bytes".to_vec());
         t.seed("hash", "2026-04", "media", b"media-bytes".to_vec());
 
         let out = batch_prefetch_shards(&t, "hash", "2026-04").expect("prefetch");
-        assert_eq!(out.len(), 4);
-        assert_eq!(out[0].shard_type, IndexType::Text);
-        assert_eq!(out[1].shard_type, IndexType::Fuzzy);
-        assert_eq!(out[2].shard_type, IndexType::Vector);
-        assert_eq!(out[3].shard_type, IndexType::Media);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0].shard_type, IndexType::Bloom);
+        assert_eq!(out[1].shard_type, IndexType::Text);
+        assert_eq!(out[2].shard_type, IndexType::Fuzzy);
+        assert_eq!(out[3].shard_type, IndexType::Vector);
+        assert_eq!(out[4].shard_type, IndexType::Media);
         for shard in &out {
             assert_eq!(shard.conversation_hash, "hash");
             assert_eq!(shard.bucket, "2026-04");
         }
         // Exactly one transport call per shard type.
-        assert_eq!(t.calls().len(), 4);
+        assert_eq!(t.calls().len(), 5);
     }
 
     #[test]
     fn batch_prefetch_skips_empty_transport_responses() {
         let t = RecordingTransport::default();
         t.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
-        // fuzzy / vector / media are unseeded → empty Vec → skipped.
+        // bloom / fuzzy / vector / media are unseeded → empty Vec → skipped.
         let out = batch_prefetch_shards(&t, "hash", "2026-04").expect("prefetch");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].shard_type, IndexType::Text);
         // The transport is still called for every type — the
         // batch contract is "one fan-out per call", not "skip
         // unseeded types".
-        assert_eq!(t.calls().len(), 4);
+        assert_eq!(t.calls().len(), 5);
+    }
+
+    #[test]
+    fn shard_prefetch_order_includes_bloom_first() {
+        let t = RecordingTransport::default();
+        t.seed("hash", "2026-04", "bloom", b"bloom-bytes".to_vec());
+        t.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
+        let _ = batch_prefetch_shards(&t, "hash", "2026-04").expect("prefetch");
+        let calls = t.calls();
+        assert_eq!(calls.len(), 5);
+        // The transport is invoked in PREFETCH_ORDER. The first
+        // call must be the bloom shard.
+        assert_eq!(calls[0].2, "bloom");
+        assert_eq!(calls[1].2, "text");
+        assert_eq!(calls[2].2, "fuzzy");
+        assert_eq!(calls[3].2, "vector");
+        assert_eq!(calls[4].2, "media");
     }
 
     #[test]
@@ -321,7 +346,11 @@ mod tests {
         let out =
             batch_prefetch_shards_with_padding(&t, "hash", "2026-04", &cfg).expect("prefetch");
         assert_eq!(out.len(), 1);
-        assert_eq!(t.calls().len(), 4, "no dummy calls when padding disabled");
+        assert_eq!(
+            t.calls().len(),
+            PREFETCH_ORDER.len(),
+            "no dummy calls when padding disabled"
+        );
     }
 
     #[test]
@@ -335,9 +364,11 @@ mod tests {
         // dummies are observable on the transport, not in the
         // returned Vec.
         assert_eq!(out.len(), 1);
-        // 4 real-target calls + (compute_padding_count(1) * 4)
+        // PREFETCH_ORDER.len() real-target calls +
+        // (compute_padding_count(1) * PREFETCH_ORDER.len())
         // dummy calls.
-        let expected = 4 + compute_padding_count(1) * 4;
+        let n = PREFETCH_ORDER.len();
+        let expected = n + compute_padding_count(1) * n;
         assert_eq!(t.calls().len(), expected);
     }
 

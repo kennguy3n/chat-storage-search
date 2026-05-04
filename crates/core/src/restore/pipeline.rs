@@ -273,10 +273,12 @@ impl RestorePipeline {
                         rows_inserted: rows.len(),
                     });
                 }
-                IndexType::Vector | IndexType::Media => {
-                    // Vector / media shards are wired in Phase 5.
-                    // For now, count them as 0-row entries so the
-                    // orchestrator's progress reporting still
+                IndexType::Vector | IndexType::Media | IndexType::Bloom => {
+                    // Vector / media shards are wired in Phase 5;
+                    // bloom shards (Phase 8) are consumed by the
+                    // prefetcher rather than restored into a
+                    // SQLite table. Count them as 0-row entries so
+                    // the orchestrator's progress reporting still
                     // sees them, but do not attempt decryption.
                     summary.push(RestoredShardSummary {
                         index_type: entry.shard.index_type,

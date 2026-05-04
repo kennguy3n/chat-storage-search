@@ -1286,6 +1286,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conv).unwrap();
     }

@@ -87,6 +87,7 @@ fn insert_conversation(db: &LocalStoreDb, id: &Uuid, pinned: bool) {
         muted: false,
         last_message_id: None,
         last_activity_ms: 1,
+        ..Default::default()
     })
     .unwrap();
 }

@@ -60,7 +60,7 @@ use crate::search::fuzzy_search::{FuzzySearchEngine, FuzzyTokenizer};
 use crate::search::shard_builder::{FtsRow, FuzzyRow};
 use crate::search::text_search::TextSearchEngine;
 use crate::search::tokenizer::{fuzzy_min_overlap, ScriptClass};
-use crate::{ContentKind, Error, SearchQuery, SearchResult, SearchScope};
+use crate::{ContentKind, Error, SearchQuery, SearchResult, SearchScope, SearchTarget};
 
 /// BM25 contribution weight in the merged rank score
 /// (`docs/PROPOSAL.md §7.5`).
@@ -951,6 +951,7 @@ impl<'a> QueryEngine<'a> {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
         push_structured_filters(query, &mut clauses, &mut binds);
+        push_target_filter(&query.effective_target(), self.db, &mut clauses, &mut binds);
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -1200,6 +1201,7 @@ impl<'a> QueryEngine<'a> {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
         push_structured_filters(query, &mut clauses, &mut binds);
+        push_target_filter(&query.effective_target(), self.db, &mut clauses, &mut binds);
         if clauses.is_empty() {
             return Ok(None);
         }
@@ -1311,6 +1313,99 @@ fn push_structured_filters(query: &SearchQuery, clauses: &mut Vec<String>, binds
             clauses.push(format!("kind = ?{}", binds.len() + 1));
             binds.push(Value::Text(k.to_string()));
         }
+    }
+}
+
+/// Phase 8 — resolve a [`SearchTarget`] into a concrete set of
+/// conversation ids the query engine should scope to. Returns
+/// `Ok(None)` for [`SearchTarget::Global`] (no filter); every
+/// other variant returns `Ok(Some(set))`. An empty set is a
+/// valid outcome — the query engine treats it as "no
+/// conversations to search" rather than as "no filter".
+pub fn resolve_target_to_conversation_set(
+    target: &SearchTarget,
+    db: &LocalStoreDb,
+) -> SearchResultSet<Option<HashSet<String>>> {
+    use crate::SearchTarget as T;
+    match target {
+        T::Global => Ok(None),
+        T::Conversation(c) => {
+            let mut s = HashSet::new();
+            s.insert(c.to_string());
+            Ok(Some(s))
+        }
+        T::Community(community) => {
+            let convs = db
+                .list_conversations_by_community(&community.to_string())
+                .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
+            Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
+        }
+        T::Domain(domain) => {
+            let convs = db
+                .list_conversations_by_domain(&domain.to_string())
+                .map_err(|e| Error::Search(format!("list domain convs: {e:?}")))?;
+            Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
+        }
+        T::Tenant(tenant) => {
+            let convs = db
+                .list_conversations_by_tenant(tenant)
+                .map_err(|e| Error::Search(format!("list tenant convs: {e:?}")))?;
+            Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
+        }
+        T::B2cAll => {
+            let convs = db
+                .list_conversations_by_scope("b2c")
+                .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
+            Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
+        }
+    }
+}
+
+/// Result alias used by [`resolve_target_to_conversation_set`].
+type SearchResultSet<T> = std::result::Result<T, Error>;
+
+/// Phase 8 — append a `conversation_id IN (…)` filter clause for
+/// the supplied [`SearchTarget`]. No-op for [`SearchTarget::Global`]
+/// (no filter wanted). For every other variant — including
+/// [`SearchTarget::Conversation`] — the target is resolved into a
+/// concrete set of `conversation_id`s and emitted as an IN-clause.
+/// An empty resolution adds `1=0` so the WHERE clause
+/// short-circuits to "no rows" rather than falling through to a
+/// global scan. If the legacy `conversation_filter` is also set,
+/// the AND of the two clauses is the (correct) more-restrictive
+/// behavior; in the normal case where they agree the duplicate
+/// IN-clause collapses cleanly.
+fn push_target_filter(
+    target: &SearchTarget,
+    db: &LocalStoreDb,
+    clauses: &mut Vec<String>,
+    binds: &mut Vec<Value>,
+) {
+    if matches!(target, SearchTarget::Global) {
+        return;
+    }
+    let resolved = match resolve_target_to_conversation_set(target, db) {
+        Ok(r) => r,
+        Err(_) => {
+            // Resolution failed (e.g. transient SQL error). Fail
+            // closed: emit `1=0` so the search returns no rows
+            // rather than silently fanning back out to Global.
+            clauses.push("1=0".to_string());
+            return;
+        }
+    };
+    let Some(set) = resolved else { return };
+    if set.is_empty() {
+        clauses.push("1=0".to_string());
+        return;
+    }
+    let placeholders = (0..set.len())
+        .map(|i| format!("?{}", binds.len() + i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    clauses.push(format!("conversation_id IN ({placeholders})"));
+    for c in set {
+        binds.push(Value::Text(c));
     }
 }
 
@@ -1752,6 +1847,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         })
         .unwrap();
     }
@@ -3378,5 +3474,237 @@ mod tests {
             (local_target.rank_score - cold_target.rank_score).abs() < f64::EPSILON,
             "LocalOnly and IncludeCold must produce identical rank_score updates",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 — SearchTarget integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod phase8_target_tests {
+    use super::*;
+    use crate::local_store::schema::Conversation;
+    use crate::message::processor::{IngestedMessage, MessagePersister};
+
+    fn fresh_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[0xB8; 32]).unwrap()
+    }
+
+    fn seed_conv(
+        db: &LocalStoreDb,
+        id: Uuid,
+        community_id: &str,
+        domain_id: &str,
+        tenant_id: &str,
+        scope: &str,
+    ) {
+        db.insert_conversation(&Conversation {
+            conversation_id: id.to_string(),
+            community_id: community_id.into(),
+            domain_id: domain_id.into(),
+            tenant_id: tenant_id.into(),
+            scope: scope.into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    fn persist(p: &MessagePersister<'_>, conv: Uuid, ts: i64, text: &str) -> Uuid {
+        let mid = Uuid::now_v7();
+        p.persist_ingested_message(&IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "alice".into(),
+            created_at_ms: ts,
+            text_content: Some(text.into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        })
+        .expect("persist");
+        mid
+    }
+
+    #[test]
+    fn resolve_target_to_conversation_set_returns_correct_sets_for_each_variant() {
+        let db = fresh_db();
+        let community = Uuid::now_v7();
+        let domain = Uuid::now_v7();
+        let conv_a = Uuid::now_v7();
+        let conv_b = Uuid::now_v7();
+        let conv_c = Uuid::now_v7();
+        seed_conv(
+            &db,
+            conv_a,
+            &community.to_string(),
+            &domain.to_string(),
+            "tenant-1",
+            "b2b",
+        );
+        seed_conv(&db, conv_b, &community.to_string(), "", "tenant-1", "b2b");
+        seed_conv(&db, conv_c, "", "", "", "b2c");
+
+        // Global → None
+        assert!(
+            resolve_target_to_conversation_set(&SearchTarget::Global, &db)
+                .unwrap()
+                .is_none()
+        );
+        // Conversation → singleton set
+        let s = resolve_target_to_conversation_set(&SearchTarget::Conversation(conv_a), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&conv_a.to_string()));
+        // Community → conv_a + conv_b
+        let s = resolve_target_to_conversation_set(&SearchTarget::Community(community), &db)
+            .unwrap()
+            .unwrap();
+        assert!(s.contains(&conv_a.to_string()));
+        assert!(s.contains(&conv_b.to_string()));
+        assert!(!s.contains(&conv_c.to_string()));
+        // Domain → conv_a only
+        let s = resolve_target_to_conversation_set(&SearchTarget::Domain(domain), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&conv_a.to_string()));
+        // Tenant → conv_a + conv_b
+        let s = resolve_target_to_conversation_set(&SearchTarget::Tenant("tenant-1".into()), &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.len(), 2);
+        // B2cAll → conv_c only
+        let s = resolve_target_to_conversation_set(&SearchTarget::B2cAll, &db)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&conv_c.to_string()));
+    }
+
+    #[test]
+    fn search_with_community_target_filters_to_community_conversations() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let community = Uuid::now_v7();
+        let conv_in = Uuid::now_v7();
+        let conv_out = Uuid::now_v7();
+        seed_conv(&db, conv_in, &community.to_string(), "", "tenant-x", "b2b");
+        seed_conv(&db, conv_out, "", "", "tenant-y", "b2c");
+        let _ = persist(&p, conv_in, 1, "shared content meeting");
+        let mid_out = persist(&p, conv_out, 2, "shared content meeting");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "meeting".into(),
+            target: SearchTarget::Community(community),
+            ..Default::default()
+        };
+        let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert!(!hits.is_empty(), "community target must surface ≥1 hit");
+        for h in &hits {
+            assert_ne!(
+                h.message_id, mid_out,
+                "out-of-community message must not surface"
+            );
+        }
+    }
+
+    #[test]
+    fn search_with_conversation_target_only_filters_to_that_conversation() {
+        // Phase 8 contract: setting `target = SearchTarget::Conversation(c)`
+        // *without* the legacy `conversation_filter` field must scope the
+        // search to that single conversation. Regression for the case
+        // where `push_target_filter` previously skipped the
+        // `Conversation(_)` arm and silently fanned back out to global.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv_in = Uuid::now_v7();
+        let conv_out = Uuid::now_v7();
+        seed_conv(&db, conv_in, "", "", "", "b2c");
+        seed_conv(&db, conv_out, "", "", "", "b2c");
+        let mid_in = persist(&p, conv_in, 1, "shared content meeting");
+        let mid_out = persist(&p, conv_out, 2, "shared content meeting");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "meeting".into(),
+            target: SearchTarget::Conversation(conv_in),
+            // legacy field intentionally left None — this is the
+            // bug-regression case.
+            conversation_filter: None,
+            ..Default::default()
+        };
+        let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let ids: std::collections::HashSet<Uuid> = hits.iter().map(|h| h.message_id).collect();
+        assert!(
+            ids.contains(&mid_in),
+            "in-conversation hit must surface (got {:?})",
+            ids
+        );
+        assert!(
+            !ids.contains(&mid_out),
+            "out-of-conversation hit must NOT surface (got {:?})",
+            ids
+        );
+    }
+
+    #[test]
+    fn search_with_global_target_returns_all_conversations() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv_a = Uuid::now_v7();
+        let conv_b = Uuid::now_v7();
+        seed_conv(&db, conv_a, "ca", "", "", "b2c");
+        seed_conv(&db, conv_b, "cb", "", "", "b2c");
+        let mid_a = persist(&p, conv_a, 1, "global content meeting");
+        let mid_b = persist(&p, conv_b, 2, "global content meeting");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "meeting".into(),
+            target: SearchTarget::Global,
+            ..Default::default()
+        };
+        let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let ids: std::collections::HashSet<Uuid> = hits.iter().map(|h| h.message_id).collect();
+        assert!(ids.contains(&mid_a));
+        assert!(ids.contains(&mid_b));
+    }
+
+    #[test]
+    fn search_with_empty_community_target_returns_no_rows() {
+        // SearchTarget::Community(uuid) where the uuid does not
+        // match any conversation must short-circuit to "no rows"
+        // rather than fall back to global search.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conv(&db, conv, "ca", "", "", "b2c");
+        let _ = persist(&p, conv, 1, "global content meeting");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "meeting".into(),
+            target: SearchTarget::Community(Uuid::now_v7()),
+            ..Default::default()
+        };
+        let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert!(hits.is_empty(), "empty community must return zero hits");
+    }
+
+    #[test]
+    fn conversation_hierarchy_columns_round_trip() {
+        let db = fresh_db();
+        let conv = Uuid::now_v7();
+        let community = Uuid::now_v7();
+        seed_conv(&db, conv, &community.to_string(), "", "tenant-z", "b2b");
+        let stored = db
+            .get_conversation(&conv.to_string())
+            .unwrap()
+            .expect("conversation must round-trip");
+        assert_eq!(stored.community_id, community.to_string());
+        assert_eq!(stored.tenant_id, "tenant-z");
+        assert_eq!(stored.scope, "b2b");
     }
 }

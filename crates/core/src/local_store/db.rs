@@ -82,6 +82,26 @@ pub fn create_schema_with_unicode61_fallback() -> String {
     )
 }
 
+/// Decode a `conversation` table row into a [`Conversation`].
+/// Centralised so every read path (single-row fetch, full
+/// list, hierarchy filter) sees the same column ordering and
+/// the Phase-8 hierarchy fields are always populated.
+fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        conversation_id: row.get(0)?,
+        title_cipher: row.get(1)?,
+        pinned: row.get::<_, i64>(2)? != 0,
+        muted: row.get::<_, i64>(3)? != 0,
+        last_message_id: row.get(4)?,
+        last_activity_ms: row.get(5)?,
+        conversation_type: row.get(6)?,
+        scope: row.get(7)?,
+        tenant_id: row.get(8)?,
+        community_id: row.get(9)?,
+        domain_id: row.get(10)?,
+    })
+}
+
 /// Whether the underlying SQLCipher build provides the FTS5 ICU
 /// tokenizer.
 ///
@@ -185,13 +205,18 @@ impl LocalStoreDb {
     // Conversation
     // ---------------------------------------------------------------
 
-    /// Insert a row into `conversation`.
+    /// Insert a row into `conversation`. Phase-8 hierarchy
+    /// columns ([`Conversation::conversation_type`], `scope`,
+    /// `tenant_id`, `community_id`, `domain_id`) are always
+    /// written so `SELECT *` round-trips the full struct.
     pub fn insert_conversation(&self, conv: &Conversation) -> DbResult<()> {
         self.conn.execute(
             "INSERT INTO conversation (
                 conversation_id, title_cipher, pinned, muted,
-                last_message_id, last_activity_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                last_message_id, last_activity_ms,
+                conversation_type, scope, tenant_id,
+                community_id, domain_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 conv.conversation_id,
                 conv.title_cipher,
@@ -199,6 +224,11 @@ impl LocalStoreDb {
                 conv.muted as i64,
                 conv.last_message_id,
                 conv.last_activity_ms,
+                conv.conversation_type,
+                conv.scope,
+                conv.tenant_id,
+                conv.community_id,
+                conv.domain_id,
             ],
         )?;
         Ok(())
@@ -255,20 +285,13 @@ impl LocalStoreDb {
         self.conn
             .query_row(
                 "SELECT conversation_id, title_cipher, pinned, muted,
-                        last_message_id, last_activity_ms
+                        last_message_id, last_activity_ms,
+                        conversation_type, scope, tenant_id,
+                        community_id, domain_id
                  FROM conversation
                  WHERE conversation_id = ?1",
                 params![conversation_id],
-                |row| {
-                    Ok(Conversation {
-                        conversation_id: row.get(0)?,
-                        title_cipher: row.get(1)?,
-                        pinned: row.get::<_, i64>(2)? != 0,
-                        muted: row.get::<_, i64>(3)? != 0,
-                        last_message_id: row.get(4)?,
-                        last_activity_ms: row.get(5)?,
-                    })
-                },
+                row_to_conversation,
             )
             .optional()
             .map_err(DbError::from)
@@ -282,21 +305,69 @@ impl LocalStoreDb {
     pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let mut stmt = self.conn.prepare(
             "SELECT conversation_id, title_cipher, pinned, muted,
-                    last_message_id, last_activity_ms
+                    last_message_id, last_activity_ms,
+                    conversation_type, scope, tenant_id,
+                    community_id, domain_id
                FROM conversation
               ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(Conversation {
-                    conversation_id: row.get(0)?,
-                    title_cipher: row.get(1)?,
-                    pinned: row.get::<_, i64>(2)? != 0,
-                    muted: row.get::<_, i64>(3)? != 0,
-                    last_message_id: row.get(4)?,
-                    last_activity_ms: row.get(5)?,
-                })
-            })?
+            .query_map([], row_to_conversation)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// List every conversation that belongs to `community_id`.
+    /// Phase 8 helper for [`crate::SearchTarget::Community`]
+    /// resolution; the WHERE clause matches the
+    /// `idx_conv_community` index added to
+    /// [`crate::local_store::schema::SCHEMA_SQL`].
+    pub fn list_conversations_by_community(
+        &self,
+        community_id: &str,
+    ) -> DbResult<Vec<Conversation>> {
+        self.list_conversations_by_column("community_id", community_id)
+    }
+
+    /// List every conversation that belongs to `domain_id`.
+    /// Phase 8 helper for [`crate::SearchTarget::Domain`].
+    pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
+        self.list_conversations_by_column("domain_id", domain_id)
+    }
+
+    /// List every conversation that belongs to `tenant_id`.
+    /// Phase 8 helper for [`crate::SearchTarget::Tenant`].
+    pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
+        self.list_conversations_by_column("tenant_id", tenant_id)
+    }
+
+    /// List every conversation with the given `scope`. Phase 8
+    /// helper for [`crate::SearchTarget::B2cAll`].
+    pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
+        self.list_conversations_by_column("scope", scope)
+    }
+
+    fn list_conversations_by_column(
+        &self,
+        column: &str,
+        value: &str,
+    ) -> DbResult<Vec<Conversation>> {
+        // The column name is taken from a closed set of literals
+        // (`tenant_id`, `community_id`, `domain_id`, `scope`)
+        // chosen by the four wrapper methods above — never user
+        // input — so the inline format string is safe.
+        let sql = format!(
+            "SELECT conversation_id, title_cipher, pinned, muted,
+                    last_message_id, last_activity_ms,
+                    conversation_type, scope, tenant_id,
+                    community_id, domain_id
+               FROM conversation
+              WHERE {column} = ?1
+              ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![value], row_to_conversation)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1666,6 +1737,7 @@ mod tests {
             muted: false,
             last_message_id: Some("msg-1".into()),
             last_activity_ms: 1_700_000_000_000,
+            ..Default::default()
         };
         db.insert_conversation(&conv).unwrap();
         let back = db.get_conversation("conv-1").unwrap().expect("present");
@@ -1682,6 +1754,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conv).unwrap();
         let skel = MessageSkeleton {
@@ -1723,6 +1796,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conv).unwrap();
         let skel = MessageSkeleton {
@@ -1754,6 +1828,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         // Inserting the same conversation twice would violate the
         // PK; ignore the second-call error so callers can seed
@@ -1898,6 +1973,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conversation).unwrap();
         let skel = MessageSkeleton {
@@ -2047,6 +2123,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conversation).unwrap();
         let skel = MessageSkeleton {
@@ -2171,6 +2248,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms,
+            ..Default::default()
         }
     }
 
@@ -2889,6 +2967,7 @@ mod tests {
             muted: false,
             last_message_id: None,
             last_activity_ms: 0,
+            ..Default::default()
         };
         db.insert_conversation(&conv).unwrap();
         let skel = archive_skeleton("m-arch", "c-arch");

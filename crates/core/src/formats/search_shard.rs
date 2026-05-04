@@ -26,10 +26,21 @@ pub const SHARD_COMPRESSION: &str = "zstd";
 /// (`xchacha20-poly1305`).
 pub const SHARD_ENCRYPTION: &str = "xchacha20-poly1305";
 
-/// Discriminant for the four kinds of search index a shard can carry.
+/// Discriminant for the kinds of search index a shard can carry.
+///
+/// Phase 8 (2026-05-04 batch) adds [`IndexType::Bloom`]: a
+/// per-`(conversation_id, time_bucket)` bloom filter built from
+/// the lowercase word set of every `search_fts` row. Bloom shards
+/// are fetched first by the prefetcher (see
+/// [`crate::search::shard_prefetch`]) so that fan-out can skip
+/// buckets whose filter rejects every query token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexType {
+    /// Per-bucket bloom filter over `search_fts` words.
+    /// Phase 8 — fetched first so the prefetcher can skip buckets
+    /// that cannot contain any query token.
+    Bloom,
     /// FTS5 (or fallback `unicode61`) full-text index.
     Text,
     /// Trigram / bigram fuzzy index.
@@ -46,6 +57,7 @@ impl IndexType {
     /// tests.
     pub fn all() -> &'static [IndexType] {
         &[
+            IndexType::Bloom,
             IndexType::Text,
             IndexType::Fuzzy,
             IndexType::Vector,
@@ -126,6 +138,7 @@ mod tests {
 
     fn sample_shard(index_type: IndexType) -> SearchIndexShard {
         let seed = match index_type {
+            IndexType::Bloom => 0x05,
             IndexType::Text => 0x10,
             IndexType::Fuzzy => 0x20,
             IndexType::Vector => 0x30,
@@ -182,6 +195,7 @@ mod tests {
 
     #[test]
     fn distinct_index_types_produce_distinct_cbor() {
+        let bloom = serde_cbor::to_vec(&sample_shard(IndexType::Bloom)).unwrap();
         let text = serde_cbor::to_vec(&sample_shard(IndexType::Text)).unwrap();
         let fuzzy = serde_cbor::to_vec(&sample_shard(IndexType::Fuzzy)).unwrap();
         let vector = serde_cbor::to_vec(&sample_shard(IndexType::Vector)).unwrap();
@@ -189,7 +203,7 @@ mod tests {
         // No two encodings should match — the discriminant alone is
         // enough to disambiguate, and the seed-derived bytes
         // reinforce the split.
-        let all = [&text, &fuzzy, &vector, &media];
+        let all = [&bloom, &text, &fuzzy, &vector, &media];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j], "shards {i} and {j} encode to the same CBOR");

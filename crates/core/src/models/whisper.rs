@@ -352,6 +352,11 @@ pub trait WhisperTranscriber: std::fmt::Debug + Send + Sync {
     fn transcribe(&self, audio_data: &[u8], mime_type: &str) -> Result<TranscriptionResult>;
 }
 
+/// Alias matching the Phase 6 task-spec name. `AudioTranscriber`
+/// and [`WhisperTranscriber`] are the same trait — the alias
+/// exists so call sites can use either name interchangeably.
+pub use WhisperTranscriber as AudioTranscriber;
+
 /// Always-`NotImplemented` [`WhisperTranscriber`] for builds
 /// without a real MLX or ONNX Whisper bridge wired in.
 ///
@@ -570,5 +575,30 @@ mod tests {
         let dynref: &dyn WhisperTranscriber = &mock;
         let result = dynref.transcribe(b"X", "audio/mpeg").unwrap();
         assert!(!result.text.is_empty());
+    }
+
+    // ----- Phase 6, Task 2 (2026-05-04 batch): AudioTranscriber alias -----
+
+    #[test]
+    fn audio_transcriber_noop_returns_not_implemented() {
+        // The `AudioTranscriber` alias resolves to the same trait
+        // as `WhisperTranscriber`, so the Noop transcriber should
+        // satisfy both.
+        let t: &dyn AudioTranscriber = &NoopWhisperTranscriber;
+        let err = t.transcribe(b"audio", "audio/mpeg").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::NotImplemented("whisper_transcriber")
+        ));
+    }
+
+    #[test]
+    fn mock_audio_transcriber_returns_configured_text() {
+        // Same `MockWhisperTranscriber` reachable via the alias.
+        let t: &dyn AudioTranscriber = &MockWhisperTranscriber;
+        let result = t.transcribe(b"hello-audio", "audio/wav").unwrap();
+        assert!(result.text.starts_with("mock transcription"));
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.language.as_deref(), Some("en"));
     }
 }

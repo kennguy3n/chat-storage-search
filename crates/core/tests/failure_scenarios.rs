@@ -1451,6 +1451,7 @@ fn offline_during_hydration_returns_cold_with_offline_flag() {
             muted: false,
             last_message_id: None,
             last_activity_ms: 1,
+            ..Default::default()
         };
         db.insert_conversation(&conv).expect("insert conv");
         let skel = DbMessageSkeleton {

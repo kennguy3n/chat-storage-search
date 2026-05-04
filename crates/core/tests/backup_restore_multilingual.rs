@@ -125,6 +125,7 @@ fn seed_conversation(db: &LocalStoreDb, conversation_id: Uuid) {
         muted: false,
         last_message_id: None,
         last_activity_ms: NOW_MS,
+        ..Default::default()
     })
     .expect("seed conversation");
 }

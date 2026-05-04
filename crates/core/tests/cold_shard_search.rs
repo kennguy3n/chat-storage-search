@@ -321,6 +321,7 @@ fn cold_shard_merge_does_not_double_weight_local_rows() {
         muted: false,
         last_message_id: None,
         last_activity_ms: created_at_ms,
+        ..Default::default()
     })
     .unwrap();
     let persister = MessagePersister::new(&db);

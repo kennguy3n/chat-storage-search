@@ -1993,65 +1993,161 @@ impl CoreImpl {
     }
 
     /// Best-effort Whisper transcription for audio media (Phase
-    /// 6, Task 1 of the 2026-05-04 batch). Runs only when (a) a
-    /// [`crate::models::whisper::WhisperTranscriber`] is
-    /// installed and (b) `mime_type` indicates audio. The
-    /// concatenated transcript and detected language land in
-    /// `media_search_index` keyed by `asset_id` with kind
-    /// `"transcript"`. All errors — both inference failures and
-    /// DB write failures — are absorbed; the message is already
+    /// 6, Task 2 of the 2026-05-04 batch). Runs only when
+    /// (a) a [`crate::models::whisper::WhisperTranscriber`] is
+    /// installed, (b) `mime_type` indicates audio, and (c) the
+    /// optional [`crate::models::resource_gate::ResourceProbe`]
+    /// reports the device is willing to run transcription work
+    /// (no probe installed = always allowed).
+    ///
+    /// The concatenated transcript lands in three places so the
+    /// search engines all treat the audio body as a first-class
+    /// searchable surface:
+    ///
+    /// * `media_search_index` keyed by `asset_id` with kind
+    ///   `"transcript"` — for caller code that still consults
+    ///   the legacy media-side index.
+    /// * `search_fts` and `search_fuzzy`, keyed by `message_id`
+    ///   — so a `core.search()` call ranks the audio message
+    ///   alongside text bodies and OCR / caption rows.
+    /// * Optionally [`crate::models::embeddings::LocalStoreEmbeddingCache`]
+    ///   under `XLMR_MODEL_VERSION` when a `TextEmbedder` is
+    ///   installed, so the semantic-search reranker can score
+    ///   the audio body.
+    ///
+    /// All errors — inference failures, gate failures, and DB
+    /// write failures — are absorbed; the message is already
     /// persisted and FTS-searchable through its caption.
+    #[allow(clippy::too_many_arguments)]
     fn maybe_transcribe_audio_message(
         &self,
         db: &LocalStoreDb,
+        message_id: &str,
         asset_id: &str,
+        sender_id: &str,
+        conversation_id: &str,
+        created_at_ms: i64,
         mime_type: &str,
         plaintext: &[u8],
     ) {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::models::resource_gate::ResourceGate;
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
         if !mime_type.starts_with("audio/") {
             return;
         }
+        // Resource-gate transcription work. Whisper is the
+        // strictest gate (`should_run_transcription`); skip
+        // entirely when the gate refuses.
+        if let Ok(slot) = self.resource_probe.lock() {
+            if let Some(probe) = slot.as_ref() {
+                let gate = ResourceGate::default();
+                if !gate.should_run_transcription(&probe.current_resources()) {
+                    return;
+                }
+            }
+        }
+
         let Ok(slot) = self.whisper_transcriber.lock() else {
             return;
         };
         let Some(transcriber) = slot.as_ref() else {
             return;
         };
-        match transcriber.transcribe(plaintext, mime_type) {
-            Ok(result) => {
-                let language = result.language.as_deref();
-                let _ = db.insert_media_search_index(
-                    asset_id,
-                    "transcript",
-                    &result.text,
-                    language,
-                    None,
-                );
-            }
-            Err(_) => {
-                // Inference failures are absorbed — same
-                // policy as `maybe_embed_text_message`.
+        let result = match transcriber.transcribe(plaintext, mime_type) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let transcript = result.text.trim();
+        if transcript.is_empty() {
+            return;
+        }
+        let language = result.language.as_deref();
+
+        // (1) Legacy media-side index.
+        let _ = db.insert_media_search_index(asset_id, "transcript", transcript, language, None);
+
+        // (2) Cross-modal FTS / fuzzy index keyed by
+        //     `message_id` — same shape `send_text` writes for
+        //     plain text bodies. Best-effort; a duplicate row
+        //     (e.g. the caption already inserted one) is
+        //     harmless because `search_fts` is content-addressed
+        //     by `(message_id, text_content)` from the engine's
+        //     POV and the fuzzy index PK is `(token, script,
+        //     message_id)`.
+        let _ = db.connection().execute(
+            "INSERT INTO search_fts(
+                message_id, conversation_id, sender_id,
+                created_at_ms, text_content
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                message_id,
+                conversation_id,
+                sender_id,
+                created_at_ms,
+                transcript,
+            ],
+        );
+        let _ = FuzzySearchEngine::new(db).index_message(message_id, transcript);
+
+        // (3) Optional XLM-R embedding so semantic search picks
+        //     up the audio body.
+        if let Ok(embedder_slot) = self.text_embedder.lock() {
+            if let Some(embedder) = embedder_slot.as_ref() {
+                let cache = LocalStoreEmbeddingCache::new(db.connection());
+                if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                    if let Ok(vec) = embedder.embed(transcript) {
+                        let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
+                    }
+                }
             }
         }
     }
 
     /// Best-effort document text extraction for PDF / DOCX media
-    /// (Phase 6, Task 2 of the 2026-05-04 batch). Runs only when
+    /// (Phase 6, Task 3 of the 2026-05-04 batch). Runs only when
     /// (a) a [`crate::models::document::DocumentExtractor`] is
     /// installed and (b) `mime_type` is one of the supported
     /// document MIME types
     /// ([`crate::models::document::is_supported_document_mime`]).
-    /// Each page lands as a `"caption"`-kind row in
-    /// `media_search_index` with text formatted as
-    /// `"[page N] …"`. Errors are absorbed.
+    ///
+    /// Each page lands in three places, mirroring the audio
+    /// transcription fan-out in
+    /// [`Self::maybe_transcribe_audio_message`]:
+    ///
+    /// * `media_search_index` keyed by `asset_id` with kind
+    ///   `"caption"` and a `"[page N] …"` prefix for the legacy
+    ///   media-side index.
+    /// * `search_fts` and `search_fuzzy`, keyed by a synthetic
+    ///   page row id (`{message_id}#page{N}`), so multilingual
+    ///   document bodies show up in `core.search()` with
+    ///   page-level granularity.
+    /// * Optionally
+    ///   [`crate::models::embeddings::LocalStoreEmbeddingCache`]
+    ///   under `XLMR_MODEL_VERSION` when a `TextEmbedder` is
+    ///   installed.
+    ///
+    /// Errors are absorbed.
+    #[allow(clippy::too_many_arguments)]
     fn maybe_extract_document_pages(
         &self,
         db: &LocalStoreDb,
+        message_id: &str,
         asset_id: &str,
+        sender_id: &str,
+        conversation_id: &str,
+        created_at_ms: i64,
         mime_type: &str,
         plaintext: &[u8],
     ) {
         use crate::models::document::is_supported_document_mime;
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::search::fuzzy_search::FuzzySearchEngine;
 
         if !is_supported_document_mime(mime_type) {
             return;
@@ -2062,35 +2158,69 @@ impl CoreImpl {
         let Some(extractor) = slot.as_ref() else {
             return;
         };
-        match extractor.extract_text(plaintext, mime_type) {
-            Ok(pages) => {
-                for page in pages {
-                    let formatted = format!("[page {}] {}", page.page_number, page.text);
-                    let _ = db.insert_media_search_index(
-                        asset_id,
-                        "caption",
-                        &formatted,
-                        page.language.as_deref(),
-                        None,
-                    );
-                }
+        let pages = match extractor.extract_text(plaintext, mime_type) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        for page in pages {
+            let trimmed = page.text.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            Err(_) => {
-                // Inference failures are absorbed.
+            let language = page.language.as_deref();
+            let formatted = format!("[page {}] {}", page.page_number, trimmed);
+
+            // (1) Legacy media-side caption row.
+            let _ = db.insert_media_search_index(asset_id, "caption", &formatted, language, None);
+
+            // (2) Page-level FTS / fuzzy rows keyed by a
+            //     synthetic per-page id so the same `message_id`
+            //     can land multiple FTS rows without colliding.
+            let page_row_id = format!("{}#page{}", message_id, page.page_number);
+            let _ = db.connection().execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    page_row_id,
+                    conversation_id,
+                    sender_id,
+                    created_at_ms,
+                    trimmed,
+                ],
+            );
+            let _ = FuzzySearchEngine::new(db).index_message(&page_row_id, trimmed);
+
+            // (3) Optional XLM-R embedding per page.
+            if let Ok(embedder_slot) = self.text_embedder.lock() {
+                if let Some(embedder) = embedder_slot.as_ref() {
+                    let cache = LocalStoreEmbeddingCache::new(db.connection());
+                    if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
+                        if let Ok(vec) = embedder.embed(trimmed) {
+                            let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Best-effort video keyframe sampling + MobileCLIP-S2
-    /// embedding for video media (Phase 6, Task 3 of the
-    /// 2026-05-04 batch). Runs only when (a) a
+    /// embedding fan-out for video media (Phase 6, Task 1 of
+    /// the 2026-05-04 batch). Runs only when (a) a
     /// [`crate::models::video::VideoKeyframeSampler`] is
     /// installed, (b) an
     /// [`crate::models::clip::ImageEmbedder`] is installed, and
-    /// (c) `mime_type` indicates video. The first keyframe's
-    /// embedding lands in `search_vector` keyed
-    /// `(message_id, MOBILECLIP_S2_MODEL_VERSION)`. Errors are
-    /// absorbed.
+    /// (c) `mime_type` indicates video.
+    ///
+    /// Each extracted keyframe is embedded under
+    /// `(message_id, "mobileclip_s2@v1_frame_{idx}")` so a
+    /// single video message can land multiple cache rows. The
+    /// canonical model_version row
+    /// (`(message_id, MOBILECLIP_S2_MODEL_VERSION)`) is also
+    /// written for the first frame so existing callers that
+    /// look up the unsuffixed key continue to find a vector.
     fn maybe_embed_video_keyframes(
         &self,
         db: &LocalStoreDb,
@@ -2118,24 +2248,40 @@ impl CoreImpl {
         };
 
         let cache = LocalStoreEmbeddingCache::new(db.connection());
-        if let Ok(Some(_)) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
-            return;
-        }
 
         // Sample up to 5 keyframes per PROPOSAL §7.6 default.
         let frames = match sampler.extract_keyframes(plaintext, mime_type, 5) {
             Ok(f) => f,
             Err(_) => return,
         };
-        let Some(first) = frames.into_iter().next() else {
-            return;
-        };
-        match embedder.embed_image(&first.image_data, &first.mime_type) {
-            Ok(vec) => {
-                let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
+
+        for (idx, frame) in frames.into_iter().enumerate() {
+            let suffix_key = format!(
+                "{}_frame_{}",
+                MOBILECLIP_S2_MODEL_VERSION, frame.frame_index
+            );
+            // Per-frame cache hit short-circuits inference for
+            // already-embedded frames.
+            if let Ok(Some(_)) = cache.get(message_id, &suffix_key) {
+                continue;
             }
-            Err(_) => {
-                // Inference failures are absorbed.
+            match embedder.embed_image(&frame.image_data, &frame.mime_type) {
+                Ok(vec) => {
+                    let _ = cache.put(message_id, &suffix_key, &vec);
+                    // Mirror the first frame's embedding under
+                    // the unsuffixed canonical model_version so
+                    // callers that look up the original key
+                    // (e.g. `maybe_embed_image_message`'s
+                    // duplicate-detection path) still resolve.
+                    if idx == 0 {
+                        if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+                            let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Inference failures are absorbed.
+                }
             }
         }
     }
@@ -2181,6 +2327,7 @@ impl CoreImpl {
             muted: false,
             last_message_id: None,
             last_activity_ms,
+            ..Default::default()
         };
         db.insert_conversation(&conv)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -3376,21 +3523,35 @@ impl KChatCore for CoreImpl {
             // persisted and FTS-searchable through its caption.
             self.maybe_embed_image_message(&db, &skel.message_id, mime_type, &plaintext);
 
-            // Phase 6, Task 1 (2026-05-04 batch): best-effort
-            // Whisper transcription for audio media. Runs only
-            // when (a) a transcriber is installed and (b) the
-            // MIME type indicates audio. The transcript lands in
-            // `media_search_index` keyed by `asset_id` with kind
-            // `"transcript"`; failures are absorbed.
-            self.maybe_transcribe_audio_message(&db, &asset_id.to_string(), mime_type, &plaintext);
+            // Phase 6, Task 2 (2026-05-04 batch): best-effort
+            // Whisper transcription for audio media. Fans the
+            // transcript out into `media_search_index`,
+            // `search_fts`, `search_fuzzy`, and the shared XLM-R
+            // embedding cache. Failures are absorbed.
+            self.maybe_transcribe_audio_message(
+                &db,
+                &skel.message_id,
+                &asset_id.to_string(),
+                &skel.sender_id,
+                &skel.conversation_id,
+                skel.created_at_ms,
+                mime_type,
+                &plaintext,
+            );
 
-            // Phase 6, Task 2 (2026-05-04 batch): best-effort PDF
-            // / DOCX page text extraction. Runs only when (a) an
-            // extractor is installed and (b) the MIME type is
-            // `application/pdf` or DOCX. Each page lands as a
-            // `"caption"`-kind row in `media_search_index`;
-            // failures are absorbed.
-            self.maybe_extract_document_pages(&db, &asset_id.to_string(), mime_type, &plaintext);
+            // Phase 6, Task 3 (2026-05-04 batch): best-effort PDF
+            // / DOCX page text extraction with page-level FTS /
+            // fuzzy / XLM-R fan-out. Failures are absorbed.
+            self.maybe_extract_document_pages(
+                &db,
+                &skel.message_id,
+                &asset_id.to_string(),
+                &skel.sender_id,
+                &skel.conversation_id,
+                skel.created_at_ms,
+                mime_type,
+                &plaintext,
+            );
 
             // Phase 6, Task 3 (2026-05-04 batch): best-effort
             // video keyframe sampling + MobileCLIP-S2 embedding.
@@ -3834,6 +3995,7 @@ mod tests {
                 muted: false,
                 last_message_id: None,
                 last_activity_ms: 1,
+                ..Default::default()
             };
             db.insert_conversation(&conv_row).unwrap();
         });
@@ -8646,6 +8808,372 @@ mod tests {
                 .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
                 .unwrap()
                 .is_none());
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 6, Tasks 1-3 (2026-05-04 batch) — send_media fan-out
+    // tests for video keyframe sampling, audio transcription,
+    // and document text extraction. The trait-level coverage of
+    // each seam lives in `crate::models::{video,whisper,document}`;
+    // these tests pin the integration contract that an
+    // installed seam fans out into the cache and FTS / fuzzy
+    // indexes during `send_media`.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn send_media_extracts_keyframes_and_embeds_when_sampler_installed() {
+        use crate::models::clip::{MockImageEmbedder, MOBILECLIP_S2_MODEL_VERSION};
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+        use crate::models::video::MockVideoKeyframeSampler;
+
+        let core = fresh_core();
+        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+            .unwrap();
+        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, b"video-bytes-x".to_vec(), "video/mp4", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            // The unsuffixed canonical key is mirrored from
+            // frame 0 so existing duplicate-detection still
+            // resolves.
+            assert!(cache
+                .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
+                .unwrap()
+                .is_some());
+            // Per-frame rows land for at least frames 0..2.
+            for frame_idx in 0..2u32 {
+                let key = format!("{}_frame_{}", MOBILECLIP_S2_MODEL_VERSION, frame_idx);
+                assert!(
+                    cache.get(&mid.to_string(), &key).unwrap().is_some(),
+                    "keyframe {frame_idx} embedding missing"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn send_media_skips_keyframe_extraction_for_non_video_mime() {
+        use crate::models::clip::{MockImageEmbedder, MOBILECLIP_S2_MODEL_VERSION};
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+        use crate::models::video::MockVideoKeyframeSampler;
+
+        let core = fresh_core();
+        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+            .unwrap();
+        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            // No frame_0 row written for non-video media.
+            let frame_key = format!("{}_frame_0", MOBILECLIP_S2_MODEL_VERSION);
+            assert!(cache.get(&mid.to_string(), &frame_key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn send_media_skips_keyframe_extraction_when_no_sampler() {
+        use crate::models::clip::{MockImageEmbedder, MOBILECLIP_S2_MODEL_VERSION};
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        let core = fresh_core();
+        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+            .unwrap();
+        // Note: no sampler installed.
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, b"video-bytes".to_vec(), "video/mp4", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let frame_key = format!("{}_frame_0", MOBILECLIP_S2_MODEL_VERSION);
+            assert!(cache.get(&mid.to_string(), &frame_key).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn send_media_transcribes_voice_message_when_transcriber_installed() {
+        use crate::models::whisper::MockWhisperTranscriber;
+
+        let core = fresh_core();
+        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, b"voice-msg".to_vec(), "audio/wav", None)
+            .expect("send_media");
+
+        // Legacy media_search_index row is present.
+        core.with_db(|db| {
+            let rows: Vec<(String, String)> = db
+                .connection()
+                .prepare("SELECT kind, text FROM media_search_index WHERE asset_id = ?1")
+                .unwrap()
+                .query_map([res.asset_id.to_string()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert!(rows.iter().any(|(k, _)| k == "transcript"));
+        });
+    }
+
+    #[test]
+    fn send_media_indexes_transcript_into_fts_and_fuzzy() {
+        use crate::models::whisper::{MockWhisperTranscriber, WhisperTranscriber};
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
+        let core = fresh_core();
+        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, b"voice-msg".to_vec(), "audio/wav", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            // FTS row keyed by the audio message_id is present.
+            let fts_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE message_id = ?1",
+                    [mid.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fts_count >= 1, "transcript should land in search_fts");
+
+            // Fuzzy index has at least one row keyed by message_id.
+            let mock_text = MockWhisperTranscriber
+                .transcribe(b"voice-msg", "audio/wav")
+                .unwrap()
+                .text;
+            // Pull the first stem from the mock transcript so
+            // we exercise the fuzzy lookup path with a real
+            // token. Mock transcripts always start with
+            // `"mock transcription"`.
+            let probe = mock_text.split_whitespace().next().unwrap_or("mock");
+            let fuzzy = FuzzySearchEngine::new(db);
+            let hits = fuzzy.search_fuzzy(probe, 16).unwrap();
+            assert!(
+                hits.iter().any(|h| h.message_id == mid.to_string()),
+                "transcript should land in search_fuzzy"
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_skips_transcription_for_non_audio_mime() {
+        use crate::models::whisper::MockWhisperTranscriber;
+
+        let core = fresh_core();
+        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'transcript'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "no transcript should be written for image media");
+        });
+    }
+
+    #[test]
+    fn send_media_skips_transcription_when_resource_gate_blocks() {
+        use crate::models::resource_gate::{
+            DeviceResources, NetworkType, ResourceProbe, ThermalState,
+        };
+        use crate::models::whisper::MockWhisperTranscriber;
+
+        // A probe that reports critical thermal — every gate
+        // refuses, including `should_run_transcription`.
+        #[derive(Debug)]
+        struct CriticalProbe;
+        impl ResourceProbe for CriticalProbe {
+            fn current_resources(&self) -> DeviceResources {
+                DeviceResources {
+                    battery_level: 1.0,
+                    is_charging: true,
+                    thermal_state: ThermalState::Critical,
+                    network_type: NetworkType::WiFi,
+                }
+            }
+        }
+
+        let core = fresh_core();
+        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+            .unwrap();
+        core.install_resource_probe(std::sync::Arc::new(CriticalProbe))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, b"voice-msg".to_vec(), "audio/wav", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'transcript'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "transcription should be gated off");
+        });
+    }
+
+    #[test]
+    fn send_media_extracts_document_text_when_extractor_installed() {
+        use crate::models::document::MockDocumentExtractor;
+
+        let core = fresh_core();
+        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(
+                conv,
+                mid,
+                b"%PDF-1.7 fake pdf bytes".to_vec(),
+                "application/pdf",
+                None,
+            )
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'caption'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                count >= 1,
+                "extractor should write at least one caption row"
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_indexes_document_pages_into_fts() {
+        use crate::models::document::MockDocumentExtractor;
+
+        let core = fresh_core();
+        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(
+            conv,
+            mid,
+            b"%PDF-1.7 fake pdf bytes".to_vec(),
+            "application/pdf",
+            None,
+        )
+        .expect("send_media");
+
+        core.with_db(|db| {
+            // Each page lands as a synthetic
+            // `{message_id}#page{N}` FTS row. Check at least
+            // one `#page1` row exists.
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts
+                     WHERE message_id LIKE ?1",
+                    [format!("{}#page%", mid)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(count >= 1, "page-level FTS rows missing");
+        });
+    }
+
+    #[test]
+    fn send_media_skips_extraction_for_non_document_mime() {
+        use crate::models::document::MockDocumentExtractor;
+
+        let core = fresh_core();
+        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'caption'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "no caption rows for image-only media");
         });
     }
 

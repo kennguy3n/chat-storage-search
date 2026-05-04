@@ -72,6 +72,7 @@ fn insert_conversation(db: &LocalStoreDb, conv: Uuid) {
         muted: false,
         last_message_id: None,
         last_activity_ms: 0,
+        ..Default::default()
     })
     .unwrap();
 }
@@ -282,6 +283,7 @@ fn archive_pipeline_timeline_skeleton_and_checkpoint_segments_round_trip() {
         muted: false,
         last_message_id: None,
         last_activity_ms: APRIL_BUCKET_MS,
+        ..Default::default()
     })
     .unwrap();
 

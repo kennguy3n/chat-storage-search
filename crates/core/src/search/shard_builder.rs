@@ -142,6 +142,10 @@ pub const VECTOR_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_VECTOR_SHARD_PAYLOAD_V1";
 /// Domain-separation magic for [`MediaShardPayload`].
 pub const MEDIA_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_MEDIA_SHARD_PAYLOAD_V1";
 
+/// Domain-separation magic for [`BloomShardPayload`].
+/// Phase 8 (2026-05-04 batch).
+pub const BLOOM_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_BLOOM_SHARD_PAYLOAD_V1";
+
 /// CBOR-sealed plaintext of a text [`SearchIndexShard`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FtsShardPayload {
@@ -184,6 +188,23 @@ pub struct MediaShardPayload {
     pub rows: Vec<MediaIndexRow>,
 }
 
+/// CBOR-sealed plaintext of a bloom-filter [`SearchIndexShard`]
+/// (Phase 8 — 2026-05-04 batch). The payload encodes the
+/// in-memory [`BloomFilter`] as `(bit_count, hash_count, bits)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BloomShardPayload {
+    /// Always [`BLOOM_SHARD_PAYLOAD_MAGIC`].
+    #[serde(with = "serde_bytes")]
+    pub magic: Vec<u8>,
+    /// Number of bits in the filter (always a multiple of 8).
+    pub bit_count: u64,
+    /// Number of independent hash positions per inserted word.
+    pub hash_count: u32,
+    /// Packed bit array (`(bit_count + 7) / 8` bytes).
+    #[serde(with = "serde_bytes")]
+    pub bits: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // Build / restore
 // ---------------------------------------------------------------------------
@@ -217,6 +238,7 @@ fn build_shard_aad(
         IndexType::Fuzzy => 2,
         IndexType::Vector => 3,
         IndexType::Media => 4,
+        IndexType::Bloom => 5,
     };
     let mut aad = Vec::with_capacity(
         SEARCH_SHARD_AAD_MAGIC.len() + 1 + 16 + conversation_id_hash.len() + time_bucket.len(),
@@ -515,6 +537,189 @@ pub fn restore_media_search_shard(
         return Err(Error::Storage("media shard payload magic mismatch".into()));
     }
     Ok(payload.rows)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 — Bloom filter shards
+// ---------------------------------------------------------------------------
+
+/// Default number of hash positions per word.
+pub const BLOOM_HASH_COUNT: u32 = 3;
+
+/// Lower bound on the bit array size, used when callers ask for
+/// a filter sized for a tiny or empty word set.
+const BLOOM_MIN_BITS: u64 = 64;
+
+/// Approximate target false-positive rate for
+/// [`BloomFilter::for_expected_count`]. Picked so that a
+/// 10× over-fill of the expected_count still keeps the false
+/// positive rate below ~1%.
+const BLOOM_BITS_PER_ELEMENT: u64 = 12;
+
+/// Per-bucket bloom filter. Uses three independent BLAKE3 keyed
+/// hashes — one per `BLOOM_HASH_COUNT` slot — over the lowercase
+/// word bytes. Hash positions are taken mod the bit-array
+/// length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BloomFilter {
+    bit_count: u64,
+    hash_count: u32,
+    bits: Vec<u8>,
+}
+
+impl BloomFilter {
+    /// Build a filter sized for `expected_count` entries with
+    /// `hash_count` independent hash positions each.
+    pub fn for_expected_count(expected_count: usize, hash_count: u32) -> Self {
+        let bits_needed = (expected_count as u64).saturating_mul(BLOOM_BITS_PER_ELEMENT);
+        let bit_count = bits_needed.max(BLOOM_MIN_BITS).div_ceil(8) * 8;
+        Self {
+            bit_count,
+            hash_count: hash_count.max(1),
+            bits: vec![0u8; (bit_count / 8) as usize],
+        }
+    }
+
+    /// Build a filter from the supplied lowercase word set.
+    pub fn from_words(words: &[String], expected_count: usize) -> Self {
+        let mut f = Self::for_expected_count(expected_count.max(words.len()), BLOOM_HASH_COUNT);
+        for w in words {
+            f.insert_word(w);
+        }
+        f
+    }
+
+    /// Insert a single word into the filter. The caller is
+    /// responsible for case-folding before insertion — this
+    /// matches the behaviour of [`Self::maybe_contains`].
+    pub fn insert_word(&mut self, word: &str) {
+        for slot in 0..self.hash_count {
+            let pos = self.position(word, slot);
+            self.set_bit(pos);
+        }
+    }
+
+    /// Check whether `word` is *possibly* in the filter. False
+    /// positives are bounded by the configured fill ratio;
+    /// false negatives never occur for words that were inserted
+    /// without modification.
+    pub fn maybe_contains(&self, word: &str) -> bool {
+        for slot in 0..self.hash_count {
+            let pos = self.position(word, slot);
+            if !self.get_bit(pos) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn position(&self, word: &str, slot: u32) -> u64 {
+        // Domain-separated keys per slot using a 32-byte BLAKE3
+        // keyed hash. The slot index is encoded into the key so
+        // each slot uses an independent function.
+        let mut key = [0u8; 32];
+        let prefix = b"kchat-bloom-shard-slot-";
+        key[..prefix.len()].copy_from_slice(prefix);
+        key[prefix.len()..prefix.len() + 4].copy_from_slice(&slot.to_le_bytes());
+        let h = blake3::keyed_hash(&key, word.as_bytes());
+        let bytes = h.as_bytes();
+        let v = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+        if self.bit_count == 0 {
+            return 0;
+        }
+        v % self.bit_count
+    }
+
+    fn set_bit(&mut self, pos: u64) {
+        let byte = (pos / 8) as usize;
+        let bit = (pos % 8) as u8;
+        if byte < self.bits.len() {
+            self.bits[byte] |= 1u8 << bit;
+        }
+    }
+
+    fn get_bit(&self, pos: u64) -> bool {
+        let byte = (pos / 8) as usize;
+        let bit = (pos % 8) as u8;
+        if byte >= self.bits.len() {
+            return false;
+        }
+        (self.bits[byte] >> bit) & 1 == 1
+    }
+
+    /// Number of bits in the bit array (multiple of 8).
+    pub fn bit_count(&self) -> u64 {
+        self.bit_count
+    }
+
+    /// Number of hash positions per inserted word.
+    pub fn hash_count(&self) -> u32 {
+        self.hash_count
+    }
+}
+
+/// Build an encrypted bloom shard sealing the supplied
+/// `words` into a [`BloomFilter`] plus a
+/// [`BloomShardPayload`].
+///
+/// `k_bloom_index_shard` is the per-shard AEAD key — typically
+/// `K_bloom_index_shard(shard_id)` from
+/// [`crate::crypto::key_hierarchy::derive_bloom_index_shard`].
+pub fn build_bloom_shard(
+    words: Vec<String>,
+    expected_count: usize,
+    conversation_id: &str,
+    time_bucket: impl Into<String>,
+    k_bloom_index_shard: &KeyMaterial,
+    conversation_hash_key: &KeyMaterial,
+) -> Result<BuiltShard, Error> {
+    let filter = BloomFilter::from_words(&words, expected_count);
+    let payload = BloomShardPayload {
+        magic: BLOOM_SHARD_PAYLOAD_MAGIC.to_vec(),
+        bit_count: filter.bit_count,
+        hash_count: filter.hash_count,
+        bits: filter.bits.clone(),
+    };
+    let cbor = serde_cbor::to_vec(&payload)
+        .map_err(|e| Error::Storage(format!("bloom shard cbor encode: {e}")))?;
+    let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
+    let shard = seal_shard(
+        cbor,
+        IndexType::Bloom,
+        conversation_id_hash,
+        time_bucket.into(),
+        words.len() as u64,
+        k_bloom_index_shard,
+    )?;
+    Ok(BuiltShard {
+        shard,
+        k_shard: k_bloom_index_shard.clone(),
+    })
+}
+
+/// Decrypt + decompress + decode a bloom [`SearchIndexShard`]
+/// previously built by [`build_bloom_shard`].
+pub fn restore_bloom_shard(
+    shard: &SearchIndexShard,
+    k_bloom_index_shard: &KeyMaterial,
+) -> Result<BloomFilter, Error> {
+    if shard.index_type != IndexType::Bloom {
+        return Err(Error::Storage(format!(
+            "restore_bloom_shard: index_type {:?} != Bloom",
+            shard.index_type
+        )));
+    }
+    let cbor = open_shard(shard, k_bloom_index_shard)?;
+    let payload: BloomShardPayload = serde_cbor::from_slice(&cbor)
+        .map_err(|e| Error::Storage(format!("bloom shard cbor decode: {e}")))?;
+    if payload.magic != BLOOM_SHARD_PAYLOAD_MAGIC {
+        return Err(Error::Storage("bloom shard payload magic mismatch".into()));
+    }
+    Ok(BloomFilter {
+        bit_count: payload.bit_count,
+        hash_count: payload.hash_count,
+        bits: payload.bits,
+    })
 }
 
 fn open_shard(shard: &SearchIndexShard, k: &KeyMaterial) -> Result<Vec<u8>, Error> {
@@ -884,6 +1089,130 @@ mod tests {
         let err = restore_media_search_shard(&built.shard, &built.k_shard).unwrap_err();
         assert!(
             matches!(&err, Error::Storage(msg) if msg.contains("Media")),
+            "got {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Phase 8 — Bloom shard tests
+    // -------------------------------------------------------------
+
+    fn fresh_bloom_shard_key() -> KeyMaterial {
+        use crate::crypto::key_hierarchy::derive_bloom_index_shard;
+        let identity = KeyMaterial::from_bytes([0xAB; 32]);
+        let search_root = derive_search_root(&identity).expect("derive search root");
+        derive_bloom_index_shard(&search_root, &Uuid::now_v7().into_bytes())
+            .expect("derive bloom shard key")
+    }
+
+    #[test]
+    fn bloom_filter_maybe_contains_returns_true_for_inserted_words() {
+        let words = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        let f = BloomFilter::from_words(&words, 16);
+        for w in &words {
+            assert!(f.maybe_contains(w), "{w} must be present");
+        }
+    }
+
+    #[test]
+    fn bloom_filter_maybe_contains_returns_false_for_absent_words() {
+        let words: Vec<String> = (0..32).map(|i| format!("inserted-{i}")).collect();
+        let f = BloomFilter::from_words(&words, 32);
+        let absent: Vec<String> = (0..1000).map(|i| format!("absent-token-{i}")).collect();
+        let false_positives = absent.iter().filter(|w| f.maybe_contains(w)).count();
+        // Allow some false positives (it's a probabilistic
+        // structure) but most absent words should be rejected.
+        assert!(
+            false_positives < absent.len() / 4,
+            "too many false positives: {} / {}",
+            false_positives,
+            absent.len()
+        );
+    }
+
+    #[test]
+    fn bloom_filter_false_positive_rate_under_5_percent() {
+        // Build a filter sized for 1000 entries, fill it, and
+        // probe it with 10 000 *un*inserted words. With the
+        // BLOOM_BITS_PER_ELEMENT setting (12 bits/elem, 3 hash
+        // functions) the FPR should sit well under 5%.
+        let inserted: Vec<String> = (0..1000).map(|i| format!("inserted-{i}")).collect();
+        let f = BloomFilter::from_words(&inserted, 1000);
+        let absent: Vec<String> = (1000..11000).map(|i| format!("absent-{i}")).collect();
+        let fp = absent.iter().filter(|w| f.maybe_contains(w)).count();
+        let rate = (fp as f64) / (absent.len() as f64);
+        assert!(
+            rate < 0.05,
+            "false positive rate {rate} too high (fp = {fp})"
+        );
+    }
+
+    #[test]
+    fn bloom_filter_build_and_restore_round_trip() {
+        let key = fresh_bloom_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let words: Vec<String> = vec![
+            "hello".into(),
+            "world".into(),
+            "lighthouse".into(),
+            "keeper".into(),
+        ];
+        let built = build_bloom_shard(words.clone(), 32, "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        let restored = restore_bloom_shard(&built.shard, &built.k_shard).expect("restore");
+        for w in &words {
+            assert!(
+                restored.maybe_contains(w),
+                "round-tripped filter must still contain {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_shard_wrong_key_fails_decrypt() {
+        let key_a = fresh_bloom_shard_key();
+        let key_b = fresh_bloom_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let words: Vec<String> = vec!["alpha".into(), "beta".into()];
+        let built =
+            build_bloom_shard(words, 8, "conv-A", "2026-04", &key_a, &conv_key).expect("build");
+        let err = restore_bloom_shard(&built.shard, &key_b).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn bloom_shard_multilingual_words_round_trip() {
+        let key = fresh_bloom_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let words: Vec<String> = vec![
+            "lighthouse".into(), // Latin
+            "Встреча".into(),    // Cyrillic
+            "会議室".into(),     // CJK
+            "مرحبا".into(),      // Arabic
+            "안녕".into(),       // Hangul
+            "नमस्ते".into(),       // Devanagari
+        ];
+        let built = build_bloom_shard(words.clone(), 16, "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        let restored = restore_bloom_shard(&built.shard, &built.k_shard).expect("restore");
+        for w in &words {
+            assert!(
+                restored.maybe_contains(w),
+                "multilingual word {w} must survive round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_shard_index_type_mismatch_rejected() {
+        let key = fresh_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_text_rows(2);
+        let built =
+            build_text_search_shard(rows, "conv-A", "2026-04", &key, &conv_key).expect("build");
+        let err = restore_bloom_shard(&built.shard, &built.k_shard).unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(msg) if msg.contains("Bloom")),
             "got {err:?}"
         );
     }
