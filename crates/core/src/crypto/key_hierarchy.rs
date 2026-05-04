@@ -246,8 +246,19 @@ fn derive_with_two_ids(
     id_a: &[u8],
     id_b: &[u8],
 ) -> CryptoResult<KeyMaterial> {
-    let mut buf = Vec::with_capacity(label.len() + id_a.len() + id_b.len());
+    // Length-prefix `id_a` so the boundary between the two
+    // variable-length ids is unambiguous. Without the prefix,
+    // `("tenant-a", "shard-1")` and `("tenant-as", "hard-1")`
+    // would collapse to identical info bytes and derive the
+    // same key, breaking per-tenant isolation. `id_a.len()` is
+    // bounded by `u32::MAX` in practice (we never feed it
+    // strings approaching 4 GiB), so the cast is safe; we
+    // still saturate to be defensive.
+    let id_a_len: u32 = u32::try_from(id_a.len()).unwrap_or(u32::MAX);
+    let len_bytes = id_a_len.to_be_bytes();
+    let mut buf = Vec::with_capacity(label.len() + len_bytes.len() + id_a.len() + id_b.len());
     buf.extend_from_slice(label);
+    buf.extend_from_slice(&len_bytes);
     buf.extend_from_slice(id_a);
     buf.extend_from_slice(id_b);
     derive(parent, &buf)
@@ -277,7 +288,12 @@ pub fn derive_b2b_tenant_root(
 /// Derive `K_b2b_archive_epoch(tenant_id, epoch_id)` from a
 /// per-tenant root produced by [`derive_b2b_tenant_root`].
 ///
-/// `info = info::B2B_ARCHIVE_EPOCH || tenant_id.as_bytes() || epoch_id.as_bytes()`.
+/// `info = info::B2B_ARCHIVE_EPOCH || u32_BE(tenant_id.len()) ||
+/// tenant_id.as_bytes() || epoch_id.as_bytes()`. The 4-byte
+/// big-endian length prefix on `tenant_id` keeps the boundary
+/// between the two variable-length ids unambiguous; without it,
+/// `("tenant-a", "epoch-1")` and `("tenant-ae", "poch-1")` would
+/// collide on the same info bytes.
 pub fn derive_b2b_archive_epoch(
     k_tenant_root: &KeyMaterial,
     tenant_id: &str,
@@ -294,7 +310,10 @@ pub fn derive_b2b_archive_epoch(
 /// Derive `K_b2b_text_index_shard(tenant_id, shard_id)` from a
 /// `K_search_root` (or any per-tenant search subtree).
 ///
-/// `info = info::B2B_TEXT_INDEX_SHARD || tenant_id.as_bytes() || shard_id.as_bytes()`.
+/// `info = info::B2B_TEXT_INDEX_SHARD || u32_BE(tenant_id.len()) ||
+/// tenant_id.as_bytes() || shard_id.as_bytes()`. The 4-byte
+/// big-endian length prefix on `tenant_id` keeps the boundary
+/// between the two variable-length ids unambiguous.
 ///
 /// The dedicated `info` string keeps every derived shard key in a
 /// disjoint key space from the B2C `K_text_index_shard` family, so
@@ -637,5 +656,50 @@ mod tests {
         let initech =
             derive_b2b_text_index_shard(&search_root, "tenant-initech", "shard-1").unwrap();
         assert_ne!(acme.as_bytes(), initech.as_bytes());
+    }
+
+    #[test]
+    fn derive_b2b_text_index_shard_resists_boundary_collision() {
+        // Without a length prefix on `tenant_id`, the HKDF info
+        // string `label || tenant_id || shard_id` would let
+        // `("tenant-a", "shard-1")` and `("tenant-as", "hard-1")`
+        // collapse to identical bytes (and therefore identical
+        // keys), letting one tenant's shard key open another
+        // tenant's shards. The 4-byte big-endian length prefix
+        // on `tenant_id` in `derive_with_two_ids` keeps the
+        // boundary unambiguous.
+        let m = master();
+        let search_root = derive_search_root(&m).unwrap();
+        let split_a = derive_b2b_text_index_shard(&search_root, "tenant-a", "shard-1").unwrap();
+        let split_b = derive_b2b_text_index_shard(&search_root, "tenant-as", "hard-1").unwrap();
+        assert_ne!(
+            split_a.as_bytes(),
+            split_b.as_bytes(),
+            "boundary-shifted (tenant_id, shard_id) pairs must derive disjoint keys"
+        );
+
+        let empty_left = derive_b2b_text_index_shard(&search_root, "", "tenant-a-shard-1").unwrap();
+        let empty_right =
+            derive_b2b_text_index_shard(&search_root, "tenant-a-shard-1", "").unwrap();
+        assert_ne!(
+            empty_left.as_bytes(),
+            empty_right.as_bytes(),
+            "empty-id boundary cases must still derive disjoint keys"
+        );
+    }
+
+    #[test]
+    fn derive_b2b_archive_epoch_resists_boundary_collision() {
+        // Same boundary-collision regression for the archive
+        // epoch derivation path.
+        let m = master();
+        let tenant_root = derive_b2b_tenant_root(&m, "tenant-a").unwrap();
+        let split_a = derive_b2b_archive_epoch(&tenant_root, "tenant-a", "2026-04").unwrap();
+        let split_b = derive_b2b_archive_epoch(&tenant_root, "tenant-a2", "026-04").unwrap();
+        assert_ne!(
+            split_a.as_bytes(),
+            split_b.as_bytes(),
+            "boundary-shifted (tenant_id, epoch_id) pairs must derive disjoint keys"
+        );
     }
 }
