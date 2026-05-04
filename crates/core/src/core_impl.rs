@@ -73,6 +73,30 @@ use crate::{
 /// only sizes the backing `Vec`.
 const DEFAULT_HYDRATION_QUEUE_CAPACITY: usize = 256;
 
+/// Cap each backup segment so an event-journal backlog does not
+/// produce a single oversized seal. Mirrors the archive
+/// segment cap (`docs/PROPOSAL.md §5.2`). Used by both
+/// [`CoreImpl::run_incremental_backup_inner`] and the Task-1
+/// shard-aware wrapper
+/// [`CoreImpl::run_incremental_backup_with_search_shards`] —
+/// kept in one module-level place so the two paths cannot
+/// drift.
+const MAX_EVENTS_PER_BACKUP_SEGMENT: usize = 4_096;
+
+/// Slim summary of a [`BackupEvent`] that
+/// [`CoreImpl::run_incremental_backup_inner`] sealed in its
+/// last pass. Returned alongside the
+/// [`BackupResult`] so the Task-1 shard-aware wrapper can build
+/// its `(conversation_id, time_bucket) → message_ids` map from
+/// the *exact* event set the inner pipeline sealed instead of a
+/// separate, racy peek of `backup_event_journal`.
+#[derive(Debug, Clone)]
+pub(crate) struct SealedBackupEventRef {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) message_id: Uuid,
+    pub(crate) created_at_ms: i64,
+}
+
 // ---------------------------------------------------------------------------
 // CoreImpl
 // ---------------------------------------------------------------------------
@@ -748,17 +772,23 @@ impl CoreImpl {
     /// Wraps [`Self::run_incremental_backup_inner`] with a
     /// post-seal sweep that:
     ///
-    /// 1. Peeks the unsegmented [`BackupEvent`] backlog before the
-    ///    cursor advances and groups it by
+    /// 1. Runs the existing incremental-backup pipeline, which
+    ///    seals the events and advances the cursor. The inner
+    ///    method also returns a slim
+    ///    [`SealedBackupEventRef`] summary of the events it
+    ///    actually sealed (`(conversation_id, message_id,
+    ///    created_at_ms)` triples derived from the *same* event
+    ///    list that drove the seal — no separate peek, so no
+    ///    TOCTOU window vs. concurrent
+    ///    `backup_event_journal.write_event` callers).
+    /// 2. Groups the sealed events by
     ///    `(conversation_id, default_time_bucket_for_ms(created_at_ms))`.
-    /// 2. Runs the existing incremental-backup pipeline, which
-    ///    seals the events and advances the cursor.
     /// 3. For every affected bucket, queries the local
     ///    `search_fts` / `search_fuzzy` rows for the message ids
     ///    that just landed in the seal and routes them through
     ///    [`Self::upload_search_shards`].
     ///
-    /// Returns the [`BackupResult`] from step 2 and the per-bucket
+    /// Returns the [`BackupResult`] from step 1 and the per-bucket
     /// [`UploadedSearchShards`] receipts from step 3 — partial
     /// upload failures are surfaced through
     /// [`UploadedSearchShards::has_failures`] just like the
@@ -790,40 +820,28 @@ impl CoreImpl {
         )>,
     {
         use crate::archive::segment_builder::default_time_bucket_for_ms;
-        use crate::backup::event_journal::BackupEventJournal;
         use std::collections::BTreeMap;
 
-        // Snapshot the (conversation_id, bucket) → message_ids
-        // map *before* the cursor advances. The journal helper is
-        // read-only so this peek does not race with the seal-and-
-        // advance loop inside `run_incremental_backup_inner`.
-        let bucket_map: BTreeMap<(String, String), Vec<String>> = {
-            let db = self.db.lock().map_err(poisoned)?;
-            let journal = BackupEventJournal::new();
-            // Cap matches the inner pipeline so we group exactly
-            // the events that are about to be sealed.
-            const MAX_EVENTS_PER_SEGMENT: usize = 4_096;
-            let events = journal
-                .read_unsegmented(db.connection(), MAX_EVENTS_PER_SEGMENT)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            drop(db);
-            let mut map: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-            for (_seq, evt) in events {
-                let Some(conv) = evt.conversation_id else {
-                    continue;
-                };
-                let Some(mid) = evt.message_id else {
-                    continue;
-                };
-                let bucket = default_time_bucket_for_ms(evt.created_at_ms);
-                map.entry((conv.to_string(), bucket))
-                    .or_default()
-                    .push(mid.to_string());
-            }
-            map
-        };
+        // Run the seal first and harvest the *exact* set of
+        // events the inner pipeline sealed. Building
+        // `bucket_map` from this list closes the TOCTOU window
+        // a separate pre-seal peek would otherwise open: a
+        // concurrent `backup_event_journal.write_event` call
+        // landing between an outer peek and the inner re-read
+        // can't cause the wrapper to miss shard coverage for
+        // events the inner just sealed (the cursor has
+        // advanced past those events, so no future call would
+        // re-peek them either).
+        let (backup, sealed_events) = self.run_incremental_backup_inner(reason)?;
 
-        let backup = self.run_incremental_backup_inner(reason)?;
+        let mut bucket_map: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for sealed in &sealed_events {
+            let bucket = default_time_bucket_for_ms(sealed.created_at_ms);
+            bucket_map
+                .entry((sealed.conversation_id.to_string(), bucket))
+                .or_default()
+                .push(sealed.message_id.to_string());
+        }
 
         if bucket_map.is_empty() || backup.segments_built == 0 {
             return Ok(RunIncrementalBackupWithShards {
@@ -1805,34 +1823,59 @@ impl CoreImpl {
     /// extend this function to drive
     /// `BackupSink::upload_backup_segment` /
     /// `BackupSink::upload_backup_manifest` here.
-    fn run_incremental_backup_inner(&self, _reason: &str) -> Result<BackupResult> {
+    fn run_incremental_backup_inner(
+        &self,
+        reason: &str,
+    ) -> Result<(BackupResult, Vec<SealedBackupEventRef>)> {
         use crate::backup::event_journal::BackupEventJournal;
         use crate::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
         use crate::backup::segment_builder::{BackupSegmentBuildRequest, BackupSegmentBuilder};
         use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
         use crate::formats::SegmentType;
 
-        // Cap each segment so an event-journal backlog does not
-        // produce a single oversized seal. Mirrors the archive
-        // segment cap (`docs/PROPOSAL.md §5.2`).
-        const MAX_EVENTS_PER_SEGMENT: usize = 4_096;
+        let _ = reason; // reserved for trace / metrics — see RunIncrementalBackup.reason
+                        // Per-segment cap is the module-level
+                        // `MAX_EVENTS_PER_BACKUP_SEGMENT`; the Task-1 wrapper
+                        // shares it so the two paths never disagree on how many
+                        // events a single seal contains.
 
         // Phase 1 — read unsegmented events (db lock).
         let (events_with_seq, last_seq) = {
             let db = self.db.lock().map_err(poisoned)?;
             let journal = BackupEventJournal::new();
             let events = journal
-                .read_unsegmented(db.connection(), MAX_EVENTS_PER_SEGMENT)
+                .read_unsegmented(db.connection(), MAX_EVENTS_PER_BACKUP_SEGMENT)
                 .map_err(|e| Error::Storage(e.to_string()))?;
             let last_seq = events.last().map(|(seq, _)| *seq);
             (events, last_seq)
         };
         if events_with_seq.is_empty() {
-            return Ok(BackupResult::default());
+            return Ok((BackupResult::default(), Vec::new()));
         }
         let last_seq = last_seq.expect("non-empty events implies a last seq");
         let events: Vec<_> = events_with_seq.into_iter().map(|(_, e)| e).collect();
         let event_count = events.len() as u64;
+        // Snapshot the (conversation_id, message_id, created_at_ms)
+        // tuples for the Task-1 wrapper's shard-grouping pass.
+        // Built from `events` itself, so by construction it
+        // covers exactly the set of events that will be sealed
+        // and cursor-advanced past in this pass — no separate
+        // peek, no TOCTOU window. Events that lack a
+        // conversation_id / message_id are silently dropped from
+        // the summary (they cannot be addressed by the search
+        // shard upload anyway).
+        let sealed_event_refs: Vec<SealedBackupEventRef> = events
+            .iter()
+            .filter_map(|e| {
+                let conversation_id = e.conversation_id?;
+                let message_id = e.message_id?;
+                Some(SealedBackupEventRef {
+                    conversation_id,
+                    message_id,
+                    created_at_ms: e.created_at_ms,
+                })
+            })
+            .collect();
         let min_event_ms = events
             .iter()
             .map(|e| e.created_at_ms)
@@ -1928,18 +1971,21 @@ impl CoreImpl {
                 k_segment: k_segment.clone(),
             });
 
-        Ok(BackupResult {
-            segments_built: 1,
-            // No transport-side BackupSink upload yet; Task 4 wires
-            // `ZkofBackupSink::upload_backup_segment` /
-            // `upload_backup_manifest` into this slot. Until then
-            // the caller is responsible for uploading the sealed
-            // bytes out-of-band.
-            segments_uploaded: 0,
-            events_segmented: event_count,
-            manifest_generation: Some(manifest_generation),
-            manifest_uploaded: false,
-        })
+        Ok((
+            BackupResult {
+                segments_built: 1,
+                // No transport-side BackupSink upload yet; Task 4 wires
+                // `ZkofBackupSink::upload_backup_segment` /
+                // `upload_backup_manifest` into this slot. Until then
+                // the caller is responsible for uploading the sealed
+                // bytes out-of-band.
+                segments_uploaded: 0,
+                events_segmented: event_count,
+                manifest_generation: Some(manifest_generation),
+                manifest_uploaded: false,
+            },
+            sealed_event_refs,
+        ))
     }
 
     /// Drive one pass of backup compaction.
@@ -2844,7 +2890,8 @@ impl KChatCore for CoreImpl {
     }
 
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
-        self.run_incremental_backup_inner(reason)
+        let (result, _sealed) = self.run_incremental_backup_inner(reason)?;
+        Ok(result)
     }
 
     fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
@@ -6894,6 +6941,167 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("fuzzy backend 503"));
+    }
+
+    /// PR-#33 review regression: the Task-1 wrapper must build
+    /// its `(conversation_id, time_bucket) → message_ids` map
+    /// from the *exact* event set the inner pipeline sealed, not
+    /// from an independent peek of `backup_event_journal`. The
+    /// pre-fix wrapper called `read_unsegmented` itself before
+    /// running the inner pipeline; a concurrent
+    /// `BackupEventJournal::write_event` between the wrapper's
+    /// peek (lock release) and the inner's re-read (lock
+    /// re-acquire) would let the inner seal + cursor-advance
+    /// past an event that the outer's `bucket_map` never saw,
+    /// silently leaving its `search_fts` / `search_fuzzy` rows
+    /// out of every shard upload — and the cursor advance meant
+    /// no future call would re-peek those events either, so the
+    /// loss was permanent. Post-fix the wrapper consumes
+    /// `run_incremental_backup_inner`'s `sealed_events` summary
+    /// directly so the two are derived from the same event
+    /// list and cannot disagree.
+    ///
+    /// Test: spawn a writer thread that interleaves event +
+    /// search-row writes with the main thread's wrapper calls.
+    /// Drive the wrapper in a loop until both the writer is
+    /// done and the journal is fully drained, then decode every
+    /// `text` shard the mock transport recorded and union the
+    /// `message_id`s. Assert the covered set equals the seeded
+    /// set — every event must end up sealed in *some* bundle's
+    /// shard upload, never sealed-and-orphaned. Also asserts
+    /// the per-call invariant `Σ text_shard.doc_count ==
+    /// backup.events_segmented`, which the post-fix wrapper
+    /// guarantees.
+    #[test]
+    fn run_incremental_backup_with_search_shards_no_event_lost_under_concurrent_writer() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::formats::search_shard::SearchIndexShard;
+        use crate::search::shard_builder::restore_text_search_shard;
+        use crate::transport::MockTransportClient;
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const TOTAL_EVENTS: usize = 80;
+
+        let core = Arc::new(fresh_core());
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Pre-allocate the message_ids in the main thread so the
+        // assertion can pin down the "seeded set".
+        let mids: Vec<Uuid> = (0..TOTAL_EVENTS).map(|_| Uuid::now_v7()).collect();
+        let expected: BTreeSet<String> = mids.iter().map(|u| u.to_string()).collect();
+
+        let writer_done = Arc::new(AtomicBool::new(false));
+
+        let writer_core = Arc::clone(&core);
+        let writer_done_w = Arc::clone(&writer_done);
+        let mids_w = mids.clone();
+        let writer = std::thread::spawn(move || {
+            // Spread across two `(conv, bucket)` pairs so the
+            // wrapper's `bucket_map` has multiple entries each
+            // call — a pre-fix peek-vs-seal split would be more
+            // visible.
+            for (i, mid) in mids_w.iter().enumerate() {
+                let base = if i % 2 == 0 {
+                    1_777_000_000_000 // 2026-04 bucket
+                } else {
+                    1_780_000_000_000 // 2026-05 bucket
+                };
+                let ts = base + i as i64;
+                seed_backup_event(&writer_core, conv, *mid, ts);
+                let body = format!("alpha-{i}");
+                seed_search_rows(
+                    &writer_core,
+                    conv,
+                    *mid,
+                    ts,
+                    &body,
+                    &[(body.as_str(), "Latn")],
+                );
+                // Tiny pause so the main thread's wrapper has a
+                // window to acquire the db mutex between writes
+                // — exercises the lock-release / re-acquire seam
+                // the original race lived in.
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            writer_done_w.store(true, Ordering::Release);
+        });
+
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+
+        let transport = MockTransportClient::new();
+        let mut total_segmented: u64 = 0;
+
+        // Drive the wrapper until both the writer is done and
+        // the inner reports zero events_segmented (i.e. the
+        // journal is fully drained past the cursor).
+        loop {
+            let bundle = core
+                .run_incremental_backup_with_search_shards(
+                    &transport,
+                    "scheduled",
+                    &conv_hash_key,
+                    |_conv, _bucket| Ok((k_text.clone(), k_fuzzy.clone())),
+                )
+                .expect("incremental backup with shards");
+
+            total_segmented += bundle.backup.events_segmented;
+            // Per-call invariant the post-fix code guarantees:
+            // every event the inner sealed must have its
+            // message_id covered by *this* bundle's text shards
+            // (the bucket_map is built directly from
+            // sealed_events).
+            let bundle_doc_count: u64 = bundle
+                .shards
+                .iter()
+                .map(|s| s.text_shard.as_ref().map(|t| t.doc_count).unwrap_or(0))
+                .sum();
+            assert_eq!(
+                bundle_doc_count, bundle.backup.events_segmented,
+                "per-call invariant: shards' text doc_count must \
+                 equal events_segmented (pre-fix wrapper could \
+                 miss events under concurrent writes)"
+            );
+
+            if writer_done.load(Ordering::Acquire) && bundle.backup.events_segmented == 0 {
+                break;
+            }
+        }
+        writer.join().expect("writer thread");
+
+        // Every event ever written must have been sealed exactly
+        // once across all wrapper calls.
+        assert_eq!(
+            total_segmented, TOTAL_EVENTS as u64,
+            "every seeded event must be sealed exactly once"
+        );
+
+        // Decode every `text` upload the mock recorded and union
+        // the message_ids — they must equal the seeded set. The
+        // mock's `upload_calls()` returns
+        // `(conv_hash, bucket, shard_type, ciphertext)`; the
+        // ciphertext is `serde_cbor::to_vec(&SearchIndexShard)`
+        // (see `CoreImpl::upload_search_shards`).
+        let mut covered: BTreeSet<String> = BTreeSet::new();
+        for (_conv_hash, _bucket, shard_type, bytes) in transport.upload_calls() {
+            if shard_type != "text" {
+                continue;
+            }
+            let shard: SearchIndexShard = serde_cbor::from_slice(&bytes).expect("decode shard");
+            let rows = restore_text_search_shard(&shard, &k_text).expect("open text shard");
+            for r in rows {
+                covered.insert(r.message_id);
+            }
+        }
+        assert_eq!(
+            covered, expected,
+            "every seeded message_id must appear in some text-shard upload"
+        );
     }
 
     // ----------------------------------------------------------------
