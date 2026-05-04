@@ -25,13 +25,22 @@ use crate::Result;
 /// One sampled keyframe returned by
 /// [`VideoKeyframeSampler::extract_keyframes`].
 ///
-/// `timestamp_ms` is the wall-clock-relative position in
-/// milliseconds from the start of the video buffer; `image_data`
-/// is an encoded image (PNG / JPEG / HEIC) ready to feed into
+/// `frame_index` is a 0-based ordinal that callers can fold into
+/// per-frame cache keys (e.g.
+/// `mobileclip_s2@v1_frame_{frame_index}`). `timestamp_ms` is
+/// the wall-clock-relative position in milliseconds from the
+/// start of the video buffer; `image_data` is an encoded image
+/// (PNG / JPEG / HEIC) ready to feed into
 /// [`crate::models::clip::ImageEmbedder::embed_image`];
 /// `mime_type` is the encoded image MIME type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyframe {
+    /// 0-based ordinal of this keyframe within the sampled set.
+    /// Used as the cache-key suffix in
+    /// [`crate::core_impl::CoreImpl::send_media`] so a single
+    /// video message can land multiple `mobileclip_s2@v1` rows
+    /// in [`crate::models::embeddings::LocalStoreEmbeddingCache`].
+    pub frame_index: u32,
     /// Position of the keyframe in milliseconds, relative to
     /// the start of the source video buffer.
     pub timestamp_ms: u64,
@@ -41,6 +50,11 @@ pub struct Keyframe {
     /// `"image/jpeg"` / `"image/heic"`).
     pub mime_type: String,
 }
+
+/// Alias matching the Phase 6 task-spec name. Both names are
+/// accepted on the public surface so existing callers continue
+/// to compile and new callers can use the spec name verbatim.
+pub use Keyframe as KeyframeData;
 
 /// On-device video keyframe-sampling seam used by media ingest
 /// (`docs/PROPOSAL.md §7.6`, Phase 6).
@@ -145,6 +159,7 @@ impl VideoKeyframeSampler for MockVideoKeyframeSampler {
             image.extend_from_slice(frame_hash.as_bytes());
             image.extend_from_slice(frame_hash.as_bytes());
             frames.push(Keyframe {
+                frame_index: i as u32,
                 timestamp_ms: (i as u64) * step_ms,
                 image_data: image,
                 mime_type: "image/png".to_string(),
@@ -226,5 +241,52 @@ mod tests {
         let dynref: &dyn VideoKeyframeSampler = &mock;
         let frames = dynref.extract_keyframes(b"X", "video/mp4", 3).unwrap();
         assert!(!frames.is_empty());
+    }
+
+    #[test]
+    fn video_keyframe_sampler_noop_returns_not_implemented() {
+        // Phase 6, Task 1 (2026-05-04 batch). Same surface as
+        // `noop_video_sampler_returns_not_implemented` above but
+        // pinned under the canonical task-spec test name so
+        // grepping across docs and source agrees.
+        let s = NoopVideoKeyframeSampler;
+        let err = s.extract_keyframes(b"unused", "video/mp4", 1).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::NotImplemented("video_keyframe_sampler")
+        ));
+    }
+
+    #[test]
+    fn mock_keyframe_sampler_returns_configured_frames() {
+        // Phase 6, Task 1 (2026-05-04 batch). Asserts the mock
+        // honours `max_frames`, populates `frame_index`
+        // monotonically from 0, and produces deterministic
+        // bytes per `(input, frame_index)`.
+        let s = MockVideoKeyframeSampler;
+        let frames = s
+            .extract_keyframes(b"sample", "video/mp4", 4)
+            .expect("keyframes");
+        assert_eq!(frames.len(), 4);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.frame_index as usize, i, "frame_index is dense from 0");
+        }
+        let again = s
+            .extract_keyframes(b"sample", "video/mp4", 4)
+            .expect("again");
+        assert_eq!(frames, again, "deterministic for identical input");
+    }
+
+    #[test]
+    fn keyframe_data_alias_round_trips() {
+        // Compile-time check that the spec-name alias resolves
+        // to the same underlying type.
+        let kf: KeyframeData = Keyframe {
+            frame_index: 7,
+            timestamp_ms: 1234,
+            image_data: vec![0u8; 4],
+            mime_type: "image/png".to_string(),
+        };
+        assert_eq!(kf.frame_index, 7);
     }
 }

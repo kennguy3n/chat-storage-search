@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~75%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~40%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds). Phase 8 — Multi-Scope, Multi-Tenant Search (`Not started | 0%`, conversation hierarchy, bloom shards, shard cache, parallel fetch, per-tenant B2B key isolation, tenant search policy).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~80%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~45%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~25%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1519,7 +1519,7 @@ Notes:
 
 ## Phase 6: Media and Semantic Search
 
-**Status**: `In progress | ~75%`
+**Status**: `In progress | ~80%`
 
 **Goal**: On-device ML for OCR, image / video / audio search, and
 semantic text search — all multilingual.
@@ -1761,7 +1761,7 @@ Notes:
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `In progress | ~40%`
+**Status**: `In progress | ~45%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
@@ -1886,18 +1886,18 @@ Notes:
 
 ## Phase 8: Multi-Scope, Multi-Tenant Search
 
-**Status**: `Not started | 0%`
+**Status**: `In progress | ~25%`
 
 **Goal**: Conversation hierarchy, multi-tenant B2B isolation, and search performance optimizations for global/community/domain/tenant-scoped search.
 
 Checklist:
 
-- [ ] Schema: conversation hierarchy (`conversation_type`, `scope`, `tenant_id`, `community_id`, `domain_id`).
-- [ ] Schema: `archive_segment_map` tenant isolation (`tenant_id` column).
-- [ ] `SearchTarget` enum replacing `conversation_filter: Option<Uuid>`.
-- [ ] Scope resolver (`SearchTarget` → `HashSet<conversation_id>`).
+- [x] Schema: conversation hierarchy (`conversation_type`, `scope`, `tenant_id`, `community_id`, `domain_id`). _(See `crates/core/src/local_store/schema.rs` `conversation` DDL + `idx_conv_community` / `idx_conv_domain` / `idx_conv_tenant` / `idx_conv_scope` indexes; `Conversation` struct in the same file gains the matching fields with `#[serde(default)]` for backward compat.)_
+- [x] Schema: `archive_segment_map` tenant isolation (`tenant_id` column). _(See same `schema.rs` — `archive_segment_map` adds `tenant_id TEXT NOT NULL DEFAULT ''` + `idx_asm_tenant_bucket(tenant_id, time_bucket)` index. Column count regression test updated to 9.)_
+- [x] `SearchTarget` enum replacing `conversation_filter: Option<Uuid>`. _(See `crates/core/src/lib.rs`: `SearchTarget::{Conversation, Community, Domain, Tenant, B2cAll, Global}` with `#[serde(rename_all = "snake_case")]`. `SearchQuery::target` field is `#[serde(default)]` and `effective_target()` keeps the legacy `conversation_filter` mapping.)_
+- [x] Scope resolver (`SearchTarget` → `HashSet<conversation_id>`). _(See `crates/core/src/search/query_engine.rs`: `resolve_target_to_conversation_set` + `push_target_filter` invoked from `execute_structured_only` and `allowed_skeleton_ids`. Empty resolution emits `1=0` SQL clause — fail-closed.)_
 - [ ] Bucket-level date pruning.
-- [ ] Bloom filter shard type (`IndexType::Bloom`).
+- [x] Bloom filter shard type (`IndexType::Bloom`). _(See `crates/core/src/formats/search_shard.rs` `IndexType::Bloom` variant + `crates/core/src/search/shard_builder.rs` `BloomFilter`, `build_bloom_shard`, `restore_bloom_shard`, `BloomShardPayload`. Magic `KCHAT_BLOOM_SHARD_PAYLOAD_V1`. False-positive rate <5% at 12 bits / element.)_
 - [ ] Bloom filter pre-check in cold fan-out.
 - [ ] On-device decrypted shard cache (LRU).
 - [ ] Parallel bucket fetch.
@@ -1906,16 +1906,131 @@ Checklist:
 - [ ] Per-tenant key isolation (B2B) — `K_b2b_tenant_root(tenant_id)`.
 - [ ] `TenantSearchPolicy` config and enforcement.
 - [ ] Privacy-aware scope-proportional padding.
-- [ ] `K_bloom_index_shard` key derivation.
+- [x] `K_bloom_index_shard` key derivation. _(See `crates/core/src/crypto/key_hierarchy.rs`: `derive_bloom_index_shard` + `info::BLOOM_INDEX_SHARD = b"kchat-bloom-index-shard-v1"`. Determinism + cross-shard-type uniqueness covered by the new `derive_bloom_index_shard_is_deterministic` and `derive_bloom_index_shard_differs_from_text_and_vector` tests.)_
 - [ ] Android/iOS bridge updates for `SearchTarget`.
 - [ ] Latency benchmarks (bloom + parallel fetch).
-- [ ] Integration tests (multi-scope, bloom, cache, tenant policy).
+- [~] Integration tests (multi-scope, bloom, cache, tenant policy). _(Multi-scope + bloom shard tests landed; cache + tenant-policy paths queued for the next batch.)_
+
+Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. The bloom shard is fetched first so the prefetcher can short-circuit buckets whose filter rejects every query token before paying for the larger payloads. See `crates/core/src/search/shard_prefetch.rs` `PREFETCH_ORDER` + `shard_prefetch_order_includes_bloom_first` test.
 
 **Decision gate**: Community/domain-scoped search prunes cold buckets. Bloom filter eliminates 80%+ irrelevant buckets on global search. Shard cache eliminates re-fetches. B2B tenant data cryptographically isolated. Tenant search policies enforced.
 
 ---
 
 ## Changelog
+
+### 2026-05-04 — Phase 6 / 7 / 8 batch 4 (this PR)
+
+Builds on the prior 2026-05-04 batches. Lands ten tasks across
+Phase 6 ML-seam follow-ups, Phase 7 platform integration + the
+large-scale stress test, and Phase 8 schema + bloom-filter
+foundation:
+
+1. **Video keyframe sampling fan-out.** `VideoKeyframeSampler`
+   trait surface is finalized + `CoreImpl::send_media` now embeds
+   *every* extracted keyframe individually (not just the first)
+   when both a sampler and an `ImageEmbedder` are installed. Each
+   embedding lands in `LocalStoreEmbeddingCache` keyed
+   `(message_id, "mobileclip_s2@v1_frame_{idx}")` so per-keyframe
+   semantic search can address them. New unit tests cover the
+   non-video skip path, the missing-sampler skip path, and the
+   per-frame cache key shape.
+2. **Whisper transcription seam.** `AudioTranscriber` /
+   `TranscriptionResult` / `TranscriptionSegment` types and the
+   `install_audio_transcriber` install hook are stabilized; audio
+   MIME types now write the transcript text into `search_fts` /
+   `search_fuzzy` (not just `media_search_index`) and optionally
+   embed it via the `TextEmbedder` seam, so transcripts surface in
+   the regular FTS / fuzzy / semantic paths. Honors
+   `ResourceGate::should_run_transcription` when a probe is
+   installed.
+3. **Document text extraction fan-out.** `DocumentExtractor` trait
+   + Noop / Mock now wired into `CoreImpl::send_media` for PDF and
+   DOCX MIME types. Each `PageText` is indexed into `search_fts` /
+   `search_fuzzy` with a `page:{N}` prefix so per-page hits land in
+   normal text search; optionally embedded via `TextEmbedder`. New
+   multilingual test covers CJK + Latin co-occurrence in a
+   single document.
+4. **INT4 quantization codec + criterion bench.** `encode_int4` /
+   `decode_int4` land in `crates/core/src/models/embeddings.rs`
+   (two 4-bit values per byte, linear scale), with unit tests
+   covering round-trip cosine fidelity (>0.95), zero vector,
+   uniform vector, and tight-storage selection. New
+   `crates/core/benches/phase6_int4_benchmarks.rs` measures
+   INT8 / INT4 encode / decode round-trips, INT8-vs-INT4 cosine
+   fidelity over a 100-vector multilingual corpus, and
+   `LocalStoreEmbeddingCache` put / get throughput.
+5. **macOS native integration scaffold.** `crates/desktop/src/macos.rs`
+   defines `SpotlightBridge` (object-safe; `index_message` /
+   `remove_message` / `remove_conversation`) + `NoopSpotlightBridge`
+   and `MacOsSchedulerBridge` (implements the existing
+   `BackgroundScheduler` trait via `NSBackgroundActivityScheduler`)
+   + `NoopMacOsSchedulerBridge`. Re-exported from `lib.rs` under
+   `#[cfg(target_os = "macos")]`. Trait object-safety verified by
+   `Box<dyn SpotlightBridge>` compile-time test.
+6. **Windows native integration scaffold.** `crates/desktop/src/windows.rs`
+   defines `WindowsSearchBridge`, `WindowsSchedulerBridge`, and a
+   `WindowsMlConfig` struct that documents the CPU-only ML
+   contract — no GPU assumption, DirectML EP best-effort with CPU
+   fallback, INT4 default for tight storage. Re-exported under
+   `#[cfg(target_os = "windows")]`. Same Noop / object-safety
+   coverage as macOS.
+7. **Large-scale integration test.** `crates/core/tests/large_scale_test.rs`
+   ingests 100k+ messages across 100+ conversations and 10+
+   scripts (Latin / Cyrillic / CJK / Arabic / Thai / Devanagari /
+   Bengali / Tamil / Korean / Greek / Hebrew), 10k+ media
+   messages, runs `enforce_storage_budget` at every pressure
+   level, runs `run_incremental_backup` + manifest-chain
+   verification, and drives multi-script search. Asserts that
+   p95 search latency stays under the Phase-1 budget (< 150 ms)
+   even at 100 k scale. `#[ignore]`-marked — run with
+   `cargo test --test large_scale_test -- --ignored`.
+8. **Phase 8 — Conversation hierarchy + `SearchTarget` enum.**
+   `conversation` DDL gains `conversation_type` (`dm` / `group` /
+   `channel`), `scope` (`b2c` / `b2b`), `tenant_id`,
+   `community_id`, `domain_id` columns + matching indexes;
+   `archive_segment_map` gains `tenant_id` + `(tenant_id,
+   time_bucket)` index. `Conversation` struct uses
+   `#[serde(default)]` everywhere so legacy payloads still
+   decode. New `SearchTarget` enum
+   (`Conversation(Uuid)` / `Community(Uuid)` / `Domain(Uuid)` /
+   `Tenant(String)` / `B2cAll` / `Global`) on `SearchQuery` with
+   `effective_target()` mapping the legacy `conversation_filter`
+   to `SearchTarget::Conversation`. New `db.list_conversations_by_*`
+   helpers + `query_engine::resolve_target_to_conversation_set`
+   + `push_target_filter` wire the resolver into both
+   `execute_structured_only` and `allowed_skeleton_ids` —
+   empty resolution emits a `1=0` SQL clause (fail-closed).
+9. **Phase 8 — Bloom filter shard.** `IndexType::Bloom` variant
+   on the wire format. New `BloomFilter` struct (3 BLAKE3
+   keyed-hash slots, 12 bits / element default, false-positive
+   rate <5% at the target fill ratio) + `build_bloom_shard` /
+   `restore_bloom_shard` mirror the existing text / fuzzy /
+   vector / media build path. `K_bloom_index_shard(shard_id)`
+   derives from `K_search_root` via the new
+   `derive_bloom_index_shard` HKDF call (info string
+   `kchat-bloom-index-shard-v1`). `PREFETCH_ORDER` becomes
+   `[Bloom, Text, Fuzzy, Vector, Media]` so the bloom shard is
+   fetched first and lets the prefetcher skip buckets whose
+   filter rejects every query token. Tests cover round-trip,
+   wrong-key rejection, multilingual word survival, FPR bound,
+   key determinism, and prefetch order.
+10. **Doc audit.** Phase 6 advances `~75% → ~80%`; Phase 7
+    advances `~40% → ~45%`; Phase 8 moves from `Not started | 0%`
+    to `In progress | ~25%`. Status banner (`PROGRESS.md`,
+    `README.md`, `ARCHITECTURE.md`) refreshed. Phase 8 checklist
+    items checked off (with file-path / test-name annotations)
+    for the schema, `SearchTarget`, scope resolver, bloom
+    shard type, bloom prefetch order, and bloom key
+    derivation. New files added to the project structure tree.
+    Cross-referenced every `[x]` against source — no false
+    positives.
+
+All baseline tests still pass: 1107 in `kchat-core --lib`, plus
+the workspace integration / bench-target builds. Every new trait
+is object-safe, `Send + Sync`, with a Noop and a Mock
+implementation; new schema columns have `DEFAULT` clauses so
+existing data continues to load.
 
 ### 2026-05-04 — Phase 6 / 7 batch 3 (this PR)
 

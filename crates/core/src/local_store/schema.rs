@@ -42,8 +42,33 @@ CREATE TABLE IF NOT EXISTS conversation (
     pinned            INTEGER NOT NULL DEFAULT 0,
     muted             INTEGER NOT NULL DEFAULT 0,
     last_message_id   TEXT,
-    last_activity_ms  INTEGER NOT NULL
+    last_activity_ms  INTEGER NOT NULL,
+    -- Phase 8 conversation hierarchy (`docs/PROPOSAL.md §11`).
+    -- `conversation_type` discriminates the conversation shape
+    -- (`'dm'`, `'group'`, `'channel'`); `scope` distinguishes
+    -- the consumer (`'b2c'`) from enterprise (`'b2b'`)
+    -- conversations. The remaining columns are foreign keys
+    -- into the (future) `tenant`, `community`, and `domain`
+    -- tables — empty strings encode "not part of a hierarchy"
+    -- so legacy rows continue to round-trip without migration.
+    conversation_type TEXT NOT NULL DEFAULT 'dm',
+    scope             TEXT NOT NULL DEFAULT 'b2c',
+    tenant_id         TEXT NOT NULL DEFAULT '',
+    community_id      TEXT NOT NULL DEFAULT '',
+    domain_id         TEXT NOT NULL DEFAULT ''
 );
+-- Phase 8 hierarchy filter indexes. Each one matches one
+-- `SearchTarget` variant in `crate::SearchTarget` so the
+-- query engine's resolve-target step can issue a single
+-- index-scan SELECT per non-`Global` target.
+CREATE INDEX IF NOT EXISTS idx_conv_community
+    ON conversation(community_id);
+CREATE INDEX IF NOT EXISTS idx_conv_domain
+    ON conversation(domain_id);
+CREATE INDEX IF NOT EXISTS idx_conv_tenant
+    ON conversation(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_conv_scope
+    ON conversation(scope);
 
 -- Skeletons render the timeline before any body / media is loaded
 CREATE TABLE IF NOT EXISTS message_skeleton (
@@ -148,8 +173,18 @@ CREATE TABLE IF NOT EXISTS archive_segment_map (
     blob_id              TEXT NOT NULL,
     storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- PROPOSAL.md §10.1
     merkle_root          BLOB NOT NULL,
-    state                TEXT NOT NULL      -- not_archived..archive_compacted
+    state                TEXT NOT NULL,     -- not_archived..archive_compacted
+    -- Phase 8: per-tenant archive segments. Empty string for
+    -- legacy / b2c rows. Mirrors `conversation.tenant_id` so
+    -- the future `SearchTarget::Tenant` resolver can scan
+    -- segments for a tenant in a single covering index scan.
+    tenant_id            TEXT NOT NULL DEFAULT ''
 );
+-- Phase 8 covering index for `SearchTarget::Tenant` resolution.
+-- The `(tenant_id, time_bucket)` shape matches the cold-shard
+-- prefetch SELECT issued by `crate::search::shard_prefetch`.
+CREATE INDEX IF NOT EXISTS idx_asm_tenant_bucket
+    ON archive_segment_map(tenant_id, time_bucket);
 
 -- Per-archive event log feeding the archive segment builder
 -- (`docs/PHASES.md` Phase 3). Mirrors `backup_event_journal` but
@@ -326,6 +361,72 @@ pub struct Conversation {
     pub last_message_id: Option<String>,
     /// Wall-clock millisecond timestamp of the most recent activity.
     pub last_activity_ms: i64,
+    // ----- Phase 8 conversation-hierarchy columns. ----------------------
+    //
+    // `#[serde(default)]` lets legacy on-wire payloads continue
+    // to deserialize: a missing field decodes as the type's
+    // [`Default`] which matches the SQL-level `DEFAULT` clause.
+    /// Conversation type discriminator. One of `"dm"`, `"group"`,
+    /// `"channel"`. Defaults to `"dm"` for legacy rows.
+    #[serde(default = "default_conversation_type")]
+    pub conversation_type: String,
+    /// Conversation scope. `"b2c"` for the consumer surface,
+    /// `"b2b"` for enterprise surfaces.
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    /// Tenant identifier. Empty for legacy / b2c rows.
+    #[serde(default)]
+    pub tenant_id: String,
+    /// Community identifier. Empty for legacy rows.
+    #[serde(default)]
+    pub community_id: String,
+    /// Domain identifier. Empty for legacy rows.
+    #[serde(default)]
+    pub domain_id: String,
+}
+
+fn default_conversation_type() -> String {
+    "dm".into()
+}
+
+fn default_scope() -> String {
+    "b2c".into()
+}
+
+impl Conversation {
+    /// Build a Phase-0-style conversation row with the legacy
+    /// hierarchy defaults. Existing call sites that don't
+    /// know about [`Self::tenant_id`] / [`Self::community_id`]
+    /// / [`Self::domain_id`] should keep using this helper so
+    /// the new defaults stay isolated to one place.
+    pub fn legacy(
+        conversation_id: impl Into<String>,
+        title_cipher: Option<Vec<u8>>,
+        pinned: bool,
+        muted: bool,
+        last_message_id: Option<String>,
+        last_activity_ms: i64,
+    ) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            title_cipher,
+            pinned,
+            muted,
+            last_message_id,
+            last_activity_ms,
+            conversation_type: default_conversation_type(),
+            scope: default_scope(),
+            tenant_id: String::new(),
+            community_id: String::new(),
+            domain_id: String::new(),
+        }
+    }
+}
+
+impl Default for Conversation {
+    fn default() -> Self {
+        Self::legacy(String::new(), None, false, false, None, 0)
+    }
 }
 
 /// `message_skeleton` row.
@@ -590,6 +691,7 @@ mod tests {
             muted: false,
             last_message_id: Some("22222222-2222-2222-2222-222222222222".to_string()),
             last_activity_ms: 1_700_000_000_000,
+            ..Default::default()
         };
         let json = serde_json::to_string(&c).unwrap();
         let back: Conversation = serde_json::from_str(&json).unwrap();
@@ -719,12 +821,13 @@ mod tests {
 
     #[test]
     fn schema_sql_columns_match_struct_fields_for_archive_segment_map() {
-        // 8 columns in ArchiveSegmentMapEntry (post-§10.1):
-        // segment_id, conversation_id, time_bucket, segment_type,
-        // blob_id, storage_backend, merkle_root, state.
+        // 9 columns post-Phase-8 (`tenant_id` added on
+        // 2026-05-04): segment_id, conversation_id, time_bucket,
+        // segment_type, blob_id, storage_backend, merkle_root,
+        // state, tenant_id.
         assert_eq!(
             count_table_columns("archive_segment_map"),
-            8,
+            9,
             "archive_segment_map column count drifted"
         );
     }

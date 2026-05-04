@@ -102,7 +102,7 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
-> **Phase 6 — Media and Semantic Search — `In progress | ~75%`**
+> **Phase 6 — Media and Semantic Search — `In progress | ~80%`**
 > (ONNX Runtime session lifecycle in
 > `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
 > seam — `TextEmbedder` trait + `NoopTextEmbedder` /
@@ -166,7 +166,7 @@
 > Items still open: real platform-bridge attach for Whisper /
 > MobileCLIP / XLM-R sessions, desktop EP tuning, and the
 > INT4-vs-INT8 multilingual relevance benchmark.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~40%`**
+> **Phase 7 — Desktop + Optimization — `In progress | ~45%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -198,9 +198,55 @@
 > with three `#[ignore]` stress tests (10k multilingual ingest;
 > 5k media-asset eviction at Critical pressure; 1k message
 > backup → manifest-chain → restore round-trip; run with
-> `cargo test --test large_scale -- --ignored`).
-> Desktop integration and platform-specific ML EP tuning
-> remain.)
+> `cargo test --test large_scale -- --ignored`); a Phase-7
+> 100 k multilingual stress test
+> (`crates/core/tests/large_scale_test.rs`) covering 100+
+> conversations, 11 scripts, 10k+ media messages, every
+> storage-budget pressure level, full backup-restore manifest
+> chain, and a p95-latency assertion against the Phase-1
+> < 150 ms budget — also `#[ignore]`-marked, run with
+> `cargo test --test large_scale_test -- --ignored`; and the
+> first **macOS / Windows native integration scaffolds**
+> (`crates/desktop/src/{macos,windows}.rs`) defining
+> `SpotlightBridge` / `WindowsSearchBridge` (object-safe
+> message indexers) + `MacOsSchedulerBridge` /
+> `WindowsSchedulerBridge` (implementing the existing
+> `BackgroundScheduler` trait for `NSBackgroundActivityScheduler`
+> and Windows Task Scheduler) + `WindowsMlConfig` (CPU-only
+> contract; DirectML EP best-effort, INT4 default for tight
+> storage). Real platform-bridge attach (DirectML EP, Spotlight
+> indexing, `NSBackgroundActivityScheduler` callback) and the
+> ML EP tuning matrix remain.)
+> **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~25%`**
+> (Phase 8 schema foundation: `conversation` table now carries
+> `conversation_type` (`dm` / `group` / `channel`), `scope`
+> (`b2c` / `b2b`), `tenant_id`, `community_id`, `domain_id`
+> columns + matching `idx_conv_community` /
+> `idx_conv_domain` / `idx_conv_tenant` / `idx_conv_scope`
+> indexes; `archive_segment_map` carries `tenant_id` +
+> `idx_asm_tenant_bucket(tenant_id, time_bucket)`. `SearchTarget`
+> enum (`Conversation(Uuid)` / `Community(Uuid)` /
+> `Domain(Uuid)` / `Tenant(String)` / `B2cAll` / `Global`) on
+> `SearchQuery` with `effective_target()` mapping the legacy
+> `conversation_filter` to `SearchTarget::Conversation`. Scope
+> resolver `query_engine::resolve_target_to_conversation_set` +
+> `push_target_filter` wired into both `execute_structured_only`
+> and `allowed_skeleton_ids` — empty resolution emits a
+> `1=0` SQL clause (fail-closed). **Bloom filter shard type**:
+> `IndexType::Bloom` on the wire; `BloomFilter` /
+> `build_bloom_shard` / `restore_bloom_shard` /
+> `BloomShardPayload` in `crates/core/src/search/shard_builder.rs`,
+> sealed under
+> `crypto::key_hierarchy::derive_bloom_index_shard` (info
+> string `kchat-bloom-index-shard-v1`). The deterministic
+> shard prefetch order is now
+> `[Bloom, Text, Fuzzy, Vector, Media]` so the bloom shard is
+> fetched first and lets the prefetcher skip buckets whose
+> filter rejects every query token before paying for the
+> larger payloads. Items still open: bloom-filter pre-check in
+> the cold fan-out path, on-device decrypted shard cache,
+> parallel bucket fetch, per-tenant B2B key isolation, and
+> `TenantSearchPolicy` enforcement.)
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -477,6 +523,7 @@ chat-storage-search/
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
         phase5_benchmarks.rs                # criterion: text_only_one_month / fuzzy_only_one_month / local_plus_one_cold_bucket — Phase 5 cold-shard latency budget
+        phase6_int4_benchmarks.rs           # criterion: int8_encode_decode_round_trip / int4_encode_decode_round_trip / int8_vs_int4_cosine_fidelity (multilingual 100-vector corpus) / embedding_cache_throughput
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
@@ -486,6 +533,7 @@ chat-storage-search/
         backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
         failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage plus the end-to-end resume gate low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete; manifest upload interrupted mid-write retries without chain break; offline_during_backup_defers_upload_and_succeeds_on_reconnect (BackupResult.deferred = true while OfflineDetector reports offline, no segments built; reconnect produces a non-deferred run); offline_during_hydration_returns_cold_with_offline_flag (HydratedMessage { is_cold: true, offline: true, text_content: None } when body is RemoteArchiveOnly + offline)
         large_scale.rs                      # Phase 7 large-scale stress scaffold (#[ignore]): large_scale_ingest_and_search_10k_messages — 10k messages × 12 scripts (en / ru / zh / ja / ar / th / hi / ko / vi / de / fr / mixed-script), FTS5 + fuzzy + QueryEngine round-trip with rank-ordering check; large_scale_storage_budget_under_pressure — 5k media-asset rows totalling 500 MiB against 100 MiB budget at Critical pressure; large_scale_backup_restore_round_trip — 1k message backup → manifest-chain → RestorePipeline::run round-trip; run with `cargo test --test large_scale -- --ignored`
+        large_scale_test.rs                 # Phase 7 production-scale stress test (#[ignore]): 100k+ messages × 100+ conversations × 11 scripts (Latin / Cyrillic / CJK / Arabic / Thai / Devanagari / Bengali / Tamil / Korean / Greek / Hebrew), 10k+ media messages, every storage-budget pressure level, full backup-restore manifest chain, p95 search latency asserted under the Phase-1 < 150 ms budget; run with `cargo test --test large_scale_test -- --ignored`
         cold_shard_search.rs                # Phase 5: encrypted shard fetch via ColdShardSource → on-device decrypt → FTS5 + fuzzy → merge with local hits → SearchScope::IncludeCold marks is_cold = true
         mixed_language_query.rs             # Phase 5: segment_by_script fan-out across Latin × CJK / Cyrillic × Latin / pure-CJK fuzzy fallback / mixed-script promotion / unrelated-row exclusion
         phase5_latency_smoke.rs             # Phase 5: cold-shard decrypt + search smoke test (debug-build smoke gate; plus the p95 latency gate phase5_cold_shard_p95_latency_under_1_5s_budget that drives 20 iterations on a 1 000-message multilingual one-month bucket and asserts the end-to-end shard fetch + AEAD decrypt + FTS5 / fuzzy search p95 stays under the 1.5 s Phase-5 budget; on-device device-matrix p95 ≤ 1.5 s gate runs in the device-matrix bench)
@@ -499,6 +547,10 @@ chat-storage-search/
     ios-bridge/                             # UniFFI → Swift (Phase 1 scaffold: kchat.udl + build.rs + FFI wrappers)
     android-bridge/                         # JNI → Kotlin (Phase 1 scaffold: Java_com_kchat_core_KChatBridge_* entry points)
     desktop/                                # macOS + Windows (Phase 7)
+      src/
+        lib.rs                              # Phase 7: re-exports macos / windows scaffolds gated on #[cfg(target_os = ...)]; depends on kchat-core for BackgroundScheduler trait
+        macos.rs                            # Phase 7 macOS scaffold (#[cfg(target_os = "macos")]): SpotlightBridge trait (object-safe) + NoopSpotlightBridge + index_message / remove_message / remove_conversation; MacOsSchedulerBridge implementing BackgroundScheduler via NSBackgroundActivityScheduler + NoopMacOsSchedulerBridge
+        windows.rs                          # Phase 7 Windows scaffold (#[cfg(target_os = "windows")]): WindowsSearchBridge trait + NoopWindowsSearchBridge mirroring the macOS Spotlight surface; WindowsSchedulerBridge + NoopWindowsSchedulerBridge backed by the Task Scheduler; WindowsMlConfig (CPU-only ML contract: DirectML EP best-effort, INT4 default for tight storage)
   tests/
     generate_vectors/
       main.go                               # Pattern C vector generator (calls Go SDK)

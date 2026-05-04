@@ -63,6 +63,38 @@ pub trait DocumentExtractor: std::fmt::Debug + Send + Sync {
     fn extract_text(&self, data: &[u8], mime_type: &str) -> Result<Vec<DocumentPage>>;
 }
 
+/// Alias matching the Phase 6 task-spec name. `PageText` and
+/// [`DocumentPage`] are the same struct — the alias lets call
+/// sites use either name interchangeably while the trait
+/// signature continues to return `Vec<DocumentPage>`.
+pub use DocumentPage as PageText;
+
+/// Wrapper helper matching the Phase 6 task-spec
+/// `DocumentExtractionResult { pages }` shape. Implementations
+/// of [`DocumentExtractor`] return `Vec<DocumentPage>` directly,
+/// but callers that prefer the wrapper can build one with
+/// [`DocumentExtractionResult::from_pages`] without changing the
+/// trait surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentExtractionResult {
+    /// Extracted pages, ordered by [`PageText::page_number`].
+    pub pages: Vec<PageText>,
+}
+
+impl DocumentExtractionResult {
+    /// Build a result from a `Vec<DocumentPage>` returned by
+    /// an extractor.
+    pub fn from_pages(pages: Vec<DocumentPage>) -> Self {
+        Self { pages }
+    }
+}
+
+impl From<Vec<DocumentPage>> for DocumentExtractionResult {
+    fn from(pages: Vec<DocumentPage>) -> Self {
+        Self::from_pages(pages)
+    }
+}
+
 /// Always-`NotImplemented` [`DocumentExtractor`] for builds
 /// without a real platform extractor wired in.
 ///

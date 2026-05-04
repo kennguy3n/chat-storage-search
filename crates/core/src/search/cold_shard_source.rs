@@ -63,6 +63,7 @@ use crate::Error;
 /// addressing schemes agree.
 fn shard_type_str(it: IndexType) -> &'static str {
     match it {
+        IndexType::Bloom => "bloom",
         IndexType::Text => "text",
         IndexType::Fuzzy => "fuzzy",
         IndexType::Vector => "vector",

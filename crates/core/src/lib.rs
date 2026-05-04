@@ -164,6 +164,40 @@ pub enum SearchScope {
     IncludeCold,
 }
 
+/// Search target. Phase 8 (2026-05-04 batch) — selects which
+/// slice of the conversation hierarchy a search query applies
+/// to. Variants:
+///
+/// * [`SearchTarget::Conversation`] — single conversation, used
+///   to back the legacy `conversation_filter` field.
+/// * [`SearchTarget::Community`] / [`SearchTarget::Domain`] —
+///   filter to the conversations attached to a community or a
+///   domain (b2b hierarchy levels).
+/// * [`SearchTarget::Tenant`] — filter to every conversation
+///   owned by a tenant string.
+/// * [`SearchTarget::B2cAll`] — every conversation with
+///   `scope = "b2c"`.
+/// * [`SearchTarget::Global`] (default) — no filter; the
+///   query engine returns results from every conversation
+///   visible to the local store.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTarget {
+    /// Single-conversation filter.
+    Conversation(Uuid),
+    /// Community-level filter (matches `community_id`).
+    Community(Uuid),
+    /// Domain-level filter (matches `domain_id`).
+    Domain(Uuid),
+    /// Tenant-level filter (matches `tenant_id`).
+    Tenant(String),
+    /// Every conversation with `scope = "b2c"`.
+    B2cAll,
+    /// No filter — search every conversation.
+    #[default]
+    Global,
+}
+
 /// Top-level search query.
 ///
 /// `docs/PROPOSAL.md §12` defines the field shape; the unified
@@ -175,7 +209,12 @@ pub struct SearchQuery {
     pub query_string: String,
     /// Optional sender filter.
     pub sender_filter: Option<String>,
-    /// Optional conversation filter.
+    /// Optional conversation filter. Phase 8 (2026-05-04
+    /// batch) introduces [`SearchQuery::target`] as the
+    /// preferred filter; this field stays as a deprecated
+    /// alias that maps onto
+    /// [`SearchTarget::Conversation`] when [`Self::target`]
+    /// is [`SearchTarget::Global`].
     pub conversation_filter: Option<Uuid>,
     /// Inclusive lower-bound `created_at_ms`.
     pub date_from: Option<i64>,
@@ -183,6 +222,27 @@ pub struct SearchQuery {
     pub date_to: Option<i64>,
     /// Content-kind filter.
     pub content_kind: Option<ContentKind>,
+    /// Phase 8 conversation-hierarchy target. `Global`
+    /// (default) when omitted from the wire payload —
+    /// `#[serde(default)]` keeps backward compat with v0
+    /// callers that only sent `conversation_filter`.
+    #[serde(default)]
+    pub target: SearchTarget,
+}
+
+impl SearchQuery {
+    /// Resolve the effective target for this query. Phase 8
+    /// preserves the legacy `conversation_filter` field by
+    /// mapping it to [`SearchTarget::Conversation`] when the
+    /// new `target` is left at its default ([`SearchTarget::Global`]).
+    pub fn effective_target(&self) -> SearchTarget {
+        if matches!(self.target, SearchTarget::Global) {
+            if let Some(c) = self.conversation_filter {
+                return SearchTarget::Conversation(c);
+            }
+        }
+        self.target.clone()
+    }
 }
 
 /// One result row from the unified search engine.
@@ -663,10 +723,64 @@ mod tests {
             date_from: Some(1_700_000_000_000),
             date_to: Some(1_800_000_000_000),
             content_kind: Some(ContentKind::Text),
+            target: SearchTarget::Global,
         };
         let json = serde_json::to_string(&q).unwrap();
         let back: SearchQuery = serde_json::from_str(&json).unwrap();
         assert_eq!(q, back);
+    }
+
+    #[test]
+    fn search_target_default_is_global() {
+        assert_eq!(SearchTarget::default(), SearchTarget::Global);
+    }
+
+    #[test]
+    fn search_target_round_trips_through_serde_for_every_variant() {
+        let cases = vec![
+            SearchTarget::Conversation(Uuid::now_v7()),
+            SearchTarget::Community(Uuid::now_v7()),
+            SearchTarget::Domain(Uuid::now_v7()),
+            SearchTarget::Tenant("t1".into()),
+            SearchTarget::B2cAll,
+            SearchTarget::Global,
+        ];
+        for t in cases {
+            let json = serde_json::to_string(&t).unwrap();
+            let back: SearchTarget = serde_json::from_str(&json).unwrap();
+            assert_eq!(t, back);
+        }
+    }
+
+    #[test]
+    fn backward_compat_conversation_filter_maps_to_search_target() {
+        // Phase 8: when only `conversation_filter` is set (legacy
+        // wire payload, no `target`), `effective_target()` must
+        // surface as `SearchTarget::Conversation(c)`.
+        let conv = Uuid::now_v7();
+        let q = SearchQuery {
+            conversation_filter: Some(conv),
+            ..Default::default()
+        };
+        assert_eq!(q.effective_target(), SearchTarget::Conversation(conv));
+        // When `target` is set explicitly to a non-Global value
+        // the new field takes precedence.
+        let other = Uuid::now_v7();
+        let q = SearchQuery {
+            conversation_filter: Some(conv),
+            target: SearchTarget::Community(other),
+            ..Default::default()
+        };
+        assert_eq!(q.effective_target(), SearchTarget::Community(other));
+    }
+
+    #[test]
+    fn search_query_target_defaults_to_global_when_missing_from_serde_payload() {
+        // Legacy wire payloads have no `target` field; serde must
+        // decode them with the default value.
+        let payload = r#"{"query_string":"hi"}"#;
+        let q: SearchQuery = serde_json::from_str(payload).unwrap();
+        assert_eq!(q.target, SearchTarget::Global);
     }
 
     #[test]

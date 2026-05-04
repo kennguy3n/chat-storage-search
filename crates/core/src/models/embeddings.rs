@@ -257,6 +257,129 @@ pub(crate) fn dequantize_int8_for_search(blob: &[u8]) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// INT4 codec — Phase 6, Task 4 (2026-05-04 batch)
+// ---------------------------------------------------------------------------
+//
+// Linear, symmetric INT4 quantization. Each f32 value is mapped
+// into the range `[-7, 7]` with a per-vector `scale = max_abs / 7`
+// and packed two values per byte (low nibble = even index, high
+// nibble = odd index). On-disk layout:
+//
+//   bytes  0..4   : little-endian f32 `scale`
+//   bytes  4..6   : little-endian u16 `len`   (number of f32 values)
+//   bytes  6..    : ceil(len / 2) packed bytes
+//
+// `len` is stored explicitly so an odd-length vector
+// (`len = 2 * packed_bytes - 1`) round-trips losslessly back to
+// the same number of f32 values. The chosen format is intentionally
+// distinct from [`quantize_int8`] / [`dequantize_int8`] so the two
+// codecs cannot accidentally alias on the same byte buffer.
+//
+// References: `docs/PROPOSAL.md §7.6` (per-tier model packaging),
+// `docs/PHASES.md` Phase 6 (storage-budget aware quantization).
+
+const INT4_HEADER_LEN: usize = 6;
+
+/// Encode an `f32` embedding as an INT4-quantized blob.
+///
+/// Two values per byte. Returns the prefix described above.
+/// Empty inputs return `[0; 6]` so the round-trip is well-defined.
+pub fn encode_int4(embedding: &[f32]) -> Vec<u8> {
+    let max_abs = embedding.iter().fold(0.0_f32, |acc, &x| acc.max(x.abs()));
+    let scale = (max_abs / 7.0).max(QUANT_EPS);
+    let len = embedding.len() as u16;
+
+    let packed_len = embedding.len().div_ceil(2);
+    let mut out = Vec::with_capacity(INT4_HEADER_LEN + packed_len);
+    out.extend_from_slice(&scale.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+
+    let mut byte = 0u8;
+    for (i, &x) in embedding.iter().enumerate() {
+        // Symmetric clamp into the signed-4-bit range
+        // `[-7, 7]`. We avoid the `-8` end of the two's
+        // complement range so the codec is symmetric and
+        // negation is an involution.
+        let q = (x / scale).round().clamp(-7.0, 7.0) as i8;
+        // Map signed nibble to its 4-bit two's-complement
+        // representation by masking with `0x0F`.
+        let nibble = (q as u8) & 0x0F;
+        if i % 2 == 0 {
+            byte = nibble;
+            if i == embedding.len() - 1 {
+                out.push(byte);
+            }
+        } else {
+            byte |= nibble << 4;
+            out.push(byte);
+            byte = 0;
+        }
+    }
+    out
+}
+
+/// Decode an INT4-quantized blob produced by [`encode_int4`].
+///
+/// Returns an empty vector when the blob is too short or
+/// inconsistent (e.g. the declared `len` exceeds the available
+/// packed bytes).
+pub fn decode_int4(blob: &[u8]) -> Vec<f32> {
+    if blob.len() < INT4_HEADER_LEN {
+        return Vec::new();
+    }
+    let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+    let len = u16::from_le_bytes([blob[4], blob[5]]) as usize;
+    let need_packed = len.div_ceil(2);
+    if blob.len() < INT4_HEADER_LEN + need_packed {
+        return Vec::new();
+    }
+    let packed = &blob[INT4_HEADER_LEN..INT4_HEADER_LEN + need_packed];
+
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let byte = packed[i / 2];
+        let nibble = if i % 2 == 0 {
+            byte & 0x0F
+        } else {
+            (byte >> 4) & 0x0F
+        };
+        // Sign-extend 4 bits to i8.
+        let signed = if nibble & 0x08 != 0 {
+            (nibble | 0xF0) as i8
+        } else {
+            nibble as i8
+        };
+        out.push(signed as f32 * scale);
+    }
+    out
+}
+
+/// Compute the cosine similarity between two equal-length
+/// vectors. Returns `0.0` for any pair containing a zero
+/// magnitude vector — that matches the semantics used by
+/// [`crate::search::semantic_search`] when reranking.
+///
+/// Lives here so the INT4 / INT8 fidelity benches and tests share
+/// a single implementation.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na <= QUANT_EPS || nb <= QUANT_EPS {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+// ---------------------------------------------------------------------------
 // TextEmbedder trait — Phase 6, Task 2
 // ---------------------------------------------------------------------------
 
@@ -603,5 +726,103 @@ mod tests {
         let dynref: &dyn TextEmbedder = &mock;
         let v = dynref.embed("trait dispatch").expect("dyn embed");
         assert_eq!(v.len(), XLMR_EMBEDDING_DIM);
+    }
+
+    // ----- Phase 6, Task 4 (2026-05-04 batch): INT4 codec ----------------
+
+    #[test]
+    fn int4_encode_decode_round_trip_preserves_cosine_above_threshold() {
+        // For typical embeddings, INT4 quantization should still
+        // preserve cosine similarity above 0.95.
+        let v = fixture_embedding(7);
+        let blob = encode_int4(&v);
+        // 6-byte header + ceil(N/2) packed bytes.
+        assert_eq!(
+            blob.len(),
+            INT4_HEADER_LEN + v.len().div_ceil(2),
+            "INT4 packed-blob size matches the documented layout"
+        );
+        let back = decode_int4(&blob);
+        assert_eq!(back.len(), v.len());
+        let sim = cosine_similarity(&v, &back);
+        assert!(
+            sim > 0.95,
+            "INT4 round-trip cosine should be > 0.95, got {sim}"
+        );
+    }
+
+    #[test]
+    fn int4_codec_handles_zero_vector() {
+        let v = vec![0.0_f32; 16];
+        let blob = encode_int4(&v);
+        let back = decode_int4(&blob);
+        assert_eq!(back.len(), v.len());
+        assert!(back.iter().all(|x| x.abs() < 1e-3));
+    }
+
+    #[test]
+    fn int4_codec_handles_uniform_vector() {
+        // All-equal-positive: scale = max / 7, every nibble lands
+        // on +7 → decoded values match the original to within
+        // half a quantization step.
+        let v = vec![0.42_f32; 12];
+        let blob = encode_int4(&v);
+        let back = decode_int4(&blob);
+        assert_eq!(back.len(), v.len());
+        for (orig, dec) in v.iter().zip(back.iter()) {
+            assert!((orig - dec).abs() < 0.42 / 7.0 + 1e-3);
+        }
+
+        // All-equal-negative: same property, opposite sign.
+        let v = vec![-0.42_f32; 12];
+        let blob = encode_int4(&v);
+        let back = decode_int4(&blob);
+        for (orig, dec) in v.iter().zip(back.iter()) {
+            assert!((orig - dec).abs() < 0.42 / 7.0 + 1e-3);
+        }
+    }
+
+    #[test]
+    fn int4_codec_handles_odd_length_vector() {
+        // Odd-length vectors exercise the trailing-half-byte
+        // path in `encode_int4` / `decode_int4`.
+        let v = vec![0.1_f32, -0.1, 0.5, -0.5, 0.9];
+        let blob = encode_int4(&v);
+        let back = decode_int4(&blob);
+        assert_eq!(back.len(), v.len());
+        let sim = cosine_similarity(&v, &back);
+        assert!(sim > 0.95, "odd-length INT4 cosine {sim}");
+    }
+
+    #[test]
+    fn int4_decode_handles_short_blob_gracefully() {
+        assert!(decode_int4(&[]).is_empty());
+        assert!(decode_int4(&[0u8, 1, 2]).is_empty());
+    }
+
+    #[test]
+    fn int4_blob_is_smaller_than_int8_blob() {
+        // A correctness guard for the storage-budget claim in
+        // `docs/PROPOSAL.md §7.6`: INT4 packs ~2x denser than
+        // INT8 for the same input vector.
+        let v = fixture_embedding(1);
+        let i8_blob = quantize_int8(&v);
+        let i4_blob = encode_int4(&v);
+        assert!(
+            i4_blob.len() < i8_blob.len(),
+            "INT4 ({} bytes) should be smaller than INT8 ({} bytes)",
+            i4_blob.len(),
+            i8_blob.len()
+        );
+    }
+
+    #[test]
+    fn select_quantization_picks_int4_for_low_storage_budget() {
+        use crate::models::model_manager::{ModelManager, Quantization};
+
+        let mgr = ModelManager::default();
+        // 100 MiB available → tight-storage tier → INT4.
+        let q = mgr.select_quantization("xlmr", 100 * 1024 * 1024);
+        assert_eq!(q, Quantization::Int4);
     }
 }

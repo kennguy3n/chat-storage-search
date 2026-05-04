@@ -47,6 +47,8 @@ pub mod info {
     pub const TEXT_INDEX_SHARD: &[u8] = b"kchat-text-index-shard-v1";
     pub const VECTOR_INDEX_SHARD: &[u8] = b"kchat-vector-index-shard-v1";
     pub const MEDIA_INDEX_SHARD: &[u8] = b"kchat-media-index-shard-v1";
+    /// Phase 8 (2026-05-04 batch) — bloom-filter shard.
+    pub const BLOOM_INDEX_SHARD: &[u8] = b"kchat-bloom-index-shard-v1";
 
     /// Phase-3 epoch-rotated archive key. `info` =
     /// `b"kchat-archive-epoch-v1" || epoch_id`.
@@ -206,6 +208,16 @@ pub fn derive_media_index_shard(
     shard_id: &[u8],
 ) -> CryptoResult<KeyMaterial> {
     derive_with_id(search_root.as_bytes(), info::MEDIA_INDEX_SHARD, shard_id)
+}
+
+/// Derive `K_bloom_index_shard(shard_id)` from `K_search_root`.
+/// Phase 8 (2026-05-04 batch) — used to seal per-bucket bloom
+/// filter shards built by [`crate::search::shard_builder::build_bloom_shard`].
+pub fn derive_bloom_index_shard(
+    search_root: &KeyMaterial,
+    shard_id: &[u8],
+) -> CryptoResult<KeyMaterial> {
+    derive_with_id(search_root.as_bytes(), info::BLOOM_INDEX_SHARD, shard_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,5 +445,26 @@ mod tests {
         let seg = derive_archive_segment_key(&epoch, "id-1").unwrap();
         let man = derive_archive_manifest_key(&epoch, "id-1").unwrap();
         assert_ne!(seg.as_bytes(), man.as_bytes());
+    }
+
+    #[test]
+    fn derive_bloom_index_shard_is_deterministic() {
+        let root = derive_search_root(&master()).unwrap();
+        let a = derive_bloom_index_shard(&root, b"shard-1").unwrap();
+        let b = derive_bloom_index_shard(&root, b"shard-1").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let other = derive_bloom_index_shard(&root, b"shard-2").unwrap();
+        assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    #[test]
+    fn derive_bloom_index_shard_differs_from_text_and_vector() {
+        let root = derive_search_root(&master()).unwrap();
+        let bloom = derive_bloom_index_shard(&root, b"shard-1").unwrap();
+        let text = derive_text_index_shard(&root, b"shard-1").unwrap();
+        let vector = derive_vector_index_shard(&root, b"shard-1").unwrap();
+        assert_ne!(bloom.as_bytes(), text.as_bytes());
+        assert_ne!(bloom.as_bytes(), vector.as_bytes());
+        assert_ne!(text.as_bytes(), vector.as_bytes());
     }
 }

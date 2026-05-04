@@ -253,6 +253,7 @@ impl SearchQuery {
             date_from: self.date_from,
             date_to: self.date_to,
             content_kind: self.content_kind.map(Into::into),
+            target: Default::default(),
         })
     }
 }

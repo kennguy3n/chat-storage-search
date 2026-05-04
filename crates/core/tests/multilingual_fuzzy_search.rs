@@ -164,6 +164,7 @@ fn seed_conversation(db: &LocalStoreDb, conversation_id: Uuid, last_activity_ms:
         muted: false,
         last_message_id: None,
         last_activity_ms,
+        ..Default::default()
     })
     .unwrap();
 }

@@ -37,6 +37,7 @@ fn seed_conversation(db: &LocalStoreDb, conv_id: &Uuid) {
         muted: false,
         last_message_id: None,
         last_activity_ms: 1,
+        ..Default::default()
     };
     db.insert_conversation(&conv).unwrap();
 }
@@ -170,6 +171,7 @@ fn bench_search_with_structured_filters(c: &mut Criterion) {
                 date_from: Some(1_700_000_000_000),
                 date_to: Some(1_700_000_002_000),
                 content_kind: Some(ContentKind::Text),
+                target: Default::default(),
             };
             let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
             black_box(hits);

@@ -90,16 +90,24 @@ goes through the FFI bridge for the host platform.
 > **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
 > (~95%); Phase 3 in flight (~97%); Phase 4 in flight (~90%);
 > Phase 5 in flight (~95%, cold-shard fetch + restore + p95
-> latency gate landed); Phase 6 in flight (~75%, ML inference
+> latency gate landed); Phase 6 in flight (~80%, ML inference
 > seams for XLM-R / MobileCLIP-S2 / Whisper /
 > DocumentExtractor / VideoKeyframeSampler + on-device
 > reranker with raw `semantic_score` + INT4 quantization
-> selection); Phase 7 in flight (~40%, failure suite at 8 of 8 +
+> selection + INT4 encode/decode codec + criterion bench
+> scaffold); Phase 7 in flight (~45%, failure suite at 8 of 8 +
 > offline detector + perf collector + large-scale ingest /
-> storage-budget / backup-restore scaffold); Phase 8 not started
-> (~0%, multi-scope / multi-tenant search — conversation
-> hierarchy, bloom shards, shard cache, parallel fetch,
-> per-tenant key isolation; see PHASES.md Phase 8).** Updates vs.
+> storage-budget / backup-restore scaffold + 100k-message
+> stress test + macOS / Windows native integration scaffolds —
+> Spotlight / Windows Search bridges, scheduler bridges,
+> `WindowsMlConfig` CPU-only contract); Phase 8 in flight
+> (~25%, multi-scope / multi-tenant search foundation —
+> conversation hierarchy columns + indexes,
+> `archive_segment_map.tenant_id`, `SearchTarget` enum + scope
+> resolver wired through `QueryEngine`, `IndexType::Bloom`
+> shard type with `K_bloom_index_shard` derivation, prefetch
+> order updated to `[Bloom, Text, Fuzzy, Vector, Media]`; see
+> PHASES.md Phase 8).** Updates vs.
 > the original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
