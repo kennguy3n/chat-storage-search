@@ -43,7 +43,7 @@
 
 use std::sync::Arc;
 
-use crate::crypto::content_hash::content_hash;
+use crate::crypto::content_hash::HASH_LEN;
 use crate::local_store::db::{DbResult, LocalStoreDb};
 use crate::local_store::schema::MediaAsset;
 use crate::media::sinks::{MediaBlobReference, MediaBlobSink};
@@ -280,9 +280,14 @@ fn migrate_one(
         Ok(_) => {}
         Err(e) => return MigrationItemOutcome::Failed(format!("get_media_asset: {e:?}")),
     }
-    // 1. Read every ciphertext chunk from the source sink.
-    let mut concatenated: Vec<u8> = Vec::new();
+    // 1. Read every ciphertext chunk from the source sink and
+    //    feed it into a streaming BLAKE3 hasher. We retain the
+    //    chunk buffers (the target sink needs them as a
+    //    `&[&[u8]]`) but deliberately do not build a single
+    //    concatenated copy — a 1 GiB media asset would otherwise
+    //    need ~2 GiB peak RSS instead of ~1 GiB.
     let mut chunk_buffers: Vec<Vec<u8>> = Vec::with_capacity(item.chunk_count as usize);
+    let mut transit_hasher = blake3::Hasher::new();
     let source_ref = MediaBlobReference {
         blob_id: item.blob_id.clone(),
         storage_sink: source_sink.to_string(),
@@ -291,7 +296,7 @@ fn migrate_one(
     for chunk_idx in 0..item.chunk_count {
         match source.fetch_media_chunk(&source_ref, chunk_idx) {
             Ok(buf) => {
-                concatenated.extend_from_slice(&buf);
+                transit_hasher.update(&buf);
                 chunk_buffers.push(buf);
             }
             Err(e) => {
@@ -301,7 +306,7 @@ fn migrate_one(
             }
         }
     }
-    let transit_hash = content_hash(&concatenated);
+    let transit_hash: [u8; HASH_LEN] = transit_hasher.finalize().into();
 
     // 2. Upload to target.
     let chunk_views: Vec<&[u8]> = chunk_buffers.iter().map(|c| c.as_slice()).collect();
@@ -321,12 +326,15 @@ fn migrate_one(
         ));
     }
 
-    // 3. Read the chunks back from the target and compare against
-    // the transit hash.
-    let mut roundtrip: Vec<u8> = Vec::new();
+    // 3. Read the chunks back from the target and stream them
+    //    through a fresh BLAKE3 hasher — same memory rationale
+    //    as step 1; we never build a concatenated copy.
+    let mut roundtrip_hasher = blake3::Hasher::new();
     for chunk_idx in 0..item.chunk_count {
         match target.fetch_media_chunk(&new_ref, chunk_idx) {
-            Ok(buf) => roundtrip.extend_from_slice(&buf),
+            Ok(buf) => {
+                roundtrip_hasher.update(&buf);
+            }
             Err(e) => {
                 return MigrationItemOutcome::Failed(format!(
                     "target fetch_media_chunk(idx={chunk_idx}): {e:?}"
@@ -334,7 +342,7 @@ fn migrate_one(
             }
         }
     }
-    let roundtrip_hash = content_hash(&roundtrip);
+    let roundtrip_hash: [u8; HASH_LEN] = roundtrip_hasher.finalize().into();
     if roundtrip_hash != transit_hash {
         return MigrationItemOutcome::Failed(
             "transit-integrity hash mismatch after roundtrip".into(),
@@ -416,6 +424,7 @@ impl MigrationProgress for InMemoryMigrationProgress {
 mod tests {
     use super::*;
     use crate::crypto::aead::BlobClass;
+    use crate::crypto::content_hash::content_hash;
     use crate::local_store::db::LocalStoreDb;
     use crate::local_store::schema::{Conversation, MediaAsset, MessageKind, MessageSkeleton};
     use crate::local_store::state_machines::{ArchiveState, BackupState, BodyState, MediaState};

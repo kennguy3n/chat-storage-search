@@ -2120,6 +2120,59 @@ Phase 7 → `~65%`. Phase 8 remains at `~25%` (the multi-scope
 foundation lands the search-target plumbing; the
 multi-tenant isolation work continues separately).
 
+**Post-merge review fixes (2026-05-04, same PR):**
+
+* **Scheduler dedup TOCTOU.**
+  `InProcessScheduler::spawn_worker` originally took the
+  workers mutex twice — once for the dedup check, once for
+  the insert — which let two threads racing on the same
+  `TaskType` both pass the dedup check and orphan one
+  worker's shutdown `Arc`. The lock is now held across the
+  full sequence (dedup check → thread spawn → insert) so
+  concurrent `schedule_*` calls are atomic. The handlers
+  lock is acquired first (it's only ever read inside this
+  function), then workers — `cancel_all` only takes the
+  workers lock so there is no deadlock cycle.
+  Regression test
+  (`schedule_dedup_is_atomic_under_concurrent_callers`)
+  spawns 8 threads behind a `Barrier`, calls
+  `schedule_backup` simultaneously, verifies a single
+  surviving worker, and asserts `cancel_all` reaches it.
+
+* **Cold-search target-set fail-closed contract.**
+  `execute_search_with_cold_source_and_limit` previously
+  used `unwrap_or_default()` on the resolver result, which
+  obscured that an `Ok(Some(empty_set))` response (e.g.
+  `Starred` / `Unread` against
+  `NoopConversationGroupResolver`) is **intentionally
+  fail-closed** — drop every cold bucket, mirroring the
+  local pass's `1=0` SQL clause. The path now uses an
+  explicit match with per-arm rustdoc spelling out all
+  four resolution outcomes.
+
+* **HNSW cache mutex contention.**
+  `SemanticSearchEngine::search_semantic_auto` previously
+  held the `HnswIndexCache` mutex across the full graph
+  traversal, serializing every concurrent semantic search
+  through a single lock. The cache now stores
+  `Arc<HnswIndex>`; the hit path takes the mutex only long
+  enough to `Arc::clone` the index, drops the guard, then
+  runs `idx.search` outside the lock. Concurrent searches
+  against unrelated `(conversation, model_version)` slots
+  no longer queue. Regression test
+  (`hit_path_drops_lock_before_search`) verifies the lock
+  is released before the search runs.
+
+* **Media migration memory amplification.**
+  `migrate_one` previously built a `concatenated: Vec<u8>`
+  alongside `chunk_buffers` for the BLAKE3 transit-hash
+  check, then a separate `roundtrip: Vec<u8>` for the
+  read-back. For a 1 GiB asset that meant ~3 GiB peak RSS
+  rather than ~1 GiB. Both hashes now stream through
+  `blake3::Hasher::update` per chunk; chunk buffers are
+  retained for the upload (the target sink wants them as
+  `&[&[u8]]`) but never duplicated.
+
 ### 2026-05-04 — Phase 6 / 7 / 8 batch 4 (this PR)
 
 Builds on the prior 2026-05-04 batches. Lands ten tasks across

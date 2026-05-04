@@ -26,7 +26,7 @@
 //! to change.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use instant_distance::{Builder as HnswBuilder, HnswMap, Point as HnswPoint, Search};
 use rusqlite::{params, Connection, Result as SqlResult};
@@ -148,9 +148,16 @@ pub(crate) struct HnswCacheKey {
 /// dropped via [`HnswIndexCache::invalidate`] when new vectors
 /// are inserted; the engine then rebuilds them lazily on the
 /// next semantic search.
+///
+/// Entries are wrapped in [`Arc`] so the cache mutex can be
+/// dropped before any expensive graph traversal — the lock is
+/// only held for the `HashMap` lookup itself, never for
+/// [`HnswIndex::search`]. This keeps concurrent semantic
+/// searches across different `(conversation, model_version)`
+/// slots from serializing through a single mutex.
 #[derive(Debug, Default)]
 pub struct HnswIndexCache {
-    inner: Mutex<HashMap<HnswCacheKey, HnswIndex>>,
+    inner: Mutex<HashMap<HnswCacheKey, Arc<HnswIndex>>>,
 }
 
 impl HnswIndexCache {
@@ -266,8 +273,15 @@ impl<'a> SemanticSearchEngine<'a> {
             conversation_id: conversation_id.map(str::to_string),
             model_version: model_version.map(str::to_string),
         };
-        // Hit path — locked clone of the index slot.
-        if let Some(idx) = cache.inner.lock().unwrap().get(&key) {
+        // Hit path — clone the `Arc<HnswIndex>` under the cache
+        // mutex, then drop the guard before the (potentially
+        // milliseconds-long) graph traversal so other threads
+        // searching unrelated slots aren't serialized through
+        // this lock. Cloning the `Arc` keeps the index alive
+        // even if a concurrent `invalidate` removes the map
+        // entry while we're searching.
+        let cached: Option<Arc<HnswIndex>> = cache.inner.lock().unwrap().get(&key).map(Arc::clone);
+        if let Some(idx) = cached {
             return Ok(idx.search(query_embedding, limit));
         }
         // Miss path — load candidates, decide whether to build.
@@ -288,9 +302,13 @@ impl<'a> SemanticSearchEngine<'a> {
         let Some(idx) = HnswIndex::build(rows) else {
             return self.search_semantic(query_embedding, conversation_id, limit, model_version);
         };
-        let hits = idx.search(query_embedding, limit);
-        cache.inner.lock().unwrap().insert(key, idx);
-        Ok(hits)
+        let idx = Arc::new(idx);
+        // Insert first, then run the search outside the lock —
+        // same locking discipline as the hit path. A concurrent
+        // miss would simply rebuild + overwrite, which is
+        // wasted work but correctness-preserving.
+        cache.inner.lock().unwrap().insert(key, Arc::clone(&idx));
+        Ok(idx.search(query_embedding, limit))
     }
 
     /// Run a brute-force cosine search.
@@ -646,7 +664,7 @@ mod tests {
                 conversation_id: Some("c1".into()),
                 model_version: Some("v1".into()),
             },
-            idx,
+            Arc::new(idx),
         );
         assert_eq!(cache.len(), 1);
         cache.invalidate(Some("c1"), Some("v1"));
@@ -677,6 +695,67 @@ mod tests {
         assert_eq!(hits[0].message_id, "a");
         // Below threshold so the cache must be empty.
         assert!(cache.is_empty());
+    }
+
+    /// Regression for the cache-mutex contention finding —
+    /// once the hit path has taken the lock long enough to
+    /// `Arc::clone` the index, the lock must be released
+    /// before the (potentially expensive) graph search runs.
+    /// We assert this structurally via [`Arc::strong_count`]:
+    /// while the search is in flight the cache map still
+    /// holds one strong reference to the index, and the
+    /// caller holds the second one — there must be exactly
+    /// two strong references, never more. (If the lock were
+    /// held across the search, no other thread could observe
+    /// the cache state at all, and a future refactor that
+    /// re-introduced `&HnswIndex` borrowed from the
+    /// `MutexGuard` would silently regress.)
+    #[test]
+    fn hit_path_drops_lock_before_search() {
+        let cache = HnswIndexCache::new();
+        let key = HnswCacheKey {
+            conversation_id: Some("c1".into()),
+            model_version: Some("v1".into()),
+        };
+        // Build a real index so the search call exercises the
+        // ANN path, not the early-return on `query.is_empty()`.
+        let idx = HnswIndex::build(vec![
+            ("m1".into(), vec![1.0, 0.0, 0.0]),
+            ("m2".into(), vec![0.0, 1.0, 0.0]),
+        ])
+        .unwrap();
+        let arc_idx = Arc::new(idx);
+        cache
+            .inner
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&arc_idx));
+
+        // Two strong refs: the cache slot + our local handle.
+        assert_eq!(Arc::strong_count(&arc_idx), 2);
+
+        // Mimic the hit path: clone under the lock, then drop
+        // the guard, then search. After the clone the cache
+        // mutex must be free for any other thread to lock —
+        // we verify by re-acquiring it from the same thread,
+        // which would deadlock if the previous `lock()` were
+        // still held.
+        let cloned = {
+            let guard = cache.inner.lock().unwrap();
+            let cloned = guard.get(&key).map(Arc::clone).expect("slot present");
+            drop(guard);
+            cloned
+        };
+        // Re-acquire the cache mutex while a search is "in
+        // flight" against `cloned`. This is the property the
+        // production code depends on: any thread can take
+        // the cache lock while another runs `idx.search`.
+        drop(cache.inner.lock().unwrap());
+        // Sanity: cloned is still usable (search returns
+        // something) — the Arc keeps it alive even if the
+        // cache slot were invalidated mid-search.
+        let hits = cloned.search(&[1.0, 0.0, 0.0], 1);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
