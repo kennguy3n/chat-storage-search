@@ -142,3 +142,129 @@ fn phase5_cold_shard_decrypt_and_search_finishes_under_smoke_budget() {
         "cold-shard decrypt + search took {elapsed:?}, exceeds 5 s smoke budget",
     );
 }
+
+/// p95 budget gate: end-to-end shard fetch (in-memory mock) +
+/// AEAD decrypt + local FTS5 / fuzzy search across a one-month
+/// bucket of ~1 000 multilingual messages must stay under
+/// **1.5 s** at the 95th percentile (`docs/PHASES.md §Phase 5`).
+///
+/// This complements the criterion benches in
+/// `crates/core/benches/phase5_benchmarks.rs` (which produce the
+/// publishable histogram) with a CI-friendly assert: it runs in
+/// every `cargo test --workspace` pass and fails the build if
+/// the p95 ever exceeds the documented budget.
+///
+/// The corpus interleaves four scripts (Latin, Cyrillic, Greek,
+/// CJK) so the script-aware fuzzy tokenizer is exercised on the
+/// fetch path. The needle term is repeated in ~1 % of rows so
+/// every iteration surfaces hits from the cold path.
+#[test]
+fn phase5_cold_shard_p95_latency_under_1_5s_budget() {
+    use std::time::Duration;
+
+    const ITERATIONS: usize = 20;
+    const P95_BUDGET: Duration = Duration::from_millis(1_500);
+
+    let identity = KeyMaterial::from_bytes([0xAB; 32]);
+    let search_root = derive_search_root(&identity).unwrap();
+    let conv_id = Uuid::now_v7().to_string();
+    let conv_hash_key = KeyMaterial::from_bytes([0xCD; 32]);
+    let k_text = derive_text_index_shard(&search_root, Uuid::now_v7().as_bytes()).unwrap();
+    let k_fuzzy = derive_text_index_shard(&search_root, Uuid::now_v7().as_bytes()).unwrap();
+
+    // Multilingual one-month corpus. Every 100th row carries the
+    // needle in Latin so the FTS path lights up; the remaining
+    // rows interleave four scripts so the fuzzy tokenizer runs
+    // each per-script branch.
+    let scripts: [&str; 4] = [
+        "lighthouse keepers gathered at dusk",
+        "смотритель маяка собрал сети на закате",
+        "οι φύλακες του φάρου μάζεψαν δίχτυα",
+        "灯塔守护者在黄昏时分聚集",
+    ];
+
+    let mut fts_rows: Vec<FtsRow> = Vec::with_capacity(SHARD_ROWS);
+    let mut fuzzy_rows: Vec<FuzzyRow> = Vec::new();
+    for i in 0..SHARD_ROWS {
+        let mid = Uuid::now_v7().to_string();
+        let text = if i % (SHARD_ROWS / 10) == 0 {
+            format!("{NEEDLE} keepers gathered at dusk near the harbor (#{i})")
+        } else {
+            format!("{} (#{i})", scripts[i % scripts.len()])
+        };
+        fts_rows.push(FtsRow {
+            message_id: mid.clone(),
+            conversation_id: conv_id.clone(),
+            sender_id: format!("user-{}", i % 5),
+            created_at_ms: 1_700_000_000_000 + i as i64,
+            text_content: text.clone(),
+        });
+        for tok in FuzzyTokenizer::generate_tokens(&text) {
+            fuzzy_rows.push(FuzzyRow {
+                token: tok.token,
+                script: tok.script.to_iso_15924().to_string(),
+                message_id: mid.clone(),
+            });
+        }
+    }
+    let text_built =
+        build_text_search_shard(fts_rows, &conv_id, BUCKET, &k_text, &conv_hash_key).unwrap();
+    let fuzzy_built =
+        build_fuzzy_search_shard(fuzzy_rows, &conv_id, BUCKET, &k_fuzzy, &conv_hash_key).unwrap();
+
+    let mut text_blobs = HashMap::new();
+    text_blobs.insert(
+        (conv_id.clone(), BUCKET.to_string()),
+        (text_built.shard, text_built.k_shard),
+    );
+    let mut fuzzy_blobs = HashMap::new();
+    fuzzy_blobs.insert(
+        (conv_id.clone(), BUCKET.to_string()),
+        (fuzzy_built.shard, fuzzy_built.k_shard),
+    );
+    let catalog = InMemoryCatalog {
+        text_blobs,
+        fuzzy_blobs,
+    };
+
+    let db = LocalStoreDb::open_in_memory(&[0x55; 32]).unwrap();
+
+    // Warm criterion-style: discard a single warm-up sample to
+    // amortise allocator + page-cache costs before measuring.
+    {
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: NEEDLE.into(),
+            ..Default::default()
+        };
+        let _ = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &catalog)
+            .unwrap();
+    }
+
+    let mut samples: Vec<Duration> = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: NEEDLE.into(),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let hits = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &catalog)
+            .unwrap();
+        samples.push(start.elapsed());
+        assert!(!hits.is_empty(), "cold path must surface needle rows");
+    }
+    samples.sort();
+
+    // p95 = ceil(0.95 * N) - 1 (zero-indexed) gives a stable
+    // pick across small sample counts. With ITERATIONS = 20 this
+    // is samples[18], i.e. the second-slowest run.
+    let p95_idx = ((samples.len() as f64) * 0.95).ceil() as usize - 1;
+    let p95 = samples[p95_idx];
+    assert!(
+        p95 <= P95_BUDGET,
+        "phase 5 p95 latency {p95:?} exceeds {P95_BUDGET:?} (samples: {samples:?})",
+    );
+}

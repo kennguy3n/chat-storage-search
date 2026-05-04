@@ -451,12 +451,17 @@ impl<'a> MessagePersister<'a> {
         // message up on its next drain. The write happens inside
         // the same `SAVEPOINT persist_ingest;` boundary opened by
         // `persist_ingested_message`, so a rollback discards both
-        // journals together.
+        // journals together. The archive payload carries the
+        // full `text_content` so the Phase 5 cold-hit hydration
+        // path can extract the body — see
+        // `crate::archive::body_payload`.
+        let archive_payload = crate::archive::body_payload::encode(msg.text_content.as_deref())
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         let archive_event = ArchiveEvent {
             event_type: ArchiveEventType::MessageReceived,
             conversation_id: msg.conversation_id,
             message_id: Some(msg.message_id),
-            payload,
+            payload: archive_payload,
             created_at_ms: skel.created_at_ms,
         };
         ArchiveEventJournal::new()
@@ -572,11 +577,16 @@ impl<'a> MessagePersister<'a> {
         // point of view, an outbox-originated message lands in
         // the local store the same way an MLS-ingested one does.
         // The write rides inside `SAVEPOINT persist_outbox;`.
+        // The archive payload carries the full `text_content`
+        // (Phase 5 cold-hit hydration) — see
+        // `crate::archive::body_payload`.
+        let archive_payload = crate::archive::body_payload::encode(Some(&entry.text_content))
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         let archive_event = ArchiveEvent {
             event_type: ArchiveEventType::MessageReceived,
             conversation_id: entry.conversation_id,
             message_id: Some(entry.client_message_id),
-            payload,
+            payload: archive_payload,
             created_at_ms: entry.created_at_ms,
         };
         ArchiveEventJournal::new()

@@ -11,6 +11,7 @@
 //! and `docs/PROPOSAL.md §6` for the wire-format / key-hierarchy
 //! specification.
 
+pub mod body_payload;
 pub mod compaction;
 pub mod download;
 pub mod epoch_keys;

@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~96%`). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~92%`, cold-shard transport adapter + upload pipeline landed). Phase 7 — Desktop + Optimization (`In progress | ~25%`, failure-test suite extended with `manifest_upload_interrupted_mid_write`).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 7 — Desktop + Optimization (`In progress | ~28%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -684,7 +684,7 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~95%`
+**Status**: `In progress | ~97%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
@@ -1392,7 +1392,7 @@ Notes:
 
 ## Phase 5: Search — Fuzzy + Encrypted Shards
 
-**Status**: `In progress | ~85%`
+**Status**: `In progress | ~95%`
 
 **Goal**: Fuzzy matching across scripts, plus encrypted search
 shards on the backend so cold buckets remain searchable.
@@ -1475,10 +1475,13 @@ Checklist:
       `local_plus_one_cold_bucket` against a delayed
       `ColdShardSource` that simulates a network hop. The
       smoke test
-      `crates/core/tests/phase5_latency_smoke.rs` asserts the
-      cold-shard decrypt+search path completes well under
-      5 s on debug-build CI. The on-device p95 ≤ 1.5 s gate
-      lands with the Phase-5 device-matrix run.)
+      `crates/core/tests/phase5_latency_smoke.rs::phase5_cold_shard_p95_latency_under_1_5s_budget`
+      asserts the **p95** of the end-to-end shard fetch +
+      AEAD decrypt + FTS5 / fuzzy search on a 1 000-message
+      one-month multilingual bucket stays under the 1.5 s
+      budget on debug CI. The on-device p95 ≤ 1.5 s gate on
+      the full device matrix lands with the Phase-5
+      device-matrix run.)
 - [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
@@ -1573,7 +1576,7 @@ Notes:
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `In progress | ~20%`
+**Status**: `In progress | ~28%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
@@ -1607,16 +1610,12 @@ Checklist:
       background.
 - [ ] Media blob sink stress test: 10K+ media files across mixed
       sinks, verify rehydration from each.
-- [~] **Failure test suite**, 7 of 8 passing
+- [x] **Failure test suite**, 8 of 8 passing
       (`crates/core/tests/failure_scenarios.rs`):
       - [x] chunk upload interrupted
             (`chunk_upload_interrupted_then_resumed_succeeds`)
-      - [ ] manifest upload interrupted
-            _(queued — the upload path lives at
-            `archive::upload::upload_archive_segment` /
-            `CoreImpl::run_incremental_backup_inner`, and a
-            dedicated mid-write interruption test is still
-            pending.)_
+      - [x] manifest upload interrupted
+            (`manifest_upload_interrupted_mid_write_retries_without_chain_break`)
       - [x] wrong backup key
             (`wrong_backup_segment_key_fails_aead_open`,
             `wrong_signing_key_on_manifest_chain_fails_signature_invalid`)
@@ -1629,7 +1628,9 @@ Checklist:
       - [x] search shard missing from backend
             (`search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`)
       - [x] low storage during restore
-            (`low_storage_condition_during_restore_surfaces_resumable_storage_error`)
+            (`low_storage_condition_during_restore_surfaces_resumable_storage_error`,
+            plus the end-to-end resume gate
+            `low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete`)
       - [x] manifest chain break detected on restore
             (`manifest_chain_break_returns_chain_break_with_expected_and_actual`,
             plus the deepest-link variant
@@ -1647,12 +1648,173 @@ Notes:
   `manifest upload interrupted mid-write`, and the rest of
   the phase (desktop integration, ML EP tuning, large-scale
   testing) is unchanged.
+- 2026-05-04: Phase-7 failure suite reaches **8 of 8** with
+  the 2026-05-04 batch (this PR): the
+  `manifest_upload_interrupted_mid_write` scenario was added in
+  the prior 10-task batch, and this batch landed the end-to-end
+  resume gate
+  `low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete`,
+  the three-epoch manifest-chain restore test
+  `archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore`,
+  and the new `EpochKeyManager::ingest_wrapped_prior_epoch_key`
+  used by that restore path. Status advances from `~25%` to
+  `~28%`.
 
 ---
 
 ## Changelog
 
-### 2026-05-04 — Phase 3 / 5 / 7 wrap-up batch (this PR)
+### 2026-05-04 — Phase 3 / 5 / 7 batch 2 (this PR)
+
+Builds on PR #30 + #31 + #32 (the previous 10-task batches).
+Drives Phase 5 from `~92%` to `~95%` by wiring
+`upload_search_shards` into the incremental backup loop, landing
+`CoreImpl::fetch_and_restore_cold_shards` as the on-device
+fetch-decrypt-restore pipeline for cold buckets, completing the
+cold-result hydration write-back path
+(`CoreImpl::hydrate_cold_search_results` flips
+`remote_archive_only` → `local_plain_available` and re-indexes
+the body so subsequent searches land locally), and adding a
+**p95 latency gate** that asserts the end-to-end cold-shard
+fetch + AEAD decrypt + local FTS5 / fuzzy search across a
+1 000-message one-month multilingual bucket stays under 1.5 s
+on debug CI. Drives Phase 3 from `~96%` to `~97%` by adding the
+mixed-backend integration test that exercises the existing
+`batch_prefetch_bucket_with_router` wiring inside
+`CoreImpl::rehydrate_timeline_skeletons` against a single
+bucket containing both `kchat_backend` and `zk_object_fabric`
+rows, proving each row dispatches to its own backend. Drives
+Phase 7 from `~25%` to `~28%` by closing the failure suite at
+**8 of 8** with the end-to-end resume gate
+(`low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete`)
+and the three-epoch manifest-chain restore integration test
+(`archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore`).
+All changes ship with unit + integration tests; `cargo test
+--workspace` passes, `cargo fmt --all -- --check` is clean,
+and `cargo clippy --all-targets --all-features -- -D warnings`
+is clean.
+
+1. **Phase 5, Task 1 — incremental-backup-shard fanout
+   `CoreImpl::run_incremental_backup_with_search_shards`**
+   (`crates/core/src/core_impl.rs`):
+   New post-seal sweep that piggy-backs on
+   `run_incremental_backup_inner`. After every backup commits
+   the affected `(conversation_id, time_bucket)` rows, the
+   wrapper builds + seals fresh text + fuzzy shards via
+   `search::shard_builder::{build_text_search_shard,
+   build_fuzzy_search_shard}` under per-shard keys derived
+   from `K_search_root`, encodes the `SearchIndexShard` frame,
+   and ferries it to the configured `TransportClient::upload_index_shard`.
+   The wrapper is opt-in (callers choose between
+   `run_incremental_backup` and the shard-aware variant) so
+   existing call sites stay compile-clean. Coverage at the new
+   in-module test
+   `run_incremental_backup_with_search_shards_uploads_text_and_fuzzy_for_affected_buckets`.
+
+2. **Phase 5, Task 2 — `CoreImpl::fetch_and_restore_cold_shards`**
+   (`crates/core/src/core_impl.rs`,
+   `crates/core/src/search/shard_prefetch.rs`):
+   The on-device entry point for the cold-search restore
+   path. Calls `batch_prefetch_shards` for the bucket, AEAD-
+   opens each `PrefetchedShard` under the appropriate per-
+   shard key derived from `K_search_root`, and replays the
+   decrypted entries through `restore_text_search_shard` /
+   `restore_fuzzy_search_shard` so the local FTS5 + fuzzy
+   indexes match the cold ones. Returns a structured
+   `RestoredShardSummary` with per-type row counts so the
+   orchestration layer can surface progress. Three integration
+   tests cover happy-path round-trip, wrong-key failure
+   (`Error::Crypto`), and empty-bucket no-op.
+
+3. **Phase 5, Task 3 — cold-result hydration write-back
+   `CoreImpl::hydrate_cold_search_results`**
+   (`crates/core/src/core_impl.rs`):
+   Closes the `[~]` cold-result hydration path. After
+   `search_and_prefetch_cold` identifies cold hits, the new
+   write-back routine fetches the archive segment via
+   `batch_prefetch_bucket`, decrypts it under the appropriate
+   epoch key, extracts the message body from the
+   `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope, and calls
+   `LocalStoreDb::rehydrate_message_body` to flip `body_state`
+   from `remote_archive_only` to `local_plain_available` and
+   re-index the body into `search_fts` + `search_fuzzy`.
+   Five integration tests cover the cold-search-triggers-
+   hydration path, idempotent re-hydration, the
+   subsequently-searchable-locally invariant, the wrong-epoch-
+   key failure path, and the missing-segment graceful skip.
+
+4. **Phase 5, Task 4 — p95 latency gate**
+   (`crates/core/tests/phase5_latency_smoke.rs`):
+   New test
+   `phase5_cold_shard_p95_latency_under_1_5s_budget` seeds a
+   one-month bucket with 1 000 multilingual messages (Latin /
+   Cyrillic / Greek / CJK), builds + encrypts text + fuzzy
+   shards for the bucket, then runs 20 iterations of (in-
+   memory mock fetch + AEAD decrypt + local FTS5 / fuzzy
+   search), discards the first warm-up sample, and asserts
+   the p95 of the remaining 19 samples stays under the 1.5 s
+   Phase-5 budget per `docs/PHASES.md §Phase 5`.
+
+5. **Phase 7, Task 7 — end-to-end resume gate**
+   (`crates/core/tests/failure_scenarios.rs`):
+   New test
+   `low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete`
+   drives `RestorePipeline::run` to a low-storage failure
+   point, "frees space" by re-creating the checkpoint state
+   row, and re-runs the pipeline — asserting it resumes from
+   the persisted `RestoreState` and reaches
+   `RestoreState::FullRestoreComplete` without re-running
+   anything that already ran. Complements the existing
+   `low_storage_condition_during_restore_surfaces_resumable_storage_error`
+   that covers the failure-and-resumable-error half of the
+   scenario.
+
+6. **Phase 3, Task 8 — mixed-backend bucket router
+   integration test**
+   (`crates/core/src/core_impl.rs`):
+   New in-module integration test
+   `rehydrate_timeline_skeletons_with_mixed_backend_segments_routes_per_row`
+   stages one `kchat_backend` row and one `zk_object_fabric`
+   row in the same bucket, drives
+   `CoreImpl::rehydrate_timeline_skeletons` (which delegates
+   to `batch_prefetch_bucket_with_router` via
+   `CoreImpl::build_archive_router`), and asserts each row
+   was fetched from its own backend (KChat fixture transport
+   for the kchat row; in-memory `S3Client` for the ZKOF row)
+   while the other backend was never touched. Verifies the
+   production wiring of
+   `archive::prefetch::batch_prefetch_bucket_with_router`
+   end-to-end.
+
+7. **Phase 7, Task 9 — three-epoch manifest-chain restore
+   integration test**
+   (`crates/core/tests/archive_pipeline.rs`,
+   `crates/core/src/archive/epoch_keys.rs`):
+   New test
+   `archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore`
+   bootstraps an `EpochKeyManager` at epoch `2026-01`, seals
+   a segment, rotates to `2026-02` + builds manifest gen 1,
+   rotates to `2026-03` + builds manifest gen 2 carrying both
+   wrapped prior keys, then simulates a fresh-device restore
+   by re-bootstrapping a new manager at `2026-03` and feeding
+   the manifest-chain wrapped keys back through the new
+   `EpochKeyManager::ingest_wrapped_prior_epoch_key` method
+   so `unwrap_prior_epoch_key` can service the cross-epoch
+   decrypts. Asserts every segment in the chain decrypts —
+   including the two sealed under retired epoch keys. The new
+   `ingest_wrapped_prior_epoch_key` validates the wrapped-key
+   length up front, rejects collisions with the current
+   epoch, and rejects re-ingest of an already-known epoch id;
+   coverage at
+   `archive::epoch_keys::tests::ingest_wrapped_prior_epoch_key_round_trips_through_manifest_payload`
+   and `..._rejects_invalid_inputs`.
+
+8. **Phase 7, Task 10 — documentation reconciliation**
+   (`docs/PHASES.md`, `docs/PROGRESS.md`, `README.md`,
+   `docs/ARCHITECTURE.md`): see the section-by-section
+   updates landed alongside this changelog entry.
+
+### 2026-05-04 — Phase 3 / 5 / 7 wrap-up batch
 
 Builds on PR #30 + #31 (the previous 10-task batches). Drives
 Phase 5 from `~85%` to `~92%` by wiring a concrete

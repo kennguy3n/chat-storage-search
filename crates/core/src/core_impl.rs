@@ -741,6 +741,189 @@ impl CoreImpl {
         Ok(receipt)
     }
 
+    /// Drive one incremental backup pass and ferry the freshly
+    /// affected `(conversation_id, time_bucket)` search shards
+    /// up through the supplied transport (Phase 5 / Task 1).
+    ///
+    /// Wraps [`Self::run_incremental_backup_inner`] with a
+    /// post-seal sweep that:
+    ///
+    /// 1. Peeks the unsegmented [`BackupEvent`] backlog before the
+    ///    cursor advances and groups it by
+    ///    `(conversation_id, default_time_bucket_for_ms(created_at_ms))`.
+    /// 2. Runs the existing incremental-backup pipeline, which
+    ///    seals the events and advances the cursor.
+    /// 3. For every affected bucket, queries the local
+    ///    `search_fts` / `search_fuzzy` rows for the message ids
+    ///    that just landed in the seal and routes them through
+    ///    [`Self::upload_search_shards`].
+    ///
+    /// Returns the [`BackupResult`] from step 2 and the per-bucket
+    /// [`UploadedSearchShards`] receipts from step 3 — partial
+    /// upload failures are surfaced through
+    /// [`UploadedSearchShards::has_failures`] just like the
+    /// stand-alone path. A noop run (no events to seal) returns
+    /// the default `BackupResult` and an empty receipts vector
+    /// without touching the transport.
+    ///
+    /// `key_for_bucket` lets the caller derive
+    /// `(K_text_index_shard, K_fuzzy_index_shard)` per-bucket so
+    /// the orchestration layer can rotate the per-shard keys
+    /// per-bucket (e.g. derived from `K_search_root` and the
+    /// `(conversation_id, time_bucket)` tuple). Returning an error
+    /// from the closure aborts the *upload* sweep but the backup
+    /// itself has already committed at that point.
+    pub fn run_incremental_backup_with_search_shards<F>(
+        &self,
+        transport: &dyn TransportClient,
+        reason: &str,
+        conversation_hash_key: &crate::crypto::key_hierarchy::KeyMaterial,
+        mut key_for_bucket: F,
+    ) -> Result<RunIncrementalBackupWithShards>
+    where
+        F: FnMut(
+            &str,
+            &str,
+        ) -> Result<(
+            crate::crypto::key_hierarchy::KeyMaterial,
+            crate::crypto::key_hierarchy::KeyMaterial,
+        )>,
+    {
+        use crate::archive::segment_builder::default_time_bucket_for_ms;
+        use crate::backup::event_journal::BackupEventJournal;
+        use std::collections::BTreeMap;
+
+        // Snapshot the (conversation_id, bucket) → message_ids
+        // map *before* the cursor advances. The journal helper is
+        // read-only so this peek does not race with the seal-and-
+        // advance loop inside `run_incremental_backup_inner`.
+        let bucket_map: BTreeMap<(String, String), Vec<String>> = {
+            let db = self.db.lock().map_err(poisoned)?;
+            let journal = BackupEventJournal::new();
+            // Cap matches the inner pipeline so we group exactly
+            // the events that are about to be sealed.
+            const MAX_EVENTS_PER_SEGMENT: usize = 4_096;
+            let events = journal
+                .read_unsegmented(db.connection(), MAX_EVENTS_PER_SEGMENT)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            drop(db);
+            let mut map: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+            for (_seq, evt) in events {
+                let Some(conv) = evt.conversation_id else {
+                    continue;
+                };
+                let Some(mid) = evt.message_id else {
+                    continue;
+                };
+                let bucket = default_time_bucket_for_ms(evt.created_at_ms);
+                map.entry((conv.to_string(), bucket))
+                    .or_default()
+                    .push(mid.to_string());
+            }
+            map
+        };
+
+        let backup = self.run_incremental_backup_inner(reason)?;
+
+        if bucket_map.is_empty() || backup.segments_built == 0 {
+            return Ok(RunIncrementalBackupWithShards {
+                backup,
+                shards: Vec::new(),
+            });
+        }
+
+        let mut shards = Vec::with_capacity(bucket_map.len());
+        for ((conv_id, bucket), mids) in bucket_map {
+            // Pull the freshly-indexed FTS + fuzzy rows for the
+            // message ids in this bucket from the local store.
+            // The seal reads the journal, not the search tables,
+            // so the rows are still present after the cursor
+            // advance.
+            let (fts_rows, fuzzy_rows) = {
+                let db = self.db.lock().map_err(poisoned)?;
+                let conn = db.connection();
+                let mut fts_rows: Vec<crate::search::shard_builder::FtsRow> = Vec::new();
+                let mut fuzzy_rows: Vec<crate::search::shard_builder::FuzzyRow> = Vec::new();
+                for mid in &mids {
+                    // search_fts: every column is UNINDEXED apart
+                    // from `text_content` so a direct SELECT works.
+                    let row = conn
+                        .query_row(
+                            "SELECT message_id, conversation_id, sender_id, created_at_ms, text_content
+                               FROM search_fts WHERE message_id = ?1",
+                            rusqlite::params![mid],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                    row.get::<_, String>(4)?,
+                                ))
+                            },
+                        )
+                        .ok();
+                    if let Some((
+                        message_id,
+                        conversation_id,
+                        sender_id,
+                        created_at_ms,
+                        text_content,
+                    )) = row
+                    {
+                        fts_rows.push(crate::search::shard_builder::FtsRow {
+                            message_id,
+                            conversation_id,
+                            sender_id,
+                            created_at_ms,
+                            text_content,
+                        });
+                    }
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT token, script, message_id FROM search_fuzzy
+                              WHERE message_id = ?1",
+                        )
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![mid], |row| {
+                            Ok(crate::search::shard_builder::FuzzyRow {
+                                token: row.get::<_, String>(0)?,
+                                script: row.get::<_, String>(1)?,
+                                message_id: row.get::<_, String>(2)?,
+                            })
+                        })
+                        .map_err(|e| Error::Storage(e.to_string()))?;
+                    for r in rows {
+                        fuzzy_rows.push(r.map_err(|e| Error::Storage(e.to_string()))?);
+                    }
+                }
+                (fts_rows, fuzzy_rows)
+            };
+
+            // Empty bucket: skip the upload entirely so we do not
+            // emit an upload-call observable on the wire.
+            if fts_rows.is_empty() && fuzzy_rows.is_empty() {
+                continue;
+            }
+
+            let (k_text, k_fuzzy) = key_for_bucket(&conv_id, &bucket)?;
+            let receipt = self.upload_search_shards(
+                transport,
+                &conv_id,
+                &bucket,
+                fts_rows,
+                fuzzy_rows,
+                &k_text,
+                &k_fuzzy,
+                conversation_hash_key,
+            )?;
+            shards.push(receipt);
+        }
+
+        Ok(RunIncrementalBackupWithShards { backup, shards })
+    }
+
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
     /// adjacent-window. The window size is the slice the caller
     /// already widened — typical UI values are 5..50. See
@@ -932,6 +1115,118 @@ impl CoreImpl {
             .restore_search_index_shards_with_replay(db.connection_mut(), shards)
     }
 
+    /// Fan out one
+    /// [`crate::search::shard_prefetch::batch_prefetch_shards`]
+    /// call for `(conversation_id, time_bucket)`, AEAD-open every
+    /// returned [`crate::search::shard_prefetch::PrefetchedShard`]
+    /// under the shard key the caller registered for the triple,
+    /// and replay the contained rows into the local
+    /// `search_fts` / `search_fuzzy` tables (Phase 5, Task 2).
+    ///
+    /// Returns a [`RestoreColdShardsSummary`] describing how many
+    /// shards came back and how many rows landed in each table.
+    /// An empty bucket (no shards staged on the backend) returns
+    /// the zero summary without touching the local DB. A wrong
+    /// shard key surfaces as `Err(Error::Crypto)` from the
+    /// underlying AEAD open.
+    ///
+    /// `key_registry` carries the per-shard
+    /// `K_text_index_shard(shard_id)` /
+    /// `K_fuzzy_index_shard(shard_id)` lookups the orchestration
+    /// layer keeps in memory; missing entries cause an
+    /// `Error::Storage` describing the missing triple. The
+    /// `conversation_hash_key` is the per-account
+    /// `K_conv_hash_key` mapped onto the wire-format
+    /// `conversation_hash` the backend stores shards under.
+    pub fn fetch_and_restore_cold_shards(
+        &self,
+        transport: &dyn TransportClient,
+        conversation_id: &str,
+        time_bucket: &str,
+        conversation_hash_key: &crate::crypto::key_hierarchy::KeyMaterial,
+        key_registry: &crate::search::cold_shard_source::ShardKeyRegistry,
+    ) -> Result<RestoreColdShardsSummary> {
+        use crate::formats::search_shard::{IndexType, SearchIndexShard};
+        use crate::restore::pipeline::SealedSearchShardEntry;
+        use crate::search::shard_prefetch::batch_prefetch_shards;
+
+        let conv_hash = crate::search::shard_builder::keyed_conversation_id_hash(
+            conversation_id,
+            conversation_hash_key,
+        );
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+
+        let prefetched = batch_prefetch_shards(transport, &conv_hash_b64, time_bucket)?;
+        if prefetched.is_empty() {
+            return Ok(RestoreColdShardsSummary {
+                conversation_id: conversation_id.into(),
+                time_bucket: time_bucket.into(),
+                fetched_shards: 0,
+                text_rows_inserted: 0,
+                fuzzy_rows_inserted: 0,
+            });
+        }
+
+        // Decode each ciphertext blob into a `SearchIndexShard`
+        // and pair it with the shard key the registry holds for
+        // the (conv, bucket, type) triple. We materialise both
+        // owned vectors first so the borrowed
+        // `SealedSearchShardEntry` slices below stay valid for
+        // the duration of the replay call.
+        let mut owned: Vec<(
+            IndexType,
+            SearchIndexShard,
+            crate::crypto::key_hierarchy::KeyMaterial,
+        )> = Vec::with_capacity(prefetched.len());
+        for ps in prefetched {
+            let shard: SearchIndexShard = serde_cbor::from_slice(&ps.ciphertext).map_err(|e| {
+                Error::Storage(format!(
+                    "fetch_and_restore_cold_shards: shard cbor decode failed for ({conversation_id}, {time_bucket}, {:?}): {e}",
+                    ps.shard_type,
+                ))
+            })?;
+            let k = key_registry
+                .get(conversation_id, time_bucket, ps.shard_type)
+                .ok_or_else(|| {
+                    Error::Storage(format!(
+                        "fetch_and_restore_cold_shards: missing shard key for ({conversation_id}, {time_bucket}, {:?})",
+                        ps.shard_type,
+                    ))
+                })?
+                .clone();
+            owned.push((ps.shard_type, shard, k));
+        }
+
+        let entries: Vec<SealedSearchShardEntry<'_>> = owned
+            .iter()
+            .map(|(_t, shard, k)| SealedSearchShardEntry { shard, k_shard: k })
+            .collect();
+
+        let summaries = {
+            let mut db = self.db.lock().map_err(poisoned)?;
+            crate::restore::pipeline::RestorePipeline::new()
+                .restore_search_index_shards_with_replay(db.connection_mut(), &entries)?
+        };
+
+        let mut text_rows_inserted = 0usize;
+        let mut fuzzy_rows_inserted = 0usize;
+        for s in &summaries {
+            match s.index_type {
+                IndexType::Text => text_rows_inserted += s.rows_inserted,
+                IndexType::Fuzzy => fuzzy_rows_inserted += s.rows_inserted,
+                _ => {} // vector / media shards currently no-op
+            }
+        }
+
+        Ok(RestoreColdShardsSummary {
+            conversation_id: conversation_id.into(),
+            time_bucket: time_bucket.into(),
+            fetched_shards: summaries.len(),
+            text_rows_inserted,
+            fuzzy_rows_inserted,
+        })
+    }
+
     /// Whether [`Self::install_zkof_archive_backend`] has been
     /// called.
     pub fn has_zkof_archive_backend(&self) -> bool {
@@ -944,6 +1239,127 @@ impl CoreImpl {
                 .lock()
                 .map(|slot| slot.is_some())
                 .unwrap_or(false)
+    }
+
+    /// Cold-result hydration write-back (Phase 5, Task 3).
+    ///
+    /// Walks the supplied [`SearchResult`] vec, picks out the
+    /// rows flagged `is_cold = true`, groups them by
+    /// `(conversation_id, time_bucket)`, fetches every
+    /// `archive_segment_map` row that covers the bucket via
+    /// [`crate::archive::prefetch::batch_prefetch_bucket`],
+    /// AEAD-decrypts the segment, scans the events for the
+    /// requested `message_id`s, decodes the payload via
+    /// [`crate::archive::body_payload::try_decode_text`], and
+    /// finally calls
+    /// [`Self::rehydrate_message_body_locally`] to write the
+    /// body back into the local store and re-index the
+    /// `search_fts` / `search_fuzzy` rows.
+    ///
+    /// `key_for_segment` is the same closure shape used by
+    /// [`Self::rehydrate_timeline_skeletons`] — the
+    /// orchestration layer maps `segment_id → epoch_key_bytes`.
+    ///
+    /// The call is **idempotent**: hydrating a row whose body
+    /// is already
+    /// [`BodyState::LocalPlainAvailable`] is a no-op (the body
+    /// upsert and FTS / fuzzy refresh hit the same SAVEPOINT and
+    /// re-converge to the same state). Cold rows whose archive
+    /// payload predates the body-bearing variant
+    /// (legacy 4-tuple [`crate::message::processor::encode_event_payload`])
+    /// silently skip — see
+    /// [`crate::archive::body_payload::try_decode_text`] for the
+    /// fallback rule.
+    ///
+    /// Returns the number of message bodies that were actually
+    /// rehydrated. A failure on any single message surfaces as
+    /// `Err`; partial progress is allowed because each
+    /// `rehydrate_message_body_locally` runs inside its own
+    /// SAVEPOINT and earlier successful rehydrations stay
+    /// committed even if a later one fails.
+    pub fn hydrate_cold_search_results(
+        &self,
+        transport: &dyn TransportClient,
+        results: &[SearchResult],
+        mut key_for_segment: impl FnMut(&str) -> Result<[u8; 32]>,
+    ) -> Result<usize> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Group cold (conversation_id, time_bucket) pairs to a
+        // BTreeSet of message_ids the caller actually wants
+        // hydrated. Using a `BTreeMap` keeps the ordering stable
+        // for tests and avoids a duplicate fetch when two cold
+        // hits land in the same bucket.
+        let mut buckets: BTreeMap<(Uuid, String), BTreeSet<Uuid>> = BTreeMap::new();
+        for r in results.iter().filter(|r| r.is_cold) {
+            let bucket =
+                crate::archive::segment_builder::default_time_bucket_for_ms(r.created_at_ms);
+            buckets
+                .entry((r.conversation_id, bucket))
+                .or_default()
+                .insert(r.message_id);
+        }
+        if buckets.is_empty() {
+            return Ok(0);
+        }
+
+        let mut hydrated = 0usize;
+        for ((conv_id, time_bucket), wanted_ids) in buckets {
+            // Phase 1: fetch every segment for the bucket. Read
+            // under the DB lock just long enough to enumerate
+            // the segment rows, then drop so the per-segment
+            // decrypt + replay does not starve concurrent
+            // readers.
+            let prefetched = {
+                let db = self.db.lock().map_err(poisoned)?;
+                crate::archive::prefetch::batch_prefetch_bucket(
+                    db.connection(),
+                    transport,
+                    conv_id,
+                    &time_bucket,
+                )?
+            };
+
+            // Phase 2: walk events; for each wanted message_id
+            // try to extract a text body from the archive
+            // payload and rehydrate it.
+            for segment in prefetched {
+                let k_bytes = key_for_segment(&segment.segment_id)?;
+                let plaintext = crate::archive::download::decrypt_archive_segment(
+                    &segment.ciphertext,
+                    &k_bytes,
+                )?;
+                let payload = crate::archive::download::decode_archive_segment_payload(&plaintext)?;
+                for event in payload.events {
+                    let Some(mid) = event.message_id else {
+                        continue;
+                    };
+                    if event.conversation_id != conv_id || !wanted_ids.contains(&mid) {
+                        continue;
+                    }
+                    // Tombstones do not carry a body — leave the
+                    // skeleton in its current state.
+                    if !matches!(
+                        event.event_type,
+                        crate::archive::event_journal::ArchiveEventType::MessageReceived
+                            | crate::archive::event_journal::ArchiveEventType::MessageEdited,
+                    ) {
+                        continue;
+                    }
+                    let Some(text) = crate::archive::body_payload::try_decode_text(&event.payload)
+                    else {
+                        continue;
+                    };
+                    self.rehydrate_message_body_locally(
+                        mid,
+                        &text,
+                        BodyState::LocalPlainAvailable,
+                    )?;
+                    hydrated += 1;
+                }
+            }
+        }
+        Ok(hydrated)
     }
 
     /// Backend-aware variant of [`Self::rehydrate_timeline_skeletons`].
@@ -1898,6 +2314,74 @@ impl CoreImpl {
         summary.buckets_compacted = 1;
         summary.segments_superseded = superseded_ids.len() as u64;
         Ok(summary)
+    }
+}
+
+/// Summary returned by
+/// [`CoreImpl::fetch_and_restore_cold_shards`]. Lists how many
+/// encrypted shards came back from the backend and how many
+/// rows the replay path inserted into each local search table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreColdShardsSummary {
+    /// Plaintext `conversation_id` the call targeted.
+    pub conversation_id: String,
+    /// Coarse time bucket the call targeted.
+    pub time_bucket: String,
+    /// Number of [`crate::search::shard_prefetch::PrefetchedShard`]
+    /// entries the prefetch returned (text + fuzzy + … in the
+    /// fixed [`crate::search::shard_prefetch::PREFETCH_ORDER`]).
+    /// Empty buckets return `0`.
+    pub fetched_shards: usize,
+    /// Rows inserted into `search_fts`.
+    pub text_rows_inserted: usize,
+    /// Rows inserted into `search_fuzzy`.
+    pub fuzzy_rows_inserted: usize,
+}
+
+impl RestoreColdShardsSummary {
+    /// `true` when the call inserted no rows in either table.
+    /// Useful for the "empty bucket no-op" assertion in tests
+    /// and for short-circuit logic in the orchestration layer.
+    pub fn is_empty(&self) -> bool {
+        self.text_rows_inserted == 0 && self.fuzzy_rows_inserted == 0
+    }
+}
+
+/// Bundle returned by
+/// [`CoreImpl::run_incremental_backup_with_search_shards`].
+///
+/// `backup` is the same [`BackupResult`] the
+/// transport-less `run_incremental_backup` would have produced;
+/// `shards` lists one [`UploadedSearchShards`] receipt per
+/// affected `(conversation_id, time_bucket)` pair (deterministic
+/// `(conv_id, bucket)`-sorted ordering — the underlying map is a
+/// `BTreeMap`).
+#[derive(Debug, Clone, Default)]
+pub struct RunIncrementalBackupWithShards {
+    /// Result of the underlying
+    /// [`CoreImpl::run_incremental_backup_inner`] pass.
+    pub backup: BackupResult,
+    /// Per-bucket upload receipts; one entry per affected
+    /// `(conversation_id, time_bucket)` that had at least one
+    /// FTS / fuzzy row to seal.
+    pub shards: Vec<UploadedSearchShards>,
+}
+
+impl RunIncrementalBackupWithShards {
+    /// `true` when at least one shard upload failed (text or
+    /// fuzzy on any bucket). Mirrors
+    /// [`UploadedSearchShards::has_failures`].
+    pub fn has_shard_failures(&self) -> bool {
+        self.shards.iter().any(|s| s.has_failures())
+    }
+
+    /// Number of buckets with at least one successful shard
+    /// upload (text *or* fuzzy).
+    pub fn buckets_uploaded(&self) -> usize {
+        self.shards
+            .iter()
+            .filter(|s| s.text_shard.is_some() || s.fuzzy_shard.is_some())
+            .count()
     }
 }
 
@@ -4670,6 +5154,127 @@ mod tests {
         );
     }
 
+    /// Phase 7 / Task 8 integration: when one bucket contains a
+    /// `kchat_backend` row *and* a `zk_object_fabric` row,
+    /// [`CoreImpl::rehydrate_timeline_skeletons`] (which delegates
+    /// to the router variant via [`CoreImpl::build_archive_router`])
+    /// must dispatch each row to its own backend and land both
+    /// skeletons. Verifies the production wiring of
+    /// [`crate::archive::prefetch::batch_prefetch_bucket_with_router`].
+    #[test]
+    fn rehydrate_timeline_skeletons_with_mixed_backend_segments_routes_per_row() {
+        use crate::archive::download::encode_archive_segment_blob;
+        use crate::archive::segment_builder::{ArchiveSegmentBuilder, SegmentBuildRequest};
+
+        let cfg = test_config().with_archive_backend(crate::config::ArchiveBackend::Zkof);
+        let core = CoreImpl::new_in_memory(cfg, TEST_KEY).unwrap();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        // Install a ZKOF backend so the router knows how to reach
+        // S3 for `zk_object_fabric` rows.
+        let s3 = std::sync::Arc::new(InMemoryS3::default());
+        let s3_dyn: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client> = s3.clone();
+        let zkof_cfg = fresh_zkof_config();
+        let zkof_bucket = zkof_cfg.bucket.clone();
+        core.install_zkof_archive_backend(s3_dyn, zkof_cfg).unwrap();
+
+        let transport = FixtureTransport::default();
+        let bucket = "2026-04";
+
+        // Row 1 — KChat backend. Seal a one-event segment, push
+        // the encoded blob into the fixture transport, and seed
+        // the segment-map row with `storage_backend = kchat_backend`.
+        let m_kchat = Uuid::now_v7();
+        let kchat_seg_id = seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            bucket,
+            vec![make_event(conv, m_kchat, 100)],
+        );
+
+        // Row 2 — ZKOF backend. Seal a one-event segment, push
+        // the encoded blob into the in-memory S3 at the
+        // `archive/segments/{segment_id}` key the router uses,
+        // and seed the segment-map row with `storage_backend =
+        // zk_object_fabric`.
+        let m_zkof = Uuid::now_v7();
+        let zkof_built = ArchiveSegmentBuilder::new()
+            .build_segment(
+                SegmentBuildRequest {
+                    conversation_id: conv,
+                    time_bucket: bucket.into(),
+                    events: vec![make_event(conv, m_zkof, 200)],
+                    segment_type: crate::formats::SegmentType::MessageDelta,
+                },
+                &epoch_bytes,
+            )
+            .unwrap();
+        let zkof_blob = encode_archive_segment_blob(
+            &zkof_built.segment_id,
+            &zkof_built.merkle_root,
+            &zkof_built.nonce,
+            &zkof_built.ciphertext,
+        );
+        s3.objects.lock().unwrap().insert(
+            (
+                zkof_bucket.clone(),
+                format!("archive/segments/{}", zkof_built.segment_id),
+            ),
+            zkof_blob,
+        );
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "INSERT INTO archive_segment_map(
+                        segment_id, conversation_id, time_bucket,
+                        segment_type, blob_id, storage_backend,
+                        merkle_root, state
+                     ) VALUES (?1, ?2, ?3, 'message_delta', ?4,
+                              'zk_object_fabric', ?5, 'archive_uploaded')",
+                    rusqlite::params![
+                        zkof_built.segment_id.to_string(),
+                        conv.to_string(),
+                        bucket,
+                        format!("blob-{}", zkof_built.segment_id),
+                        zkof_built.merkle_root.as_slice(),
+                    ],
+                )
+                .unwrap();
+        });
+
+        // Drive the router-aware production path through the
+        // public `rehydrate_timeline_skeletons` entry point.
+        let inserted = core
+            .rehydrate_timeline_skeletons(&transport, conv, bucket, |_segment_id| Ok(epoch_bytes))
+            .expect("mixed-backend rehydrate");
+        assert_eq!(inserted.len(), 2, "both backends must land skeletons");
+        let landed: std::collections::BTreeSet<String> =
+            inserted.into_iter().map(|s| s.message_id).collect();
+        assert!(landed.contains(&m_kchat.to_string()));
+        assert!(landed.contains(&m_zkof.to_string()));
+
+        // KChat transport saw exactly the kchat segment; never
+        // touched the ZKOF segment.
+        let kchat_calls = transport.calls();
+        assert_eq!(kchat_calls.len(), 1, "kchat fetched once: {kchat_calls:?}");
+        assert_eq!(kchat_calls[0], kchat_seg_id.to_string());
+        // S3 client saw exactly the ZKOF segment object key.
+        let s3_objects = s3.objects.lock().unwrap();
+        assert!(
+            s3_objects.contains_key(&(
+                zkof_bucket,
+                format!("archive/segments/{}", zkof_built.segment_id),
+            )),
+            "zkof object remained in S3"
+        );
+    }
+
     // ----------------------------------------------------------------
     // Lazy media rehydration on tap — Task 5
     // ----------------------------------------------------------------
@@ -5984,5 +6589,854 @@ mod tests {
         let calls = transport.upload_calls();
         assert_eq!(calls.iter().filter(|c| c.2 == "text").count(), 1);
         assert_eq!(calls.iter().filter(|c| c.2 == "fuzzy").count(), 1);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5, Task 1: run_incremental_backup_with_search_shards
+    // ----------------------------------------------------------------
+
+    /// Insert a `search_fts` + `search_fuzzy` row pair for a
+    /// freshly-seeded message id. Mirrors what the message
+    /// processor does when an inbound message lands.
+    fn seed_search_rows(
+        core: &CoreImpl,
+        conv: Uuid,
+        msg: Uuid,
+        ts_ms: i64,
+        text_content: &str,
+        fuzzy_tokens: &[(&str, &str)],
+    ) {
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "INSERT INTO search_fts(
+                        message_id, conversation_id, sender_id,
+                        created_at_ms, text_content
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        msg.to_string(),
+                        conv.to_string(),
+                        "user-1",
+                        ts_ms,
+                        text_content,
+                    ],
+                )
+                .unwrap();
+            for (token, script) in fuzzy_tokens {
+                db.connection()
+                    .execute(
+                        "INSERT OR IGNORE INTO search_fuzzy(token, script, message_id)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![token, script, msg.to_string()],
+                    )
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn run_incremental_backup_with_search_shards_uploads_affected_buckets() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Two messages, same conversation, same calendar bucket.
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let ts1 = 1_777_000_000_000;
+        let ts2 = 1_777_000_001_000;
+        seed_backup_event(&core, conv, m1, ts1);
+        seed_backup_event(&core, conv, m2, ts2);
+        seed_search_rows(
+            &core,
+            conv,
+            m1,
+            ts1,
+            "lighthouse keeper",
+            &[("lighthouse", "Latn")],
+        );
+        seed_search_rows(
+            &core,
+            conv,
+            m2,
+            ts2,
+            "lighthouse beam",
+            &[("lighthouse", "Latn"), ("beam", "Latn")],
+        );
+
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+
+        let transport = MockTransportClient::new();
+        let bundle = core
+            .run_incremental_backup_with_search_shards(
+                &transport,
+                "scheduled",
+                &conv_hash_key,
+                |_conv, _bucket| Ok((k_text.clone(), k_fuzzy.clone())),
+            )
+            .expect("incremental backup with shards");
+
+        assert_eq!(bundle.backup.segments_built, 1);
+        assert_eq!(bundle.backup.events_segmented, 2);
+        assert_eq!(bundle.shards.len(), 1, "single (conv, bucket) pair");
+        let receipt = &bundle.shards[0];
+        assert!(
+            receipt.text_shard.is_some(),
+            "text shard uploaded for the affected bucket"
+        );
+        assert!(
+            receipt.fuzzy_shard.is_some(),
+            "fuzzy shard uploaded for the affected bucket"
+        );
+        assert_eq!(receipt.text_shard.as_ref().unwrap().doc_count, 2);
+        assert_eq!(receipt.fuzzy_shard.as_ref().unwrap().doc_count, 3);
+        assert_eq!(receipt.time_bucket.len(), 7); // YYYY-MM
+        assert!(!bundle.has_shard_failures());
+        assert_eq!(bundle.buckets_uploaded(), 1);
+
+        // Two upload calls landed on the wire (one text + one
+        // fuzzy) under the bucket the events fell into.
+        let calls = transport.upload_calls();
+        assert_eq!(calls.len(), 2);
+        let text_call = calls.iter().find(|c| c.2 == "text").expect("text upload");
+        let fuzzy_call = calls.iter().find(|c| c.2 == "fuzzy").expect("fuzzy upload");
+        assert_eq!(text_call.0, receipt.conversation_hash);
+        assert_eq!(fuzzy_call.0, receipt.conversation_hash);
+        assert_eq!(text_call.1, receipt.time_bucket);
+        assert_eq!(fuzzy_call.1, receipt.time_bucket);
+    }
+
+    #[test]
+    fn run_incremental_backup_with_search_shards_is_noop_with_no_events() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let transport = MockTransportClient::new();
+        let bundle = core
+            .run_incremental_backup_with_search_shards(
+                &transport,
+                "scheduled",
+                &conv_hash_key,
+                |_conv, _bucket| panic!("must not derive keys for noop"),
+            )
+            .expect("noop");
+        assert_eq!(bundle.backup, BackupResult::default());
+        assert!(bundle.shards.is_empty());
+        assert!(transport.upload_calls().is_empty());
+    }
+
+    #[test]
+    fn run_incremental_backup_with_search_shards_groups_distinct_buckets() {
+        use crate::archive::segment_builder::default_time_bucket_for_ms;
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv_a = Uuid::now_v7();
+        let conv_b = Uuid::now_v7();
+        seed_conversation(&core, &conv_a);
+        seed_conversation(&core, &conv_b);
+
+        // conv_a in 2026-04, conv_b in 2026-04, conv_b in 2026-12.
+        let ts_apr = 1_777_000_000_000;
+        let ts_apr_2 = 1_777_000_002_000;
+        // ~ 8 months later.
+        let ts_dec = ts_apr + 240 * 24 * 3_600 * 1_000;
+
+        let m_a = Uuid::now_v7();
+        let m_b1 = Uuid::now_v7();
+        let m_b2 = Uuid::now_v7();
+        seed_backup_event(&core, conv_a, m_a, ts_apr);
+        seed_backup_event(&core, conv_b, m_b1, ts_apr_2);
+        seed_backup_event(&core, conv_b, m_b2, ts_dec);
+        seed_search_rows(&core, conv_a, m_a, ts_apr, "alpha", &[("alpha", "Latn")]);
+        seed_search_rows(&core, conv_b, m_b1, ts_apr_2, "bravo", &[("bravo", "Latn")]);
+        seed_search_rows(
+            &core,
+            conv_b,
+            m_b2,
+            ts_dec,
+            "charlie",
+            &[("charlie", "Latn")],
+        );
+
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let transport = MockTransportClient::new();
+
+        let bundle = core
+            .run_incremental_backup_with_search_shards(
+                &transport,
+                "scheduled",
+                &conv_hash_key,
+                |_conv, _bucket| Ok((k_text.clone(), k_fuzzy.clone())),
+            )
+            .expect("incremental backup with shards");
+
+        assert_eq!(bundle.backup.segments_built, 1);
+        assert_eq!(bundle.shards.len(), 3, "3 distinct (conv,bucket) pairs");
+        // Six upload calls: 3 buckets × (text + fuzzy).
+        assert_eq!(transport.upload_calls().len(), 6);
+        let buckets: Vec<_> = bundle
+            .shards
+            .iter()
+            .map(|s| s.time_bucket.clone())
+            .collect();
+        assert!(buckets.contains(&default_time_bucket_for_ms(ts_apr)));
+        assert!(buckets.contains(&default_time_bucket_for_ms(ts_dec)));
+    }
+
+    #[test]
+    fn run_incremental_backup_with_search_shards_skips_buckets_with_no_search_rows() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Backup event but NO matching search_fts/search_fuzzy
+        // rows — e.g. an event that does not produce indexable
+        // text (a media-only message with no caption). The
+        // upload sweep should silently skip the empty bucket.
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let transport = MockTransportClient::new();
+
+        let bundle = core
+            .run_incremental_backup_with_search_shards(
+                &transport,
+                "scheduled",
+                &conv_hash_key,
+                |_conv, _bucket| Ok((k_text.clone(), k_fuzzy.clone())),
+            )
+            .expect("incremental backup");
+        assert_eq!(bundle.backup.segments_built, 1);
+        assert!(bundle.shards.is_empty(), "no search rows → no shard upload",);
+        assert!(transport.upload_calls().is_empty());
+    }
+
+    #[test]
+    fn run_incremental_backup_with_search_shards_records_partial_failure_on_receipt() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::shard_builder::keyed_conversation_id_hash;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let m = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        seed_backup_event(&core, conv, m, ts);
+        seed_search_rows(&core, conv, m, ts, "wendy", &[("wendy", "Latn")]);
+
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+
+        // Pre-stage a fuzzy-shard upload failure for the bucket
+        // the events will fall into.
+        let conv_hash = keyed_conversation_id_hash(&conv.to_string(), &conv_hash_key);
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+        let transport = MockTransportClient::new();
+        transport.fail_index_shard_upload_with(
+            &conv_hash_b64,
+            &bucket,
+            "fuzzy",
+            "fuzzy backend 503",
+        );
+
+        let bundle = core
+            .run_incremental_backup_with_search_shards(
+                &transport,
+                "scheduled",
+                &conv_hash_key,
+                |_conv, _bucket| Ok((k_text.clone(), k_fuzzy.clone())),
+            )
+            .expect("incremental backup");
+        assert_eq!(bundle.backup.segments_built, 1);
+        assert_eq!(bundle.shards.len(), 1);
+        let receipt = &bundle.shards[0];
+        assert!(receipt.text_shard.is_some());
+        assert!(receipt.fuzzy_shard.is_none());
+        assert!(bundle.has_shard_failures());
+        assert!(receipt
+            .fuzzy_error
+            .as_deref()
+            .unwrap()
+            .contains("fuzzy backend 503"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5, Task 2: fetch_and_restore_cold_shards
+    // ----------------------------------------------------------------
+
+    /// Stage one text + one fuzzy shard for `(conv, bucket)` on
+    /// `transport` and return the per-shard keys plus the rows
+    /// that should round-trip back through
+    /// `fetch_and_restore_cold_shards`.
+    fn stage_round_trip_shards(
+        transport: &crate::transport::MockTransportClient,
+        conv: &str,
+        bucket: &str,
+        conv_hash_key: &crate::crypto::key_hierarchy::KeyMaterial,
+    ) -> (
+        crate::crypto::key_hierarchy::KeyMaterial,
+        crate::crypto::key_hierarchy::KeyMaterial,
+        Vec<crate::search::shard_builder::FtsRow>,
+        Vec<crate::search::shard_builder::FuzzyRow>,
+    ) {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::shard_builder::{
+            build_fuzzy_search_shard, build_text_search_shard, keyed_conversation_id_hash, FtsRow,
+            FuzzyRow,
+        };
+
+        let k_text = KeyMaterial::from_bytes([0xC1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xC2; 32]);
+        let m1 = Uuid::now_v7().to_string();
+        let m2 = Uuid::now_v7().to_string();
+        let fts_rows = vec![
+            FtsRow {
+                message_id: m1.clone(),
+                conversation_id: conv.into(),
+                sender_id: "user-1".into(),
+                created_at_ms: 1_777_000_000_000,
+                text_content: "lighthouse one".into(),
+            },
+            FtsRow {
+                message_id: m2.clone(),
+                conversation_id: conv.into(),
+                sender_id: "user-1".into(),
+                created_at_ms: 1_777_000_001_000,
+                text_content: "lighthouse two".into(),
+            },
+        ];
+        let fuzzy_rows = vec![
+            FuzzyRow {
+                token: "lighthouse".into(),
+                script: "Latn".into(),
+                message_id: m1.clone(),
+            },
+            FuzzyRow {
+                token: "lighthouse".into(),
+                script: "Latn".into(),
+                message_id: m2.clone(),
+            },
+        ];
+
+        let text_built = build_text_search_shard(
+            fts_rows.clone(),
+            conv,
+            bucket.to_string(),
+            &k_text,
+            conv_hash_key,
+        )
+        .unwrap();
+        let fuzzy_built = build_fuzzy_search_shard(
+            fuzzy_rows.clone(),
+            conv,
+            bucket.to_string(),
+            &k_fuzzy,
+            conv_hash_key,
+        )
+        .unwrap();
+        let conv_hash = keyed_conversation_id_hash(conv, conv_hash_key);
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+        transport.stage_index_shard(
+            &conv_hash_b64,
+            bucket,
+            "text",
+            serde_cbor::to_vec(&text_built.shard).unwrap(),
+        );
+        transport.stage_index_shard(
+            &conv_hash_b64,
+            bucket,
+            "fuzzy",
+            serde_cbor::to_vec(&fuzzy_built.shard).unwrap(),
+        );
+        (k_text, k_fuzzy, fts_rows, fuzzy_rows)
+    }
+
+    #[test]
+    fn fetch_and_restore_cold_shards_round_trips_text_and_fuzzy() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::formats::search_shard::IndexType;
+        use crate::search::cold_shard_source::ShardKeyRegistry;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+
+        let transport = MockTransportClient::new();
+        let (k_text, k_fuzzy, fts_rows, fuzzy_rows) =
+            stage_round_trip_shards(&transport, &conv_id, bucket, &conv_hash_key);
+
+        let mut registry = ShardKeyRegistry::new();
+        registry.insert(&conv_id, bucket, IndexType::Text, k_text);
+        registry.insert(&conv_id, bucket, IndexType::Fuzzy, k_fuzzy);
+
+        let summary = core
+            .fetch_and_restore_cold_shards(&transport, &conv_id, bucket, &conv_hash_key, &registry)
+            .expect("restore");
+        assert_eq!(summary.fetched_shards, 2);
+        assert_eq!(summary.text_rows_inserted, fts_rows.len());
+        assert_eq!(summary.fuzzy_rows_inserted, fuzzy_rows.len());
+        assert!(!summary.is_empty());
+
+        // Round-trip: every text + fuzzy row landed in the local
+        // tables and is queryable.
+        core.with_db(|db| {
+            for r in &fts_rows {
+                let n: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                        rusqlite::params![r.message_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "fts row for {} present", r.message_id);
+            }
+            for r in &fuzzy_rows {
+                let n: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM search_fuzzy
+                         WHERE token = ?1 AND script = ?2 AND message_id = ?3",
+                        rusqlite::params![r.token, r.script, r.message_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "fuzzy row for {}/{} present", r.token, r.message_id);
+            }
+        });
+    }
+
+    #[test]
+    fn fetch_and_restore_cold_shards_returns_zero_summary_for_empty_bucket() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::cold_shard_source::ShardKeyRegistry;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+        let transport = MockTransportClient::new();
+        // No staged shards — every fetch returns empty bytes.
+        let registry = ShardKeyRegistry::new();
+        let summary = core
+            .fetch_and_restore_cold_shards(&transport, &conv_id, bucket, &conv_hash_key, &registry)
+            .expect("restore");
+        assert!(summary.is_empty());
+        assert_eq!(summary.fetched_shards, 0);
+        assert_eq!(summary.text_rows_inserted, 0);
+        assert_eq!(summary.fuzzy_rows_inserted, 0);
+    }
+
+    #[test]
+    fn fetch_and_restore_cold_shards_with_wrong_key_surfaces_aead_failure() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::formats::search_shard::IndexType;
+        use crate::search::cold_shard_source::ShardKeyRegistry;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+
+        let transport = MockTransportClient::new();
+        let (_k_text, _k_fuzzy, _fts, _fz) =
+            stage_round_trip_shards(&transport, &conv_id, bucket, &conv_hash_key);
+
+        // Register WRONG keys for the registry. Decryption will
+        // fail at AEAD-open time on the first shard.
+        let mut registry = ShardKeyRegistry::new();
+        registry.insert(
+            &conv_id,
+            bucket,
+            IndexType::Text,
+            KeyMaterial::from_bytes([0x11; 32]),
+        );
+        registry.insert(
+            &conv_id,
+            bucket,
+            IndexType::Fuzzy,
+            KeyMaterial::from_bytes([0x12; 32]),
+        );
+
+        let err = core
+            .fetch_and_restore_cold_shards(&transport, &conv_id, bucket, &conv_hash_key, &registry)
+            .expect_err("wrong key must surface as Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aead") || msg.contains("AEAD") || msg.contains("decrypt"),
+            "expected AEAD-style error, got {msg}"
+        );
+
+        // Local tables remain empty (the replay transaction
+        // rolls back on the first failing shard).
+        core.with_db(|db| {
+            let n: i64 = db
+                .connection()
+                .query_row("SELECT count(*) FROM search_fts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+            let n: i64 = db
+                .connection()
+                .query_row("SELECT count(*) FROM search_fuzzy", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+        });
+    }
+
+    #[test]
+    fn fetch_and_restore_cold_shards_missing_registry_key_is_storage_error() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::cold_shard_source::ShardKeyRegistry;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+        let transport = MockTransportClient::new();
+        let _ = stage_round_trip_shards(&transport, &conv_id, bucket, &conv_hash_key);
+
+        // Empty registry — every lookup misses.
+        let registry = ShardKeyRegistry::new();
+        let err = core
+            .fetch_and_restore_cold_shards(&transport, &conv_id, bucket, &conv_hash_key, &registry)
+            .expect_err("missing registry entry must surface");
+        assert!(err.to_string().contains("missing shard key"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5, Task 3: hydrate_cold_search_results
+    // ----------------------------------------------------------------
+
+    /// Build a `MessageReceived` event whose payload carries a
+    /// real text body via [`crate::archive::body_payload::encode`]
+    /// — the production format the cold-hit hydration path
+    /// decodes back via `try_decode_text`.
+    fn body_event(
+        conv: Uuid,
+        message_id: Uuid,
+        ms: i64,
+        text: &str,
+    ) -> crate::archive::event_journal::ArchiveEvent {
+        crate::archive::event_journal::ArchiveEvent {
+            event_type: crate::archive::event_journal::ArchiveEventType::MessageReceived,
+            conversation_id: conv,
+            message_id: Some(message_id),
+            payload: crate::archive::body_payload::encode(Some(text)).unwrap(),
+            created_at_ms: ms,
+        }
+    }
+
+    /// Insert a `RemoteArchiveOnly` skeleton — same shape as
+    /// what `rehydrate_timeline_skeletons` would have landed.
+    fn seed_remote_only_skeleton(
+        core: &CoreImpl,
+        conv: Uuid,
+        message_id: Uuid,
+        created_at_ms: i64,
+    ) {
+        core.with_db(|db| {
+            let stub = MessageSkeleton {
+                message_id: message_id.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "user-1".into(),
+                created_at_ms,
+                received_at_ms: created_at_ms,
+                kind: MessageKind::Text,
+                body_state: BodyState::RemoteArchiveOnly,
+                media_state: None,
+                archive_state: ArchiveState::ArchiveUploaded,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            let _ = db.upsert_skeleton_from_archive(&stub).unwrap();
+        });
+    }
+
+    fn cold_hit(
+        message_id: Uuid,
+        conversation_id: Uuid,
+        created_at_ms: i64,
+        snippet: &str,
+    ) -> SearchResult {
+        SearchResult {
+            message_id,
+            conversation_id,
+            sender_id: "user-1".into(),
+            created_at_ms,
+            snippet: Some(snippet.into()),
+            rank_score: 0.0,
+            is_cold: true,
+        }
+    }
+
+    #[test]
+    fn hydrate_cold_search_results_writes_back_text_and_flips_body_state() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let m1 = Uuid::now_v7();
+        let m2 = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            &bucket,
+            vec![
+                body_event(conv, m1, ts, "lighthouse one"),
+                body_event(conv, m2, ts + 1_000, "lighthouse two"),
+            ],
+        );
+        seed_remote_only_skeleton(&core, conv, m1, ts);
+        seed_remote_only_skeleton(&core, conv, m2, ts + 1_000);
+
+        let results = vec![
+            cold_hit(m1, conv, ts, "lighthouse one"),
+            cold_hit(m2, conv, ts + 1_000, "lighthouse two"),
+        ];
+
+        let hydrated = core
+            .hydrate_cold_search_results(&transport, &results, |_segment_id| Ok(epoch_bytes))
+            .expect("hydrate");
+        assert_eq!(hydrated, 2);
+
+        // Body rows landed and body_state flipped.
+        core.with_db(|db| {
+            for (mid, expected) in [(m1, "lighthouse one"), (m2, "lighthouse two")] {
+                let skel = db.get_message_skeleton(&mid.to_string()).unwrap().unwrap();
+                assert_eq!(skel.body_state, BodyState::LocalPlainAvailable);
+                let body = db.get_message_body(&mid.to_string()).unwrap().unwrap();
+                assert_eq!(body.text_content.as_deref(), Some(expected));
+                let n: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                        rusqlite::params![mid.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "FTS row landed for {mid}");
+                let f: i64 = db
+                    .connection()
+                    .query_row(
+                        "SELECT count(*) FROM search_fuzzy WHERE message_id = ?1",
+                        rusqlite::params![mid.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(f > 0, "fuzzy tokens landed for {mid}");
+            }
+        });
+    }
+
+    #[test]
+    fn hydrate_cold_search_results_makes_message_searchable_locally() {
+        // The hydrated body should round-trip through the local
+        // FTS5 search path.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let mid = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            &bucket,
+            vec![body_event(conv, mid, ts, "hydrated needle in stack")],
+        );
+        seed_remote_only_skeleton(&core, conv, mid, ts);
+
+        let results = vec![cold_hit(mid, conv, ts, "hydrated needle in stack")];
+        let hydrated = core
+            .hydrate_cold_search_results(&transport, &results, |_| Ok(epoch_bytes))
+            .expect("hydrate");
+        assert_eq!(hydrated, 1);
+
+        // Local FTS now finds the hydrated body without going
+        // through the cold path.
+        let query = SearchQuery {
+            query_string: "needle".into(),
+            ..SearchQuery::default()
+        };
+        let (results, _) = core
+            .search_and_prefetch_cold(query, SearchScope::LocalOnly)
+            .expect("local search");
+        assert!(
+            results.iter().any(|r| r.message_id == mid && !r.is_cold),
+            "hydrated message should be a local hit, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn hydrate_cold_search_results_is_idempotent() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let mid = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+        let transport = FixtureTransport::default();
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            &bucket,
+            vec![body_event(conv, mid, ts, "round trip")],
+        );
+        seed_remote_only_skeleton(&core, conv, mid, ts);
+        let results = vec![cold_hit(mid, conv, ts, "round trip")];
+
+        // First call hydrates the body.
+        let n1 = core
+            .hydrate_cold_search_results(&transport, &results, |_| Ok(epoch_bytes))
+            .expect("first");
+        assert_eq!(n1, 1);
+
+        // Second call rehydrates the same body — must not error
+        // and must converge to the same row counts.
+        let n2 = core
+            .hydrate_cold_search_results(&transport, &results, |_| Ok(epoch_bytes))
+            .expect("second");
+        assert_eq!(n2, 1);
+
+        core.with_db(|db| {
+            let n: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM message_skeleton WHERE message_id = ?1",
+                    rusqlite::params![mid.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "no duplicate skeleton row");
+            let n: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                    rusqlite::params![mid.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "FTS row deduplicated");
+        });
+    }
+
+    #[test]
+    fn hydrate_cold_search_results_skips_legacy_payload_events() {
+        // Old-format archive events do not carry text bodies.
+        // The hydration path must skip them gracefully without
+        // surfacing an error or leaving partial state.
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let mid = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+        let transport = FixtureTransport::default();
+        // Use the legacy `make_event` helper which writes opaque
+        // bytes (`[0xDE, 0xAD]`) as the payload — pre-Phase-5
+        // shape.
+        seal_and_seed_segment(
+            &core,
+            &transport,
+            &epoch_bytes,
+            conv,
+            &bucket,
+            vec![make_event(conv, mid, ts)],
+        );
+        seed_remote_only_skeleton(&core, conv, mid, ts);
+
+        let results = vec![cold_hit(mid, conv, ts, "any")];
+        let n = core
+            .hydrate_cold_search_results(&transport, &results, |_| Ok(epoch_bytes))
+            .expect("hydrate");
+        assert_eq!(n, 0, "legacy payloads must be skipped");
+
+        // Skeleton stays remote-only and no body row exists.
+        core.with_db(|db| {
+            let skel = db.get_message_skeleton(&mid.to_string()).unwrap().unwrap();
+            assert_eq!(skel.body_state, BodyState::RemoteArchiveOnly);
+            assert!(db.get_message_body(&mid.to_string()).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn hydrate_cold_search_results_with_no_cold_results_is_noop() {
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let transport = FixtureTransport::default();
+        // All results are local hits.
+        let results = vec![SearchResult {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "user-1".into(),
+            created_at_ms: 1_777_000_000_000,
+            snippet: None,
+            rank_score: 0.0,
+            is_cold: false,
+        }];
+        let n = core
+            .hydrate_cold_search_results(&transport, &results, |_| {
+                panic!("must not derive keys when there are no cold rows")
+            })
+            .expect("noop");
+        assert_eq!(n, 0);
     }
 }

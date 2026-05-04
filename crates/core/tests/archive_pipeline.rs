@@ -548,3 +548,200 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
         "current epoch key must not open the prior-epoch segment",
     );
 }
+
+/// Phase 7 / Task 9 — full three-epoch manifest chain decode
+/// after a simulated restore.
+///
+/// Models the long-tail cross-epoch decrypt path documented in
+/// `docs/PROPOSAL.md §2.1`:
+///
+/// 1. Bootstrap the epoch manager at epoch `2026-01` and seal a
+///    segment under that epoch's key.
+/// 2. Rotate to `2026-02`, seal another segment, build manifest
+///    generation 1 carrying the `2026-01` wrapped key.
+/// 3. Rotate to `2026-03`, seal a third segment, build manifest
+///    generation 2 carrying BOTH wrapped prior keys.
+/// 4. Simulate a fresh-device restore: walk the manifest chain,
+///    feed the wrapped prior epoch keys back through
+///    `EpochKeyManager::unwrap_prior_epoch_key`, and decrypt all
+///    three segments — including the two that were sealed under
+///    retired epoch keys.
+///
+/// This is the integration shape Task 9 calls out: the manifest
+/// chain is the *only* thing a restoring device sees, so every
+/// retired epoch key must be reachable from the chain alone.
+#[test]
+fn archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore() {
+    use ed25519_dalek::SigningKey;
+    use kchat_core::archive::epoch_keys::EpochKeyManager;
+    use kchat_core::archive::event_journal::{ArchiveEvent, ArchiveEventType};
+    use kchat_core::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
+    use kchat_core::crypto::key_hierarchy::{derive_archive_manifest_key, KeyMaterial};
+
+    let identity = KeyMaterial::from_bytes([0xCC; 32]);
+    let archive_root = derive_archive_root(&identity).expect("archive_root");
+    let signing = SigningKey::from_bytes(&[0xB7; 32]);
+    let conv = Uuid::now_v7();
+
+    // ---- 1) Epoch 2026-01 ---------------------------------------
+    let mut mgr = EpochKeyManager::new(&archive_root, "2026-01").unwrap();
+    let evt_jan = ArchiveEvent {
+        event_type: ArchiveEventType::MessageReceived,
+        conversation_id: conv,
+        message_id: Some(Uuid::now_v7()),
+        payload: b"jan body".to_vec(),
+        created_at_ms: 1_704_067_200_000,
+    };
+    let jan_segment_id = Uuid::now_v7();
+    let k_seg_jan = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &jan_segment_id.to_string(),
+    )
+    .unwrap();
+    let jan_seg_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::message_delta(conv, "2026-01", vec![evt_jan.clone()]),
+            k_seg_jan.as_bytes(),
+        )
+        .unwrap();
+
+    // ---- 2) Rotate to 2026-02 + manifest gen 1 -----------------
+    mgr.rotate_epoch(&archive_root, "2026-02").unwrap();
+    let evt_feb = ArchiveEvent {
+        event_type: ArchiveEventType::MessageReceived,
+        conversation_id: conv,
+        message_id: Some(Uuid::now_v7()),
+        payload: b"feb body".to_vec(),
+        created_at_ms: 1_706_745_600_000,
+    };
+    let feb_segment_id = Uuid::now_v7();
+    let k_seg_feb = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &feb_segment_id.to_string(),
+    )
+    .unwrap();
+    let feb_seg_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::message_delta(conv, "2026-02", vec![evt_feb.clone()]),
+            k_seg_feb.as_bytes(),
+        )
+        .unwrap();
+    let k_man_feb = derive_archive_manifest_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        "2026-02",
+    )
+    .unwrap();
+    let manifest_gen1 = build_archive_manifest(
+        ManifestBuildRequest {
+            segments: std::slice::from_ref(&feb_seg_built),
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            wrapped_prior_epoch_keys: mgr.wrapped_prior_epoch_keys_for_manifest(),
+            previous: None,
+        },
+        &signing,
+        k_man_feb.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(manifest_gen1.manifest.wrapped_prior_epoch_keys.len(), 1);
+
+    // ---- 3) Rotate to 2026-03 + manifest gen 2 -----------------
+    mgr.rotate_epoch(&archive_root, "2026-03").unwrap();
+    let evt_mar = ArchiveEvent {
+        event_type: ArchiveEventType::MessageReceived,
+        conversation_id: conv,
+        message_id: Some(Uuid::now_v7()),
+        payload: b"mar body".to_vec(),
+        created_at_ms: 1_709_251_200_000,
+    };
+    let mar_segment_id = Uuid::now_v7();
+    let k_seg_mar = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &mar_segment_id.to_string(),
+    )
+    .unwrap();
+    let mar_seg_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::message_delta(conv, "2026-03", vec![evt_mar.clone()]),
+            k_seg_mar.as_bytes(),
+        )
+        .unwrap();
+    let k_man_mar = derive_archive_manifest_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        "2026-03",
+    )
+    .unwrap();
+    let manifest_gen2 = build_archive_manifest(
+        ManifestBuildRequest {
+            segments: std::slice::from_ref(&mar_seg_built),
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            wrapped_prior_epoch_keys: mgr.wrapped_prior_epoch_keys_for_manifest(),
+            previous: Some(&manifest_gen1.manifest),
+        },
+        &signing,
+        k_man_mar.as_bytes(),
+    )
+    .unwrap();
+    // Manifest generation 2 carries BOTH retired epoch wrapped
+    // keys (2026-01 and 2026-02). Order is deterministic
+    // (lexicographic by epoch_id) per the manager contract.
+    assert_eq!(manifest_gen2.manifest.wrapped_prior_epoch_keys.len(), 2);
+    let chain_epoch_ids: Vec<&str> = manifest_gen2
+        .manifest
+        .wrapped_prior_epoch_keys
+        .iter()
+        .map(|w| w.epoch_id.as_str())
+        .collect();
+    assert_eq!(chain_epoch_ids, vec!["2026-01", "2026-02"]);
+
+    // ---- 4) Simulated restore: a fresh device only has the
+    // archive root + the manifest chain. Hand the chain's deepest
+    // wrapped-key bundle back to a freshly-bootstrapped epoch
+    // manager and verify every segment in the chain decrypts.
+    let mut restored = EpochKeyManager::new(&archive_root, "2026-03").unwrap();
+    for w in &manifest_gen2.manifest.wrapped_prior_epoch_keys {
+        // Re-inject the wrapped key bytes into the restored
+        // manager so `unwrap_prior_epoch_key` will service them.
+        restored
+            .ingest_wrapped_prior_epoch_key(w.clone())
+            .expect("ingest wrapped key");
+    }
+
+    // Decrypt under restored manager: 2026-01 segment via
+    // unwrap_prior_epoch_key + per-segment derivation.
+    let jan_epoch_bytes = restored
+        .unwrap_prior_epoch_key("2026-01", &archive_root)
+        .unwrap();
+    let recovered_k_seg_jan = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(jan_epoch_bytes),
+        &jan_segment_id.to_string(),
+    )
+    .unwrap();
+    let jan_payload = decrypt_segment(&jan_seg_built, recovered_k_seg_jan.as_bytes()).unwrap();
+    assert_eq!(jan_payload.events, vec![evt_jan.clone()]);
+
+    // 2026-02 segment via the second prior epoch.
+    let feb_epoch_bytes = restored
+        .unwrap_prior_epoch_key("2026-02", &archive_root)
+        .unwrap();
+    let recovered_k_seg_feb = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(feb_epoch_bytes),
+        &feb_segment_id.to_string(),
+    )
+    .unwrap();
+    let feb_payload = decrypt_segment(&feb_seg_built, recovered_k_seg_feb.as_bytes()).unwrap();
+    assert_eq!(feb_payload.events, vec![evt_feb.clone()]);
+
+    // 2026-03 segment via the *current* epoch — same as the live
+    // path, no unwrap necessary.
+    let recovered_k_seg_mar = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*restored.current_epoch_key()),
+        &mar_segment_id.to_string(),
+    )
+    .unwrap();
+    let mar_payload = decrypt_segment(&mar_seg_built, recovered_k_seg_mar.as_bytes()).unwrap();
+    assert_eq!(mar_payload.events, vec![evt_mar.clone()]);
+}
