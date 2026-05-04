@@ -1281,3 +1281,66 @@ Checklist:
 **Decision gate**: Production-ready performance on the target
 device matrix (defined per platform during Phase 7). The full
 failure test suite passes on every platform.
+
+---
+
+## Phase 8: Multi-Scope, Multi-Tenant Search
+
+**Goal**: Introduce conversation hierarchy (channels, communities, domains), multi-tenant B2B isolation, and search performance optimizations (bloom filters, shard cache, parallel fetch, progressive results) to support global, community, domain, and tenant-scoped search.
+
+> This phase addresses the structural gaps in the search architecture
+> when KChat introduces channels, communities (B2C), domains (B2B),
+> and global search. The current codebase has a flat conversation
+> model with no hierarchy and a single-conversation filter — both
+> of which break down at community/domain/global scale.
+
+Checklist:
+
+- [ ] **Schema: conversation hierarchy** — Add `conversation_type` (`dm` | `group` | `channel`), `scope` (`b2c` | `b2b`), `tenant_id`, `community_id`, `domain_id` columns to the `conversation` table. Add indexes: `idx_conv_community`, `idx_conv_domain`, `idx_conv_tenant`, `idx_conv_scope`. File: `crates/core/src/local_store/schema.rs`.
+
+- [ ] **Schema: archive_segment_map tenant isolation** — Add `tenant_id TEXT NOT NULL DEFAULT ''` column and `idx_asm_tenant_bucket` index to `archive_segment_map`. File: `crates/core/src/local_store/schema.rs`.
+
+- [ ] **SearchTarget enum** — Replace `conversation_filter: Option<Uuid>` on `SearchQuery` with a `target: SearchTarget` field. `SearchTarget` variants: `Conversation(Uuid)`, `Community(Uuid)`, `Domain(Uuid)`, `Tenant(String)`, `B2cAll`, `Global` (default). File: `crates/core/src/lib.rs`.
+
+- [ ] **Scope resolver** — Implement `resolve_target_to_conversation_set(target: &SearchTarget, db: &LocalStoreDb) -> HashSet<String>` that maps each `SearchTarget` variant to a set of `conversation_id`s via SQL lookups on the new conversation columns. File: `crates/core/src/search/query_engine.rs`.
+
+- [ ] **Bucket-level date pruning** — Before the `for (conv, bucket) in buckets` loop in `execute_search_with_cold_source`, parse each `time_bucket` string into a `(start_ms, end_ms)` range and skip buckets that fall entirely outside `[date_from, date_to]`. Implement `bucket_overlaps_date_range(bucket: &str, date_from: Option<i64>, date_to: Option<i64>) -> bool`. File: `crates/core/src/search/query_engine.rs`.
+
+- [ ] **Bloom filter shard type** — Add `IndexType::Bloom` variant to the shard format enum. Implement `build_bloom_shard` / `restore_bloom_shard` in `crates/core/src/search/shard_builder.rs`. At shard build time, construct a bloom filter over the lowercased words in the bucket. Upload as a new shard type alongside `[Text, Fuzzy, Vector, Media]`. Add `fetch_bloom_filter()` to the `ColdShardSource` trait. Files: `crates/core/src/formats/search_shard.rs`, `crates/core/src/search/shard_builder.rs`, `crates/core/src/search/cold_shard_source.rs`.
+
+- [ ] **Bloom filter pre-check in cold fan-out** — Before fetching full text + fuzzy shards for a cold bucket, fetch the (tiny) bloom shard first. Check if query terms could exist in the bucket. Only download full shards for buckets where the bloom filter says "maybe match". File: `crates/core/src/search/query_engine.rs`.
+
+- [ ] **On-device decrypted shard cache (LRU)** — Implement `ShardCache` with LRU eviction keyed by `(conversation_id, time_bucket, IndexType)` → decrypted rows. Configurable memory budget (default 50 MB). Integrate into the cold fan-out path so subsequent searches reuse cached shards without network round-trips. File: `crates/core/src/search/cold_shard_source.rs` (new `ShardCache` struct).
+
+- [ ] **Parallel bucket fetch** — Replace the sequential `for (conv, bucket) in buckets` loop with bounded-concurrency parallel fetch (e.g., 4-8 concurrent fetches). The `ColdShardSource` trait may need a batch/async variant. Merge results after all fetches complete. File: `crates/core/src/search/query_engine.rs`.
+
+- [ ] **Progressive/streaming search results** — Define `SearchEvent` enum (`LocalResults`, `ColdBucketComplete`, `SearchComplete`). Return local results immediately, then stream cold results as each bucket completes. File: `crates/core/src/search/query_engine.rs`, `crates/core/src/lib.rs`.
+
+- [ ] **Background shard warming (P5 idle)** — During idle time (charging + Wi-Fi), pre-fetch and decrypt cold shards into the on-device shard cache. Aligns with the existing `OpportunisticFill` hydration priority (P5). File: `crates/core/src/search/cold_shard_source.rs`, `crates/core/src/offload/hydration.rs`.
+
+- [ ] **Per-tenant key isolation (B2B)** — Extend the key hierarchy with `K_b2b_tenant_root(tenant_id)` derived from `K_user_master`, and per-tenant `K_b2b_archive_epoch` / `K_b2b_text_index_shard` derivation paths. File: `crates/core/src/crypto/key_hierarchy.rs`.
+
+- [ ] **TenantSearchPolicy** — Add `TenantSearchPolicy { allow_global_search, allow_cross_tenant_results, max_cold_buckets_per_search, require_bloom_shards }` to config. Apply tenant policies during cold fan-out to skip buckets from tenants that disallow global search. Files: `crates/core/src/config.rs`, `crates/core/src/search/query_engine.rs`.
+
+- [ ] **Privacy-aware scope-proportional padding** — Scale the dummy-request padding count proportionally to the search scope size. For global search, the padding ratio should be higher to obscure cross-tenant access patterns. File: `crates/core/src/search/shard_prefetch.rs`.
+
+- [ ] **K_bloom_index_shard key derivation** — Add `derive_bloom_index_shard` to the key hierarchy under `K_search_root`. File: `crates/core/src/crypto/key_hierarchy.rs`.
+
+- [ ] **Android/iOS bridge updates** — Update the bridge layers to accept `SearchTarget` instead of `conversation_filter`. Files: `crates/android-bridge/src/lib.rs`, `crates/ios-bridge/src/lib.rs`.
+
+- [ ] **Latency budget: bloom + parallel fetch** — Benchmark the bloom-filter pre-check + parallel fetch path. Target: global search over 100 cold buckets completes bloom pre-check in < 2s, full shard fetch for matching buckets in < 5s total (parallel). File: `crates/core/benches/phase8_benchmarks.rs`.
+
+- [ ] **Integration tests** — End-to-end tests for community-scoped search, domain-scoped search, tenant-scoped search, global search with bloom filter pruning, shard cache hit/miss, and tenant policy enforcement. File: `crates/core/tests/phase8_multi_scope_search.rs`.
+
+**Decision gate**: Community and domain-scoped search prunes cold buckets to the target scope. Bloom filter pre-check eliminates 80%+ of irrelevant buckets on a global search. Shard cache eliminates re-fetches on repeated searches. B2B tenant data is cryptographically isolated under per-tenant keys. Tenant search policies are enforced.
+
+Priority order:
+1. Schema + SearchTarget (foundation)
+2. Bucket-level date pruning (trivial, high impact when dates are set)
+3. Bloom filter shards (highest impact for community/domain/global search)
+4. Shard cache (LRU) (eliminates re-fetches)
+5. Parallel fetch (reduces wall-clock time)
+6. Progressive streaming (UX improvement)
+7. Per-tenant key isolation (B2B compliance)
+8. Tenant search policy (B2B admin controls)
+9. Background shard warming (best long-term)

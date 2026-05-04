@@ -96,8 +96,11 @@ goes through the FFI bridge for the host platform.
 > reranker with raw `semantic_score` + INT4 quantization
 > selection); Phase 7 in flight (~40%, failure suite at 8 of 8 +
 > offline detector + perf collector + large-scale ingest /
-> storage-budget / backup-restore scaffold).** Updates vs. the
-> original target structure below:
+> storage-budget / backup-restore scaffold); Phase 8 not started
+> (~0%, multi-scope / multi-tenant search — conversation
+> hierarchy, bloom shards, shard cache, parallel fetch,
+> per-tenant key isolation; see PHASES.md Phase 8).** Updates vs.
+> the original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
 >   CBOR wire-format types (segment frames, manifest spec, media
@@ -799,6 +802,12 @@ CREATE TABLE restore_state (
 The whole database is a SQLCipher database keyed by `K_local_db`,
 itself wrapped by the platform Keychain / Keystore.
 
+> **Phase 8 extension.** The `conversation` table gains hierarchy
+> columns (`conversation_type`, `scope`, `tenant_id`,
+> `community_id`, `domain_id`) and the `archive_segment_map` table
+> gains a `tenant_id` column for B2B isolation. See PHASES.md
+> Phase 8 and PROPOSAL.md §7.10.
+
 ---
 
 ## 5. Message State Machine
@@ -1002,6 +1011,12 @@ seam (put/get round-trip with INT8-codec cosine fidelity > 0.999,
 version-mismatch → `None`, two-instance same-connection
 cross-pipeline visibility).
 
+> **Phase 8 extension.** The search pipeline gains multi-scope
+> support (`SearchTarget` replacing `conversation_filter`),
+> bucket-level date pruning, encrypted bloom filter pre-check,
+> on-device shard cache, parallel bucket fetch, and progressive
+> result streaming. See PHASES.md Phase 8 and PROPOSAL.md §7.10.
+
 ### 6.1 Encrypted shard prefetch
 
 When a query needs a shard that is not in the on-device cache, the
@@ -1138,6 +1153,15 @@ hit into the `HydrationQueue` at `HydrationReason::SearchResultTap`
 (P0) priority so the actual body / media chase the search hit on
 tap. End-to-end coverage lives at
 [`crates/core/tests/cold_shard_search.rs`](../crates/core/tests/cold_shard_search.rs).
+
+> **Phase 8 optimizations.** The sequential `for (conv, bucket) in
+> buckets` loop gains four optimizations: (1) bucket-level date
+> pruning skips entire months outside `[date_from, date_to]`,
+> (2) bloom filter pre-check eliminates buckets that cannot match
+> the query terms, (3) an LRU shard cache eliminates re-fetches
+> for recently-searched buckets, and (4) parallel fetch with
+> bounded concurrency reduces wall-clock time. See PHASES.md
+> Phase 8.
 
 When the backend returns 404 / `Error::Transport` for a shard
 (offloaded then garbage-collected), the orchestration layer wraps
@@ -1303,6 +1327,24 @@ flowchart LR
 > layer can rotate epochs (default cadence: monthly, matching
 > `time_bucket`) and still recover prior-epoch segment / manifest
 > keys from the wrapped form persisted in the manifest chain.
+
+> **Phase 8 extension.** The key hierarchy gains per-tenant B2B
+> isolation:
+>
+> ```
+> K_user_master
+>   ├── K_b2c_archive_root              (personal B2C archive)
+>   ├── K_b2b_tenant_root(tenant_id)    (per-tenant B2B archive)
+>   │     └── K_b2b_archive_epoch(tenant_id, epoch_id)
+>   └── K_search_root
+>         ├── K_b2c_text_index_shard(shard_id)
+>         ├── K_b2b_text_index_shard(tenant_id, shard_id)
+>         └── K_bloom_index_shard(shard_id)   ← NEW
+> ```
+>
+> Per-tenant keys allow cryptographic separation of B2B
+> organizational data from personal B2C data. See PHASES.md
+> Phase 8 and PROPOSAL.md §7.10.
 
 ZK Object Fabric backups use Pattern C, derived deterministically
 from the plaintext + tenant ID. The Rust path must produce

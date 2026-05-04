@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~75%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~40%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~75%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~40%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds). Phase 8 — Multi-Scope, Multi-Tenant Search (`Not started | 0%`, conversation hierarchy, bloom shards, shard cache, parallel fetch, per-tenant B2B key isolation, tenant search policy).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1881,6 +1881,37 @@ Notes:
   and the new `EpochKeyManager::ingest_wrapped_prior_epoch_key`
   used by that restore path. Status advances from `~25%` to
   `~28%`.
+
+---
+
+## Phase 8: Multi-Scope, Multi-Tenant Search
+
+**Status**: `Not started | 0%`
+
+**Goal**: Conversation hierarchy, multi-tenant B2B isolation, and search performance optimizations for global/community/domain/tenant-scoped search.
+
+Checklist:
+
+- [ ] Schema: conversation hierarchy (`conversation_type`, `scope`, `tenant_id`, `community_id`, `domain_id`).
+- [ ] Schema: `archive_segment_map` tenant isolation (`tenant_id` column).
+- [ ] `SearchTarget` enum replacing `conversation_filter: Option<Uuid>`.
+- [ ] Scope resolver (`SearchTarget` → `HashSet<conversation_id>`).
+- [ ] Bucket-level date pruning.
+- [ ] Bloom filter shard type (`IndexType::Bloom`).
+- [ ] Bloom filter pre-check in cold fan-out.
+- [ ] On-device decrypted shard cache (LRU).
+- [ ] Parallel bucket fetch.
+- [ ] Progressive/streaming search results.
+- [ ] Background shard warming (P5 idle).
+- [ ] Per-tenant key isolation (B2B) — `K_b2b_tenant_root(tenant_id)`.
+- [ ] `TenantSearchPolicy` config and enforcement.
+- [ ] Privacy-aware scope-proportional padding.
+- [ ] `K_bloom_index_shard` key derivation.
+- [ ] Android/iOS bridge updates for `SearchTarget`.
+- [ ] Latency benchmarks (bloom + parallel fetch).
+- [ ] Integration tests (multi-scope, bloom, cache, tenant policy).
+
+**Decision gate**: Community/domain-scoped search prunes cold buckets. Bloom filter eliminates 80%+ irrelevant buckets on global search. Shard cache eliminates re-fetches. B2B tenant data cryptographically isolated. Tenant search policies enforced.
 
 ---
 
