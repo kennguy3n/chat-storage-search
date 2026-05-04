@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use kchat_core::crypto::key_hierarchy::{derive_search_root, derive_text_index_shard, KeyMaterial};
 use kchat_core::formats::search_shard::SearchIndexShard;
 use kchat_core::local_store::db::LocalStoreDb;
+use kchat_core::local_store::schema::Conversation;
+use kchat_core::message::processor::{IngestedMessage, MessagePersister};
 use kchat_core::search::query_engine::{ColdShardSource, QueryEngine};
 use kchat_core::search::shard_builder::{
     build_fuzzy_search_shard, build_text_search_shard, restore_fuzzy_search_shard,
@@ -278,4 +280,181 @@ fn cold_shard_conversation_filter_scopes_fan_out() {
         .unwrap();
     assert_eq!(results.len(), 1, "filter must scope cold buckets");
     assert_eq!(results[0].message_id, mid_a);
+}
+
+/// Phase 5, Task 1 regression: a message that exists in **both**
+/// the local FTS / fuzzy result set and a cold shard for the same
+/// `(conversation_id, time_bucket)` must
+///
+/// 1. Stay marked `is_cold = false` (its body is local — the
+///    hydration queue must not enqueue work for it).
+/// 2. Have its rank score *increase* relative to the local-only
+///    pass (the cold contribution should accumulate).
+/// 3. **Not** have the Task-3 recency × kind weighting applied a
+///    second time on top of the local pass.
+///
+/// The pre-fix code paths (`merge_cold_hit` flipped `is_cold`
+/// unconditionally; `apply_cold_recency_weight` keyed off
+/// `is_cold`) caused condition 1 and 3 to fail. This test pins
+/// the corrected contract end-to-end.
+#[test]
+fn cold_shard_merge_does_not_double_weight_local_rows() {
+    let identity = KeyMaterial::from_bytes([0xEF; 32]);
+    let search_root = derive_search_root(&identity).unwrap();
+    let conv_hash_key = KeyMaterial::from_bytes([0xBA; 32]);
+
+    let conv_id = Uuid::now_v7();
+    let bucket = "2026-04";
+    // Pin the timestamp so the recency component is deterministic
+    // across invocations.
+    let created_at_ms = 1_700_000_000_000_i64;
+    let text = "lighthouse beacon shines bright";
+
+    // Seed the local store with a single ingested message via
+    // the production MessagePersister path so FTS + fuzzy rows
+    // are populated under the local pipeline.
+    let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
+    db.insert_conversation(&Conversation {
+        conversation_id: conv_id.to_string(),
+        title_cipher: None,
+        pinned: false,
+        muted: false,
+        last_message_id: None,
+        last_activity_ms: created_at_ms,
+    })
+    .unwrap();
+    let persister = MessagePersister::new(&db);
+    let mid = Uuid::now_v7();
+    persister
+        .persist_ingested_message(&IngestedMessage {
+            message_id: mid,
+            conversation_id: conv_id,
+            sender_id: "alice".into(),
+            created_at_ms,
+            text_content: Some(text.into()),
+            media_descriptors: vec![],
+            reply_to: None,
+        })
+        .unwrap();
+
+    // Build a cold shard for the *same* (conversation, bucket,
+    // message_id, content) so the cold fan-out hits the row that
+    // is also in the local result set.
+    let text_shard_id = Uuid::now_v7();
+    let k_text = derive_text_index_shard(&search_root, text_shard_id.as_bytes()).unwrap();
+    let fts_rows = vec![FtsRow {
+        message_id: mid.to_string(),
+        conversation_id: conv_id.to_string(),
+        sender_id: "alice".into(),
+        created_at_ms,
+        text_content: text.into(),
+    }];
+    let text_built = build_text_search_shard(
+        fts_rows,
+        &conv_id.to_string(),
+        bucket,
+        &k_text,
+        &conv_hash_key,
+    )
+    .unwrap();
+
+    let mut catalog = EncryptedShardCatalog::new();
+    catalog.insert_text(
+        &conv_id.to_string(),
+        bucket,
+        text_built.shard,
+        text_built.k_shard,
+    );
+
+    let engine = QueryEngine::new(&db);
+    let q = SearchQuery {
+        query_string: "lighthouse".into(),
+        ..Default::default()
+    };
+
+    // Baseline: local-only pass — already includes Task 3 recency
+    // × kind weighting from `apply_recency_and_kind_weight`.
+    let local_only = engine
+        .execute_search(&q, &SearchScope::LocalOnly)
+        .expect("local-only search must succeed");
+    assert_eq!(local_only.len(), 1);
+    let local_only_score = local_only[0].rank_score;
+    assert!(
+        local_only_score > 0.0,
+        "local-only rank must be strictly positive"
+    );
+    assert!(
+        !local_only[0].is_cold,
+        "body is local — local-only result must not be flagged cold"
+    );
+
+    // Merged path: same row also surfaces from the cold shard.
+    let merged = engine
+        .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &catalog)
+        .expect("cold fan-out must succeed");
+
+    assert_eq!(merged.len(), 1, "deduplicated to one row by message_id");
+    let row = &merged[0];
+    assert_eq!(row.message_id, mid);
+
+    // Contract 1: body is local → row must NOT be flagged cold.
+    // Pre-fix this assertion failed because `merge_cold_hit`
+    // flipped `is_cold` for every row that surfaced from a cold
+    // shard, regardless of local availability.
+    assert!(
+        !row.is_cold,
+        "row's body is local — merge_cold_hit must not flip is_cold to true \
+         (would cause spurious P0 hydration enqueue)",
+    );
+
+    // Contract 2: cold contribution accumulated on top of local
+    // contribution → merged rank > local-only rank.
+    assert!(
+        row.rank_score > local_only_score,
+        "merged rank ({:.4}) must exceed local-only rank ({:.4}) — cold \
+         contribution should accumulate",
+        row.rank_score,
+        local_only_score
+    );
+
+    // Contract 3: recency × kind must NOT have been applied a
+    // second time. Pre-fix: `apply_cold_recency_weight` keyed off
+    // `is_cold` (set by `merge_cold_hit`), re-multiplying the
+    // already-weighted local contribution. Since the recency ×
+    // kind factor is strictly < 1 for any non-zero age × text
+    // kind, the buggy result would be:
+    //
+    //     merged_buggy = (local_only_score + raw_cold) * recency * kind
+    //                  < local_only_score + raw_cold
+    //
+    // and could even fall below `local_only_score`. The fix path
+    // sums raw cold contribution onto local without re-weighting
+    // local, so the merged score is bounded above by
+    // `local_only_score + (BM25_WEIGHT × matched_words)`. The
+    // upper bound below is loose — `BM25_WEIGHT = 2.0` and
+    // exactly one word ("lighthouse") matches in the cold shard,
+    // so the raw cold contribution is `2.0`. We assert merged is
+    // close to `local_only_score + 2.0` and not blown up by a
+    // second-application factor.
+    let raw_cold_contribution = 2.0_f64; // BM25_WEIGHT × 1 matched word
+    let upper_bound = local_only_score + raw_cold_contribution + 1e-6;
+    assert!(
+        row.rank_score <= upper_bound,
+        "merged rank ({:.4}) must not exceed local-only rank ({:.4}) plus \
+         raw cold contribution ({:.4}); a higher value indicates the cold \
+         path applied a multiplicative factor it should not have",
+        row.rank_score,
+        local_only_score,
+        raw_cold_contribution
+    );
+    let lower_bound = local_only_score + raw_cold_contribution - 1e-6;
+    assert!(
+        row.rank_score >= lower_bound,
+        "merged rank ({:.4}) must be at least local-only rank ({:.4}) plus \
+         raw cold contribution ({:.4}); a lower value indicates the cold \
+         path re-weighted (shrank) the local contribution",
+        row.rank_score,
+        local_only_score,
+        raw_cold_contribution
+    );
 }

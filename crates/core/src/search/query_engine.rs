@@ -249,6 +249,16 @@ impl<'a> QueryEngine<'a> {
             by_id.insert(r.message_id.to_string(), r);
         }
 
+        // Snapshot the IDs that came from the local FTS / fuzzy
+        // pass. Their `rank_score` already had the Task-3 recency
+        // × kind weighting applied inside
+        // [`Self::execute_fts_and_fuzzy_with_filters`], so the
+        // cold-only re-weighting step at the end of this method
+        // must skip them — otherwise any message that surfaces in
+        // both local and cold paths would have recency × kind
+        // applied twice.
+        let local_ids: HashSet<String> = by_id.keys().cloned().collect();
+
         // Tokenize once: the same query is reused for every
         // (conversation_id, time_bucket) pair.
         let q_words = lowercase_word_set(trimmed);
@@ -372,12 +382,13 @@ impl<'a> QueryEngine<'a> {
 
         let mut out: Vec<SearchResult> = by_id.into_values().collect();
 
-        // Apply the same Task 3 ranking adjustments to the merged
-        // local + cold result set. The cold rows skipped the local
-        // FTS / fuzzy path so they have not been re-weighted yet.
-        // Pure cold rows that have no skeleton fall back to the
-        // text default — see [`Self::apply_cold_recency_weight`].
-        self.apply_cold_recency_weight(&mut out);
+        // Apply the Task 3 recency × kind weighting to the rows
+        // that came exclusively from the cold path. Rows that
+        // were also surfaced by local FTS / fuzzy already had
+        // recency × kind applied inside
+        // [`Self::execute_fts_and_fuzzy_with_filters`] — we must
+        // not re-weight them or the score would be doubled.
+        self.apply_cold_recency_weight(&mut out, &local_ids);
 
         out.sort_by(|a, b| {
             b.rank_score
@@ -391,31 +402,31 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// Cold-path variant of [`Self::apply_recency_and_kind_weight`]
-    /// that skips the `message_skeleton` lookup. The local-only
-    /// rows in the result set already had recency + kind applied
-    /// inside [`Self::execute_fts_and_fuzzy_with_filters`]; we
-    /// only need to re-weight the cold contributions, which never
-    /// have an inline kind tag.
-    fn apply_cold_recency_weight(&self, results: &mut [SearchResult]) {
+    /// that skips the `message_skeleton` lookup. Re-weights only
+    /// the rows whose `message_id` is **not** in `local_ids` —
+    /// those rows came exclusively from the cold path and have
+    /// not had Task 3 applied yet. Rows that exist in both local
+    /// and cold (i.e. their ID is in `local_ids`) had recency ×
+    /// kind applied during the local FTS / fuzzy pass and must
+    /// not be re-weighted here.
+    fn apply_cold_recency_weight(&self, results: &mut [SearchResult], local_ids: &HashSet<String>) {
         if results.is_empty() {
             return;
         }
         let now_ms = results.iter().map(|r| r.created_at_ms).max().unwrap_or(0);
         let lambda = std::f64::consts::LN_2 / RECENCY_HALF_LIFE_DAYS;
         for r in results.iter_mut() {
-            // Local rows had Task 3 applied already during the
-            // FTS/fuzzy merge step. Only re-weight rows that came
-            // exclusively from the cold path.
-            if !r.is_cold {
+            if local_ids.contains(&r.message_id.to_string()) {
                 continue;
             }
             let age_ms = (now_ms - r.created_at_ms).max(0) as f64;
             let age_days = age_ms / 86_400_000.0;
             let recency_score = (-lambda * age_days).exp();
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
-            // Cold rows are decrypted text shards by construction
-            // (Phase 5 only ships text + fuzzy cold paths), so we
-            // pin the kind weight to `TEXT_KIND_WEIGHT`.
+            // Cold-only rows are decrypted text shards by
+            // construction (Phase 5 only ships text + fuzzy cold
+            // paths), so we pin the kind weight to
+            // `TEXT_KIND_WEIGHT`.
             r.rank_score *= recency_factor * TEXT_KIND_WEIGHT;
         }
     }
@@ -893,8 +904,10 @@ fn date_filter_matches(query: &SearchQuery, created_at_ms: i64) -> bool {
 /// Merge a cold-bucket contribution into the running result set,
 /// keyed by `message_id`. If the row already exists (e.g. it was
 /// also surfaced by the local FTS / fuzzy path) we accumulate the
-/// rank score; otherwise we synthesize a fresh row with
-/// `is_cold = true`.
+/// rank score and **leave `is_cold` untouched** — the body is
+/// already local, so the row must not enter the cold-only
+/// re-weighting path nor be enqueued for hydration. Otherwise we
+/// synthesize a fresh row with `is_cold = true`.
 fn merge_cold_hit(
     by_id: &mut HashMap<String, SearchResult>,
     message_id: &str,
@@ -905,7 +918,13 @@ fn merge_cold_hit(
 ) {
     if let Some(existing) = by_id.get_mut(message_id) {
         existing.rank_score += rank;
-        existing.is_cold = true;
+        // Do NOT flip `is_cold`: a row that is already in the
+        // local FTS / fuzzy result set has its body resident on
+        // device, so flagging it cold would (a) trigger a
+        // duplicate Task 3 recency × kind multiplication in
+        // [`QueryEngine::apply_cold_recency_weight`] and (b) push
+        // a spurious P0 hydration request through
+        // `enqueue_cold_results_for_hydration`.
         return;
     }
     let mid_uuid = Uuid::parse_str(message_id).unwrap_or(Uuid::nil());
