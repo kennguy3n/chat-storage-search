@@ -1866,7 +1866,15 @@ impl CoreImpl {
         let mut trace = crate::perf::PerfTrace::new("ingest_messages");
         trace.insert_metadata("messages_in", messages.len().to_string());
 
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = match self.db.lock().map_err(poisoned) {
+            Ok(db) => db,
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                return Err(e);
+            }
+        };
         let persister = MessagePersister::new(&db);
         let mut result = IngestResult::default();
         for msg in messages {
@@ -3132,7 +3140,15 @@ impl KChatCore for CoreImpl {
             },
         );
 
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = match self.db.lock().map_err(poisoned) {
+            Ok(db) => db,
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                return Err(e);
+            }
+        };
         let engine = QueryEngine::new(&db);
         let results = match engine.execute_search(&query, &scope) {
             Ok(r) => r,
@@ -3564,7 +3580,15 @@ impl KChatCore for CoreImpl {
             self.record_perf_trace(trace);
             return Ok(result);
         }
-        let (mut result, _sealed) = self.run_incremental_backup_inner(reason)?;
+        let (mut result, _sealed) = match self.run_incremental_backup_inner(reason) {
+            Ok(pair) => pair,
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                return Err(e);
+            }
+        };
         result.deferred = false;
         trace.insert_metadata("segments_built", result.segments_built.to_string());
         trace.insert_metadata("events_segmented", result.events_segmented.to_string());
@@ -3581,58 +3605,73 @@ impl KChatCore for CoreImpl {
         let mut trace = crate::perf::PerfTrace::new("enforce_storage_budget");
 
         // Phase-3 foundation: assess pressure and execute an
-        // empty plan when no candidates are surfaced. Wiring the
-        // actual candidate-collection query is queued for once
-        // the message_skeleton<->media_asset join is finalised.
-        let db = self.db.lock().map_err(poisoned)?;
-        let enforcer = StorageBudgetEnforcer::new();
-        let budget = StorageBudget::default_recommended();
-        let assessment = enforcer.assess(db.connection(), &budget)?;
-        trace.insert_metadata("pressure_level", format!("{:?}", assessment.pressure_level));
-        if !assessment.pressure_level.requires_eviction() {
-            trace.insert_metadata("freed_bytes", "0");
-            trace.insert_metadata("evicted_count", "0");
-            trace.finish();
-            self.record_perf_trace(trace);
-            return Ok(OffloadResult {
-                freed_bytes: 0,
-                evicted_count: 0,
-            });
+        // empty plan when no candidates are surfaced. The body is
+        // wrapped in an immediately-invoked closure so every error
+        // path closes the trace before propagating, per the
+        // contract documented in `docs/ARCHITECTURE.md` §11.11.
+        let outcome: Result<(OffloadResult, String)> = (|| -> Result<(OffloadResult, String)> {
+            let db = self.db.lock().map_err(poisoned)?;
+            let enforcer = StorageBudgetEnforcer::new();
+            let budget = StorageBudget::default_recommended();
+            let assessment = enforcer.assess(db.connection(), &budget)?;
+            let pressure_str = format!("{:?}", assessment.pressure_level);
+            if !assessment.pressure_level.requires_eviction() {
+                return Ok((
+                    OffloadResult {
+                        freed_bytes: 0,
+                        evicted_count: 0,
+                    },
+                    pressure_str,
+                ));
+            }
+            // `eviction_target_bytes` is threshold-relative (Warning →
+            // warning_bytes, Critical → critical_bytes, Extreme →
+            // max_bytes). Driving the planner directly off
+            // `(-headroom).max(0)` would only produce a non-zero target
+            // for Extreme pressure.
+            let target_bytes = assessment.eviction_target_bytes();
+            let now_ms = now_ms_for_send_media();
+            // `MIN_OFFLOAD_AGE_MS`: keep media less than 24 h old
+            // resident locally so the typical
+            // "scroll back to yesterday" pattern does not trigger an
+            // immediate refetch from cold storage. Phase 5 will lift
+            // this into a per-tenant configurable knob.
+            const MIN_OFFLOAD_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+            let candidates =
+                collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms)?;
+            // Tiered eviction (`docs/PROPOSAL.md §5.4`): exhaust the
+            // cloud-offload pool first; only fall through to the
+            // KChat-backend pool if the cloud pass underran the budget.
+            let tiered =
+                plan_tiered_eviction(candidates, target_bytes, now_ms, assessment.pressure_level);
+            let cloud_result = execute_eviction(db.connection(), &tiered.cloud_offload)?;
+            let full_result = execute_eviction(db.connection(), &tiered.full_eviction)?;
+            let out = OffloadResult {
+                freed_bytes: cloud_result
+                    .freed_bytes
+                    .saturating_add(full_result.freed_bytes),
+                evicted_count: cloud_result
+                    .evicted_count
+                    .saturating_add(full_result.evicted_count),
+            };
+            Ok((out, pressure_str))
+        })();
+        match outcome {
+            Ok((out, pressure_str)) => {
+                trace.insert_metadata("pressure_level", pressure_str);
+                trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
+                trace.insert_metadata("evicted_count", out.evicted_count.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                Ok(out)
+            }
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                Err(e)
+            }
         }
-        // `eviction_target_bytes` is threshold-relative (Warning →
-        // warning_bytes, Critical → critical_bytes, Extreme →
-        // max_bytes). Driving the planner directly off
-        // `(-headroom).max(0)` would only produce a non-zero target
-        // for Extreme pressure.
-        let target_bytes = assessment.eviction_target_bytes();
-        let now_ms = now_ms_for_send_media();
-        // `MIN_OFFLOAD_AGE_MS`: keep media less than 24 h old
-        // resident locally so the typical
-        // "scroll back to yesterday" pattern does not trigger an
-        // immediate refetch from cold storage. Phase 5 will lift
-        // this into a per-tenant configurable knob.
-        const MIN_OFFLOAD_AGE_MS: i64 = 24 * 60 * 60 * 1000;
-        let candidates = collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms)?;
-        // Tiered eviction (`docs/PROPOSAL.md §5.4`): exhaust the
-        // cloud-offload pool first; only fall through to the
-        // KChat-backend pool if the cloud pass underran the budget.
-        let tiered =
-            plan_tiered_eviction(candidates, target_bytes, now_ms, assessment.pressure_level);
-        let cloud_result = execute_eviction(db.connection(), &tiered.cloud_offload)?;
-        let full_result = execute_eviction(db.connection(), &tiered.full_eviction)?;
-        let out = OffloadResult {
-            freed_bytes: cloud_result
-                .freed_bytes
-                .saturating_add(full_result.freed_bytes),
-            evicted_count: cloud_result
-                .evicted_count
-                .saturating_add(full_result.evicted_count),
-        };
-        trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
-        trace.insert_metadata("evicted_count", out.evicted_count.to_string());
-        trace.finish();
-        self.record_perf_trace(trace);
-        Ok(out)
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
