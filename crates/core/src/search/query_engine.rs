@@ -324,10 +324,21 @@ fn cold_source_fetch_fuzzy_with_cache(
 }
 
 /// Cache-aware twin of [`cold_source_fetch_text_with_cache`] for
-/// bloom shards. Returns `Ok(None)` for both "not in cache and
-/// transport says no shard" and "transport raised a soft error" —
-/// the bucket loop falls through to the full text/fuzzy fetches
-/// in either case (graceful degradation, per the trait contract).
+/// bloom shards. Returns `Ok(None)` for **all three** of the
+/// following cases:
+/// 1. the bloom shard is not in the cache and the transport
+///    reports no shard for `(conversation, bucket)`,
+/// 2. the bloom shard is not in the cache and the transport
+///    raised a soft error (404, network blip, decode failure),
+/// 3. cache acquisition failed.
+///
+/// In every case the bucket loop falls through to the full
+/// text/fuzzy fetches (graceful degradation, per the
+/// `ColdShardSource::fetch_bloom_shard` trait contract). The
+/// signature still returns `Result` for symmetry with the text /
+/// fuzzy variants and to keep the door open for a future
+/// "loud error" path, but the function itself never propagates
+/// transport errors today.
 fn cold_source_fetch_bloom_with_cache(
     src: &dyn ColdShardSource,
     cache: Option<&Mutex<ShardCache>>,
@@ -342,7 +353,17 @@ fn cold_source_fetch_bloom_with_cache(
             }
         }
     }
-    let result = src.fetch_bloom_shard(conv, bucket)?;
+    let result = match src.fetch_bloom_shard(conv, bucket) {
+        Ok(r) => r,
+        // Swallow transport errors: bloom is an optimization, not
+        // a correctness path. The cold loop falls through to the
+        // full text/fuzzy fetches when the bloom probe yields
+        // `None`, so an `Err` here is observationally identical
+        // to "no shard available". Returning `Ok(None)` keeps the
+        // function self-contained against any future caller that
+        // might `?`-propagate or `.unwrap()` the result.
+        Err(_) => return Ok(None),
+    };
     if let Some(filter) = &result {
         if let Some(c) = cache {
             if let Ok(mut guard) = c.lock() {
@@ -4386,6 +4407,33 @@ mod phase8_target_tests {
         assert_eq!(source.bloom_calls.get(), 1);
         assert_eq!(source.text_calls.get(), 1);
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn cold_source_fetch_bloom_with_cache_swallows_transport_errors() {
+        // Function-level regression for the Phase 8 batch 6
+        // contract on `cold_source_fetch_bloom_with_cache`:
+        // even when the underlying `ColdShardSource::fetch_bloom_shard`
+        // returns `Err(_)`, the helper must yield `Ok(None)` so
+        // any future caller that `?`-propagates or `.unwrap()`s
+        // the result still gets the documented graceful-degradation
+        // behaviour. Pairs with `bloom_precheck_falls_through_on_transport_error`,
+        // which exercises the same code path through the public
+        // `execute_search_with_cold_source` API.
+        let conv = "conv-1";
+        let bucket = "2026-04";
+        let source = BloomFakeColdSource::new().with_bloom_failure();
+        let result = cold_source_fetch_bloom_with_cache(&source, None, conv, bucket);
+        assert!(
+            matches!(result, Ok(None)),
+            "transport errors must be swallowed into Ok(None); got {:?}",
+            result.as_ref().map(|r| r.as_ref().map(|_| "Some(_)")),
+        );
+        assert_eq!(
+            source.bloom_calls.get(),
+            1,
+            "the helper must still issue exactly one bloom fetch attempt"
+        );
     }
 
     #[test]
