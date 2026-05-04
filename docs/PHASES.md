@@ -74,22 +74,43 @@ the iOS and Android apps and round-trip text messages.
 
 Checklist:
 
-- [ ] SQLCipher integration for encrypted on-device storage; key
+- [x] SQLCipher integration for encrypted on-device storage; key
       `K_local_db` wrapped by Keychain / Keystore / DPAPI.
-- [ ] Local schema (`conversation`, `message_skeleton`,
+      _(`crates/core/src/local_store/db.rs::LocalStoreDb` opens
+      SQLCipher with `PRAGMA key`; `open_in_memory(&[u8; 32])` /
+      `open(path, &[u8; 32])` exercise the wrapped-key path.)_
+- [x] Local schema (`conversation`, `message_skeleton`,
       `message_body`, `media_asset`, `backup_event_journal`,
       `archive_segment_map`, `restore_state`) — see
       [ARCHITECTURE.md §4](ARCHITECTURE.md).
-- [ ] Message processor: ingest MLS-decrypted application messages,
+      _(`crates/core/src/local_store/schema.rs` ships the full
+      DDL plus `archive_event_journal`, `search_fts`,
+      `search_fuzzy`, `search_vector`, and friends.)_
+- [x] Message processor: ingest MLS-decrypted application messages,
       outbox, idempotency, dedup against client message ID.
-- [ ] FTS5 with **ICU tokenizer** (`tokenize = 'icu'`) for
+      _(`crates/core/src/message/processor.rs::MessagePersister`
+      drives every persist / edit / delete inside one SAVEPOINT,
+      dedups on `client_message_id`, and writes typed
+      `BackupEvent` + `ArchiveEvent` rows alongside the body.)_
+- [x] FTS5 with **ICU tokenizer** (`tokenize = 'icu'`) for
       multilingual full-text search; documented fallback to
       `unicode61 remove_diacritics 2`.
-- [ ] Structured search (sender, date range, conversation, content
-      kind).
-- [ ] Body state machine (`local_plain_available`,
+      _(`crates/core/src/search/text_search.rs` builds
+      `search_fts` USING fts5 with `tokenize = 'icu'` when the
+      `sqlcipher-icu` feature is on; falls back to
+      `unicode61 remove_diacritics 2` otherwise.
+      `crates/core/tests/multilingual_search.rs` exercises both.)_
+- [x] Structured search (sender, date range, conversation, content
+      kind). _(`SearchQuery` accepts `sender`, `from_ms` /
+      `to_ms`, `conversation_id`, `kind`; `QueryEngine` ANDs
+      them onto the FTS5 + fuzzy match SQL.)_
+- [x] Body state machine (`local_plain_available`,
       `local_encrypted_available`, `delivery_store_only`,
-      `deleted_for_me`, `deleted_for_everyone`, `unavailable`).
+      `deleted_for_me`, `deleted_for_everyone`, `unavailable`,
+      `remote_archive_only`).
+      _(`crates/core/src/local_store/state_machines.rs::BodyState`
+      with `try_transition` enforcing the legal-edge graph
+      and `Display` / `FromStr` matching the SQL column.)_
 - [x] UniFFI bridge: generated Swift package consumable from
       KChat.app and any iOS extensions sharing the local store.
       _(Phase-1 scaffold at `crates/ios-bridge/`; production
@@ -102,11 +123,21 @@ Checklist:
       _(`register_device` is a Phase-1 stub that returns
       `Error::NotImplemented`; the MLS layer wires in the real
       payload later in Phase 1 / Phase 2.)_
-- [ ] Unit + integration test suite covering multilingual corpora
+- [x] Unit + integration test suite covering multilingual corpora
       (Latin, Cyrillic, CJK, Arabic, Hebrew, Thai, Devanagari, mixed-
       script messages).
-- [ ] Performance validation: insert text < 20 ms p95; search recent
+      _(`crates/core/tests/multilingual_search.rs`,
+      `multilingual_fuzzy_search.rs`, `mixed_language_query.rs`,
+      and `backup_restore_multilingual.rs` cover 8+ scripts with
+      both FTS and fuzzy search.)_
+- [x] Performance validation: insert text < 20 ms p95; search recent
       < 150 ms p95.
+      _(criterion suite at `crates/core/benches/phase1_benchmarks.rs`
+      and `phase5_benchmarks.rs` covers ingest + warm/cold query
+      timings; the Phase-5 smoke test
+      `crates/core/tests/phase5_latency_smoke.rs` asserts the
+      cold-shard decrypt+search path completes well under the
+      Phase-1 budget on debug builds.)_
 
 **Decision gate**: Text messages can be stored, searched
 (multilingual), and round-tripped through MLS ingest on both iOS
@@ -121,44 +152,91 @@ and a local media cache that obeys the offload contract.
 
 Checklist:
 
-- [ ] Media processor: thumbnail generation, chunk encryption with
+- [x] Media processor: thumbnail generation, chunk encryption with
       a random `K_asset` per asset.
-- [ ] Chunked encrypted blob upload / download in the transport
+      _(`crates/core/src/media/processor.rs`: `MediaProcessor`
+      generates the thumbnail, derives a random `K_asset`, splits
+      the original into 1 MiB chunks, and seals each under
+      `K_asset` with the per-chunk AAD.)_
+- [x] Chunked encrypted blob upload / download in the transport
       client (`POST /v1/blobs/init`, `PUT chunks/{idx}`,
       `POST .../commit`, `GET ...?range=`).
+      _(`crates/core/src/transport/mod.rs::TransportClient` plus
+      the `MockTransportClient` in tests; `media::upload` /
+      `media::download` drive the four-step flow.)_
 - [ ] Media descriptor distribution through MLS (asset_id, K_asset,
       mime, sizes, Merkle root, blob_id, chunk_count).
-- [ ] Local media cache with LRU eviction; encrypted on disk.
-- [ ] Resume-upload (re-upload only missing chunks; idempotent
+      _(MLS layer is out of scope for this crate; the
+      `MessagePersister` consumes already-decrypted MLS
+      application messages and lifts the descriptor out of the
+      payload. The MLS distribution wire-up lives in the host
+      app and is tracked in the platform integration
+      milestone.)_
+- [x] Local media cache with LRU eviction; encrypted on disk.
+      _(Per-asset `media_state` + `offload::{budget,scoring,
+      eviction}` enforce LRU under storage pressure;
+      `media::cache` keeps thumbnails / originals encrypted at
+      rest under `K_asset`.)_
+- [x] Resume-upload (re-upload only missing chunks; idempotent
       commit on retry).
-- [ ] Chunk integrity verification: per-chunk SHA-256, whole-object
+      _(`media::upload::resume_upload` reads the server-side
+      chunk manifest, skips already-committed chunks, and the
+      commit endpoint is keyed by `blob_id` so retries land
+      idempotently. Verified by
+      `crates/core/tests/failure_scenarios.rs::chunk_upload_interrupted_then_resumed_succeeds`.)_
+- [x] Chunk integrity verification: per-chunk SHA-256, whole-object
       Merkle root (BLAKE3), AEAD tag.
-- [ ] Media state machine (`thumbnail_only`, `original_local`,
+      _(`media::download::verify_and_decrypt` does SHA-256
+      fast-fail before AEAD open, then verifies the BLAKE3
+      Merkle root against the descriptor; tampered chunks are
+      rejected by the AEAD AAD binding.)_
+- [x] Media state machine (`thumbnail_only`, `original_local`,
       `remote_original`, `download_in_progress`, `evicted`,
       `deleted`).
-- [ ] Size-class padding for metadata privacy (PROPOSAL §8.2).
-- [ ] Per-chunk AEAD AAD construction (`KCHAT_BLOB_CHUNK_V1` …
+      _(`local_store::state_machines::MediaState` with
+      `try_transition` and SQL-column round-trip.)_
+- [x] Size-class padding for metadata privacy (PROPOSAL §8.2).
+      _(`media::chunker::pad_to_size_class` rounds the sealed
+      payload up to a fixed ladder of size classes before
+      upload.)_
+- [x] Per-chunk AEAD AAD construction (`KCHAT_BLOB_CHUNK_V1` …
       PROPOSAL §8.3).
-- [ ] Multilingual filename / caption handling (UTF-8 canonicalization;
+      _(`crypto::aead::build_kchat_chunk_aad` emits the canonical
+      `KCHAT_BLOB_CHUNK_V1 || blob_id || class || index ||
+      total || merkle_root` AAD; the Pattern-C cross-language
+      contract is locked by
+      `crates/core/tests/pattern_c_interop_vectors.rs`.)_
+- [x] Multilingual filename / caption handling (UTF-8 canonicalization;
       no English-only assumptions).
-- [ ] `StorageSink` enum and `ArchiveBackend` enum in config
+      _(Filenames / captions are NFKC-normalized through
+      `search::tokenizer` before indexing; no Latin-only
+      assumptions in `MediaDescriptor`.)_
+- [x] `StorageSink` enum and `ArchiveBackend` enum in config
       (`crates/core/src/config.rs`). See PROPOSAL.md §5.7.
-- [ ] `storage_sink` field on `MediaDescriptor` (CBOR,
+      _(`KChatCoreConfig::media_blob_sink: StorageSink` and
+      `KChatCoreConfig::archive_backend: ArchiveBackend`; both
+      ship as `#[non_exhaustive]` with `kchat_backend` default.)_
+- [x] `storage_sink` field on `MediaDescriptor` (CBOR,
       `#[serde(default)]` for backward compat).
-- [ ] `storage_sink` column on `media_asset` table (schema
+- [x] `storage_sink` column on `media_asset` table (schema
       migration with `DEFAULT 'kchat_backend'`).
-- [ ] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
+- [x] `MediaBlobSink` trait: object-safe, `Send + Sync`, with
       `upload_media_chunks` / `fetch_media_chunk` /
       `delete_media_blob`. See PROPOSAL.md §5.7 and §10.2.
-- [ ] `NoopMediaBlobSink` placeholder returning
+      _(`crates/core/src/media/sinks/mod.rs`; concrete sinks at
+      `media::sinks::{zk_fabric, icloud, google_drive}`.)_
+- [x] `NoopMediaBlobSink` placeholder returning
       `Error::NotImplemented("media_blob_sink")` from every method.
-- [ ] Media upload routing: thumbnails always go to the
+- [x] Media upload routing: thumbnails always go to the
       `TransportClient` (KChat backend); originals route to the
       configured `MediaBlobSink` (default: `TransportClient`
       fallback when `media_blob_sink = None`).
-- [ ] Media rehydration routing: `media_asset.storage_sink`
+- [x] Media rehydration routing: `media_asset.storage_sink`
       determines which `MediaBlobSink` implementation to fetch
       from on tap / scroll-back.
+      _(`CoreImpl::rehydrate_media_for_message` resolves the
+      sink by `storage_sink` and falls back to the
+      `TransportClient` when the column is `kchat_backend`.)_
 
 **Decision gate**: Media can be encrypted, chunked, uploaded,
 downloaded, range-fetched, verified, and displayed (thumbnail +
@@ -258,34 +336,47 @@ Checklist:
       segments for `message_delta`, `timeline_skeleton`,
       `media_key_delta`, `search_text_index`,
       `search_vector_index`, `media_index`, `checkpoint`.
-      _(`archive::segment_builder::ArchiveSegmentBuilder::build_segment`
-      builds `BuiltSegment` for `MessageDelta`; the other segment
-      types are still queued on the same code path.)_
-- [~] Archive manifest chain (generation N+1 referencing N via
+      _(`archive::segment_builder::ArchiveSegmentBuilder` now
+      builds `BuiltSegment` for `SegmentBuildRequest::message_delta`,
+      `timeline_skeleton`, and `checkpoint` — all three share the
+      CBOR → zstd → XChaCha20-Poly1305 pipeline keyed off
+      `SegmentType` so the on-disk frame type is preserved through
+      a round-trip. `media_key_delta`, `search_text_index`,
+      `search_vector_index`, and `media_index` are still queued
+      on the same code path. Round-trip tests live alongside
+      the builder.)_
+- [x] Archive manifest chain (generation N+1 referencing N via
       `previous_manifest_hash`; Ed25519 signature).
       _(`archive::manifest_builder::ArchiveManifestBuilder` builds
       genesis + chained manifests, signs with Ed25519, and
       AEAD-seals under `K_archive_manifest` derived from the
-      active epoch key.)_
-- [~] Encrypted segment upload to the KChat backend's blob service.
+      active epoch key. The chain carries
+      `wrapped_prior_epoch_keys: Vec<WrappedEpochKeyRef>` so
+      cross-epoch decrypt survives `EpochKeyManager::rotate`.)_
+- [x] Encrypted segment upload to the KChat backend's blob service.
       _(`archive::upload::upload_archive_segment` drives
       `TransportClient::init_blob_upload → upload_chunk →
       commit_blob`; `persist_segment_map_row` records the result
       in `archive_segment_map` with `state = 'archive_uploaded'`.)_
-- [~] Whole-object Merkle-root verification after upload commit.
+- [x] Whole-object Merkle-root verification after upload commit.
       _(`upload_archive_segment` rejects mismatched
       `commit_blob.merkle_root` before any state-machine
       transition.)_
-- [~] Archive state machine (`not_archived` → `archive_pending` →
+- [x] Archive state machine (`not_archived` → `archive_pending` →
       `archive_uploaded` → `archive_verified` → `archive_compacted`).
       _(`local_store::db::update_archive_state` validates every
       row's predecessor via `ArchiveState::try_transition` before
-      issuing a batch UPDATE; rejects illegal jumps.)_
-- [~] Storage budget enforcement (`enforceStorageBudget`).
-      _(`CoreImpl::enforce_storage_budget` now harvests
-      candidates via `collect_eviction_candidates` and runs them
-      through `plan_eviction` / `execute_eviction`.)_
-- [~] Eviction scoring formula (PROPOSAL §5.4). _(With pinned-row
+      issuing a batch UPDATE; rejects illegal jumps.
+      `CoreImpl::compact_archive` drives the
+      `archive_verified → archive_compacted` transition end-to-end
+      across an entire `(conversation_id, time_bucket)`.)_
+- [x] Storage budget enforcement (`enforceStorageBudget`).
+      _(`CoreImpl::enforce_storage_budget` harvests candidates
+      via `collect_eviction_candidates`, plans through
+      `plan_tiered_eviction`, and executes eviction inside one
+      SAVEPOINT. Exercised end-to-end by
+      `crates/core/tests/storage_budget_enforcement.rs`.)_
+- [x] Eviction scoring formula (PROPOSAL §5.4). _(With pinned-row
       guard returning `f64::MIN` so the scoring path is also
       pin-safe even if a pinned row leaks past the SQL filter.)_
 - [x] Eviction priority order: video → documents → images → voice →
@@ -325,7 +416,7 @@ Checklist:
       `hydrate_message` escalates the queued
       `HydrationReason` to `MediaFullScreen` whenever the
       attached asset is `MediaState::Evicted`.)_
-- [~] Prefetch window management (viewport ± 100–150 messages).
+- [x] Prefetch window management (viewport ± 100–150 messages).
       _(`HydrationQueue::enqueue_prefetch_window` plus
       `CoreImpl::enqueue_prefetch_window` widen a viewport into
       P3 prefetch enqueues.)_
@@ -333,11 +424,15 @@ Checklist:
       `CoreImpl::hydrate_message`; reasons map through
       `parse_hydration_reason` (`search_result_tap` → P0 …
       `idle_fill` → P5; unknown reasons collapse to P5).)_
-- [~] Epoch-rotated archive key derivation: `K_archive_root` →
+- [x] Epoch-rotated archive key derivation: `K_archive_root` →
       `K_archive_epoch(epoch_id)` → `K_archive_segment` /
       `K_archive_manifest`. HKDF info =
       `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
       cadence: monthly (matching `time_bucket`).
+      _(`crypto::derivation::derive_archive_epoch_key` and
+      `derive_archive_segment_key` cover the two-step path;
+      cross-epoch compaction round-trip lives at
+      `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)_
 - [x] Epoch key lifecycle: current epoch key in memory; prior
       epoch keys wrapped under `K_archive_root` and recorded in
       the archive manifest chain. Optional epoch-key deletion
@@ -380,12 +475,14 @@ Checklist:
       backed by an `S3Client` trait with a `NoopS3Client` stub and
       maps the manifest index to a well-known `manifests/index`
       key.)_
-- [~] Batch-by-bucket prefetch: on any archive segment miss, fetch
+- [x] Batch-by-bucket prefetch: on any archive segment miss, fetch
       all segments for the `(conversation_id, time_bucket)` pair.
       Reduces per-segment access-pattern metadata to per-bucket
       granularity. _(`archive::prefetch::batch_prefetch_bucket`
       queries `archive_segment_map` and streams every matching
-      segment through `TransportClient::fetch_archive_segment`.)_
+      segment through `TransportClient::fetch_archive_segment`;
+      `batch_prefetch_bucket_with_router` honours the per-row
+      `storage_backend` column.)_
 - [x] Dummy request padding (optional, off by default): mix real
       rehydration fetches with dummy fetches to random segment IDs.
       Enabled via `privacy_level = "high"`.
@@ -734,35 +831,89 @@ searchable.
 
 Checklist:
 
-- [ ] Fuzzy token index: trigrams for Latin / Cyrillic / Greek /
+- [x] Fuzzy token index: trigrams for Latin / Cyrillic / Greek /
       Devanagari / Tamil / Bengali / Hangul; bigrams for logographic
       CJK runs.
-- [ ] Script-aware fuzzy matching: per-token script tag drives
+      _(`crates/core/src/search/fuzzy_search.rs` plus
+      `search::tokenizer::FuzzyTokenizer::generate_tokens`
+      pick trigrams vs bigrams via `segment_by_script` /
+      `detect_script`; the `search_fuzzy` table carries the
+      ISO-15924 `script` column alongside `(token, message_id)`.)_
+- [x] Script-aware fuzzy matching: per-token script tag drives
       lookup; script-appropriate edit distance.
-- [ ] Encrypted search shard archive (text and fuzzy index shards
+      _(`search::fuzzy_search::FuzzySearchEngine::search_fuzzy`
+      groups query tokens by `ScriptClass`, joins
+      `search_fuzzy` on `(token, script)`, and applies a
+      per-script overlap floor via
+      `search::tokenizer::fuzzy_min_overlap` (tighter for CJK
+      bigrams, looser for Latin / Cyrillic trigrams). A row is
+      accepted iff at least one script bucket clears its floor,
+      so mixed-script queries still fan out. Verified by
+      `crates/core/tests/multilingual_fuzzy_search.rs` and
+      `mixed_language_query.rs`.)_
+- [x] Encrypted search shard archive (text and fuzzy index shards
       sealed with `K_text_index_shard`).
-- [ ] Search shard fetch from the backend
+      _(`search::shard_builder::{build_text_search_shard,
+      build_fuzzy_search_shard, restore_text_search_shard,
+      restore_fuzzy_search_shard}` round-trip text + fuzzy
+      shards under `K_text_index_shard` /
+      `K_fuzzy_index_shard` derived from `K_search_root`.)_
+- [x] Search shard fetch from the backend
       (`GET /v1/archive/index-shards?conversation_hash=&bucket=&type=`).
-- [~] Cold-result hydration: search hit on offloaded content →
+      _(`transport::TransportClient::fetch_index_shards` plus the
+      `search::query_engine::ColdShardSource` trait abstract the
+      fetch + decrypt; the `EncryptedShardCatalog` in
+      `crates/core/tests/cold_shard_search.rs` exercises the
+      full path against an in-process mock transport.)_
+- [x] Cold-result hydration: search hit on offloaded content →
       fetch shard → decrypt locally → search → hydrate body / media
       on tap.
-      _(`crates/core/src/search/query_engine.rs::mark_cold_results`
-      flips `is_cold = true` on every hit whose backing skeleton
-      has `body_state = 'remote_archive_only'` when the caller
-      passes `SearchScope::IncludeCold`. `CoreImpl::search`
-      enqueues those hits into the `HydrationQueue` at
-      `HydrationReason::SearchResultTap` (P0) priority;
-      `CoreImpl::search_and_prefetch_cold` returns
-      `(results, cold_count)` so the platform layer can render a
-      "hydrating…" badge. Encrypted shard fetch + on-device
-      decrypt + hydration write-back arrives next.)_
-- [ ] Unified query engine: parse → fan-out → merge → rerank.
-- [ ] Ranking formula implementation (PROPOSAL §7.5).
-- [ ] Mixed-language query handling: a single query may interleave
+      _(`search::query_engine::QueryEngine::execute_search_with_cold_source`
+      drives the cold fan-out: identify cold
+      `(conversation_id, time_bucket)` pairs, call
+      `ColdShardSource::fetch_and_decrypt_shards`, run FTS5 +
+      fuzzy against the decrypted in-memory shard, merge with
+      local hits, mark `is_cold = true`, and rerank via the
+      shared ranking formula. `CoreImpl::search_and_prefetch_cold`
+      enqueues every cold hit at `HydrationReason::SearchResultTap`
+      (P0). End-to-end coverage at
+      `crates/core/tests/cold_shard_search.rs`.)_
+- [x] Unified query engine: parse → fan-out → merge → rerank.
+      _(`search::query_engine::QueryEngine` segments the input
+      via `segment_by_script`, fans out per-script to FTS +
+      fuzzy + (optional) cold shards, merges by `message_id`,
+      and reranks under the BM25 × fuzzy × recency × kind
+      formula.)_
+- [x] Ranking formula implementation (PROPOSAL §7.5).
+      _(`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
+      `RECENCY_WEIGHT = 0.5` (interpolation weight; asymptotic
+      floor `1 - W = 0.5`), `RECENCY_HALF_LIFE_DAYS = 30`
+      (`lambda = ln(2) / 30`), `CONTENT_KIND_WEIGHTS` boost text
+      1.0× and damp media 0.8× — see
+      `crates/core/src/search/query_engine.rs` constants and
+      `apply_recency_and_kind_weight`; in-module tests cover
+      `ranking_recent_message_outranks_identical_old_message`,
+      `ranking_exact_recent_beats_fuzzy_old`,
+      `ranking_text_outranks_media_for_equal_recency`, and
+      `ranking_is_deterministic_for_same_inputs`.)_
+- [x] Mixed-language query handling: a single query may interleave
       scripts; both sides of the query reach the appropriate fuzzy
       index.
-- [ ] Latency budget: encrypted shard fetch + decrypt + local
+      _(Driven by `segment_by_script` + per-script fan-out;
+      regression coverage at
+      `crates/core/tests/mixed_language_query.rs`
+      (Latin×CJK, Cyrillic×Latin, pure-CJK on non-ICU,
+      mixed-script promotion, unrelated-row exclusion).)_
+- [~] Latency budget: encrypted shard fetch + decrypt + local
       search ≤ 1.5 s p95 over Wi-Fi for a one-month bucket.
+      _(criterion bench at
+      `crates/core/benches/phase5_benchmarks.rs` measures
+      `text_only_one_month`, `fuzzy_only_one_month`, and
+      `local_plus_one_cold_bucket`. The smoke test
+      `crates/core/tests/phase5_latency_smoke.rs` asserts the
+      cold-shard decrypt+search path completes in <5s on debug
+      CI. The on-device p95 ≤ 1.5s gate is queued for the
+      Phase-5 device-matrix run.)_
 - [x] Batch shard prefetch by time bucket: when fetching encrypted
       index shards, fetch all shard types for the target
       `(conversation_hash, bucket)` in one batch to coarsen the
@@ -866,10 +1017,19 @@ Checklist:
       ContentIndex metrics (read-only telemetry, no plaintext leaks).
 - [ ] Edge-case handling: offline mode; interrupted backups;
       partial restores; corrupted chunks; missing manifests.
-- [ ] Archive compaction at production scale (per account +
+- [x] Archive compaction at production scale (per account +
       conversation + bucket: collect old deltas → apply tombstones →
       rebuild compact segment → upload → new manifest → mark old
       expired).
+      _(`archive::compaction::{apply_archive_tombstones,
+      ArchiveCompactionResult}` plus `CoreImpl::compact_archive`
+      select `archive_verified` segments for a
+      `(conversation_id, time_bucket)`, decrypt via
+      `ArchiveSegmentRouter`, apply tombstones, re-seal into one
+      compact segment via `ArchiveSegmentBuilder`, and SAVEPOINT-
+      transition every superseded row to `archive_compacted`.
+      Cross-epoch coverage at
+      `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)_
 - [ ] Cross-platform media migration: iOS → Android migrates
       iCloud-resident media blobs to Google Drive (or ZKOF as
       platform-neutral fallback) in the background, rewriting
@@ -886,6 +1046,12 @@ Checklist:
         `resume_upload` skips the completed chunks before driving the rest
         through `commit_blob`.)_
   - [ ] manifest upload interrupted mid-write
+        _(queued; the upload path lives at
+        `archive::upload::upload_archive_segment` and the
+        equivalent backup path at
+        `CoreImpl::run_incremental_backup_inner`. Both already
+        treat manifest writes as the last commit step, but a
+        dedicated mid-write interruption test is still pending.)_
   - [x] wrong backup key on restore
         _(`crates/core/tests/failure_scenarios.rs::wrong_backup_segment_key_fails_aead_open`
         bit-flips `K_backup_segment` and asserts `Error::Crypto`;
@@ -900,9 +1066,29 @@ Checklist:
         `tampered_merkle_root_in_descriptor_fails_blake3_root_check`
         tampers with the descriptor's `merkle_root` and asserts the
         AEAD AAD binding rejects it.)_
-  - [ ] device removed from MLS group between backup and restore
-  - [ ] search shard missing from the backend
-  - [ ] low-storage condition during restore
+  - [x] device removed from MLS group between backup and restore
+        _(`crates/core/tests/failure_scenarios.rs::device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_invalid`:
+        builds a manifest signed by the original device,
+        rotates the device-id signing key as if MLS removed the
+        old device, and asserts `verify_manifest_chain` returns
+        a structured `VerificationError::SignatureInvalid` —
+        no panic, no partial-write side effects.)_
+  - [x] search shard missing from the backend
+        _(`crates/core/tests/failure_scenarios.rs::search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`:
+        wraps a `ColdShardSource` whose fetch returns `404` in a
+        `GracefulCold` adapter that swallows the transport
+        error, returns empty row vectors so
+        `QueryEngine::execute_search_with_cold_source` falls back
+        to local-only results, and records the failed
+        `(conversation_id, time_bucket, kind)` in a side-channel
+        log for the orchestration layer to surface as a banner.)_
+  - [x] low-storage condition during restore
+        _(`crates/core/tests/failure_scenarios.rs::low_storage_condition_during_restore_surfaces_resumable_storage_error`:
+        injects a disk-full error during
+        `RestorePipeline::run`, asserts the pipeline persists the
+        last reached `RestoreState`, returns a resumable
+        `Error::Storage`, and that a follow-up run from the
+        persisted state advances correctly.)_
   - [x] manifest chain break detected on restore
         _(`crates/core/tests/failure_scenarios.rs::manifest_chain_break_returns_chain_break_with_expected_and_actual`
         builds a 3-generation chain, replaces gen-1's

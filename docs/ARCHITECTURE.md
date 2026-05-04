@@ -979,6 +979,174 @@ caller's job to decrypt under the appropriate
 `K_search_root`. This keeps the transport layer ignorant of the
 shard payload format.
 
+### 6.2 Cold-shard search pipeline (Phase 5)
+
+Cold-bucket search lives behind the
+[`search::query_engine::ColdShardSource`](../crates/core/src/search/query_engine.rs)
+trait. The trait is what lets the
+[`QueryEngine`](../crates/core/src/search/query_engine.rs) fan out
+to offloaded buckets without taking a hard dependency on the
+`TransportClient` — the same code path covers production (real
+network) and tests (in-process mocks).
+
+```mermaid
+flowchart LR
+    Q["User query<br/>(SearchScope::IncludeCold)"]
+    SEG["segment_by_script<br/>(per-script fan-out)"]
+    LOCAL["Local hits<br/>(FTS5 + fuzzy +<br/>structured filters)"]
+    COLD_RES["ColdShardSource::cold_buckets<br/>→ Vec&lt;(conversation_id,<br/>time_bucket)&gt;"]
+    FETCH_T["ColdShardSource::fetch_text_rows<br/>(conversation_id, time_bucket)<br/>K_text_index_shard"]
+    FETCH_F["ColdShardSource::fetch_fuzzy_rows<br/>(conversation_id, time_bucket)<br/>K_fuzzy_index_shard"]
+    SHARD_FTS["FTS-like scoring against<br/>decrypted FtsRow set<br/>(in-memory)"]
+    SHARD_FZ["Fuzzy overlap against<br/>decrypted FuzzyRow set<br/>(per-script floor)"]
+    MARK["mark_cold_results<br/>(is_cold = true)"]
+    MERGE["Merge by message_id"]
+    RANK["apply_recency_and_kind_weight<br/>(see §6.3)"]
+    HQ["HydrationQueue<br/>(SearchResultTap, P0)"]
+    OUT["SearchResult { snippet,<br/>rank_score, is_cold }"]
+
+    Q --> SEG --> LOCAL
+    SEG --> COLD_RES
+    COLD_RES --> FETCH_T
+    COLD_RES --> FETCH_F
+    FETCH_T --> SHARD_FTS
+    FETCH_F --> SHARD_FZ
+    SHARD_FTS --> MARK
+    SHARD_FZ --> MARK
+    LOCAL --> MERGE
+    MARK --> MERGE
+    MERGE --> RANK --> OUT
+    OUT -->|"every is_cold = true hit"| HQ
+```
+
+The trait surface is intentionally narrow:
+
+```rust
+pub trait ColdShardSource {
+    fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error>;
+    fn fetch_text_rows(
+        &self,
+        conversation_id: &str,
+        time_bucket: &str,
+    ) -> Result<Vec<FtsRow>, Error>;
+    fn fetch_fuzzy_rows(
+        &self,
+        conversation_id: &str,
+        time_bucket: &str,
+    ) -> Result<Vec<FuzzyRow>, Error>;
+}
+```
+
+`cold_buckets` is allowed to consult local state (e.g. join
+`message_skeleton.body_state` against `archive_segment_map.state`)
+to enumerate offloaded `(conversation_id, time_bucket)` pairs.
+The two `fetch_*` methods perform the
+`TransportClient::fetch_index_shards` call and run the
+[`search::shard_builder::restore_text_search_shard`](../crates/core/src/search/shard_builder.rs)
+/ `restore_fuzzy_search_shard` decrypt path under the appropriate
+`K_text_index_shard` / `K_fuzzy_index_shard` (derived from
+`K_search_root`). Implementations return `Ok(Vec::new())` when no
+shard exists for the pair — that is a legitimate "no results"
+signal, not an error — so the query engine can search without
+touching the SQLCipher store.
+
+`QueryEngine::execute_search_with_cold_source` is the entry point
+the platform layer calls when `SearchScope::IncludeCold` is set.
+It runs the local fan-out first, then asks the source for cold
+buckets, decrypts each one, runs FTS5 + fuzzy against the
+in-memory shard, marks every cold hit with `is_cold = true`, and
+merges with local hits before reranking under the §6.3 formula.
+`CoreImpl::search_and_prefetch_cold` in turn enqueues every cold
+hit into the `HydrationQueue` at `HydrationReason::SearchResultTap`
+(P0) priority so the actual body / media chase the search hit on
+tap. End-to-end coverage lives at
+[`crates/core/tests/cold_shard_search.rs`](../crates/core/tests/cold_shard_search.rs).
+
+When the backend returns 404 / `Error::Transport` for a shard
+(offloaded then garbage-collected), the orchestration layer wraps
+the underlying `ColdShardSource` in a graceful-degradation
+adapter that swallows the transport error, returns an empty row
+vector to the query engine, and records the failed
+`(conversation_id, time_bucket, kind)` in a side-channel log so
+the platform layer can render a "search results may be
+incomplete" banner without losing local hits. The
+`search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`
+failure-suite test pins that contract end-to-end (see
+`GracefulCold` in
+[`crates/core/tests/failure_scenarios.rs`](../crates/core/tests/failure_scenarios.rs)).
+
+### 6.3 Ranking formula (PROPOSAL §7.5)
+
+After the local + cold candidates merge by `message_id`, the
+query engine reranks with the multiplicative formula
+
+```
+rank_score = (BM25_WEIGHT × bm25 + FUZZY_WEIGHT × fuzzy)
+           × recency_factor(age_days)
+           × content_kind_weight(kind)
+```
+
+implemented in
+[`apply_recency_and_kind_weight`](../crates/core/src/search/query_engine.rs).
+The constants live in the same module:
+
+| Constant                  | Value | Role                                                    |
+| ------------------------- | ----- | ------------------------------------------------------- |
+| `BM25_WEIGHT`             | `2.0` | Multiplier on the FTS5 BM25 score                       |
+| `FUZZY_WEIGHT`            | `1.0` | Multiplier on the fuzzy overlap score                   |
+| `RECENCY_WEIGHT`          | `0.5` | Weight on the exponential term (also `1 - W = 0.5` is the asymptotic floor) |
+| `RECENCY_HALF_LIFE_DAYS`  | `30`  | `lambda = ln(2) / 30` — 30-day half-life decay          |
+| `TEXT_KIND_WEIGHT`        | `1.0` | Text messages keep their full BM25 + fuzzy contribution |
+| `MEDIA_KIND_WEIGHT`       | `0.8` | Media is 0.8× since thumbnails / captions are coarser   |
+
+The recency decay is a linear interpolation between the
+asymptotic floor `1 - RECENCY_WEIGHT = 0.5` and an exponential
+decay with a 30-day half-life:
+
+```
+recency_factor = (1 - RECENCY_WEIGHT)
+               + RECENCY_WEIGHT × exp(-ln(2) × age_days / 30)
+```
+
+so a message authored today scores at `1.0`, a 30-day-old message
+scores at `0.75`, a 90-day-old message at ~`0.5625`, and any
+sufficiently-old message asymptotically approaches the
+`1 - RECENCY_WEIGHT = 0.5` floor rather than disappearing
+entirely. The same decay is applied to cold hits via
+`apply_cold_recency_weight`, so local-vs-cold relative ordering
+is symmetric — a cold hit on a recent message can still beat a
+local hit on an old one if the underlying BM25 / fuzzy
+contributions warrant it.
+
+In-module unit tests pin every direction of the formula:
+`ranking_recent_message_outranks_identical_old_message`,
+`ranking_exact_recent_beats_fuzzy_old`,
+`ranking_text_outranks_media_for_equal_recency`, and
+`ranking_is_deterministic_for_same_inputs`.
+
+### 6.4 Script-aware fuzzy matching
+
+`FuzzySearchEngine::search_fuzzy` (Phase 5, Task 2) groups query
+tokens by `ScriptClass`, joins
+`search_fuzzy(token, script, message_id)` on `(token, script)`,
+and applies a per-script overlap floor via
+[`search::tokenizer::fuzzy_min_overlap`](../crates/core/src/search/tokenizer.rs).
+Latin and Cyrillic trigrams use a looser threshold so typos
+like `"meetng" → "meeting"` recover; CJK bigrams use a tighter
+threshold so two-character collisions across unrelated rows
+don't fan out into noise.
+
+Critically, a row is accepted iff at least *one* script bucket
+clears its floor. That keeps mixed-script queries —
+`"meeting 会議"`, `"встреча meeting"` — fanning out to both
+indexes: a row that matches perfectly on the Latin half still
+surfaces, just with a lower overall score because the CJK
+contribution is zero. The
+[`crates/core/tests/mixed_language_query.rs`](../crates/core/tests/mixed_language_query.rs)
+suite walks through Latin × CJK, Cyrillic × Latin, pure-CJK on
+non-ICU builds via fuzzy fallback, mixed-script promotion, and
+unrelated-row exclusion.
+
 ---
 
 ## 7. Crypto Architecture

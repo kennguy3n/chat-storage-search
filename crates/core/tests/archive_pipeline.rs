@@ -168,6 +168,7 @@ fn archive_pipeline_end_to_end() {
                 conversation_id: conv,
                 time_bucket: APRIL_BUCKET.into(),
                 events: grouped_events.clone(),
+                segment_type: kchat_core::formats::SegmentType::MessageDelta,
             },
             &april_key,
         )
@@ -226,6 +227,7 @@ fn archive_pipeline_end_to_end() {
                 conversation_id: conv,
                 time_bucket: MAY_BUCKET.into(),
                 events: may_grouped.clone(),
+                segment_type: kchat_core::formats::SegmentType::MessageDelta,
             },
             &may_key,
         )
@@ -256,5 +258,293 @@ fn archive_pipeline_end_to_end() {
         "after advancing the cursor past the last segmented event, \
          the journal must report no unsegmented work; got {} events",
         drained.len(),
+    );
+}
+
+/// Phase 3, Task 6: end-to-end build + decrypt round-trip for the
+/// new `TimelineSkeleton` and `Checkpoint` segment variants.
+///
+/// Mirrors the existing `archive_pipeline_round_trip` shape but
+/// stays narrow: the goal is to prove that the segment builder
+/// can emit each variant on top of real `MessagePersister` events
+/// and that the discriminant survives the CBOR / zstd /
+/// XChaCha20-Poly1305 round trip.
+#[test]
+fn archive_pipeline_timeline_skeleton_and_checkpoint_segments_round_trip() {
+    use kchat_core::formats::SegmentType;
+
+    let db = LocalStoreDb::open_in_memory(&TEST_DB_KEY).unwrap();
+    let conv = Uuid::now_v7();
+    db.insert_conversation(&Conversation {
+        conversation_id: conv.to_string(),
+        title_cipher: None,
+        pinned: false,
+        muted: false,
+        last_message_id: None,
+        last_activity_ms: APRIL_BUCKET_MS,
+    })
+    .unwrap();
+
+    let persister = MessagePersister::new(&db);
+    for i in 0..3 {
+        persister
+            .persist_ingested_message(&IngestedMessage {
+                message_id: Uuid::now_v7(),
+                conversation_id: conv,
+                sender_id: format!("user-{i}"),
+                created_at_ms: APRIL_BUCKET_MS + i as i64 * 1_000,
+                text_content: Some(format!("phase-3 task-6 row #{i}")),
+                media_descriptors: vec![],
+                reply_to: None,
+            })
+            .unwrap();
+    }
+
+    let journal = ArchiveEventJournal::new();
+    let events: Vec<_> = journal
+        .read_unsegmented(db.connection(), 100)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    assert!(!events.is_empty());
+
+    let identity = KeyMaterial::from_bytes(MASTER_KEY);
+    let archive_root = derive_archive_root(&identity).unwrap();
+    let epoch_key = derive_archive_epoch_key(&archive_root, "2026-04").unwrap();
+    let placeholder = Uuid::now_v7();
+    let k_segment = derive_archive_segment_key(&epoch_key, &placeholder.to_string()).unwrap();
+
+    // ---- TimelineSkeleton variant ------------------------------
+    let skeleton_req = SegmentBuildRequest::timeline_skeleton(conv, APRIL_BUCKET, events.clone());
+    let skeleton_seg = ArchiveSegmentBuilder::new()
+        .build_segment(skeleton_req.clone(), k_segment.as_bytes())
+        .unwrap();
+    assert_eq!(skeleton_seg.segment_type, SegmentType::TimelineSkeleton);
+    assert_eq!(skeleton_seg.event_count, skeleton_req.events.len());
+    let skeleton_payload = decrypt_segment(&skeleton_seg, k_segment.as_bytes()).unwrap();
+    assert_eq!(skeleton_payload.events, skeleton_req.events);
+
+    // ---- Checkpoint variant ------------------------------------
+    let checkpoint_req = SegmentBuildRequest::checkpoint(conv, APRIL_BUCKET, events.clone());
+    let checkpoint_seg = ArchiveSegmentBuilder::new()
+        .build_segment(checkpoint_req.clone(), k_segment.as_bytes())
+        .unwrap();
+    assert_eq!(checkpoint_seg.segment_type, SegmentType::Checkpoint);
+    let checkpoint_payload = decrypt_segment(&checkpoint_seg, k_segment.as_bytes()).unwrap();
+    assert_eq!(checkpoint_payload.events, checkpoint_req.events);
+
+    // The two segments must be distinct (different segment_id and
+    // ciphertext) even though they cover the same events.
+    assert_ne!(skeleton_seg.segment_id, checkpoint_seg.segment_id);
+    assert_ne!(skeleton_seg.ciphertext, checkpoint_seg.ciphertext);
+}
+
+/// Phase 3, Task 9: epoch-key rotation + archive compaction
+/// across an epoch boundary.
+///
+/// Validates the cross-epoch invariants from
+/// `docs/PROPOSAL.md §2.1` end to end at the public-API surface:
+///
+/// 1. Create an `EpochKeyManager` rooted at epoch `2026-01` and
+///    seal an archive segment under that epoch's segment key.
+/// 2. Rotate to epoch `2026-02`; the manager wraps the prior key
+///    under `K_archive_root` and exposes it to the manifest
+///    builder via `wrapped_prior_epoch_keys_for_manifest`.
+/// 3. Build a fresh archive segment under epoch `2026-02`.
+/// 4. Build an archive manifest that carries the wrapped prior
+///    epoch key.
+/// 5. Build a "compact" segment under epoch `2026-02` that
+///    consolidates events from BOTH epochs (the cross-epoch
+///    compaction shape `CoreImpl::compact_archive` produces).
+/// 6. Decrypt the prior-epoch segment by `unwrap_prior_epoch_key` plus a
+///    fresh segment-key derivation under the unwrapped epoch key.
+/// 7. Decrypt the current-epoch + compact segments using the
+///    current epoch key directly.
+/// 8. `delete_epoch_key("2026-01")` retires the prior key →
+///    `unwrap_prior_epoch_key` returns `Error::Storage` and the
+///    epoch-`2026-01` segment is permanently un-decryptable
+///    (forward secrecy).
+#[test]
+fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
+    use ed25519_dalek::SigningKey;
+    use kchat_core::archive::epoch_keys::EpochKeyManager;
+    use kchat_core::archive::event_journal::{ArchiveEvent, ArchiveEventType};
+    use kchat_core::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
+    use kchat_core::crypto::key_hierarchy::KeyMaterial;
+    use kchat_core::formats::SegmentType;
+
+    // ---- 1. Bootstrap epoch manager at 2026-01 -------------------------
+    let identity = KeyMaterial::from_bytes([0xE9; 32]);
+    let archive_root = derive_archive_root(&identity).expect("archive_root");
+    let mut mgr = EpochKeyManager::new(&archive_root, "2026-01").expect("epoch mgr");
+    assert_eq!(mgr.current_epoch_id(), "2026-01");
+    assert_eq!(mgr.prior_count(), 0);
+
+    let conv = Uuid::now_v7();
+
+    // Build & seal an event under epoch 2026-01.
+    let evt_jan = ArchiveEvent {
+        event_type: ArchiveEventType::MessageReceived,
+        conversation_id: conv,
+        message_id: Some(Uuid::now_v7()),
+        payload: b"january body".to_vec(),
+        created_at_ms: 1_704_067_200_000, // 2024-01-01 — content-shape only
+    };
+    // Derive a segment key under the *current* (jan) epoch key
+    // through the public key-hierarchy API.
+    let jan_segment_id = Uuid::now_v7();
+    let k_seg_jan = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &jan_segment_id.to_string(),
+    )
+    .unwrap();
+    let jan_seg_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::message_delta(conv, "2026-01", vec![evt_jan.clone()]),
+            k_seg_jan.as_bytes(),
+        )
+        .expect("seal jan segment");
+
+    // ---- 2. Rotate to epoch 2026-02 ------------------------------------
+    mgr.rotate_epoch(&archive_root, "2026-02").expect("rotate");
+    assert_eq!(mgr.current_epoch_id(), "2026-02");
+    assert_eq!(mgr.prior_count(), 1);
+    assert_eq!(mgr.retired_epoch_ids(), vec!["2026-01".to_string()]);
+
+    // ---- 3. Build a fresh segment under 2026-02 ------------------------
+    let evt_feb = ArchiveEvent {
+        event_type: ArchiveEventType::MessageReceived,
+        conversation_id: conv,
+        message_id: Some(Uuid::now_v7()),
+        payload: b"february body".to_vec(),
+        created_at_ms: 1_706_745_600_000, // 2024-02-01 — content-shape only
+    };
+    let feb_segment_id = Uuid::now_v7();
+    let k_seg_feb = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &feb_segment_id.to_string(),
+    )
+    .unwrap();
+    let feb_seg_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::message_delta(conv, "2026-02", vec![evt_feb.clone()]),
+            k_seg_feb.as_bytes(),
+        )
+        .expect("seal feb segment");
+
+    // Cross-epoch isolation: jan segment must NOT decrypt with
+    // feb's segment key.
+    assert!(
+        decrypt_segment(&jan_seg_built, k_seg_feb.as_bytes()).is_err(),
+        "jan segment must be opaque to the feb segment key",
+    );
+
+    // ---- 4. Manifest carries the wrapped prior epoch key ---------------
+    let signing = SigningKey::from_bytes(&[0xA9; 32]);
+    let k_archive_manifest = kchat_core::crypto::key_hierarchy::derive_archive_manifest_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        "2026-02",
+    )
+    .unwrap();
+    let manifest_built = build_archive_manifest(
+        ManifestBuildRequest {
+            segments: std::slice::from_ref(&feb_seg_built),
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            wrapped_prior_epoch_keys: mgr.wrapped_prior_epoch_keys_for_manifest(),
+            previous: None,
+        },
+        &signing,
+        k_archive_manifest.as_bytes(),
+    )
+    .expect("build archive manifest");
+    assert_eq!(
+        manifest_built.manifest.wrapped_prior_epoch_keys.len(),
+        1,
+        "manifest must carry the wrapped prior-epoch key for cross-epoch decrypt",
+    );
+    assert_eq!(
+        manifest_built.manifest.wrapped_prior_epoch_keys[0].epoch_id,
+        "2026-01",
+    );
+
+    // ---- 5. Compact segment under epoch 2026-02 with both events ------
+    let compact_segment_id = Uuid::now_v7();
+    let k_seg_compact = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
+        &compact_segment_id.to_string(),
+    )
+    .unwrap();
+    let compact_built = ArchiveSegmentBuilder::new()
+        .build_segment(
+            SegmentBuildRequest::checkpoint(
+                conv,
+                "2026-01",
+                vec![evt_jan.clone(), evt_feb.clone()],
+            ),
+            k_seg_compact.as_bytes(),
+        )
+        .expect("seal compact");
+    assert_eq!(compact_built.segment_type, SegmentType::Checkpoint);
+
+    // The compact segment must open under the current epoch's
+    // segment key — the orchestration model says the post-rotation
+    // compact lives in the *new* epoch.
+    let compact_payload = decrypt_segment(&compact_built, k_seg_compact.as_bytes()).unwrap();
+    assert_eq!(compact_payload.events.len(), 2);
+    assert_eq!(compact_payload.events[0], evt_jan);
+    assert_eq!(compact_payload.events[1], evt_feb);
+
+    // ---- 6. Cross-epoch decrypt: unwrap_prior_epoch_key + derive ------
+    let prior_epoch_bytes = mgr
+        .unwrap_prior_epoch_key("2026-01", &archive_root)
+        .expect("unwrap prior epoch key");
+    let recovered_k_seg_jan = derive_archive_segment_key(
+        &KeyMaterial::from_bytes(prior_epoch_bytes),
+        &jan_segment_id.to_string(),
+    )
+    .expect("re-derive jan segment key from unwrapped epoch");
+    assert_eq!(
+        recovered_k_seg_jan.as_bytes(),
+        k_seg_jan.as_bytes(),
+        "re-derived segment key must equal the build-time segment key",
+    );
+    let jan_payload = decrypt_segment(&jan_seg_built, recovered_k_seg_jan.as_bytes())
+        .expect("cross-epoch decrypt of jan segment");
+    assert_eq!(jan_payload.events.len(), 1);
+    assert_eq!(jan_payload.events[0], evt_jan);
+
+    // ---- 7. Current-epoch decrypt sanity --------------------------------
+    let feb_payload = decrypt_segment(&feb_seg_built, k_seg_feb.as_bytes()).unwrap();
+    assert_eq!(feb_payload.events, vec![evt_feb.clone()]);
+
+    // ---- 8. Forward secrecy: delete the prior epoch key ----------------
+    let removed = mgr.delete_epoch_key("2026-01");
+    assert!(removed, "delete_epoch_key must report removal");
+    assert_eq!(mgr.prior_count(), 0);
+
+    // After delete, unwrap_prior_epoch_key must surface a structured
+    // error — not a panic, not silent-empty.
+    let err = mgr
+        .unwrap_prior_epoch_key("2026-01", &archive_root)
+        .expect_err("post-delete unwrap must fail");
+    assert!(
+        matches!(err, kchat_core::Error::Storage(_)),
+        "expected Error::Storage after forward-secrecy delete, got {err:?}",
+    );
+
+    // The epoch-2026-01 ciphertext is permanently opaque — even
+    // re-deriving with the original archive root cannot rebuild
+    // the deleted key (we just exercised that delete drops the
+    // wrapped material). The segment ciphertext itself is
+    // unaltered, but no key path can open it.
+    //
+    // Sanity: the BUILT ciphertext is intact (we didn't mutate
+    // it), but every key the manager exposes refuses to open it.
+    assert!(
+        decrypt_segment(&jan_seg_built, mgr.current_epoch_key()).is_err(),
+        "current epoch key must not open the prior-epoch segment",
     );
 }

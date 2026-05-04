@@ -58,6 +58,74 @@ pub struct SegmentBuildRequest {
     /// re-sort the events: the journal already returns them in
     /// `event_seq` order.
     pub events: Vec<ArchiveEvent>,
+    /// Discriminant for the encrypted payload. Must be an
+    /// archive-segment-type variant (i.e.
+    /// [`SegmentType::is_archive_segment`] returns true). Defaults
+    /// to [`SegmentType::MessageDelta`] for backwards compatibility
+    /// with the Phase 3 / Task 6 builder which only emitted
+    /// delta-style segments.
+    ///
+    /// Phase 3, Task 6 (this file) extends the builder with two
+    /// additional payload shapes that share the same CBOR / zstd
+    /// / XChaCha20-Poly1305 pipeline:
+    ///
+    /// * [`SegmentType::TimelineSkeleton`] — events that landed
+    ///   only the skeleton row (no body), used by the scroll-back
+    ///   rehydration path.
+    /// * [`SegmentType::Checkpoint`] — a full-state snapshot of
+    ///   the conversation at a point in time, used as a
+    ///   compaction target.
+    pub segment_type: SegmentType,
+}
+
+impl SegmentBuildRequest {
+    /// Construct a delta-style request — the historical default
+    /// shape. Equivalent to setting
+    /// `segment_type = SegmentType::MessageDelta` explicitly.
+    pub fn message_delta(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::MessageDelta,
+        }
+    }
+
+    /// Construct a [`SegmentType::TimelineSkeleton`] request.
+    /// `events` must be skeleton-only (the orchestration layer
+    /// filters bodies out before calling).
+    pub fn timeline_skeleton(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::TimelineSkeleton,
+        }
+    }
+
+    /// Construct a [`SegmentType::Checkpoint`] request — a
+    /// full-state snapshot. The orchestration layer collapses all
+    /// prior deltas into the supplied event list.
+    pub fn checkpoint(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::Checkpoint,
+        }
+    }
 }
 
 /// Output of [`ArchiveSegmentBuilder::build_segment`]: a sealed,
@@ -71,11 +139,12 @@ pub struct BuiltSegment {
     pub conversation_id: Uuid,
     /// Time bucket the request supplied.
     pub time_bucket: String,
-    /// Always [`SegmentType::MessageDelta`] today (events bucketed
-    /// per-conversation are delta-style by definition). Reserved
-    /// for the orchestration layer to pick a different
-    /// `SegmentType` for skeletons / search indexes / media-key
-    /// deltas.
+    /// Variant of [`SegmentType`] this segment encodes.
+    /// Propagated verbatim from
+    /// [`SegmentBuildRequest::segment_type`] so callers can
+    /// inspect the variant without re-decrypting the payload.
+    /// Possible values today: [`SegmentType::MessageDelta`],
+    /// [`SegmentType::TimelineSkeleton`], [`SegmentType::Checkpoint`].
     pub segment_type: SegmentType,
     /// 24-byte XChaCha20-Poly1305 nonce sealing `ciphertext`.
     pub nonce: [u8; NONCE_LEN],
@@ -161,6 +230,15 @@ impl ArchiveSegmentBuilder {
                 "ArchiveSegmentBuilder::build_segment: empty events list".into(),
             ));
         }
+        // Reject backup-only variants up front — the
+        // archive segment frame can only carry the seven
+        // archive payload variants from `docs/PROPOSAL.md §5.1`.
+        if !request.segment_type.is_archive_segment() {
+            return Err(Error::Storage(format!(
+                "ArchiveSegmentBuilder::build_segment: {:?} is not an archive segment type",
+                request.segment_type,
+            )));
+        }
 
         // 1) CBOR-encode the payload.
         let payload = ArchiveSegmentPayload {
@@ -197,7 +275,7 @@ impl ArchiveSegmentBuilder {
             segment_id,
             conversation_id: request.conversation_id,
             time_bucket: request.time_bucket,
-            segment_type: SegmentType::MessageDelta,
+            segment_type: request.segment_type,
             nonce,
             ciphertext,
             merkle_root,
@@ -289,6 +367,7 @@ mod tests {
             conversation_id: conv,
             time_bucket: "2026-04".into(),
             events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::MessageDelta,
         };
         let k = [0x33; 32];
         let built = ArchiveSegmentBuilder::new()
@@ -312,6 +391,7 @@ mod tests {
                 event_at(conv, 2, ArchiveEventType::MessageEdited),
                 event_at(conv, 3, ArchiveEventType::MediaReceived),
             ],
+            segment_type: SegmentType::MessageDelta,
         };
         let k = [0x77; 32];
         let built = ArchiveSegmentBuilder::new()
@@ -347,6 +427,7 @@ mod tests {
             conversation_id: Uuid::now_v7(),
             time_bucket: "2026-04".into(),
             events: Vec::new(),
+            segment_type: SegmentType::MessageDelta,
         };
         let err = ArchiveSegmentBuilder::new()
             .build_segment(req, &[0; 32])
@@ -361,6 +442,7 @@ mod tests {
             conversation_id: conv,
             time_bucket: "2026-06".into(),
             events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::MessageDelta,
         };
         let k1 = [0x11; 32];
         let k2 = [0x22; 32];
@@ -384,5 +466,92 @@ mod tests {
         assert!(bucket.starts_with("20"), "got {bucket}");
         assert_eq!(bucket.len(), 7);
         assert_eq!(&bucket[4..5], "-");
+    }
+
+    // -----------------------------------------------------------
+    // Phase 3, Task 6 — TimelineSkeleton + Checkpoint variants
+    // -----------------------------------------------------------
+
+    #[test]
+    fn timeline_skeleton_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::timeline_skeleton(
+            conv,
+            "2026-04",
+            vec![
+                event_at(conv, 1, ArchiveEventType::MessageReceived),
+                event_at(conv, 2, ArchiveEventType::MessageReceived),
+            ],
+        );
+        let k = [0x55; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::TimelineSkeleton);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+        assert_eq!(payload.conversation_id, conv.to_string());
+    }
+
+    #[test]
+    fn checkpoint_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::checkpoint(
+            conv,
+            "2026-05",
+            vec![
+                event_at(conv, 1, ArchiveEventType::MessageReceived),
+                event_at(conv, 2, ArchiveEventType::MessageEdited),
+                event_at(conv, 3, ArchiveEventType::MediaReceived),
+            ],
+        );
+        let k = [0x66; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::Checkpoint);
+        assert_eq!(built.event_count, 3);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+    }
+
+    #[test]
+    fn segment_type_is_preserved_through_cbor_round_trip() {
+        // Each archive variant must round-trip its discriminant
+        // through the build → decrypt cycle.
+        let conv = Uuid::now_v7();
+        for variant in [
+            SegmentType::MessageDelta,
+            SegmentType::TimelineSkeleton,
+            SegmentType::Checkpoint,
+        ] {
+            let req = SegmentBuildRequest {
+                conversation_id: conv,
+                time_bucket: "2026-07".into(),
+                events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+                segment_type: variant,
+            };
+            let k = [0x91; 32];
+            let built = ArchiveSegmentBuilder::new().build_segment(req, &k).unwrap();
+            assert_eq!(built.segment_type, variant, "variant must round-trip");
+        }
+    }
+
+    #[test]
+    fn build_segment_rejects_backup_only_variant() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest {
+            conversation_id: conv,
+            time_bucket: "2026-04".into(),
+            events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+            segment_type: SegmentType::Events, // backup-only
+        };
+        let err = ArchiveSegmentBuilder::new()
+            .build_segment(req, &[0; 32])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an archive segment type"),
+            "got {err}",
+        );
     }
 }
