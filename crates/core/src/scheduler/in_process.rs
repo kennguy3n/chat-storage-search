@@ -259,13 +259,28 @@ impl InProcessScheduler {
             *q = deferred;
             ready
         };
-        let count = drained.len();
-        if let Some(h) = handler {
-            for (task, constraints) in &drained {
-                // Errors from one task don't poison the rest of
-                // the drain.
-                let _ = h(task, constraints);
+        let Some(h) = handler else {
+            // No handler installed yet — push the drained tasks
+            // back onto the queue so they're retried after a
+            // handler arrives. Returning `Ok(0)` keeps the
+            // documented "number of tasks executed" contract
+            // honest.
+            if !drained.is_empty() {
+                let mut q = self
+                    .one_offs
+                    .lock()
+                    .map_err(|_| Error::Storage("scheduler mutex poisoned".into()))?;
+                for entry in drained {
+                    q.push(entry);
+                }
             }
+            return Ok(0);
+        };
+        let count = drained.len();
+        for (task, constraints) in &drained {
+            // Errors from one task don't poison the rest of
+            // the drain.
+            let _ = h(task, constraints);
         }
         Ok(count)
     }
@@ -754,6 +769,41 @@ mod tests {
         let n = s.run_pending_one_off_tasks(&probe).unwrap();
         assert_eq!(n, 0);
         assert_eq!(s.pending_one_off_count(), 1);
+    }
+
+    #[test]
+    fn run_pending_one_off_tasks_re_enqueues_when_no_handler_installed() {
+        // Regression for the silent-task-loss bug spotted by
+        // Devin Review: draining constraint-satisfied tasks
+        // before checking for a handler used to drop them
+        // permanently. The expected behaviour is that the
+        // tasks stay queued and fire when a handler arrives.
+        let s = InProcessScheduler::new();
+        s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
+            .unwrap();
+        assert_eq!(s.pending_one_off_count(), 1);
+
+        // First run with no handler installed: nothing executed,
+        // task remains queued.
+        let n = s
+            .run_pending_one_off_tasks(&StaticResourceProbe::all_available())
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(s.pending_one_off_count(), 1);
+
+        // Install a handler; the task now drains and executes.
+        let runs = Arc::new(AtomicU32::new(0));
+        let r = Arc::clone(&runs);
+        s.set_one_off_handler(move |_t, _c| {
+            r.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let n = s
+            .run_pending_one_off_tasks(&StaticResourceProbe::all_available())
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(s.pending_one_off_count(), 0);
     }
 
     #[test]

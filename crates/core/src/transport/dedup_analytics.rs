@@ -287,12 +287,18 @@ impl DedupAnalytics for FixedDedupAnalytics {
 /// `ZkofDedupAnalytics` that talks to the live ContentIndex; the
 /// in-process probe is the production fallback when the
 /// ContentIndex is unreachable.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InProcessDedupAnalytics {
     inner: std::sync::Mutex<InProcessState>,
     /// Maximum number of recent events retained in the ring
     /// buffer. Defaults to 512.
     pub recent_capacity: usize,
+}
+
+impl Default for InProcessDedupAnalytics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -613,6 +619,27 @@ mod tests {
         let savings = probe.query_storage_savings("tenant-1").unwrap();
         assert_eq!(savings.bytes_saved, 100);
         assert_eq!(savings.objects_deduped, 1);
+    }
+
+    /// Regression for the BUG-0002 finding: `Default::default()`
+    /// must produce the same recent-buffer behaviour as `new()`
+    /// (capacity 512), not the broken `recent_capacity: 0` that
+    /// the auto-derived `Default` produced.
+    #[test]
+    fn in_process_dedup_analytics_default_matches_new_capacity() {
+        let probe = InProcessDedupAnalytics::default();
+        assert_eq!(probe.recent_capacity, 512);
+        // Record more than the (broken) capacity-0 ring would
+        // hold but well under 512: every event must be retained.
+        for size in 0u64..16 {
+            probe
+                .record_event(DedupEvent::ObjectUploaded {
+                    size_bytes: size,
+                    was_deduped: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(probe.recent_events().len(), 16);
     }
 
     #[test]
