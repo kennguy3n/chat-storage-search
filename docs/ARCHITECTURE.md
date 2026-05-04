@@ -930,7 +930,7 @@ flowchart TD
         STRUCT["Structured index<br/>(sender, date, conversation)"]
         ECACHE["Embedding cache check<br/>(search_vector,<br/>(message_id, model_version))"]
         EMB["TextEmbedder.embed<br/>(XLM-R, query string)"]
-        SEM["SemanticSearchEngine<br/>(brute-force cosine over<br/>search_vector rows;<br/>HNSW upgrade is a follow-up)"]
+        SEM["SemanticSearchEngine<br/>(brute-force cosine for<br/>&lt; 1k vectors,<br/>HNSW ANN graph for &gt;= 1k<br/>via instant-distance + HnswIndexCache)"]
     end
 
     Cold["Cold bucket?<br/>fetch encrypted shard<br/>by coarse bucket"]
@@ -964,10 +964,14 @@ string flows through `QueryEngine::execute_search_with_semantic`
 which:
 1. runs the existing FTS5 + fuzzy fan-out;
 2. if a `TextEmbedder` is installed, embeds the query and runs
-   `SemanticSearchEngine::search_semantic` (brute-force cosine
-   over the bounded per-conversation `search_vector` corpus —
-   the HNSW upgrade is held in reserve for the corpus size where
-   brute-force becomes unappealing);
+   `SemanticSearchEngine::search_semantic_auto` which selects
+   between the brute-force path (`search_semantic`) and the
+   `instant-distance` HNSW ANN path
+   (`search_semantic_with_hnsw`) based on
+   `HNSW_FALLBACK_THRESHOLD = 1000` rows; built indexes are
+   cached per `(conversation_id, model_version)` slot through
+   `HnswIndexCache` and invalidated on insert via
+   `HnswIndexCache::invalidate`;
 3. merges semantic hits into the candidate set, summing
    contributions for rows that hit both surfaces, and stamps
    `SearchResult.semantic_score: Option<f64>` with the **raw
@@ -2192,10 +2196,18 @@ out of the hot path: a guardrail-pipeline write on the same
 `(message_id, "xlmr@v1")` key is read straight back by the
 search pipeline without re-embedding.
 
-The HNSW upgrade is held in reserve for the corpus size where
-brute-force cosine becomes unappealing — Phase 6 ships
-brute-force because the per-conversation `search_vector`
-population is bounded.
+The HNSW upgrade lands in batch-5 (2026-05-04). Brute-force
+cosine remains the implementation for slots smaller than
+`HNSW_FALLBACK_THRESHOLD = 1000` rows where it is still cheaper
+than building an ANN graph; for larger slots
+`SemanticSearchEngine::search_semantic_auto` builds an
+`instant-distance` HNSW graph lazily on the first query and
+caches it in `HnswIndexCache` keyed by
+`(conversation_id, model_version)`. Inserts call
+`HnswIndexCache::invalidate(slot)` so the next query rebuilds
+the graph. The HNSW path returns `Vec<SemanticHit>` with the
+same `cosine_similarity` shape as the brute-force path, so the
+public API contract is unchanged.
 
 ### 11.9 ML seams (continued): `WhisperTranscriber` / `DocumentExtractor` / `VideoKeyframeSampler`
 
@@ -2309,6 +2321,89 @@ runtime-policy surface. Both follow the §11.5 contract
   + freed bytes + evicted count. Every code path — success,
   error, offline / no-pressure short-circuit — closes the
   trace before returning.
+
+### 11.12 Phase-7 batch-5 seams: `ExecutionProviderSelector`, `InProcessScheduler`, `MediaMigration`, `DedupAnalytics`, desktop crate
+
+The 2026-05-04 batch-5 push lands four additional Phase-7
+seams on `CoreImpl` plus a platform-agnostic `crates/desktop`
+trait scaffold. All four follow the §11.5 contract
+(`Send + Sync + Debug`, object-safe where appropriate,
+`install_*` / `has_*` on `CoreImpl`).
+
+* `models::ep_tuning::ExecutionProviderSelector` — pure-data
+  EP-selection state machine. `select_ep(platform,
+  device_capabilities) -> ExecutionProvider` returns the
+  preferred EP for `(macOS, iOS) → CoreMl`,
+  `Android → Nnapi`, `Windows + GPU → DirectMl`,
+  `Linux → Cpu`, with an explicit CPU fallback for every
+  platform. `EpBenchmark { ep, latency_ms, batch_size }` lets
+  the selector record runtime measurements so future selection
+  can lean on observed performance. The `DesktopMlEpSelector`
+  in `crates/desktop/src/ml_ep.rs` forwards to this selector
+  with the desktop platform pinned.
+* `scheduler::in_process::InProcessScheduler` — Rust-native
+  scheduler that runs scheduled tasks on a background thread
+  pool implementing the `BackgroundScheduler` trait. Public
+  surface: `schedule_backup`, `schedule_archive_compaction`,
+  `schedule_index_maintenance`,
+  `schedule_media_cache_eviction`, `cancel_all`,
+  `is_task_pending(task_type)`. Task deduplication ensures the
+  same task type is never scheduled twice. `Drop` cancels
+  every pending task, so a graceful shutdown leaks no
+  background work.
+* `media::migration::{MediaMigrationPlan, MediaMigrationItem,
+  MigrationProgress, plan_media_migration,
+  execute_media_migration}` — cross-platform media-blob
+  migration. `plan_media_migration(db, source_sink,
+  target_sink)` reads `media_asset` rows where
+  `storage_sink = source_sink` into a plan; the executor
+  fetches each chunk from the source sink, uploads to the
+  target sink, verifies the BLAKE3 transit hash, and rewrites
+  `media_asset.storage_sink` plus `MediaDescriptor.storage_sink`
+  in a single SAVEPOINT. Optional `delete_source_after_success`
+  drains the source sink in idempotent re-runs. The
+  `MigrationProgress` callback trait reports per-item /
+  per-byte progress to UI surfaces. Wired into `CoreImpl`
+  via `plan_media_migration` / `migrate_media_sink`.
+* `transport::dedup_analytics::DedupAnalytics` — read-only
+  telemetry trait surfaced over the ZK Object Fabric
+  ContentIndex.
+  `query_dedup_ratio(tenant_id) -> Result<DedupStats>` returns
+  `DedupStats { total_objects, unique_objects,
+  dedup_ratio_percent, total_bytes, unique_bytes }`;
+  `query_storage_savings(tenant_id) -> Result<StorageSavings>`
+  returns `StorageSavings { bytes_saved, objects_deduped,
+  last_updated_ms }`. `NoopDedupAnalytics` returns
+  `Error::NotImplemented("dedup_analytics")`;
+  `FixedDedupAnalytics` is the unit-test test double. Privacy
+  contract: only opaque ciphertext-side metrics cross the
+  boundary — never plaintext, never derived plaintext such as
+  tokens or embeddings. Wired into `CoreImpl` via
+  `install_dedup_analytics` / `query_dedup_stats` /
+  `query_storage_savings`.
+
+The `crates/desktop/` crate gains a platform-agnostic batch-5
+trait scaffold alongside the existing
+`#[cfg(target_os = …)]`-gated `macos.rs` / `windows.rs`
+modules:
+
+* `crates/desktop/src/spotlight.rs` — `SpotlightAnchor` trait
+  + `NoopSpotlightAnchor`. Object-safe `Send + Sync + Debug`
+  surface for index / deindex / search-anchor calls into
+  Spotlight on macOS.
+* `crates/desktop/src/windows_search.rs` —
+  `WindowsSearchAnchor` trait + `NoopWindowsSearchAnchor`.
+  Mirrors the Spotlight surface for the Windows Search
+  protocol handler.
+* `crates/desktop/src/background.rs` — `DesktopScheduler`
+  trait + `NoopDesktopScheduler` implementing the
+  `BackgroundScheduler` trait from
+  `crates/core/src/scheduler/mod.rs` so the desktop bridge
+  can plug straight into `CoreImpl::install_scheduler`.
+* `crates/desktop/src/ml_ep.rs` — `DesktopMlEpSelector` that
+  forwards to `kchat_core::models::ep_tuning::ExecutionProviderSelector`
+  with the desktop platform pinned, plus a `DirectMl`
+  vs `CoreMl` vs `Cpu` fallback ladder.
 
 ---
 

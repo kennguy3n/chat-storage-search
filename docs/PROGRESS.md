@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~80%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~45%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~25%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~85%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + HNSW ANN upgrade with `instant-distance` + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~65%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore + 100k message + 10k media + archive compaction + concurrent-operations scaffolds + media-blob sink stress test + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract — `desktop` crate scaffold (`SpotlightAnchor`, `WindowsSearchAnchor`, `DesktopScheduler`, `DesktopMlEpSelector`) + `ExecutionProviderSelector` + `InProcessScheduler` + `DedupAnalytics` read-only telemetry + cross-platform media migration (`MediaMigrationPlan`, `migrate_media_sink`)). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~25%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1548,10 +1548,18 @@ Checklist:
       `core_impl::tests::ingest_messages_writes_text_embedding_when_embedder_installed`.)_
 - [x] HNSW vector index for semantic text search.
       _(Brute-force cosine over the bounded per-conversation
-      `search_vector` corpus is the bring-up implementation,
-      `crates/core/src/search/semantic_search.rs`; HNSW upgrade
-      is queued for the corpus-size follow-up. Tests:
-      `search::semantic_search::tests::*`.)_
+      `search_vector` corpus is the bring-up implementation
+      and remains the fallback below
+      `HNSW_FALLBACK_THRESHOLD = 1000` rows. **2026-05-04
+      batch-5**: `instant-distance` HNSW ANN graph builds
+      lazily via `HnswIndex::build` and caches per
+      `(conversation_id, model_version)` slot through
+      `HnswIndexCache`. `SemanticSearchEngine::search_semantic_auto`
+      auto-selects the path. Tests:
+      `search::semantic_search::tests::*` (10 unit tests
+      covering brute-force vs HNSW top-k overlap, cache
+      invalidation, empty-corpus handling, threshold
+      fallback).)_
 - [x] `MobileCLIP-S2` image / video embeddings (~80 MB INT8 ONNX).
       _(Inference seam: `ImageEmbedder` trait, `NoopImageEmbedder`,
       `MockImageEmbedder` in `crates/core/src/models/clip.rs`;
@@ -1768,10 +1776,25 @@ explicit failure-test matrix.
 
 Checklist:
 
-- [ ] macOS native integration (Spotlight anchors;
+- [~] macOS native integration (Spotlight anchors;
       `NSBackgroundActivityScheduler`).
-- [ ] Windows native integration (Windows Search anchors; CPU-only
+      _(2026-05-04 batch-5: trait scaffold lands in
+      `crates/desktop/src/spotlight.rs` (`SpotlightAnchor` +
+      `NoopSpotlightAnchor`) and
+      `crates/desktop/src/background.rs` (`DesktopScheduler` +
+      `NoopDesktopScheduler` implementing the
+      `BackgroundScheduler` trait from
+      `crates/core/src/scheduler/mod.rs`). Native ObjC bridge
+      attach is the platform-bridge follow-up.)_
+- [~] Windows native integration (Windows Search anchors; CPU-only
       ML; no GPU assumption).
+      _(2026-05-04 batch-5: trait scaffold lands in
+      `crates/desktop/src/windows_search.rs`
+      (`WindowsSearchAnchor` + `NoopWindowsSearchAnchor`) and
+      `crates/desktop/src/ml_ep.rs`
+      (`DesktopMlEpSelector` + DirectML / CPU fallback wiring).
+      Native Win32 bridge attach is the platform-bridge
+      follow-up.)_
 - [~] Performance profiling and optimization.
       _(Lightweight in-tree instrumentation scaffold:
       `PerfTrace`, `PerfCollector` trait, `NoopPerfCollector`,
@@ -1785,20 +1808,44 @@ Checklist:
       follow-up. Tests: `perf::tests::*`,
       `core_impl::tests::perf_collector_records_*`.)_
 - [~] Large-scale testing (100K+ messages, 10K+ media, 10+ scripts).
-      _(Scaffold: `crates/core/tests/large_scale.rs` with three
+      _(Scaffold: `crates/core/tests/large_scale.rs` with seven
       `#[ignore]` stress tests — 10k multilingual ingest +
       FTS5 / fuzzy / QueryEngine round-trip across 12 scripts
       (en / ru / zh / ja / ar / th / hi / ko / vi / de / fr /
       mixed-script); 5k media-asset eviction at Critical
       pressure; 1k message backup → manifest-chain → restore
-      round-trip with full-recency hydration. Run with
-      `cargo test --test large_scale -- --ignored`. The 100k+
-      message and 10k+ media full-matrix run is queued for the
-      device-matrix follow-up.)_
-- [ ] Platform-specific ML EP tuning (CoreML, NNAPI, optional
+      round-trip with full-recency hydration; **2026-05-04
+      batch-5 expansions**: 100k message ingest + FTS5 / fuzzy /
+      QueryEngine search; 10k media-asset round-trip across
+      mixed MIME types and 4 sinks; 50k message ingest stress
+      across 100 conversations; concurrent writer / reader /
+      eviction stress. Run with
+      `cargo test --test large_scale -- --ignored`.)_
+- [~] Platform-specific ML EP tuning (CoreML, NNAPI, optional
       DirectML).
-- [ ] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
+      _(2026-05-04 batch-5: scaffold in
+      `crates/core/src/models/ep_tuning.rs` —
+      `ExecutionProviderSelector`, `ExecutionProvider` enum
+      (`CoreMl`, `Nnapi`, `DirectMl`, `Cpu`,
+      `MetalPerformanceShaders`), `DeviceCapabilities`,
+      `EpBenchmark`. Selection logic per
+      `ARCHITECTURE.md §11.4`: macOS / iOS → CoreML, Android →
+      NNAPI, Windows + GPU → DirectML, Linux → CPU. The
+      `DesktopMlEpSelector` in `crates/desktop/src/ml_ep.rs`
+      forwards to the core selector with the desktop platform
+      pinned. Real on-device benchmark capture and the
+      production EP-router upgrade are the follow-up.)_
+- [~] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
       `metadata/content_index` (read-only, no plaintext leaks).
+      _(2026-05-04 batch-5: trait + Noop / Fixed test doubles
+      land in `crates/core/src/transport/dedup_analytics.rs`
+      (`DedupAnalytics` trait, `DedupStats`, `StorageSavings`,
+      `NoopDedupAnalytics`, `FixedDedupAnalytics`). Wired
+      through `CoreImpl::install_dedup_analytics` /
+      `query_dedup_stats` / `query_storage_savings`. Privacy
+      contract: only opaque ciphertext-side metrics
+      cross the boundary; never plaintext or derived
+      plaintext.)_
 - [~] Edge-case handling (offline, interrupted, partial, corrupted,
       missing).
       _(Offline path: `OfflineDetector` trait,
@@ -1827,11 +1874,35 @@ Checklist:
       SAVEPOINT-transitions every superseded row to
       `archive_compacted`. Cross-epoch coverage at
       `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)
-- [ ] Cross-platform media migration: iOS → Android migrates
+- [~] Cross-platform media migration: iOS → Android migrates
       iCloud media blobs to Google Drive (or ZKOF fallback) in the
       background.
-- [ ] Media blob sink stress test: 10K+ media files across mixed
+      _(2026-05-04 batch-5: in-tree pipeline lands in
+      `crates/core/src/media/migration.rs` —
+      `MediaMigrationPlan`, `MediaMigrationItem`,
+      `plan_media_migration`, `execute_media_migration`,
+      `MigrationProgress` callback trait,
+      `NoopMigrationProgress` /
+      `InMemoryMigrationProgress` test doubles, and the
+      idempotent re-run / BLAKE3 transit-hash verification
+      paths. Wired through
+      `CoreImpl::plan_media_migration` /
+      `migrate_media_sink`. Tests:
+      `crates/core/src/media/migration.rs::tests::*` (8) and
+      `crates/core/tests/media_migration.rs` (5
+      integration tests). Background-scheduling integration is
+      the platform-bridge follow-up.)_
+- [~] Media blob sink stress test: 10K+ media files across mixed
       sinks, verify rehydration from each.
+      _(2026-05-04 batch-5: `#[ignore]`-marked stress test in
+      `crates/core/tests/media_sink_stress.rs` seeds 10 000
+      assets split 40 / 20 / 20 / 20 across `kchat_backend`,
+      `icloud`, `google_drive`, `zk_object_fabric`, asserts
+      `media_asset.storage_sink` round-trips for every sink
+      type, samples chunk-fetch round-trips, and exercises the
+      migration executor at scale by draining iCloud into
+      Google Drive. Run with
+      `cargo test --test media_sink_stress -- --ignored`.)_
 - [x] **Failure test suite**, 8 of 8 passing
       (`crates/core/tests/failure_scenarios.rs`):
       - [x] chunk upload interrupted
@@ -1918,6 +1989,225 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 ---
 
 ## Changelog
+
+### 2026-05-04 — Phase 3 / 6 / 7 / 8 batch 5 (this PR)
+
+Builds on the prior 2026-05-04 batches. Lands the ten tasks
+itemised in the Phase 3 / 6 / 7 / 8 plan in one push:
+
+1. **Archive segment builder coverage.**
+   `crates/core/src/archive/segment_builder.rs` gains four new
+   constructors covering the remaining segment types in
+   `docs/PHASES.md` Phase 3:
+   `media_key_delta`, `search_text_index`,
+   `search_vector_index`, `media_index`. Each runs the same
+   `CBOR → zstd → XChaCha20-Poly1305` pipeline. New
+   round-trip tests + non-archive rejection tests live in
+   `crates/core/tests/archive_pipeline.rs`. Phase 3 advances
+   from `~97%` to `~99%`.
+
+2. **Desktop crate scaffold.**
+   `crates/desktop/` gains `spotlight.rs`, `windows_search.rs`,
+   `background.rs`, `ml_ep.rs`. Object-safe `Send + Sync`
+   traits — `SpotlightAnchor`, `WindowsSearchAnchor`,
+   `DesktopScheduler` (implementing the
+   `BackgroundScheduler` trait from
+   `crates/core/src/scheduler/mod.rs`), `DesktopMlEpSelector`
+   (forwarding to `ExecutionProviderSelector`) — plus
+   `Noop*` test doubles and unit tests for each. Phase 7
+   macOS / Windows checkboxes flip to `[~]`.
+
+3. **Cross-platform media migration.**
+   `crates/core/src/media/migration.rs` ships the
+   `MediaMigrationPlan` / `MediaMigrationItem` data model,
+   `plan_media_migration` / `execute_media_migration`, the
+   `MigrationProgress` callback trait with `Noop` /
+   `InMemory` test doubles, BLAKE3 transit-hash verification,
+   idempotent re-run handling, and optional source-blob
+   delete. Wired through `CoreImpl::plan_media_migration` /
+   `migrate_media_sink`. New DB helpers
+   `LocalStoreDb::list_media_assets_by_storage_sink` /
+   `update_media_storage_sink`. Tests: 8 unit + 5
+   integration in `crates/core/tests/media_migration.rs`.
+
+4. **Media blob sink stress test.**
+   `crates/core/tests/media_sink_stress.rs` is a new
+   `#[ignore]`-marked stress test that seeds 10 000 assets
+   split 40 / 20 / 20 / 20 across `kchat_backend`, `icloud`,
+   `google_drive`, `zk_object_fabric`, asserts every
+   `media_asset.storage_sink` round-trips, samples
+   chunk-fetch round-trips per sink, and exercises the
+   migration executor at scale by draining iCloud into
+   Google Drive. Run with
+   `cargo test --test media_sink_stress -- --ignored`.
+
+5. **Dedup analytics integration.**
+   `crates/core/src/transport/dedup_analytics.rs` lands the
+   `DedupAnalytics` trait (object-safe, `Send + Sync`),
+   `DedupStats` / `StorageSavings` types,
+   `NoopDedupAnalytics` (returning
+   `Error::NotImplemented("dedup_analytics")`), and a
+   `FixedDedupAnalytics` test double. Wired through
+   `CoreImpl::install_dedup_analytics` / `query_dedup_stats`
+   / `query_storage_savings`. Privacy contract: only opaque
+   ciphertext-side metrics are sent — never plaintext or
+   derived plaintext.
+
+6. **Platform ML EP tuning scaffold.**
+   `crates/core/src/models/ep_tuning.rs` lands
+   `ExecutionProviderSelector`,
+   `ExecutionProvider` (`CoreMl`, `Nnapi`, `DirectMl`,
+   `Cpu`, `MetalPerformanceShaders`),
+   `DeviceCapabilities`, `Platform`, `Arch`, `EpBenchmark`.
+   Selection logic per `ARCHITECTURE.md §11.4`: macOS / iOS
+   → CoreML, Android → NNAPI, Windows + GPU → DirectML,
+   Linux → CPU. Comprehensive unit-test matrix covers every
+   platform × capability × benchmark combination.
+
+7. **HNSW vector index upgrade.**
+   `instant-distance` is added to
+   `crates/core/Cargo.toml`. New `HnswIndex` /
+   `HnswIndexCache` types in
+   `crates/core/src/search/semantic_search.rs` build an
+   ANN graph lazily for slots above
+   `HNSW_FALLBACK_THRESHOLD = 1000` rows.
+   `SemanticSearchEngine::search_semantic_auto` selects
+   between the brute-force and HNSW paths and caches the
+   built graph per `(conversation_id, model_version)`.
+   Cache is invalidated on insert via
+   `HnswIndexCache::invalidate`. Tests assert ≥ 80 % top-k
+   overlap against brute force at 1 500 rows. Phase 6
+   advances from `~80%` to `~85%`.
+
+8. **Expanded large-scale tests.**
+   `crates/core/tests/large_scale.rs` gains four new
+   `#[ignore]` scenarios: 100 000-message multilingual
+   ingest + FTS5 / fuzzy / QueryEngine search; 10 000
+   media assets spanning image / video / audio / document
+   MIME types and 4 sinks; 50 000 messages across 100
+   conversations end-to-end ingest stress; concurrent
+   writer / reader stress through an `Arc<Mutex<_>>` DB
+   handle. Run with
+   `cargo test --test large_scale -- --ignored`.
+
+9. **Multi-scope search foundation.**
+   `crates/core/src/search/search_target.rs` adds the
+   `SearchTarget` enum (`AllConversations`,
+   `Conversation(Uuid)`, `ConversationGroup(Vec<Uuid>)`,
+   `Channel(Uuid)`, `Starred`, `Unread`), the
+   `ConversationGroupResolver` trait, and the
+   `QueryEngine::execute_search_with_target` path. Wired
+   through `SearchQuery.search_target`. Cold-shard fan-out
+   respects the resolved scope. Tests:
+   `crates/core/tests/multi_scope_search.rs` exercises
+   single conversation, conversation group, channel,
+   starred, unread, and empty-target cases.
+
+10. **Background scheduler platform wiring.**
+    `crates/core/src/scheduler/in_process.rs` lands
+    `InProcessScheduler` — a Rust-native scheduler with a
+    background thread pool, task deduplication, graceful
+    `Drop` cancellation, and per-task-type
+    `is_task_pending` / `cancel_all` helpers. Wired through
+    `CoreImpl` so the desktop crate can install it as the
+    default platform scheduler. Tests:
+    `crates/core/tests/scheduler_integration.rs` covers
+    schedule + verify execution, cancellation, dedup,
+    concurrent task isolation, and graceful shutdown.
+
+Phase status moves: Phase 3 → `~99%`; Phase 6 → `~85%`;
+Phase 7 → `~65%`. Phase 8 remains at `~25%` (the multi-scope
+foundation lands the search-target plumbing; the
+multi-tenant isolation work continues separately).
+
+**Post-merge review fixes (2026-05-04, same PR):**
+
+* **Scheduler dedup TOCTOU.**
+  `InProcessScheduler::spawn_worker` originally took the
+  workers mutex twice — once for the dedup check, once for
+  the insert — which let two threads racing on the same
+  `TaskType` both pass the dedup check and orphan one
+  worker's shutdown `Arc`. The lock is now held across the
+  full sequence (dedup check → thread spawn → insert) so
+  concurrent `schedule_*` calls are atomic. The handlers
+  lock is acquired first (it's only ever read inside this
+  function), then workers — `cancel_all` only takes the
+  workers lock so there is no deadlock cycle.
+  Regression test
+  (`schedule_dedup_is_atomic_under_concurrent_callers`)
+  spawns 8 threads behind a `Barrier`, calls
+  `schedule_backup` simultaneously, verifies a single
+  surviving worker, and asserts `cancel_all` reaches it.
+
+* **Cold-search target-set fail-closed contract.**
+  `execute_search_with_cold_source_and_limit` previously
+  used `unwrap_or_default()` on the resolver result, which
+  obscured that an `Ok(Some(empty_set))` response (e.g.
+  `Starred` / `Unread` against
+  `NoopConversationGroupResolver`) is **intentionally
+  fail-closed** — drop every cold bucket, mirroring the
+  local pass's `1=0` SQL clause. The path now uses an
+  explicit match with per-arm rustdoc spelling out all
+  four resolution outcomes.
+
+* **HNSW cache mutex contention.**
+  `SemanticSearchEngine::search_semantic_auto` previously
+  held the `HnswIndexCache` mutex across the full graph
+  traversal, serializing every concurrent semantic search
+  through a single lock. The cache now stores
+  `Arc<HnswIndex>`; the hit path takes the mutex only long
+  enough to `Arc::clone` the index, drops the guard, then
+  runs `idx.search` outside the lock. Concurrent searches
+  against unrelated `(conversation, model_version)` slots
+  no longer queue. Regression test
+  (`hit_path_drops_lock_before_search`) verifies the lock
+  is released before the search runs.
+
+* **Media migration memory amplification.**
+  `migrate_one` previously built a `concatenated: Vec<u8>`
+  alongside `chunk_buffers` for the BLAKE3 transit-hash
+  check, then a separate `roundtrip: Vec<u8>` for the
+  read-back. For a 1 GiB asset that meant ~3 GiB peak RSS
+  rather than ~1 GiB. Both hashes now stream through
+  `blake3::Hasher::update` per chunk; chunk buffers are
+  retained for the upload (the target sink wants them as
+  `&[&[u8]]`) but never duplicated.
+
+* **Media migration DB lock held during sink I/O.**
+  `CoreImpl::migrate_media_sink` previously locked
+  `self.db` at entry and held the `MutexGuard<LocalStoreDb>`
+  for the entire `execute_media_migration` run, blocking
+  every other DB-using worker (search, ingest, backup,
+  hydration, eviction) for the duration of the migration —
+  potentially minutes or hours of total lock-out for a
+  10 000-asset run against real iCloud / Drive / ZKOF
+  backends. A new `MigrationDbHandle` trait abstracts the
+  two DB calls `migrate_one` performs (`get_media_asset`
+  for idempotency + `update_media_storage_sink` after a
+  successful upload). The production path uses the new
+  `LockingDbHandle<'_>` adapter which locks the shared
+  `Mutex` **per call** and drops the guard between
+  operations; the `&LocalStoreDb` impl keeps the existing
+  test callers working unchanged. Regression test
+  (`locking_db_handle_releases_lock_during_sink_io`)
+  asserts the executor releases the DB lock during chunk
+  fetches: a probing sink calls `try_lock` from inside
+  `fetch_media_chunk` and fails the test if any call sees
+  the mutex still held by the executor.
+
+* **HNSW search\_semantic\_auto miss-path double-fetch.**
+  On a cache miss below `HNSW_FALLBACK_THRESHOLD` (or when
+  the graph builder rejected every candidate),
+  `search_semantic_auto` previously delegated to
+  `search_semantic`, which re-issued the same `SELECT`
+  against `search_vector` that just populated the local
+  `raw` candidate list. For a near-threshold corpus
+  (e.g. 999 rows) every cache-miss query doubled the
+  SQLite I/O. Brute-force scoring is now factored into a
+  module-level `score_candidates_brute_force` helper that
+  takes the already-fetched candidate set; both
+  `search_semantic` and the fallback paths in
+  `search_semantic_auto` reuse it.
 
 ### 2026-05-04 — Phase 6 / 7 / 8 batch 4 (this PR)
 

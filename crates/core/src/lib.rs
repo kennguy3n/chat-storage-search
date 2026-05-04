@@ -170,6 +170,13 @@ pub enum SearchScope {
 ///
 /// * [`SearchTarget::Conversation`] — single conversation, used
 ///   to back the legacy `conversation_filter` field.
+/// * [`SearchTarget::ConversationGroup`] — explicit list of
+///   conversation ids (Phase 8, batch-5 — 2026-05-04). The
+///   query engine treats the variant as the materialized set
+///   directly and skips the resolver.
+/// * [`SearchTarget::Channel`] — single channel id; the
+///   resolver is responsible for mapping it to a conversation
+///   set.
 /// * [`SearchTarget::Community`] / [`SearchTarget::Domain`] —
 ///   filter to the conversations attached to a community or a
 ///   domain (b2b hierarchy levels).
@@ -177,14 +184,30 @@ pub enum SearchScope {
 ///   owned by a tenant string.
 /// * [`SearchTarget::B2cAll`] — every conversation with
 ///   `scope = "b2c"`.
+/// * [`SearchTarget::Starred`] — every conversation the user
+///   has starred (Phase 8, batch-5 — 2026-05-04). Resolution
+///   is delegated to a
+///   [`crate::search::search_target::ConversationGroupResolver`]
+///   because the starred-state is held by the orchestration
+///   layer rather than the local store schema.
+/// * [`SearchTarget::Unread`] — every conversation that has
+///   unread messages (same delegation contract as
+///   [`SearchTarget::Starred`]).
 /// * [`SearchTarget::Global`] (default) — no filter; the
 ///   query engine returns results from every conversation
-///   visible to the local store.
+///   visible to the local store. `AllConversations` is an
+///   alias used in the Phase-8 task spec.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchTarget {
     /// Single-conversation filter.
     Conversation(Uuid),
+    /// Phase 8, batch-5 — explicit conversation-id list.
+    ConversationGroup(Vec<Uuid>),
+    /// Phase 8, batch-5 — channel-level filter. Resolution is
+    /// delegated to the registered
+    /// [`crate::search::search_target::ConversationGroupResolver`].
+    Channel(Uuid),
     /// Community-level filter (matches `community_id`).
     Community(Uuid),
     /// Domain-level filter (matches `domain_id`).
@@ -193,9 +216,28 @@ pub enum SearchTarget {
     Tenant(String),
     /// Every conversation with `scope = "b2c"`.
     B2cAll,
+    /// Phase 8, batch-5 — every conversation the user has
+    /// starred. Resolution is delegated to the registered
+    /// [`crate::search::search_target::ConversationGroupResolver`].
+    Starred,
+    /// Phase 8, batch-5 — every conversation with unread
+    /// messages. Same resolver-delegation contract as
+    /// [`SearchTarget::Starred`].
+    Unread,
     /// No filter — search every conversation.
     #[default]
     Global,
+}
+
+impl SearchTarget {
+    /// Phase-8 task-spec alias: the spec uses the name
+    /// `AllConversations` for the global / no-filter variant.
+    /// `Global` is the long-standing canonical name; this
+    /// constant is provided so call sites that prefer the
+    /// spec name compile cleanly.
+    pub const fn all_conversations() -> Self {
+        Self::Global
+    }
 }
 
 /// Top-level search query.

@@ -332,19 +332,22 @@ Checklist:
       into `CoreImpl::send_media` via `ArchiveEventType::MediaReceived`,
       all inside the existing SAVEPOINT alongside the
       `BackupEvent` write.)_
-- [~] Archive segment builder: per-conversation, per-time-bucket
+- [x] Archive segment builder: per-conversation, per-time-bucket
       segments for `message_delta`, `timeline_skeleton`,
       `media_key_delta`, `search_text_index`,
       `search_vector_index`, `media_index`, `checkpoint`.
       _(`archive::segment_builder::ArchiveSegmentBuilder` now
-      builds `BuiltSegment` for `SegmentBuildRequest::message_delta`,
-      `timeline_skeleton`, and `checkpoint` — all three share the
-      CBOR → zstd → XChaCha20-Poly1305 pipeline keyed off
-      `SegmentType` so the on-disk frame type is preserved through
-      a round-trip. `media_key_delta`, `search_text_index`,
-      `search_vector_index`, and `media_index` are still queued
-      on the same code path. Round-trip tests live alongside
-      the builder.)_
+      builds `BuiltSegment` for every Phase-3 segment type:
+      `SegmentBuildRequest::message_delta`,
+      `timeline_skeleton`, `checkpoint`, **2026-05-04 batch-5**:
+      `media_key_delta`, `search_text_index`,
+      `search_vector_index`, `media_index`. All seven share
+      the CBOR → zstd → XChaCha20-Poly1305 pipeline keyed off
+      `SegmentType` so the on-disk frame type is preserved
+      through a round-trip. Non-archive segment types are
+      rejected up-front with `Error::Storage`. Round-trip
+      tests live alongside the builder and in
+      `crates/core/tests/archive_pipeline.rs`.)_
 - [x] Archive manifest chain (generation N+1 referencing N via
       `previous_manifest_hash`; Ed25519 signature).
       _(`archive::manifest_builder::ArchiveManifestBuilder` builds
@@ -970,13 +973,20 @@ Checklist:
       `core_impl::tests::ingest_messages_writes_text_embedding_when_embedder_installed`,
       `models::embeddings::tests::*`.)_
 - [x] HNSW vector index for semantic text search.
-      _(Bring-up implementation is a brute-force cosine search
-      over the bounded per-conversation `search_vector` corpus —
-      `crates/core/src/search/semantic_search.rs` — which is the
-      practical fit for Phase 6 conversation sizes. The HNSW
-      upgrade is tracked as a follow-up once a single conversation
-      crosses the brute-force budget. Tests:
-      `search::semantic_search::tests::*`.)_
+      _(Brute-force cosine over the bounded per-conversation
+      `search_vector` corpus is the bring-up implementation
+      and remains the fallback below
+      `HNSW_FALLBACK_THRESHOLD = 1000` rows.
+      **2026-05-04 batch-5**: `instant-distance` HNSW ANN
+      graph builds lazily via `HnswIndex::build` and caches
+      per `(conversation_id, model_version)` slot through
+      `HnswIndexCache`. `SemanticSearchEngine::search_semantic_auto`
+      auto-selects the path. Cache invalidation lives on
+      `HnswIndexCache::invalidate`. Tests:
+      `search::semantic_search::tests::*` (10 unit tests
+      covering brute-force vs HNSW top-k overlap, cache
+      invalidation, empty-corpus handling, threshold
+      fallback).)_
 - [x] `MobileCLIP-S2` integration for image search (multilingual
       text→image, ~80 MB INT8 ONNX).
       _(Inference seam: `ImageEmbedder` trait, `NoopImageEmbedder`,
@@ -1146,10 +1156,26 @@ and an explicit failure-test matrix.
 
 Checklist:
 
-- [ ] macOS native integration (Spotlight anchors for app-internal
+- [~] macOS native integration (Spotlight anchors for app-internal
       results; `NSBackgroundActivityScheduler` for background work).
-- [ ] Windows native integration (Windows Search anchors; CPU-only
+      _(2026-05-04 batch-5: trait scaffold lands in
+      `crates/desktop/src/spotlight.rs` (`SpotlightAnchor` +
+      `NoopSpotlightAnchor`) and
+      `crates/desktop/src/background.rs` (`DesktopScheduler` +
+      `NoopDesktopScheduler` implementing the
+      `BackgroundScheduler` trait from
+      `crates/core/src/scheduler/mod.rs`). Native ObjC bridge
+      attach is the platform-bridge follow-up.)_
+- [~] Windows native integration (Windows Search anchors; CPU-only
       ML; no GPU assumption).
+      _(2026-05-04 batch-5: trait scaffold lands in
+      `crates/desktop/src/windows_search.rs`
+      (`WindowsSearchAnchor` + `NoopWindowsSearchAnchor`) and
+      `crates/desktop/src/ml_ep.rs`
+      (`DesktopMlEpSelector` forwarding to
+      `ExecutionProviderSelector`; DirectML / CPU fallback).
+      Native Win32 bridge attach is the platform-bridge
+      follow-up.)_
 - [~] Performance profiling and optimization (memory residency,
       CPU per request, battery cost per backup, peak transfer
       throughput).
@@ -1169,14 +1195,34 @@ Checklist:
       behind `#[ignore]`: 10k multilingual ingest +
       FTS5 / fuzzy / QueryEngine round-trip across 12 scripts;
       5k media-asset eviction at Critical pressure;
-      1k message backup → manifest-chain → restore round-trip.
-      Run with `cargo test --test large_scale -- --ignored`.
-      The full 100k+ × 10k+ device-matrix run is the
-      production-hardening follow-up.)_
-- [ ] Platform-specific ML execution-provider tuning (CoreML EP,
+      1k message backup → manifest-chain → restore round-trip;
+      **2026-05-04 batch-5**: 100k message ingest + FTS5 /
+      fuzzy / QueryEngine search; 10k media-asset round-trip
+      across mixed MIME types and 4 sinks; 50k message ingest
+      stress across 100 conversations; concurrent
+      writer / reader / eviction stress.
+      Run with `cargo test --test large_scale -- --ignored`.)_
+- [~] Platform-specific ML execution-provider tuning (CoreML EP,
       NNAPI EP, optional DirectML EP on Windows when GPU is present).
-- [ ] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
+      _(2026-05-04 batch-5: scaffold in
+      `crates/core/src/models/ep_tuning.rs` —
+      `ExecutionProviderSelector`, `ExecutionProvider` enum
+      (`CoreMl`, `Nnapi`, `DirectMl`, `Cpu`,
+      `MetalPerformanceShaders`), `DeviceCapabilities`,
+      `EpBenchmark`. Selection logic per
+      `ARCHITECTURE.md §11.4`: macOS / iOS → CoreML, Android →
+      NNAPI, Windows + GPU → DirectML, Linux → CPU. Real
+      on-device benchmark capture is the follow-up.)_
+- [~] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
       ContentIndex metrics (read-only telemetry, no plaintext leaks).
+      _(2026-05-04 batch-5: trait + Noop / Fixed test doubles
+      land in `crates/core/src/transport/dedup_analytics.rs`
+      (`DedupAnalytics` trait, `DedupStats`, `StorageSavings`,
+      `NoopDedupAnalytics`, `FixedDedupAnalytics`). Wired
+      through `CoreImpl::install_dedup_analytics` /
+      `query_dedup_stats` / `query_storage_savings`. Privacy
+      contract: only opaque ciphertext-side metrics cross
+      the boundary.)_
 - [~] Edge-case handling: offline mode; interrupted backups;
       partial restores; corrupted chunks; missing manifests.
       _(Offline mode: `OfflineDetector` trait,
@@ -1205,14 +1251,38 @@ Checklist:
       transition every superseded row to `archive_compacted`.
       Cross-epoch coverage at
       `crates/core/tests/archive_pipeline.rs::archive_pipeline_epoch_rotation_and_cross_epoch_compaction`.)_
-- [ ] Cross-platform media migration: iOS → Android migrates
+- [~] Cross-platform media migration: iOS → Android migrates
       iCloud-resident media blobs to Google Drive (or ZKOF as
       platform-neutral fallback) in the background, rewriting
       `media_asset.storage_sink` and the related `MediaDescriptor`
       field as it goes. See PROPOSAL.md §5.7.
-- [ ] Media blob sink stress test: 10K+ media files across mixed
+      _(2026-05-04 batch-5: in-tree pipeline lands in
+      `crates/core/src/media/migration.rs` —
+      `MediaMigrationPlan`, `MediaMigrationItem`,
+      `plan_media_migration`, `execute_media_migration`,
+      `MigrationProgress` callback trait,
+      `NoopMigrationProgress` / `InMemoryMigrationProgress`
+      test doubles, BLAKE3 transit-hash verification,
+      idempotent re-run handling, and optional source-blob
+      delete. Wired through `CoreImpl::plan_media_migration`
+      / `migrate_media_sink`. New DB helpers
+      `LocalStoreDb::list_media_assets_by_storage_sink` /
+      `update_media_storage_sink`. Tests: 8 unit + 5
+      integration in `crates/core/tests/media_migration.rs`.
+      Background-scheduling integration is the platform-bridge
+      follow-up.)_
+- [~] Media blob sink stress test: 10K+ media files across mixed
       sinks (KChat backend + iCloud + Google Drive + ZKOF in the
       same account); verify rehydration from each.
+      _(2026-05-04 batch-5: `#[ignore]`-marked stress test in
+      `crates/core/tests/media_sink_stress.rs` seeds 10 000
+      assets split 40 / 20 / 20 / 20 across `kchat_backend`,
+      `icloud`, `google_drive`, `zk_object_fabric`, asserts
+      every `media_asset.storage_sink` round-trips, samples
+      chunk-fetch round-trips per sink, and exercises the
+      migration executor at scale by draining iCloud into
+      Google Drive. Run with
+      `cargo test --test media_sink_stress -- --ignored`.)_
 - [x] **Failure test suite**, all passing:
   - [x] chunk upload interrupted mid-stream
         _(`crates/core/tests/failure_scenarios.rs::chunk_upload_interrupted_then_resumed_succeeds`:

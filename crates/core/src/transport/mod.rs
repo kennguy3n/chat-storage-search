@@ -29,6 +29,7 @@
 //! The shape of this module's public re-exports is intentionally
 //! narrow so it can grow without breaking downstream callers.
 
+pub mod dedup_analytics;
 pub mod offline;
 
 use std::ops::Range;

@@ -53,6 +53,7 @@ zstd = { version = "0.13", default-features = false }
 # t_cost = 3, p_cost = 1) inside the wrapper so callers cannot
 # accidentally weaken them.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+instant-distance = "0.6"
 ort = { workspace = true, optional = true }
 
 # On Windows builds, additionally enable the `directml` feature on the

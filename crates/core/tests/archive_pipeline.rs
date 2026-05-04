@@ -342,6 +342,116 @@ fn archive_pipeline_timeline_skeleton_and_checkpoint_segments_round_trip() {
     assert_ne!(skeleton_seg.ciphertext, checkpoint_seg.ciphertext);
 }
 
+/// Phase 3, batch-5 (2026-05-04): the archive segment builder
+/// covers the remaining four `SegmentType` variants from
+/// `docs/PROPOSAL.md §5.1` — `MediaKeyDelta`, `SearchTextIndex`,
+/// `SearchVectorIndex`, `MediaIndex`. Each shares the same
+/// CBOR → zstd → XChaCha20-Poly1305 pipeline, and the
+/// constructor on `SegmentBuildRequest` must preserve the
+/// segment_type discriminant through a round-trip on top of
+/// real `MessagePersister` events. A non-archive (backup-only)
+/// `SegmentType::Events` request must be rejected before any
+/// crypto runs.
+#[test]
+fn archive_pipeline_remaining_segment_types_round_trip_and_reject_non_archive() {
+    use kchat_core::formats::SegmentType;
+
+    let db = LocalStoreDb::open_in_memory(&TEST_DB_KEY).unwrap();
+    let conv = Uuid::now_v7();
+    db.insert_conversation(&Conversation {
+        conversation_id: conv.to_string(),
+        title_cipher: None,
+        pinned: false,
+        muted: false,
+        last_message_id: None,
+        last_activity_ms: APRIL_BUCKET_MS,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let persister = MessagePersister::new(&db);
+    for i in 0..3 {
+        persister
+            .persist_ingested_message(&IngestedMessage {
+                message_id: Uuid::now_v7(),
+                conversation_id: conv,
+                sender_id: format!("user-{i}"),
+                created_at_ms: APRIL_BUCKET_MS + i as i64 * 1_000,
+                text_content: Some(format!("batch-5 row #{i}")),
+                media_descriptors: vec![],
+                reply_to: None,
+            })
+            .unwrap();
+    }
+
+    let journal = ArchiveEventJournal::new();
+    let events: Vec<_> = journal
+        .read_unsegmented(db.connection(), 100)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    assert!(!events.is_empty());
+
+    let identity = KeyMaterial::from_bytes(MASTER_KEY);
+    let archive_root = derive_archive_root(&identity).unwrap();
+    let epoch_key = derive_archive_epoch_key(&archive_root, "2026-04").unwrap();
+    let placeholder = Uuid::now_v7();
+    let k_segment = derive_archive_segment_key(&epoch_key, &placeholder.to_string()).unwrap();
+
+    // Each constructor must preserve its discriminant through
+    // build → decrypt and surface the same events list back.
+    let cases: Vec<(SegmentBuildRequest, SegmentType)> = vec![
+        (
+            SegmentBuildRequest::media_key_delta(conv, APRIL_BUCKET, events.clone()),
+            SegmentType::MediaKeyDelta,
+        ),
+        (
+            SegmentBuildRequest::search_text_index(conv, APRIL_BUCKET, events.clone()),
+            SegmentType::SearchTextIndex,
+        ),
+        (
+            SegmentBuildRequest::search_vector_index(conv, APRIL_BUCKET, events.clone()),
+            SegmentType::SearchVectorIndex,
+        ),
+        (
+            SegmentBuildRequest::media_index(conv, APRIL_BUCKET, events.clone()),
+            SegmentType::MediaIndex,
+        ),
+    ];
+
+    for (req, expected_ty) in cases {
+        assert_eq!(req.segment_type, expected_ty);
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), k_segment.as_bytes())
+            .unwrap_or_else(|e| panic!("build_segment {:?}: {e}", expected_ty));
+        assert_eq!(built.segment_type, expected_ty);
+        assert_eq!(built.event_count, req.events.len());
+        let payload = decrypt_segment(&built, k_segment.as_bytes()).unwrap();
+        assert_eq!(payload.events, req.events);
+        assert_eq!(payload.conversation_id, conv.to_string());
+        assert_eq!(payload.time_bucket, APRIL_BUCKET);
+    }
+
+    // Non-archive (backup-only) `Events` segment_type must be
+    // rejected up front — the archive pipeline will never seal a
+    // `BackupSegmentFrame` payload through the archive segment
+    // builder.
+    let bad = SegmentBuildRequest {
+        conversation_id: conv,
+        time_bucket: APRIL_BUCKET.into(),
+        events: events.clone(),
+        segment_type: SegmentType::Events,
+    };
+    let err = ArchiveSegmentBuilder::new()
+        .build_segment(bad, k_segment.as_bytes())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not an archive segment type"),
+        "expected reject-on-backup-variant error, got: {err}",
+    );
+}
+
 /// Phase 3, Task 9: epoch-key rotation + archive compaction
 /// across an epoch boundary.
 ///
