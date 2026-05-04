@@ -1247,7 +1247,9 @@ impl CoreImpl {
     /// rows flagged `is_cold = true`, groups them by
     /// `(conversation_id, time_bucket)`, fetches every
     /// `archive_segment_map` row that covers the bucket via
-    /// [`crate::archive::prefetch::batch_prefetch_bucket`],
+    /// [`crate::archive::prefetch::batch_prefetch_bucket_with_router`]
+    /// (so `storage_backend = zk_object_fabric` rows fetch
+    /// through ZKOF / S3 instead of the KChat transport),
     /// AEAD-decrypts the segment, scans the events for the
     /// requested `message_id`s, decodes the payload via
     /// [`crate::archive::body_payload::try_decode_text`], and
@@ -1303,6 +1305,16 @@ impl CoreImpl {
             return Ok(0);
         }
 
+        // Build the backend-aware router *once* before the
+        // bucket loop so a re-acquire of the ZKOF config locks
+        // does not happen on every iteration. The router
+        // dispatches each `archive_segment_map` row to the
+        // backend named in its `storage_backend` column —
+        // KChat rows go through `transport`, ZKOF rows go
+        // through the installed S3 client. Mirrors the wiring
+        // used by [`Self::rehydrate_timeline_skeletons`].
+        let router = self.build_archive_router(transport)?;
+
         let mut hydrated = 0usize;
         for ((conv_id, time_bucket), wanted_ids) in buckets {
             // Phase 1: fetch every segment for the bucket. Read
@@ -1312,9 +1324,9 @@ impl CoreImpl {
             // readers.
             let prefetched = {
                 let db = self.db.lock().map_err(poisoned)?;
-                crate::archive::prefetch::batch_prefetch_bucket(
+                crate::archive::prefetch::batch_prefetch_bucket_with_router(
                     db.connection(),
-                    transport,
+                    &router,
                     conv_id,
                     &time_bucket,
                 )?
@@ -7438,5 +7450,124 @@ mod tests {
             })
             .expect("noop");
         assert_eq!(n, 0);
+    }
+
+    /// Phase-5 cold-hit hydration with mixed-backend segments
+    /// (PR-#33 review feedback). The cold-hydration write-back
+    /// path must route through
+    /// [`crate::archive::prefetch::batch_prefetch_bucket_with_router`]
+    /// so a bucket whose `archive_segment_map` rows carry
+    /// `storage_backend = 'zk_object_fabric'` lands the body
+    /// via the installed S3 client instead of erroring with
+    /// `Error::Storage("ZKOF row encountered ...")` from the
+    /// KChat-only `batch_prefetch_bucket` variant.
+    #[test]
+    fn hydrate_cold_search_results_routes_zkof_segments_through_s3_client() {
+        use crate::archive::download::encode_archive_segment_blob;
+        use crate::archive::segment_builder::{ArchiveSegmentBuilder, SegmentBuildRequest};
+
+        // Build a core with the ZKOF archive backend so
+        // `build_archive_router` returns a router wired to
+        // S3 instead of the KChat-only fallback.
+        let cfg = test_config().with_archive_backend(crate::config::ArchiveBackend::Zkof);
+        let core = CoreImpl::new_in_memory(cfg, TEST_KEY).unwrap();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let root = fresh_archive_root();
+        core.install_epoch_key_manager(&root, "2026-04").unwrap();
+        let epoch_bytes = core.with_current_epoch_key(|k| *k).unwrap();
+
+        let s3 = std::sync::Arc::new(InMemoryS3::default());
+        let s3_dyn: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client> = s3.clone();
+        let zkof_cfg = fresh_zkof_config();
+        let zkof_bucket = zkof_cfg.bucket.clone();
+        core.install_zkof_archive_backend(s3_dyn, zkof_cfg).unwrap();
+
+        // Seal a ZKOF-backed segment carrying one body-bearing
+        // event, push it into the in-memory S3 at the key the
+        // router uses, and seed the segment-map row with
+        // `storage_backend = 'zk_object_fabric'`.
+        let mid = Uuid::now_v7();
+        let ts = 1_777_000_000_000;
+        let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(
+                SegmentBuildRequest {
+                    conversation_id: conv,
+                    time_bucket: bucket.clone(),
+                    events: vec![body_event(conv, mid, ts, "north star body")],
+                    segment_type: crate::formats::SegmentType::MessageDelta,
+                },
+                &epoch_bytes,
+            )
+            .unwrap();
+        let blob = encode_archive_segment_blob(
+            &built.segment_id,
+            &built.merkle_root,
+            &built.nonce,
+            &built.ciphertext,
+        );
+        s3.objects.lock().unwrap().insert(
+            (
+                zkof_bucket.clone(),
+                format!("archive/segments/{}", built.segment_id),
+            ),
+            blob,
+        );
+        core.with_db(|db| {
+            db.connection()
+                .execute(
+                    "INSERT INTO archive_segment_map(
+                        segment_id, conversation_id, time_bucket,
+                        segment_type, blob_id, storage_backend,
+                        merkle_root, state
+                     ) VALUES (?1, ?2, ?3, 'message_delta', ?4,
+                              'zk_object_fabric', ?5, 'archive_uploaded')",
+                    rusqlite::params![
+                        built.segment_id.to_string(),
+                        conv.to_string(),
+                        bucket,
+                        format!("blob-{}", built.segment_id),
+                        built.merkle_root.as_slice(),
+                    ],
+                )
+                .unwrap();
+        });
+        seed_remote_only_skeleton(&core, conv, mid, ts);
+
+        // The transport handed to `hydrate_cold_search_results`
+        // is the KChat-side `FixtureTransport`. The bucket has
+        // no `kchat_backend` rows, so it must never be touched
+        // — every fetch must dispatch to the in-memory S3.
+        let transport = FixtureTransport::default();
+        let results = vec![cold_hit(mid, conv, ts, "north star body")];
+        let hydrated = core
+            .hydrate_cold_search_results(&transport, &results, |_segment_id| Ok(epoch_bytes))
+            .expect("hydrate via ZKOF");
+        assert_eq!(hydrated, 1);
+
+        assert!(
+            transport.calls().is_empty(),
+            "ZKOF-only bucket must never hit the KChat transport: \
+             {:?}",
+            transport.calls(),
+        );
+
+        // Body row landed; body_state flipped; FTS row indexed.
+        core.with_db(|db| {
+            let skel = db.get_message_skeleton(&mid.to_string()).unwrap().unwrap();
+            assert_eq!(skel.body_state, BodyState::LocalPlainAvailable);
+            let body = db.get_message_body(&mid.to_string()).unwrap().unwrap();
+            assert_eq!(body.text_content.as_deref(), Some("north star body"));
+            let n: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM search_fts WHERE message_id = ?1",
+                    rusqlite::params![mid.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "FTS row landed");
+        });
     }
 }

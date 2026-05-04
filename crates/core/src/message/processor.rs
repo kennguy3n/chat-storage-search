@@ -716,25 +716,31 @@ impl<'a> MessagePersister<'a> {
             event_type: "message_edited".into(),
             conversation_id: Some(skel.conversation_id.clone()),
             message_id: Some(skel.message_id.clone()),
-            payload: payload.clone(),
+            payload,
             created_at_ms: edited_at_ms,
         };
         self.db.insert_backup_event(&entry)?;
 
         // Archive-side mirror of the edit. Rides inside
         // `SAVEPOINT edit_message;` so a downstream failure
-        // discards both journal writes.
+        // discards both journal writes. The archive payload
+        // carries the *edited* body text inside the
+        // `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope so the Phase
+        // 5 cold-hit hydration path lands the post-edit body
+        // when the segment is re-fetched from cold storage.
         let conversation_id = Uuid::parse_str(&skel.conversation_id).map_err(|e| {
             ProcessorError::StorageError(format!("invalid conversation_id in store: {e}"))
         })?;
         let message_id = Uuid::parse_str(&skel.message_id).map_err(|e| {
             ProcessorError::StorageError(format!("invalid message_id in store: {e}"))
         })?;
+        let archive_payload = crate::archive::body_payload::encode(Some(new_text))
+            .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
         let archive_event = ArchiveEvent {
             event_type: ArchiveEventType::MessageEdited,
             conversation_id,
             message_id: Some(message_id),
-            payload,
+            payload: archive_payload,
             created_at_ms: edited_at_ms,
         };
         ArchiveEventJournal::new()
@@ -2176,6 +2182,66 @@ mod tests {
         // The receive event should still be there from the
         // initial persist.
         assert_eq!(archive_event_count(&db, "message_received"), 1);
+    }
+
+    /// Phase-5 cold-hit hydration regression
+    /// (PR-#33 review feedback): the archive-side payload of a
+    /// `message_edited` event must carry the *edited* body
+    /// inside the `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope, not
+    /// the legacy `{message_id, edited_at_ms}` shape — otherwise
+    /// `CoreImpl::hydrate_cold_search_results` would silently
+    /// land the pre-edit body on edited cold messages.
+    #[test]
+    fn edit_message_archive_payload_carries_edited_body_text() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "before edit");
+
+        p.edit_message(&mid.to_string(), "after edit")
+            .expect("edit");
+
+        // Pull the most recent archive-event-journal row whose
+        // `event_type = 'message_edited'` and decode it via the
+        // production `try_decode_text` helper that the cold-hit
+        // hydration path uses.
+        let payload: Vec<u8> = db
+            .connection()
+            .query_row(
+                "SELECT payload FROM archive_event_journal \
+                 WHERE event_type = 'message_edited' \
+                 ORDER BY event_seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row");
+        let decoded = crate::archive::body_payload::try_decode_text(&payload);
+        assert_eq!(
+            decoded.as_deref(),
+            Some("after edit"),
+            "edit's archive payload must round-trip the *edited* body text"
+        );
+
+        // The backup-event-journal still uses the legacy
+        // `{message_id, edited_at_ms}` shape — backups don't
+        // need the body to drive the edit dispatch and we keep
+        // that contract stable.
+        let backup_payload: Vec<u8> = db
+            .connection()
+            .query_row(
+                "SELECT payload FROM backup_event_journal \
+                 WHERE event_type = 'message_edited' \
+                 ORDER BY event_seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("backup row");
+        assert!(
+            crate::archive::body_payload::try_decode_text(&backup_payload).is_none(),
+            "backup payload remains the legacy edit shape; \
+             try_decode_text must NOT match"
+        );
     }
 
     #[test]
