@@ -70,6 +70,15 @@ pub(crate) const BM25_WEIGHT: f64 = 2.0;
 /// (`docs/PROPOSAL.md §7.5`).
 pub(crate) const FUZZY_WEIGHT: f64 = 1.0;
 
+/// Semantic / cosine-similarity contribution weight in the merged
+/// rank score (`docs/PROPOSAL.md §7.5`). Sits between BM25 (`2.0`)
+/// and fuzzy (`1.0`) so the on-device reranker leans on
+/// surface-form matches when both signals are available, but
+/// still surfaces semantic-only hits when FTS misses.
+///
+/// Phase 6, Task 8.
+pub(crate) const SEMANTIC_WEIGHT: f64 = 1.5;
+
 /// Recency-decay weight in the merged rank score
 /// (`docs/PROPOSAL.md §7.5` — `recency_boost`).
 pub(crate) const RECENCY_WEIGHT: f64 = 0.5;
@@ -86,6 +95,48 @@ pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 pub(crate) const TEXT_KIND_WEIGHT: f64 = 1.0;
 /// See [`TEXT_KIND_WEIGHT`].
 pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
+
+/// Map a `message_skeleton.kind` string to the multiplicative
+/// content-kind weight used by the ranker. The canonical
+/// vocabulary is whatever
+/// [`crate::local_store::schema::MessageKind::as_str`] writes
+/// — today `"text"`, `"media"`, or `"system"`. Unknown / missing
+/// kinds default to [`TEXT_KIND_WEIGHT`] so cold-only rows that
+/// appear before the local skeleton lands still rank sensibly.
+///
+/// This is the single source of truth for the kind→weight
+/// mapping. Both [`QueryEngine::apply_recency_and_kind_weight`]
+/// (FTS / fuzzy lane) and
+/// [`QueryEngine::execute_search_with_semantic`] (semantic-only
+/// lane) call it so the two paths cannot drift on this mapping
+/// — the bug fixed in 187c666 was exactly that drift, where the
+/// semantic-only branch matched on `MediaDescriptor.kind`
+/// vocabulary (`"image" | "video" | "audio" | "file"`) instead
+/// of `MessageKind` vocabulary, silently demoting media hits to
+/// `TEXT_KIND_WEIGHT`.
+pub(crate) fn kind_str_to_weight(kind: &str) -> f64 {
+    match kind {
+        "text" => TEXT_KIND_WEIGHT,
+        "media" => MEDIA_KIND_WEIGHT,
+        _ => TEXT_KIND_WEIGHT,
+    }
+}
+
+/// Skeleton-row projection used by
+/// [`QueryEngine::execute_search_with_semantic`] to materialize
+/// semantic-only hits.
+///
+/// Carries `kind` so the recency × content-kind multiplier
+/// can be applied without a second round trip — see the merge
+/// loop in
+/// [`QueryEngine::execute_search_with_semantic`].
+#[derive(Debug, Clone)]
+struct SemanticSkeletonInfo {
+    conversation_id: String,
+    sender_id: String,
+    created_at_ms: i64,
+    kind: String,
+}
 
 /// Source of decrypted search-shard rows for cold
 /// (`body_state = 'remote_archive_only'`) buckets.
@@ -495,6 +546,271 @@ impl<'a> QueryEngine<'a> {
     }
 
     // ----------------------------------------------------------------
+    // Semantic reranking (Phase 6, Task 8)
+    // ----------------------------------------------------------------
+
+    /// Run a unified search and merge in cosine-similarity hits
+    /// from the on-device `search_vector` table.
+    ///
+    /// `text_embedder` is the [`TextEmbedder`] previously
+    /// installed via
+    /// [`crate::core_impl::CoreImpl::install_text_embedder`].
+    /// When `text_embedder.embed` succeeds, the engine fans the
+    /// query embedding through
+    /// [`crate::search::semantic_search::SemanticSearchEngine`]
+    /// and merges the hits into the FTS / fuzzy candidate set:
+    ///
+    /// * Rows that already had an FTS or fuzzy hit have
+    ///   `cosine * SEMANTIC_WEIGHT` added to `rank_score`. The
+    ///   FTS / fuzzy pass already folded recency × content-kind
+    ///   into the row, so the semantic contribution stacks on
+    ///   top without re-applying that multiplier.
+    /// * Rows that **only** appear via semantic search are added
+    ///   to the result set with `rank_score =
+    ///   cosine * SEMANTIC_WEIGHT * recency_factor *
+    ///   kind_weight`. The recency anchor is the maximum
+    ///   `created_at_ms` across the combined candidate set —
+    ///   FTS / fuzzy hits in `local` plus the semantic-only
+    ///   skeletons — so the half-life decay is honoured. (An
+    ///   earlier bug computed the anchor from a single-element
+    ///   slice, which collapsed `age_ms` to `0` and made the
+    ///   factor always `1.0`.)
+    ///
+    /// When `text_embedder.embed` fails (or the query is
+    /// empty / `embed` returns
+    /// [`crate::Error::NotImplemented`]), the engine falls back
+    /// to the FTS-only path.
+    ///
+    /// `is_cold` is stamped against the **merged** result set
+    /// when `scope == IncludeCold`. Semantic-only hits whose
+    /// owning skeleton has `body_state = 'remote_archive_only'`
+    /// are flagged so the `HydrationQueue` can enqueue the cold
+    /// body for hydration at `SearchResultTap` priority — the
+    /// initial materialization defaults `is_cold: false` because
+    /// the skeleton-fetch projection does not include
+    /// `body_state`.
+    ///
+    /// `query.sender_filter`, `query.date_from`, `query.date_to`,
+    /// and `query.content_kind` apply uniformly to both lanes:
+    /// the FTS / fuzzy lane filters via `allowed_skeleton_ids`
+    /// during candidate building, and the semantic-only lane
+    /// re-runs `allowed_skeleton_ids` against the
+    /// `SemanticMatch::message_id` set before materializing
+    /// fresh `SearchResult`s. Without that guard a query like
+    /// `{ sender_filter: Some("alice"), date_from: Some(yesterday) }`
+    /// would surface alice's FTS hits plus arbitrary
+    /// semantic-only hits from any sender / any date.
+    ///
+    /// `model_version` defaults to
+    /// [`crate::models::embeddings::XLMR_MODEL_VERSION`] when
+    /// `None` is passed.
+    pub fn execute_search_with_semantic(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        text_embedder: &dyn crate::models::embeddings::TextEmbedder,
+        model_version: Option<&str>,
+        limit: usize,
+    ) -> DbResult<Vec<SearchResult>> {
+        let mut local = self.execute_search_with_limit(query, scope, limit)?;
+        let trimmed = query.query_string.trim();
+        if trimmed.is_empty() {
+            return Ok(local);
+        }
+        // Embed the query. If the embedder is a Noop / failure,
+        // fall back to the FTS-only path silently.
+        let q_emb = match text_embedder.embed(trimmed) {
+            Ok(v) => v,
+            Err(_) => return Ok(local),
+        };
+        let mv = model_version.unwrap_or(crate::models::embeddings::XLMR_MODEL_VERSION);
+        let conn = self.db.connection();
+        let semantic = crate::search::semantic_search::SemanticSearchEngine::new(conn);
+        let conv_filter_str = query.conversation_filter.map(|c| c.to_string());
+        let hits = match semantic.search_semantic(
+            &q_emb,
+            conv_filter_str.as_deref(),
+            limit.max(1),
+            Some(mv),
+        ) {
+            Ok(h) => h,
+            Err(_) => return Ok(local),
+        };
+        if hits.is_empty() {
+            return Ok(local);
+        }
+
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        for (idx, r) in local.iter().enumerate() {
+            by_id.insert(r.message_id.to_string(), idx);
+        }
+
+        // Bulk-fetch skeleton metadata for any semantic-only hit
+        // we'll need to materialize as a fresh SearchResult. The
+        // projection includes `kind` so the recency × content-kind
+        // multiplier can be applied inline without a second round
+        // trip.
+        let new_ids: Vec<String> = hits
+            .iter()
+            .filter(|h| !by_id.contains_key(&h.message_id))
+            .map(|h| h.message_id.clone())
+            .collect();
+        // Apply the structured filters (`sender_filter`,
+        // `date_from`, `date_to`, `content_kind`) to the
+        // semantic-only candidate set the same way the
+        // FTS / fuzzy pass does via `allowed_skeleton_ids`.
+        // FTS / fuzzy hits are already in `local` and were
+        // filtered by `execute_search_with_limit`; this guards
+        // the *semantic-only* path so a query like
+        // `{ sender_filter: Some("alice"),
+        //    date_from: Some(yesterday) }` cannot leak hits
+        // from other senders or outside the date window.
+        // `allowed_skeleton_ids` returns `None` when no
+        // structured filter is set — keep the candidate set
+        // intact in that case.
+        let new_ids: Vec<String> = match self.allowed_skeleton_ids(query, &new_ids)? {
+            Some(allowed) => new_ids
+                .into_iter()
+                .filter(|m| allowed.contains(m))
+                .collect(),
+            None => new_ids,
+        };
+        let new_skeletons = if !new_ids.is_empty() {
+            self.fetch_skeleton_columns_for_semantic(&new_ids)?
+        } else {
+            HashMap::new()
+        };
+
+        // Anchor `now_ms` against the combined candidate set —
+        // FTS / fuzzy hits already in `local` plus any
+        // semantic-only hit the bulk fetch resolved. This matches
+        // `apply_cold_recency_weight`'s pattern. Anchoring on a
+        // single-element slice (the previous bug) collapsed
+        // `age_ms` to `0` for every semantic-only hit and made
+        // `recency_factor` always `1.0`, defeating the
+        // `RECENCY_HALF_LIFE_DAYS` decay.
+        let now_ms: i64 = local
+            .iter()
+            .map(|r| r.created_at_ms)
+            .chain(new_skeletons.values().map(|s| s.created_at_ms))
+            .max()
+            .unwrap_or(0);
+        let lambda = std::f64::consts::LN_2 / RECENCY_HALF_LIFE_DAYS;
+
+        for hit in hits {
+            let semantic_contribution = (hit.similarity as f64) * SEMANTIC_WEIGHT;
+            if let Some(&idx) = by_id.get(&hit.message_id) {
+                // FTS / fuzzy already applied recency × kind in
+                // `execute_search_with_limit`; just stack the
+                // semantic contribution on top.
+                local[idx].rank_score += semantic_contribution;
+                continue;
+            }
+            // Semantic-only hit: build a fresh SearchResult.
+            let Some(meta) = new_skeletons.get(&hit.message_id) else {
+                continue;
+            };
+            let Ok(message_uuid) = Uuid::parse_str(&hit.message_id) else {
+                continue;
+            };
+            let Ok(conv_uuid) = Uuid::parse_str(&meta.conversation_id) else {
+                continue;
+            };
+            // Inline the same recency × content-kind multiplier
+            // that `apply_recency_and_kind_weight` produces, but
+            // anchored on the combined-set `now_ms` rather than
+            // re-deriving it from a single-element slice.
+            let age_ms = (now_ms - meta.created_at_ms).max(0) as f64;
+            let age_days = age_ms / 86_400_000.0;
+            let recency_score = (-lambda * age_days).exp();
+            let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
+            let kind_w = kind_str_to_weight(meta.kind.as_str());
+            let weighted = semantic_contribution * recency_factor * kind_w;
+            local.push(SearchResult {
+                message_id: message_uuid,
+                conversation_id: conv_uuid,
+                sender_id: meta.sender_id.clone(),
+                created_at_ms: meta.created_at_ms,
+                rank_score: weighted,
+                is_cold: false,
+                snippet: None,
+            });
+        }
+        // Re-sort: descending rank_score, then created_at DESC,
+        // then message_id for determinism.
+        local.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        local.truncate(limit);
+        // Re-stamp `is_cold` against the merged set. Semantic-
+        // only rows pushed onto `local` were materialized with
+        // `is_cold: false` because `fetch_skeleton_columns_for_semantic`
+        // doesn't read `body_state`; without this pass an
+        // offloaded message (`body_state = 'remote_archive_only'`)
+        // whose vector still lives in `search_vector` would
+        // surface with `is_cold = false`, and the
+        // `HydrationQueue` would never enqueue it for
+        // `SearchResultTap`-priority body fetch. The FTS / fuzzy
+        // rows in `local` were already marked once by
+        // `execute_search_with_limit`; `mark_cold_results` is
+        // idempotent.
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.mark_cold_results(&mut local)?;
+        }
+        Ok(local)
+    }
+
+    fn fetch_skeleton_columns_for_semantic(
+        &self,
+        ids: &[String],
+    ) -> DbResult<HashMap<String, SemanticSkeletonInfo>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind
+               FROM message_skeleton
+              WHERE message_id IN ({placeholders})"
+        );
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
+        for id in ids {
+            binds.push(Value::Text(id.clone()));
+        }
+        let mut out: HashMap<String, SemanticSkeletonInfo> = HashMap::new();
+        for r in stmt.query_map(params_from_iter(binds.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })? {
+            let (mid, conv, sender, ts, kind) = r?;
+            out.insert(
+                mid,
+                SemanticSkeletonInfo {
+                    conversation_id: conv,
+                    sender_id: sender,
+                    created_at_ms: ts,
+                    kind,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    // ----------------------------------------------------------------
     // Structured-only path (no FTS query string)
     // ----------------------------------------------------------------
 
@@ -733,16 +1049,12 @@ impl<'a> QueryEngine<'a> {
             // zero rank — they should still rank below newer
             // identical-relevance hits but stay visible.
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
+            // Default to text weight when the row is missing
+            // from `message_skeleton` (cold-only rows can be
+            // surfaced before the skeleton lands locally).
             let kind_w = kind_by_id
                 .get(&r.message_id.to_string())
-                .map(|k| match k.as_str() {
-                    "text" => TEXT_KIND_WEIGHT,
-                    "media" => MEDIA_KIND_WEIGHT,
-                    _ => TEXT_KIND_WEIGHT,
-                })
-                // Default to text weight when the row is missing
-                // from `message_skeleton` (cold-only rows can be
-                // surfaced before the skeleton lands locally).
+                .map(|k| kind_str_to_weight(k.as_str()))
                 .unwrap_or(TEXT_KIND_WEIGHT);
             r.rank_score *= recency_factor * kind_w;
         }
@@ -2033,5 +2345,694 @@ mod tests {
             pos_text < pos_media,
             "text outranks media at equal recency / equal FTS hit",
         );
+    }
+
+    // ----- Phase 6, Task 8: semantic reranking ----------------------
+
+    use crate::models::embeddings::{
+        EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, NoopTextEmbedder, TextEmbedder,
+        XLMR_MODEL_VERSION,
+    };
+
+    #[test]
+    fn semantic_weight_constant_matches_proposal() {
+        // PROPOSAL §7.5 ranking formula constants. Kept as
+        // runtime asserts (rather than `const { … }` blocks) so a
+        // future tweak to the constants surfaces as a normal
+        // test failure with a useful diff.
+        let bm25: f64 = BM25_WEIGHT;
+        let fuzzy: f64 = FUZZY_WEIGHT;
+        let semantic: f64 = SEMANTIC_WEIGHT;
+        assert!((bm25 - 2.0).abs() < f64::EPSILON);
+        assert!((fuzzy - 1.0).abs() < f64::EPSILON);
+        assert!((semantic - 1.5).abs() < f64::EPSILON);
+        assert!(semantic > fuzzy);
+        assert!(semantic < bm25);
+    }
+
+    #[test]
+    fn semantic_reranker_falls_back_when_embedder_is_noop() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let noop = NoopTextEmbedder;
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &noop, None, 200)
+            .unwrap();
+        let plain_ids: Vec<Uuid> = plain.iter().map(|r| r.message_id).collect();
+        let semantic_ids: Vec<Uuid> = with_semantic.iter().map(|r| r.message_id).collect();
+        assert_eq!(plain_ids, semantic_ids);
+    }
+
+    #[test]
+    fn semantic_reranker_short_circuits_on_empty_query() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery::default();
+        let mock = MockTextEmbedder::default();
+        let res = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 10)
+            .unwrap();
+        // Same as the plain-FTS empty-query path: structured-only.
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert_eq!(res.len(), plain.len());
+    }
+
+    #[test]
+    fn semantic_reranker_surfaces_semantic_only_hits() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        // Pick the message that the mock encoder will rank highest
+        // for the query "good morning team": the message itself.
+        // Insert a vector for that message into search_vector.
+        let conn = db.connection();
+        let target_text = "good morning team";
+        let target_msg_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = ?1 LIMIT 1",
+                rusqlite::params![target_text],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_msg_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed(target_text).unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        // Query that misses on FTS but matches semantically — use
+        // the same mock embedding so cosine ~ 1.0.
+        let q = SearchQuery {
+            query_string: target_text.into(),
+            ..Default::default()
+        };
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+        let target_uuid = Uuid::parse_str(&target_msg_id).unwrap();
+        assert!(with_semantic.iter().any(|r| r.message_id == target_uuid));
+    }
+
+    #[test]
+    fn semantic_reranker_combines_scores_for_dual_hits() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        let conn = db.connection();
+        // Pick a message whose text contains "hello".
+        let target_msg_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello world' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_msg_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed("hello world").unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello world".into(),
+            ..Default::default()
+        };
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+        let target_uuid = Uuid::parse_str(&target_msg_id).unwrap();
+        let plain_score = plain
+            .iter()
+            .find(|r| r.message_id == target_uuid)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+        let merged_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == target_uuid)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+        assert!(
+            merged_score > plain_score,
+            "semantic contribution should raise the dual-hit row's rank ({merged_score} vs {plain_score})",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_recency_decays_against_combined_anchor() {
+        // Regression test for the recency-anchor bug fixed in
+        // this commit: `execute_search_with_semantic` previously
+        // called `apply_recency_and_kind_weight(std::slice::from_mut(&mut sr))`
+        // per semantic-only hit, which made `now_ms` equal the
+        // row's own `created_at_ms`, collapsed `age_ms` to `0`,
+        // and pinned `recency_factor` at `1.0`. A 90-day-old
+        // semantic-only hit therefore had its score boosted to
+        // `cosine * SEMANTIC_WEIGHT * 1.0` instead of being
+        // decayed by the 30-day half-life. This test forces the
+        // anchor to come from a fresher row in the combined
+        // candidate set and asserts the stale row's score is
+        // demonstrably below the un-decayed value.
+
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+
+        // 90-day gap so `recency_factor` is well below the
+        // floor's halfway point.
+        let recent_ms: i64 = 90 * 86_400_000;
+        let stale_ms: i64 = 0;
+        let recent_msg = uuid_fixture(101).to_string();
+        let stale_msg = uuid_fixture(102).to_string();
+
+        // Anchor row: skeleton-only (no FTS body) so the FTS
+        // pass returns an empty `local`. The semantic merge has
+        // to derive its `now_ms` from the combined candidate
+        // set on its own.
+        insert_fixture(
+            &db,
+            &recent_msg,
+            &conv,
+            "alice",
+            recent_ms,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        insert_fixture(
+            &db,
+            &stale_msg,
+            &conv,
+            "bob",
+            stale_ms,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+
+        // Plant identical mock embeddings for both messages so
+        // both round-trip with cosine ≈ 1.0 against the query
+        // embedding.
+        let mock = MockTextEmbedder::default();
+        let q_text = "find this stale message";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(&recent_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
+        cache.put(&stale_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+
+        let recent_uuid = Uuid::parse_str(&recent_msg).unwrap();
+        let stale_uuid = Uuid::parse_str(&stale_msg).unwrap();
+        let recent_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == recent_uuid)
+            .map(|r| r.rank_score)
+            .expect("anchor (recent) semantic-only hit should surface");
+        let stale_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == stale_uuid)
+            .map(|r| r.rank_score)
+            .expect("90-day-old semantic-only hit should surface");
+
+        // Numeric envelope:
+        //   cosine ≈ 1.0 (round-trips via the INT8 codec at
+        //     >0.999 fidelity).
+        //   SEMANTIC_WEIGHT = 1.5
+        //   kind_weight = 1.0 (text)
+        //   For the anchor row, age = 0, so recency_factor = 1.0
+        //     and rank_score ≈ 1.5.
+        //   For the 90-day row, age_days = 90,
+        //     recency_score = exp(-90 * ln(2) / 30) = 1/8 = 0.125,
+        //     recency_factor = 0.5 + 0.5 * 0.125 = 0.5625,
+        //     rank_score ≈ 1.5 * 0.5625 ≈ 0.844.
+        let undecayed = SEMANTIC_WEIGHT;
+        assert!(
+            (recent_score - undecayed).abs() < 0.05,
+            "anchor row should sit at ≈ SEMANTIC_WEIGHT (1.5); got {recent_score:.4}",
+        );
+        // The bug under test made stale_score ≈ recent_score.
+        // Demand a clear gap: at least 30% below the un-decayed
+        // value, well above the floor (recency_factor ≥ 0.5
+        // → rank_score ≥ 0.75).
+        assert!(
+            stale_score < undecayed * 0.7,
+            "90-day-old semantic-only hit must be recency-decayed: \
+             got {stale_score:.4}, expected < {:.4} \
+             (un-decayed = {undecayed:.4})",
+            undecayed * 0.7,
+        );
+        assert!(
+            stale_score > undecayed * 0.45,
+            "score floor invariant violated: \
+             got {stale_score:.4} (floor ≈ {:.4})",
+            undecayed * 0.5,
+        );
+        // And the stale hit must rank below the anchor.
+        assert!(
+            stale_score < recent_score,
+            "stale hit should rank strictly below anchor: \
+             stale {stale_score:.4} vs anchor {recent_score:.4}",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_marks_cold_for_offloaded_body() {
+        // Regression test: `execute_search_with_semantic`
+        // materializes semantic-only hits with `is_cold: false`
+        // because `fetch_skeleton_columns_for_semantic` does not
+        // project `body_state`. Without a final cold-marking
+        // pass against the merged set, an offloaded message
+        // (`body_state = 'remote_archive_only'`) whose vector
+        // still lives in `search_vector` would surface with
+        // `is_cold = false` and the `HydrationQueue` would
+        // never enqueue it for `SearchResultTap`-priority
+        // hydration.
+        //
+        // This test seeds a single skeleton-only message,
+        // flips its `body_state` to `remote_archive_only`,
+        // plants a matching mock embedding, and asserts the
+        // returned `SearchResult` has `is_cold = true` under
+        // `SearchScope::IncludeCold`.
+
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        let mid = uuid_fixture(201).to_string();
+
+        insert_fixture(
+            &db,
+            &mid,
+            &conv,
+            "alice",
+            10_000,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        flip_to_remote_archive_only(&db, &mid);
+
+        let mock = MockTextEmbedder::default();
+        let q_text = "needle in cold archive";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::IncludeCold, &mock, None, 50)
+            .unwrap();
+
+        let target = Uuid::parse_str(&mid).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.message_id == target)
+            .expect("offloaded semantic-only hit should surface under IncludeCold");
+        assert!(
+            row.is_cold,
+            "semantic-only hit for `remote_archive_only` body must carry is_cold = true \
+             so HydrationQueue can enqueue it",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_stays_warm_under_local_only_scope() {
+        // Even when a body has been offloaded, `LocalOnly`
+        // searches must NOT stamp `is_cold = true` — the
+        // hydration queue is intentionally bypassed in that
+        // scope, and stamping cold would mislead callers about
+        // whether the result needs a network round trip.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        let mid = uuid_fixture(202).to_string();
+
+        insert_fixture(
+            &db,
+            &mid,
+            &conv,
+            "alice",
+            10_000,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        flip_to_remote_archive_only(&db, &mid);
+
+        let mock = MockTextEmbedder::default();
+        let q_text = "warm-only scope skips cold marking";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+
+        let target = Uuid::parse_str(&mid).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.message_id == target)
+            .expect("semantic-only hit should still surface under LocalOnly");
+        assert!(
+            !row.is_cold,
+            "LocalOnly scope must not stamp is_cold (got is_cold = true)",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Structured filters propagate to the semantic-only lane
+    // -----------------------------------------------------------------
+
+    /// Build two skeleton-only messages and plant identical mock
+    /// embeddings for both so semantic search returns both with
+    /// cosine ≈ 1.0. Returns `(allowed_uuid, blocked_uuid)`
+    /// — the caller pairs them with a filter to assert the
+    /// blocked one is dropped.
+    fn seed_two_semantic_only_hits(
+        db: &LocalStoreDb,
+        allowed: (&str, i64, &str, &str), // (sender, created_at_ms, kind, msg_id_str)
+        blocked: (&str, i64, &str, &str),
+        q_text: &str,
+    ) -> (Uuid, Uuid) {
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        insert_fixture(
+            db,
+            allowed.3,
+            &conv,
+            allowed.0,
+            allowed.1,
+            allowed.2,
+            None,
+            &mut conv_seen,
+        );
+        insert_fixture(
+            db,
+            blocked.3,
+            &conv,
+            blocked.0,
+            blocked.1,
+            blocked.2,
+            None,
+            &mut conv_seen,
+        );
+        let mock = MockTextEmbedder::default();
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(allowed.3, XLMR_MODEL_VERSION, &q_emb).unwrap();
+        cache.put(blocked.3, XLMR_MODEL_VERSION, &q_emb).unwrap();
+        (
+            Uuid::parse_str(allowed.3).unwrap(),
+            Uuid::parse_str(blocked.3).unwrap(),
+        )
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_sender_filter() {
+        // Regression: `execute_search_with_semantic` previously
+        // pushed every semantic-only hit onto `local` without
+        // running it through `allowed_skeleton_ids`, so a query
+        // with `sender_filter: Some("alice")` would surface
+        // bob's semantic-only hits too.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(301).to_string();
+        let blocked_mid = uuid_fixture(302).to_string();
+        let q_text = "needle";
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &allowed_mid),
+            ("bob", 11_000, "text", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        // With the sender filter set, only alice's semantic-only
+        // hit should surface.
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            sender_filter: Some("alice".into()),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "alice's semantic-only hit must pass the sender filter",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "bob's semantic-only hit must NOT leak through sender_filter = alice",
+        );
+
+        // Sanity: with no filter, both hits surface.
+        let q_no_filter = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_no_filter, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_date_window() {
+        // Regression: `date_from` / `date_to` must filter
+        // semantic-only hits, not just the FTS / fuzzy lane.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(303).to_string();
+        let blocked_mid = uuid_fixture(304).to_string();
+        let q_text = "needle";
+        // Allowed row inside the window, blocked row well below
+        // it.
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 5_000, "text", &allowed_mid),
+            ("alice", 1_000, "text", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            date_from: Some(4_000),
+            date_to: Some(6_000),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "in-window semantic-only hit must pass the date filter",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "out-of-window semantic-only hit must NOT leak through date_from / date_to",
+        );
+
+        // Sanity: with no filter, both hits surface.
+        let q_no_filter = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_no_filter, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_content_kind_filter() {
+        // Regression: `content_kind` must filter semantic-only
+        // hits. `ContentKind::Text` maps to skeleton kind
+        // `"text"`; `ContentKind::Image|Video|Audio|Document`
+        // map to `"media"`. The non-text path in
+        // `execute_fts_and_fuzzy_with_filters` short-circuits
+        // FTS for media kinds (line 270-272 above) and relies
+        // on `allowed_skeleton_ids` for filtering the
+        // structured-only / fuzzy / semantic legs.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(305).to_string();
+        let blocked_mid = uuid_fixture(306).to_string();
+        let q_text = "needle";
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &allowed_mid),
+            ("alice", 11_000, "media", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            content_kind: Some(ContentKind::Text),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "text semantic-only hit must pass content_kind = Text",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "media semantic-only hit must NOT leak through content_kind = Text",
+        );
+
+        // Sanity: with `ContentKind::Any`, both hits surface.
+        let q_any = SearchQuery {
+            query_string: q_text.into(),
+            content_kind: Some(ContentKind::Any),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_any, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_media_hit_uses_media_kind_weight() {
+        // Regression: the kind-weight match arm in
+        // `execute_search_with_semantic` previously matched on
+        // `"image" | "video" | "audio" | "file"` — vocabulary
+        // borrowed from `MediaDescriptor.kind`, not the canonical
+        // `MessageKind::as_str()` strings actually written into
+        // `message_skeleton.kind` ("text" | "media" | "system").
+        // Media-typed semantic-only hits silently fell through
+        // the `_` arm and got `TEXT_KIND_WEIGHT (= 1.0)` instead
+        // of `MEDIA_KIND_WEIGHT (= 0.8)` — overranked by 25%.
+        //
+        // This test seeds two skeleton-only rows at the same
+        // timestamp (so `recency_factor = 1.0` and only the
+        // kind weight differs), one `kind = "text"` and one
+        // `kind = "media"`, plants identical mock embeddings,
+        // and asserts:
+        //
+        //   * text  rank_score ≈ SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT  = 1.50
+        //   * media rank_score ≈ SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT = 1.20
+        //
+        // The buggy code produced 1.50 for both. Tolerances
+        // absorb INT8-quant cosine fidelity (> 0.999).
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let text_mid = uuid_fixture(401).to_string();
+        let media_mid = uuid_fixture(402).to_string();
+        let q_text = "needle";
+        let (text_uuid, media_uuid) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &text_mid),
+            ("alice", 10_000, "media", &media_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+
+        let text_score = results
+            .iter()
+            .find(|r| r.message_id == text_uuid)
+            .map(|r| r.rank_score)
+            .expect("text semantic-only hit should surface");
+        let media_score = results
+            .iter()
+            .find(|r| r.message_id == media_uuid)
+            .map(|r| r.rank_score)
+            .expect("media semantic-only hit should surface");
+
+        let expected_text = SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT;
+        let expected_media = SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT;
+        let tol = 0.05;
+
+        assert!(
+            (text_score - expected_text).abs() < tol,
+            "text rank_score {text_score:.4} should be ≈ {expected_text:.4}",
+        );
+        assert!(
+            (media_score - expected_media).abs() < tol,
+            "media rank_score {media_score:.4} should be ≈ {expected_media:.4}; \
+             buggy code (matching on \"image\"/\"video\"/\"audio\"/\"file\") would \
+             have produced {expected_text:.4}",
+        );
+
+        // Tight invariant: the ratio must reflect the kind
+        // weight ratio (1.0 / 0.8 = 1.25), independent of any
+        // INT8 quant noise.
+        let ratio = text_score / media_score;
+        let expected_ratio = TEXT_KIND_WEIGHT / MEDIA_KIND_WEIGHT;
+        assert!(
+            (ratio - expected_ratio).abs() < 0.01,
+            "rank_score ratio {ratio:.4} should be ≈ {expected_ratio:.4} \
+             (= TEXT_KIND_WEIGHT / MEDIA_KIND_WEIGHT)",
+        );
+    }
+
+    #[test]
+    fn kind_str_to_weight_canonical_mapping() {
+        // The helper is the single source of truth for the
+        // skeleton-kind → ranker-weight mapping. Pin the
+        // canonical `MessageKind::as_str()` vocabulary —
+        // anything else collapses to TEXT_KIND_WEIGHT so cold
+        // / unknown rows stay visible.
+        assert_eq!(kind_str_to_weight("text"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("media"), MEDIA_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("system"), TEXT_KIND_WEIGHT);
+        // Vocabulary that previously slipped through the dead
+        // arm in `execute_search_with_semantic` — pin them as
+        // unknown / text-weight so a future regression on the
+        // semantic-only path cannot silently re-route media
+        // hits through these strings.
+        assert_eq!(kind_str_to_weight("image"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("video"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("audio"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("file"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight(""), TEXT_KIND_WEIGHT);
     }
 }

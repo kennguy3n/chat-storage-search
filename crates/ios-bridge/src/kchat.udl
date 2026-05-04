@@ -27,6 +27,7 @@ interface KChatError {
   Message(string message);
   Transport(string message);
   NotImplemented(string method);
+  Model(string message);
   InvalidArgument(string message);
 };
 

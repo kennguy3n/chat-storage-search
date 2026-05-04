@@ -134,6 +134,116 @@ mod posix_cpu {
 #[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
 pub use posix_cpu::create_mobileclip_session;
 
+// ---------------------------------------------------------------------------
+// ImageEmbedder trait — Phase 6, Task 9
+// ---------------------------------------------------------------------------
+
+use crate::Result;
+
+/// On-device image-embedding seam used by the media-ingest
+/// pipeline (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
+///
+/// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
+/// can stash it inside `Mutex<Option<Box<dyn ImageEmbedder>>>`.
+/// Implementations MUST return an L2-normalized vector of length
+/// [`MOBILECLIP_S2_EMBEDDING_DIM`] for the canonical encoder.
+///
+/// The MIME hint is a courtesy: implementations are free to
+/// sniff the leading bytes and ignore the hint, but using it
+/// short-circuits the image-codec dispatch in the common case.
+pub trait ImageEmbedder: std::fmt::Debug + Send + Sync {
+    /// Run image inference over `image_data`. `mime_type` is the
+    /// source MIME hint (`"image/jpeg"`, `"image/png"`,
+    /// `"image/webp"`, …). Implementations SHOULD reject non-
+    /// image MIME types with [`crate::Error::Model`] rather than
+    /// returning a degenerate embedding.
+    fn embed_image(&self, image_data: &[u8], mime_type: &str) -> Result<Vec<f32>>;
+}
+
+/// Always-`NotImplemented` `ImageEmbedder` for builds without a
+/// real MobileCLIP-S2 model wired in.
+///
+/// `embed_image` returns
+/// [`crate::Error::NotImplemented("image_embedder")`](crate::Error::NotImplemented).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopImageEmbedder;
+
+impl ImageEmbedder for NoopImageEmbedder {
+    fn embed_image(&self, _image_data: &[u8], _mime_type: &str) -> Result<Vec<f32>> {
+        Err(crate::Error::NotImplemented("image_embedder"))
+    }
+}
+
+/// Deterministic test [`ImageEmbedder`] that hashes
+/// `(mime_type, image_data)` into a reproducible, L2-normalized
+/// vector.
+///
+/// Used by the Phase 6 unit tests to stand in for a real
+/// MobileCLIP-S2 encoder. Same construction as
+/// [`crate::models::embeddings::MockTextEmbedder`]: BLAKE3 of
+/// the input seeds an LCG, and the resulting `dim`-length f32
+/// vector is L2-normalized.
+#[derive(Debug, Clone, Copy)]
+pub struct MockImageEmbedder {
+    dim: usize,
+}
+
+impl Default for MockImageEmbedder {
+    fn default() -> Self {
+        Self {
+            dim: MOBILECLIP_S2_EMBEDDING_DIM,
+        }
+    }
+}
+
+impl MockImageEmbedder {
+    /// Build a [`MockImageEmbedder`] that emits `dim`-length
+    /// vectors. Default constructor uses
+    /// [`MOBILECLIP_S2_EMBEDDING_DIM`].
+    pub fn with_dim(dim: usize) -> Self {
+        assert!(dim > 0, "MockImageEmbedder dim must be > 0");
+        Self { dim }
+    }
+
+    /// Embedding dimensionality the mock emits.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+impl ImageEmbedder for MockImageEmbedder {
+    fn embed_image(&self, image_data: &[u8], mime_type: &str) -> Result<Vec<f32>> {
+        if !mime_type.starts_with("image/") {
+            return Err(crate::Error::Model(format!(
+                "MockImageEmbedder rejects non-image mime_type: {mime_type}"
+            )));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(mime_type.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(image_data);
+        let hash = hasher.finalize();
+        let seed_bytes = &hash.as_bytes()[..4];
+        let mut x =
+            u32::from_le_bytes([seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3]]);
+        if x == 0 {
+            x = 1;
+        }
+        let mut raw: Vec<f32> = Vec::with_capacity(self.dim);
+        for _ in 0..self.dim {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            raw.push((x as i32) as f32 / i32::MAX as f32);
+        }
+        let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for v in &mut raw {
+                *v /= norm;
+            }
+        }
+        Ok(raw)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +281,51 @@ mod tests {
         fn directml_available(&self) -> bool {
             false
         }
+    }
+
+    // ----- Phase 6, Task 9: ImageEmbedder coverage --------------
+
+    #[test]
+    fn noop_image_embedder_returns_not_implemented() {
+        let emb = NoopImageEmbedder;
+        let err = emb.embed_image(b"bytes", "image/png").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::NotImplemented("image_embedder")
+        ));
+    }
+
+    #[test]
+    fn mock_image_embedder_is_deterministic_and_normalized() {
+        let emb = MockImageEmbedder::default();
+        let a = emb.embed_image(b"AAA", "image/png").expect("a");
+        let b = emb.embed_image(b"AAA", "image/png").expect("b");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), MOBILECLIP_S2_EMBEDDING_DIM);
+        let norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mock_image_embedder_distinct_inputs_diverge() {
+        let emb = MockImageEmbedder::default();
+        let a = emb.embed_image(b"AAA", "image/png").unwrap();
+        let b = emb.embed_image(b"BBB", "image/png").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mock_image_embedder_rejects_non_image_mime() {
+        let emb = MockImageEmbedder::default();
+        let err = emb.embed_image(b"unused", "text/plain").unwrap_err();
+        assert!(matches!(err, crate::Error::Model(_)));
+    }
+
+    #[test]
+    fn image_embedder_trait_is_object_safe() {
+        let mock = MockImageEmbedder::default();
+        let dynref: &dyn ImageEmbedder = &mock;
+        let v = dynref.embed_image(b"X", "image/jpeg").unwrap();
+        assert_eq!(v.len(), MOBILECLIP_S2_EMBEDDING_DIM);
     }
 }

@@ -710,6 +710,13 @@ impl<'a> MessagePersister<'a> {
         let fuzzy = FuzzySearchEngine::new(self.db);
         fuzzy.remove_message(&skel.message_id)?;
         fuzzy.index_message(&skel.message_id, new_text)?;
+        // Invalidate the pre-edit embedding so semantic search
+        // does not surface the old text. Re-embedding is the
+        // CoreImpl ingest path's job (it owns the
+        // `TextEmbedder` slot) and runs lazily on the next
+        // ingest tick / cache miss; here we only ensure no
+        // stale row remains.
+        self.db.delete_vector_row(&skel.message_id)?;
         let payload = encode_edit_event_payload(&skel.message_id, edited_at_ms);
         let entry = BackupEventJournalEntry {
             event_seq: 0,
@@ -818,6 +825,15 @@ impl<'a> MessagePersister<'a> {
         self.db
             .update_skeleton_deleted(&skel.message_id, deleted_at_ms, target)?;
         self.db.delete_fts_row(&skel.message_id)?;
+        // Drop the cross-pipeline embedding row so a deleted
+        // message no longer surfaces via
+        // `QueryEngine::execute_search_with_semantic`. The FTS /
+        // fuzzy / vector cleanup is symmetric across the three
+        // search lanes; without this, `SemanticSearchEngine`
+        // would still find the orphan vector row and
+        // `fetch_skeleton_columns_for_semantic` (which does not
+        // filter on `body_state`) would materialize it.
+        self.db.delete_vector_row(&skel.message_id)?;
         FuzzySearchEngine::new(self.db).remove_message(&skel.message_id)?;
         if matches!(scope, DeleteScope::ForEveryone) {
             self.db.delete_message_body(&skel.message_id)?;
@@ -2051,6 +2067,101 @@ mod tests {
 
         p.delete_for_everyone(&mid_s).expect("delete_for_everyone");
         assert_eq!(fuzzy_count(&db, &mid_s), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // search_vector cleanup on delete / edit (Phase 6)
+    // -----------------------------------------------------------------
+
+    fn vector_count(db: &LocalStoreDb, message_id: &str) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM search_vector WHERE message_id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn put_test_embedding(db: &LocalStoreDb, message_id: &str) {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        // Deterministic 384-dim unit vector.
+        let mut v = vec![0.0_f32; 384];
+        v[0] = 1.0;
+        cache.put(message_id, XLMR_MODEL_VERSION, &v).unwrap();
+    }
+
+    #[test]
+    fn delete_for_me_removes_search_vector_row() {
+        // Regression: per-message delete must drop the
+        // cross-pipeline embedding so semantic search does not
+        // continue to surface a deleted message. Conversation-
+        // level delete already handles this; the per-message
+        // path was the gap.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+        put_test_embedding(&db, &mid_s);
+        assert_eq!(vector_count(&db, &mid_s), 1);
+
+        p.delete_for_me(&mid_s).expect("delete_for_me");
+        assert_eq!(
+            vector_count(&db, &mid_s),
+            0,
+            "delete_for_me must drop search_vector row alongside FTS / fuzzy"
+        );
+    }
+
+    #[test]
+    fn delete_for_everyone_removes_search_vector_row() {
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+        put_test_embedding(&db, &mid_s);
+        assert_eq!(vector_count(&db, &mid_s), 1);
+
+        p.delete_for_everyone(&mid_s).expect("delete_for_everyone");
+        assert_eq!(
+            vector_count(&db, &mid_s),
+            0,
+            "delete_for_everyone must drop search_vector row alongside FTS / fuzzy"
+        );
+    }
+
+    #[test]
+    fn edit_message_invalidates_search_vector_row() {
+        // Regression: the edit path reindexes FTS / fuzzy from
+        // the new text but, before this fix, left the old
+        // embedding in `search_vector`. Semantic search would
+        // then return matches based on the pre-edit text.
+        // Re-embedding is `CoreImpl::ingest_messages`'s job
+        // (it owns the `TextEmbedder` slot) — here we only
+        // assert the stale row is gone.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv = Uuid::now_v7();
+        seed_conversation(&db, &conv);
+        let mid = persist_text_message(&p, conv, "lighthouse keeper");
+        let mid_s = mid.to_string();
+        put_test_embedding(&db, &mid_s);
+        assert_eq!(vector_count(&db, &mid_s), 1);
+
+        p.edit_message(&mid_s, "fresh banana smoothie")
+            .expect("edit");
+        assert_eq!(
+            vector_count(&db, &mid_s),
+            0,
+            "edit_message must invalidate the pre-edit search_vector row"
+        );
     }
 
     #[test]

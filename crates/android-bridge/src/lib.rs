@@ -93,6 +93,7 @@ impl From<kchat_core::Error> for BridgeError {
             kchat_core::Error::Message(s) => ("message", s),
             kchat_core::Error::Transport(s) => ("transport", s),
             kchat_core::Error::NotImplemented(m) => ("not_implemented", m.to_string()),
+            kchat_core::Error::Model(s) => ("model", s),
         };
         BridgeError::Core {
             category: category.to_string(),

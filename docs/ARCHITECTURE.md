@@ -486,11 +486,31 @@ the standard library and chosen primitives.
 > based on `is_thumbnail` and `MediaBlobReference::storage_sink`).
 >
 > The remaining higher-level modules (`backup`, `restore`,
-> `models`, `transport`, `scheduler`) are Phase-0 placeholders
+> `transport`, `scheduler`) are Phase-0 placeholders
 > and are filled in across Phases 3 – 7. `transport` is
 > partially populated by Phase 1 (`DeliveryClient` /
 > `TransportClient` traits, `NoopTransportClient`,
 > `MockDeliveryClient`).
+>
+> The Phase-6 `models` module is no longer a placeholder: it
+> hosts the on-device ML seam surface that the platform bridges
+> wire actual inference into. See §11 for the full surface, but
+> in brief:
+> `models::embeddings` (the `TextEmbedder` trait + the
+> shared `EmbeddingCache` / `LocalStoreEmbeddingCache` keyed
+> `(message_id, model_version)` and the INT8 codec used for
+> on-disk storage), `models::embeddings_onnx` (ONNX Runtime
+> session lifecycle + EP-selection state machine, gated behind
+> `#[cfg(feature = "onnx-runtime")]`), `models::clip` (the
+> `ImageEmbedder` trait + MobileCLIP-S2 constants),
+> `models::ocr` (the `OcrBridge` trait — platform OCR is the
+> Vision / ML Kit / Windows.Media.Ocr backend implementing this
+> seam), `models::resource_gate` (battery / thermal / charging /
+> network policy with a `ResourceProbe` trait so the host
+> platform supplies the live readings), and
+> `models::model_manager` (the on-disk artifact lifecycle:
+> register / ensure / verify / list / delete plus the
+> `ModelDownloader` trait that isolates HTTP from the core).
 >
 > The Phase 3 modules `archive` and `offload` are no longer
 > placeholders: `archive::event_journal` (append-only mutation
@@ -886,14 +906,14 @@ flowchart TD
         FZ["Fuzzy index<br/>(trigram for Latn / Cyrl,<br/>bigram for CJK)"]
         STRUCT["Structured index<br/>(sender, date, conversation)"]
         ECACHE["Embedding cache check<br/>(search_vector,<br/>(message_id, model_version))"]
-        EMB["Multilingual embedding<br/>(XLM-R)"]
-        HNSW["HNSW vector index"]
+        EMB["TextEmbedder.embed<br/>(XLM-R, query string)"]
+        SEM["SemanticSearchEngine<br/>(brute-force cosine over<br/>search_vector rows;<br/>HNSW upgrade is a follow-up)"]
     end
 
     Cold["Cold bucket?<br/>fetch encrypted shard<br/>by coarse bucket"]
     Decrypt["Decrypt shard locally"]
-    Merge["Merge candidates"]
-    Rerank["Rerank<br/>(see PROPOSAL.md §7.5)"]
+    Merge["Merge candidates by<br/>message_id"]
+    Rerank["Rerank<br/>BM25_WEIGHT × bm25 +<br/>FUZZY_WEIGHT × fuzzy +<br/>SEMANTIC_WEIGHT × cosine ×<br/>recency × content_kind<br/>(see PROPOSAL.md §7.5)"]
     Out["Skeleton results<br/>(hydrate on tap)"]
 
     Q --> LD --> NORM --> TOK
@@ -901,20 +921,34 @@ flowchart TD
     TOK --> FZ
     Q --> STRUCT
     Q --> ECACHE
-    ECACHE -->|"hit"| HNSW
+    ECACHE -->|"hit"| SEM
     ECACHE -->|"miss"| EMB
-    EMB --> HNSW
+    EMB --> SEM
     FTS -->|"index missing locally"| Cold
     FZ -->|"index missing locally"| Cold
-    HNSW -->|"index missing locally"| Cold
+    SEM -->|"index missing locally"| Cold
     Cold --> Decrypt
     Decrypt --> Merge
     FTS --> Merge
     FZ --> Merge
     STRUCT --> Merge
-    HNSW --> Merge
+    SEM --> Merge
     Merge --> Rerank --> Out
 ```
+
+The semantic path is the Phase 6 implementation. The query
+string flows through `QueryEngine::execute_search_with_semantic`
+which:
+1. runs the existing FTS5 + fuzzy fan-out;
+2. if a `TextEmbedder` is installed, embeds the query and runs
+   `SemanticSearchEngine::search_semantic` (brute-force cosine
+   over the bounded per-conversation `search_vector` corpus —
+   the HNSW upgrade is held in reserve for the corpus size where
+   brute-force becomes unappealing);
+3. merges semantic hits into the candidate set, summing
+   contributions for rows that hit both surfaces;
+4. weights surviving candidates by the recency × content-kind
+   factor and re-sorts.
 
 The embedding cache is populated by both the guardrail pipeline
 (`kennguy3n/slm-guardrail`) and the search pipeline. A message's
@@ -924,9 +958,13 @@ first observes the message writes the 384-dim vector into the
 'xlmr@v1')`, and the other pipeline reads it back from that row
 instead of running its own ONNX inference. See
 [`docs/PROPOSAL.md` §7.6.1](./PROPOSAL.md) for the full contract
-(version-mismatch handling, locality / non-replication rules) and
-[`crate::models::embeddings::EmbeddingCache`] for the trait that
-binds the seam.
+(version-mismatch handling, locality / non-replication rules)
+and [`crate::models::embeddings::EmbeddingCache`] for the trait
+that binds the seam. The Phase-6 integration test
+`crates/core/tests/phase6_embedding_cache.rs` exercises the
+seam (put/get round-trip with INT8-codec cosine fidelity > 0.999,
+version-mismatch → `None`, two-instance same-connection
+cross-pipeline visibility).
 
 ### 6.1 Encrypted shard prefetch
 
@@ -1952,6 +1990,126 @@ sequenceDiagram
 > EP-selection state machine is factored as a pure function over
 > a `DirectMlProbe` trait so it can be exhaustively unit-tested
 > on non-Windows hosts.
+
+### 11.5 ML seams: `TextEmbedder` / `ImageEmbedder` / `OcrBridge`
+
+The Phase 6 model surface is intentionally a set of thin
+object-safe traits in `crates/core/src/models/` that the
+platform bridges implement. The Rust core never owns an HTTP
+client, never decodes images on its own, and never calls into
+Vision / ML Kit / Windows.Media.Ocr directly.
+
+* `models::embeddings::TextEmbedder` — `fn embed(&self, text:
+  &str) -> Result<Vec<f32>>`. The `NoopTextEmbedder` returns
+  `Error::NotImplemented("text_embedder")`; the
+  `MockTextEmbedder` returns deterministic INT8-quantizable
+  vectors for tests; the ONNX-backed implementation lives behind
+  `#[cfg(feature = "onnx-runtime")]` in `embeddings_onnx.rs` and
+  pipes `tokenize → pad/truncate → session.run → mean-pool →
+  L2-normalize`. Installed on the core via
+  `CoreImpl::install_text_embedder`.
+* `models::clip::ImageEmbedder` — `fn embed_image(&self, bytes:
+  &[u8], mime: &str) -> Result<Vec<f32>>`. Same shape as
+  `TextEmbedder`; `Noop` / `Mock` plus an ONNX-gated
+  implementation that runs `decode → resize 224×224 → RGB
+  NCHW → ImageNet-normalize → session.run → L2-normalize`.
+  Installed via `CoreImpl::install_image_embedder`.
+* `models::ocr::OcrBridge` — `fn recognize_text(&self, bytes:
+  &[u8], mime: &str) -> Result<Vec<OcrResult>>` returning text
+  + language + confidence + optional bounding box. Platform
+  implementations are `VNRecognizeTextRequest` (iOS / macOS), ML
+  Kit Text Recognition v2 (Android), `Windows.Media.Ocr` /
+  Tesseract (Windows). Installed via
+  `CoreImpl::install_ocr_bridge`.
+
+All three traits are `Send + Sync` and object-safe so they live
+behind a `Mutex<Option<Box<dyn …>>>` (or `Arc` for `OcrBridge` /
+`ResourceProbe`) on `CoreImpl`. This lets the bridge crates swap
+in a real implementation without recompiling the core, and keeps
+the test surface small (mock ↔ real swap is a one-line install).
+
+### 11.6 `ModelManager` lifecycle
+
+`crates/core/src/models/model_manager.rs` owns the on-disk
+artifact lifecycle, but **not** the download itself.
+
+```
+ModelManager::ensure(model_id, version) ──┐
+   ├─ artifact already on disk?  → return cached  ModelArtifact
+   ├─ otherwise → ModelDownloader::download_model(...) → register
+   └─ verify_integrity (SHA-256) before handing back to the caller
+```
+
+Surface: `register_model`, `ensure_model`, `verify_integrity`,
+`list_models`, `delete_model`, `select_quantization(model_id,
+storage)` (returns `Quantization::Int4` on tight cache budgets,
+`Int8` otherwise). `ModelDownloader` is the
+`Send + Sync` HTTP seam; `NoopModelDownloader` returns
+`Error::NotImplemented("model_downloader")`. The bridge crates
+ship the real downloader so the core stays free of TLS / cert
+plumbing.
+
+### 11.7 `ResourceGate` policy
+
+`crates/core/src/models/resource_gate.rs` keeps the on-device
+"is it OK to run this work right now?" decision as pure logic:
+
+```
+DeviceResources { battery_level, is_charging, thermal_state, network_type }
+      │
+      ▼
+ResourcePolicy { min_battery, require_charging_for_heavy,
+                 max_thermal, require_wifi_for_download }
+      │
+      ▼
+ResourceGate::should_run_embedding   (cheap, runs at moderate battery)
+ResourceGate::should_run_ocr         (medium, gated on thermal headroom)
+ResourceGate::should_run_transcription (expensive, strictest gate)
+ResourceGate::should_download_model  (gated on Wi-Fi by default)
+```
+
+Live readings come from a `ResourceProbe` trait the platform
+implements; `NoopResourceProbe` returns an "all-clear"
+`DeviceResources` so unit tests don't have to fake battery
+readings. Installed via `CoreImpl::install_resource_probe`.
+
+### 11.8 Semantic search pipeline
+
+The on-device semantic path runs entirely inside the Rust core
+once a `TextEmbedder` is installed:
+
+```
+QueryEngine::execute_search_with_semantic
+   ├─ run existing FTS5 + fuzzy fan-out (BM25 + fuzzy scores per row)
+   ├─ if a TextEmbedder is installed AND the query is non-empty:
+   │     ├─ embed the query string → q_vec
+   │     ├─ SemanticSearchEngine::search_semantic(q_vec, conv_filter, top_k)
+   │     │     └─ brute-force cosine over `search_vector` rows
+   │     │        for the conversation; INT8 codec is decoded via
+   │     │        `dequantize_int8`
+   │     ├─ merge into the candidate set keyed by message_id
+   │     └─ for rows that hit BOTH surfaces:
+   │           combined = BM25_WEIGHT  * bm25
+   │                    + FUZZY_WEIGHT * fuzzy
+   │                    + SEMANTIC_WEIGHT * cosine
+   ├─ apply recency × content-kind weighting to semantic-only hits
+   └─ re-sort and truncate
+```
+
+`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
+`SEMANTIC_WEIGHT = 1.5` per PROPOSAL §7.5. The path is a strict
+opt-in: with no embedder installed, `execute_search_with_semantic`
+falls back to the existing FTS5 + fuzzy result set so a missing
+model never breaks the search surface. The cross-pipeline
+`EmbeddingCache` (PROPOSAL §7.6.1) is what keeps inference work
+out of the hot path: a guardrail-pipeline write on the same
+`(message_id, "xlmr@v1")` key is read straight back by the
+search pipeline without re-embedding.
+
+The HNSW upgrade is held in reserve for the corpus size where
+brute-force cosine becomes unappealing — Phase 6 ships
+brute-force because the per-conversation `search_vector`
+population is bounded.
 
 ---
 

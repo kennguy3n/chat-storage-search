@@ -102,6 +102,45 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
+> **Phase 6 — Media and Semantic Search — `In progress | ~55%`**
+> (ONNX Runtime session lifecycle in
+> `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
+> seam — `TextEmbedder` trait + `NoopTextEmbedder` /
+> `MockTextEmbedder` in `crates/core/src/models/embeddings.rs`,
+> wired into `CoreImpl::ingest_messages` via the best-effort
+> `maybe_embed_text_message` that lands the vector in the shared
+> `LocalStoreEmbeddingCache` keyed `(message_id, "xlmr@v1")`;
+> MobileCLIP-S2 inference seam — `ImageEmbedder` /
+> `NoopImageEmbedder` / `MockImageEmbedder` in
+> `crates/core/src/models/clip.rs`, wired through
+> `CoreImpl::send_media` and gated on
+> `mime_type.starts_with("image/")` plus the cross-pipeline cache
+> key `(message_id, "mobileclip_s2@v1")`; brute-force semantic
+> search engine over the per-conversation `search_vector` corpus
+> (`crates/core/src/search/semantic_search.rs`); on-device
+> reranker — `SEMANTIC_WEIGHT = 1.5` between BM25 / fuzzy
+> contributions, merged in
+> `QueryEngine::execute_search_with_semantic`; OCR bridge —
+> `OcrBridge` trait + `NoopOcrBridge` in
+> `crates/core/src/models/ocr.rs` plus
+> `LocalStoreDb::insert_media_search_index` /
+> `search_media_index` storage helpers; resource-gated background
+> processing — `ResourceGate` / `ResourcePolicy` /
+> `ResourceProbe` in `crates/core/src/models/resource_gate.rs`;
+> model manager — `ModelManager` / `ModelDownloader` /
+> `Quantization` in `crates/core/src/models/model_manager.rs`;
+> encrypted vector and media shards through
+> `crates/core/src/search/shard_builder.rs::{build,restore}_{vector,media}_search_shard`
+> with new key-derivation helpers
+> `crypto::key_hierarchy::derive_{vector,media}_index_shard`;
+> cross-pipeline embedding cache — `EmbeddingCache` trait +
+> `LocalStoreEmbeddingCache` plus the dedicated integration test
+> at `crates/core/tests/phase6_embedding_cache.rs` that asserts
+> put / get cosine fidelity > 0.999, version-mismatch → `None`,
+> and two-instance same-connection cross-pipeline visibility.
+> Items still open: video keyframe sampling, Whisper multilingual
+> inference loop, document text extraction, desktop EP tuning,
+> INT4 benchmarking.)
 > **Phase 7 — Desktop + Optimization — `In progress | ~28%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
@@ -315,9 +354,10 @@ chat-storage-search/
           mod.rs
           tokenizer.rs                      # ICU + ScriptClass + FuzzyGranularity
           text_search.rs                    # FTS5 BM25 engine, ICU/unicode61 fallback
-          query_engine.rs                   # FTS + sender/date/conv/kind structured filters
+          query_engine.rs                   # FTS + sender/date/conv/kind structured filters; Phase 6: execute_search_with_semantic merges semantic hits using SEMANTIC_WEIGHT = 1.5
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
-          shard_builder.rs                  # build_text_search_shard / build_fuzzy_search_shard / restore_text_search_shard / restore_fuzzy_search_shard (encrypted search shards for Phase 4 backup / restore)
+          semantic_search.rs                # Phase 6: SemanticSearchEngine (brute-force cosine over `search_vector` rows, conversation-filterable)
+          shard_builder.rs                  # build/restore_text_search_shard, build/restore_fuzzy_search_shard, build/restore_vector_search_shard, build/restore_media_search_shard (encrypted search shards for Phase 4 backup / restore + Phase 6 vector / media)
           shard_prefetch.rs                 # batch_prefetch_shards / batch_prefetch_shards_with_padding: one batch per (conversation_hash, bucket) over [Text, Fuzzy, Vector, Media] — coarsens metadata signal (Phase 5)
           cold_shard_source.rs              # TransportColdShardSource (TransportClient + ShardKeyRegistry → ColdShardSource) + GracefulCold wrapper (Phase 5)
         archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding + compaction
@@ -359,7 +399,14 @@ chat-storage-search/
             zk_fabric.rs                    # ZkObjectFabricSink: per-chunk S3 keys media/{asset_id}/chunk-{idx:08}, S3Client trait + NoopS3Client
             icloud.rs                       # ICloudBlobBridge trait + ICloudMediaBlobSink + NoopICloudBridge (storage_sink = "icloud")
             google_drive.rs                 # GoogleDriveBridge trait + GoogleDriveMediaBlobSink + NoopGoogleDriveBridge (storage_sink = "google_drive")
-        models/                             # placeholder (Phase 6)
+        models/                             # Phase 6: on-device ML seams
+          mod.rs                            # re-exports
+          embeddings.rs                     # TextEmbedder trait + NoopTextEmbedder + MockTextEmbedder + EmbeddingCache trait + LocalStoreEmbeddingCache + INT8 codec + XLMR_MODEL_VERSION / XLMR_EMBEDDING_DIM
+          embeddings_onnx.rs                # ONNX Runtime session lifecycle (gated `#[cfg(feature = "onnx-runtime")]`); EP-selection state machine + Error::Model mapping
+          clip.rs                           # ImageEmbedder trait + NoopImageEmbedder + MockImageEmbedder + MOBILECLIP_S2_MODEL_VERSION / MOBILECLIP_S2_EMBEDDING_DIM
+          ocr.rs                            # OcrBridge trait (Send+Sync, object-safe) + NoopOcrBridge + OcrResult + BoundingBox
+          model_manager.rs                  # ModelManager + ModelArtifact + ModelManagerConfig + Quantization (Int8 / Int4 / Float32) + ModelDownloader trait + NoopModelDownloader + select_quantization
+          resource_gate.rs                  # ResourceGate + ResourcePolicy + DeviceResources + ThermalState + NetworkType + ResourceProbe trait + NoopResourceProbe
         offload/                            # Phase 3 foundation: budget + scoring + eviction + hydration
           mod.rs
           budget.rs                         # StorageBudget / StorageUsage / BudgetAssessment / PressureLevel / StorageBudgetEnforcer
@@ -392,6 +439,7 @@ chat-storage-search/
         storage_budget_enforcement.rs       # Phase 3 end-to-end: pressure assessment → candidate collection → tiered eviction → executor (every PressureLevel × every EvictionTier)
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
+        phase6_embedding_cache.rs           # Phase 6: cross-pipeline EmbeddingCache integration test — put/get round-trip with INT8-codec cosine > 0.999, version-mismatch → None, two LocalStoreEmbeddingCache instances on the same SQLCipher connection see each other's writes
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
         pattern_c_interop_vectors.json
     ios-bridge/                             # UniFFI → Swift (Phase 1 scaffold: kchat.udl + build.rs + FFI wrappers)
