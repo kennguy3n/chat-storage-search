@@ -875,6 +875,77 @@ impl LocalStoreDb {
         Ok(out)
     }
 
+    /// Phase 7, batch-5 — list every `media_asset` row whose
+    /// `storage_sink` matches the supplied tag, ordered by
+    /// `asset_id` for deterministic iteration. Used by the
+    /// cross-sink media migration planner
+    /// (`crate::media::migration::plan_media_migration`).
+    pub fn list_media_assets_by_storage_sink(
+        &self,
+        storage_sink: &str,
+    ) -> DbResult<Vec<MediaAsset>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
+                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                        storage_sink
+                   FROM media_asset
+                  WHERE storage_sink = ?1
+                  ORDER BY asset_id",
+            )
+            .map_err(DbError::from)?;
+        let rows = stmt
+            .query_map(params![storage_sink], |row| {
+                let media_state: String = row.get(5)?;
+                let media_state = media_state.parse::<MediaState>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                })?;
+                Ok(MediaAsset {
+                    asset_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    mime_type: row.get(2)?,
+                    bytes_total: row.get(3)?,
+                    bytes_local: row.get(4)?,
+                    media_state,
+                    wrapped_k_asset: row.get(6)?,
+                    chunk_count: row.get(7)?,
+                    merkle_root: row.get(8)?,
+                    blob_id: row.get(9)?,
+                    storage_sink: row.get(10)?,
+                })
+            })
+            .map_err(DbError::from)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(DbError::from)?);
+        }
+        Ok(out)
+    }
+
+    /// Phase 7, batch-5 — update `media_asset.storage_sink` and
+    /// `media_asset.blob_id` for `asset_id`. Returns the number
+    /// of rows updated (0 when no asset matches). Used by the
+    /// migration executor after a successful cross-sink upload.
+    pub fn update_media_storage_sink(
+        &self,
+        asset_id: &str,
+        new_sink: &str,
+        new_blob_id: &str,
+    ) -> DbResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE media_asset
+                SET storage_sink = ?1, blob_id = ?2
+              WHERE asset_id = ?3",
+            params![new_sink, new_blob_id, asset_id],
+        )?;
+        Ok(rows)
+    }
+
     /// Update `media_asset.media_state` for `asset_id`. Returns the
     /// number of rows updated (0 when no asset matches).
     ///

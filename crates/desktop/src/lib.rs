@@ -14,5 +14,9 @@
 
 pub use kchat_core as core;
 
+pub mod background;
 pub mod macos;
+pub mod ml_ep;
+pub mod spotlight;
 pub mod windows;
+pub mod windows_search;

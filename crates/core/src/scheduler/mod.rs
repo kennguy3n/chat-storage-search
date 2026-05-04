@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
+pub mod in_process;
+pub use in_process::{InProcessScheduler, TaskHandler};
+
 // ---------------------------------------------------------------------------
 // TaskType — enumerated recurring background tasks
 // ---------------------------------------------------------------------------
@@ -151,6 +154,19 @@ pub trait BackgroundScheduler: Send + Sync + std::fmt::Debug {
     /// Schedule the [`TaskType::IndexMaintenance`] loop with
     /// the given cadence.
     fn schedule_index_maintenance(&self, interval_ms: u64) -> Result<(), Error>;
+
+    /// Schedule the [`TaskType::MediaCacheEviction`] loop with
+    /// the given cadence.
+    ///
+    /// Default impl returns
+    /// [`Error::NotImplemented("scheduler")`] so existing
+    /// platform bridges that haven't migrated yet keep
+    /// compiling — production bridges (`InProcessScheduler`,
+    /// `IosBgTaskBridge`, `AndroidWorkManagerBridge`) override
+    /// this method.
+    fn schedule_media_cache_eviction(&self, _interval_ms: u64) -> Result<(), Error> {
+        Err(Error::NotImplemented("scheduler"))
+    }
 
     /// Cancel every kchat-owned scheduled task. Used during
     /// account teardown, device deregistration, and the

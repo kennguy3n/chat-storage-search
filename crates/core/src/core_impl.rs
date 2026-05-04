@@ -242,6 +242,23 @@ pub struct CoreImpl {
     /// `run_incremental_backup`, `enforce_storage_budget`) emit
     /// [`crate::perf::PerfTrace`] records into the collector.
     perf_collector: Mutex<Option<std::sync::Arc<dyn crate::perf::PerfCollector>>>,
+    /// Phase-7 dedup-analytics probe (read-only telemetry against
+    /// the upstream ZK Object Fabric ContentIndex). `None` until
+    /// [`CoreImpl::install_dedup_analytics`] is called; when set,
+    /// [`CoreImpl::query_dedup_stats`] /
+    /// [`CoreImpl::query_storage_savings`] dispatch through it.
+    /// See `crates/core/src/transport/dedup_analytics.rs` for the
+    /// privacy contract.
+    dedup_analytics:
+        Mutex<Option<std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>>,
+    /// Phase-8 multi-scope search resolver. `None` until
+    /// [`CoreImpl::install_conversation_group_resolver`] is
+    /// called; the query engine treats `None` as the default
+    /// [`crate::search::search_target::NoopConversationGroupResolver`]
+    /// (Channel resolves to its singleton id, Starred / Unread
+    /// resolve to the empty set).
+    conversation_group_resolver:
+        Mutex<Option<std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>>>,
 }
 
 /// One row of [`CoreImpl::tracked_backup_segments`].
@@ -412,6 +429,8 @@ impl CoreImpl {
             video_keyframe_sampler: Mutex::new(None),
             offline_detector: Mutex::new(None),
             perf_collector: Mutex::new(None),
+            dedup_analytics: Mutex::new(None),
+            conversation_group_resolver: Mutex::new(None),
         })
     }
 
@@ -447,6 +466,8 @@ impl CoreImpl {
             video_keyframe_sampler: Mutex::new(None),
             offline_detector: Mutex::new(None),
             perf_collector: Mutex::new(None),
+            dedup_analytics: Mutex::new(None),
+            conversation_group_resolver: Mutex::new(None),
         })
     }
 
@@ -1417,6 +1438,154 @@ impl CoreImpl {
                 collector.record(trace);
             }
         }
+    }
+
+    /// Install (or replace) the read-only dedup-analytics probe
+    /// (Phase 7, batch-5 — 2026-05-04). Wrapped in `Arc` so
+    /// multiple workers can share one probe. See
+    /// `crates/core/src/transport/dedup_analytics.rs` for the
+    /// privacy contract — the probe MUST NOT receive plaintext,
+    /// derived plaintext (FTS tokens, embeddings), or media
+    /// bytes.
+    pub fn install_dedup_analytics(
+        &self,
+        probe: std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+    ) -> Result<()> {
+        *self.dedup_analytics.lock().map_err(poisoned)? = Some(probe);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_dedup_analytics`] has been called
+    /// with a real probe.
+    pub fn has_dedup_analytics(&self) -> bool {
+        self.dedup_analytics
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Read the current dedup-ratio snapshot for `tenant_id`.
+    /// Returns [`crate::Error::NotImplemented("dedup_analytics")`]
+    /// when no probe is installed (so callers can pattern-match
+    /// on the missing-capability case identically to every other
+    /// optional CoreImpl seam).
+    pub fn query_dedup_stats(
+        &self,
+        tenant_id: &str,
+    ) -> Result<crate::transport::dedup_analytics::DedupStats> {
+        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
+        match slot.as_ref() {
+            Some(p) => p.query_dedup_ratio(tenant_id),
+            None => Err(crate::Error::NotImplemented("dedup_analytics")),
+        }
+    }
+
+    /// Read the cumulative storage-savings snapshot for
+    /// `tenant_id`. Same behavior as
+    /// [`Self::query_dedup_stats`] — returns
+    /// [`crate::Error::NotImplemented("dedup_analytics")`] when no
+    /// probe is installed.
+    pub fn query_storage_savings(
+        &self,
+        tenant_id: &str,
+    ) -> Result<crate::transport::dedup_analytics::StorageSavings> {
+        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
+        match slot.as_ref() {
+            Some(p) => p.query_storage_savings(tenant_id),
+            None => Err(crate::Error::NotImplemented("dedup_analytics")),
+        }
+    }
+
+    /// Install (or replace) the multi-scope search resolver
+    /// (Phase 8, batch-5 — 2026-05-04). Wrapped in `Arc` so the
+    /// orchestration layer can share one resolver across worker
+    /// threads. When no resolver is installed, the query engine
+    /// uses the default
+    /// [`crate::search::search_target::NoopConversationGroupResolver`].
+    pub fn install_conversation_group_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>,
+    ) -> Result<()> {
+        *self.conversation_group_resolver.lock().map_err(poisoned)? = Some(resolver);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_conversation_group_resolver`] has
+    /// been called.
+    pub fn has_conversation_group_resolver(&self) -> bool {
+        self.conversation_group_resolver
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Phase 7, batch-5 — build a media-migration plan that
+    /// moves every `media_asset` row whose `storage_sink` is
+    /// `source_sink` to `target_sink`. Wraps
+    /// [`crate::media::migration::plan_media_migration`].
+    pub fn plan_media_migration(
+        &self,
+        source_sink: &str,
+        target_sink: &str,
+    ) -> Result<crate::media::migration::MediaMigrationPlan> {
+        let db = self.db.lock().map_err(poisoned)?;
+        crate::media::migration::plan_media_migration(&db, source_sink, target_sink)
+            .map_err(|e| crate::Error::Storage(e.to_string()))
+    }
+
+    /// Phase 7, batch-5 — execute a previously-built migration
+    /// plan against the supplied sinks. The orchestration
+    /// layer is responsible for constructing the plan via
+    /// [`Self::plan_media_migration`] and for handing in
+    /// `MediaBlobSink` impls for both the source and the
+    /// target. The caller decides whether to delete the source
+    /// blobs after a successful migration.
+    pub fn migrate_media_sink(
+        &self,
+        plan: &crate::media::migration::MediaMigrationPlan,
+        source: &dyn crate::media::sinks::MediaBlobSink,
+        target: &dyn crate::media::sinks::MediaBlobSink,
+        progress: &dyn crate::media::migration::MigrationProgress,
+        delete_source_after_success: bool,
+    ) -> Result<crate::media::migration::MigrationReport> {
+        let db = self.db.lock().map_err(poisoned)?;
+        crate::media::migration::execute_media_migration(
+            plan,
+            source,
+            target,
+            &db,
+            progress,
+            delete_source_after_success,
+        )
+    }
+
+    /// Run a unified search scoped to `target`. Phase-8 entry
+    /// point that ferries the installed
+    /// [`crate::search::search_target::ConversationGroupResolver`]
+    /// (or the [`crate::search::search_target::NoopConversationGroupResolver`]
+    /// default) into [`crate::search::query_engine::QueryEngine::execute_search_with_target`].
+    pub fn search_with_target(
+        &self,
+        query: &crate::SearchQuery,
+        scope: &crate::SearchScope,
+        target: &crate::SearchTarget,
+        limit: usize,
+    ) -> Result<Vec<crate::SearchResult>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let installed = self
+            .conversation_group_resolver
+            .lock()
+            .map_err(poisoned)?
+            .clone();
+        let resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver> =
+            installed.unwrap_or_else(|| {
+                std::sync::Arc::new(
+                    crate::search::search_target::NoopConversationGroupResolver::new(),
+                )
+            });
+        crate::search::query_engine::QueryEngine::new(&db)
+            .execute_search_with_target(query, scope, target, resolver.as_ref(), limit)
+            .map_err(|e| crate::Error::Search(e.to_string()))
     }
 
     /// Replay the supplied search-index shards into the local

@@ -12,7 +12,7 @@
 > Media Encryption and Blob Service — `In progress | ~95%` (chunked
 > media pipeline + thumbnailing landed; tiered media-storage routing
 > wired through `MediaBlobSink`).**
-> **Phase 3 — Personal Archive and Offload — `In progress | ~95%`
+> **Phase 3 — Personal Archive and Offload — `In progress | ~99%`
 > (foundation: archive event journal wired into `MessagePersister`,
 > archive segment builder, archive manifest chain builder, archive
 > segment upload orchestration, archive state machine transitions,
@@ -102,7 +102,7 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
-> **Phase 6 — Media and Semantic Search — `In progress | ~80%`**
+> **Phase 6 — Media and Semantic Search — `In progress | ~85%`**
 > (ONNX Runtime session lifecycle in
 > `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
 > seam — `TextEmbedder` trait + `NoopTextEmbedder` /
@@ -166,7 +166,7 @@
 > Items still open: real platform-bridge attach for Whisper /
 > MobileCLIP / XLM-R sessions, desktop EP tuning, and the
 > INT4-vs-INT8 multilingual relevance benchmark.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~45%`**
+> **Phase 7 — Desktop + Optimization — `In progress | ~65%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -214,9 +214,25 @@
 > `BackgroundScheduler` trait for `NSBackgroundActivityScheduler`
 > and Windows Task Scheduler) + `WindowsMlConfig` (CPU-only
 > contract; DirectML EP best-effort, INT4 default for tight
-> storage). Real platform-bridge attach (DirectML EP, Spotlight
-> indexing, `NSBackgroundActivityScheduler` callback) and the
-> ML EP tuning matrix remain.)
+> storage). **2026-05-04 batch-5**: the `crates/desktop/`
+> trait scaffold (`SpotlightAnchor`, `WindowsSearchAnchor`,
+> `DesktopScheduler`, `DesktopMlEpSelector`); cross-platform
+> media migration (`crates/core/src/media/migration.rs`
+> with `MediaMigrationPlan`, `plan_media_migration`,
+> `execute_media_migration`, `MigrationProgress`); the
+> 10 000-asset stress test
+> (`crates/core/tests/media_sink_stress.rs`); the
+> `ExecutionProviderSelector` ML-EP scaffold
+> (`crates/core/src/models/ep_tuning.rs`); the
+> `InProcessScheduler` Rust-native scheduler
+> (`crates/core/src/scheduler/in_process.rs`); the
+> read-only `DedupAnalytics` integration
+> (`crates/core/src/transport/dedup_analytics.rs`); and four
+> additional `#[ignore]` large-scale tests (100 k messages,
+> 10 k media, 50 k archive compaction, concurrent
+> writer / reader). Real platform-bridge attach (DirectML EP,
+> Spotlight indexing, `NSBackgroundActivityScheduler` callback)
+> remains.)
 > **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~25%`**
 > (Phase 8 schema foundation: `conversation` table now carries
 > `conversation_type` (`dm` / `group` / `channel`), `scope`
@@ -548,9 +564,13 @@ chat-storage-search/
     android-bridge/                         # JNI → Kotlin (Phase 1 scaffold: Java_com_kchat_core_KChatBridge_* entry points)
     desktop/                                # macOS + Windows (Phase 7)
       src/
-        lib.rs                              # Phase 7: re-exports macos / windows scaffolds gated on #[cfg(target_os = ...)]; depends on kchat-core for BackgroundScheduler trait
+        lib.rs                              # Phase 7: re-exports macos / windows scaffolds gated on #[cfg(target_os = ...)] + the platform-agnostic batch-5 trait scaffold; depends on kchat-core for BackgroundScheduler trait
         macos.rs                            # Phase 7 macOS scaffold (#[cfg(target_os = "macos")]): SpotlightBridge trait (object-safe) + NoopSpotlightBridge + index_message / remove_message / remove_conversation; MacOsSchedulerBridge implementing BackgroundScheduler via NSBackgroundActivityScheduler + NoopMacOsSchedulerBridge
         windows.rs                          # Phase 7 Windows scaffold (#[cfg(target_os = "windows")]): WindowsSearchBridge trait + NoopWindowsSearchBridge mirroring the macOS Spotlight surface; WindowsSchedulerBridge + NoopWindowsSchedulerBridge backed by the Task Scheduler; WindowsMlConfig (CPU-only ML contract: DirectML EP best-effort, INT4 default for tight storage)
+        spotlight.rs                        # Phase 7 batch-5: SpotlightAnchor trait (object-safe, Send+Sync, Debug) + NoopSpotlightAnchor — platform-agnostic Spotlight indexing surface
+        windows_search.rs                   # Phase 7 batch-5: WindowsSearchAnchor trait + NoopWindowsSearchAnchor — Windows Search protocol-handler surface
+        background.rs                       # Phase 7 batch-5: DesktopScheduler trait + NoopDesktopScheduler implementing BackgroundScheduler from kchat-core
+        ml_ep.rs                            # Phase 7 batch-5: DesktopMlEpSelector forwarding to kchat-core's ExecutionProviderSelector with CoreML / DirectML / CPU fallback
   tests/
     generate_vectors/
       main.go                               # Pattern C vector generator (calls Go SDK)
@@ -595,8 +615,24 @@ cargo test --test large_scale -- --ignored
 Each test seeds either 10 000 multilingual messages (FTS5 +
 fuzzy + QueryEngine round-trip), 5 000 media-asset rows
 totalling 500 MiB against a 100 MiB budget at Critical
-pressure, or a 1 000-message backup → manifest-chain →
-restore round-trip.
+pressure, a 1 000-message backup → manifest-chain → restore
+round-trip, or — added in the 2026-05-04 batch-5 — a
+100 000-message multilingual ingest + search round-trip,
+10 000 media-asset round-trip across 4 sinks, 50 000-message
+ingest stress across 100 conversations, or a concurrent
+writer / reader stress.
+
+The Phase-7 media-blob sink stress test at
+[`crates/core/tests/media_sink_stress.rs`](crates/core/tests/media_sink_stress.rs)
+seeds 10 000 assets across `kchat_backend` / `icloud` /
+`google_drive` / `zk_object_fabric`, asserts every
+`media_asset.storage_sink` round-trips, samples chunk-fetch
+round-trips, and exercises the migration executor at scale.
+Run it explicitly:
+
+```sh
+cargo test --test media_sink_stress -- --ignored
+```
 
 The criterion benchmarks live under
 [`crates/core/benches/`](crates/core/benches/) and run with

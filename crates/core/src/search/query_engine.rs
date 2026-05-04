@@ -221,6 +221,48 @@ impl<'a> QueryEngine<'a> {
         Ok(out)
     }
 
+    /// Phase 8, batch-5 — run a unified search scoped to the
+    /// supplied [`SearchTarget`]. Equivalent to setting
+    /// `query.target = target` and calling
+    /// [`Self::execute_search`], but works for the new variants
+    /// (`ConversationGroup`, `Channel`, `Starred`, `Unread`) by
+    /// pre-resolving the conversation set through the supplied
+    /// [`crate::search::search_target::ConversationGroupResolver`]
+    /// before SQL is built.
+    ///
+    /// `limit` is the row cap; pass `200` to match the default
+    /// [`Self::execute_search`] behaviour.
+    pub fn execute_search_with_target(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        target: &SearchTarget,
+        resolver: &dyn crate::search::search_target::ConversationGroupResolver,
+        limit: usize,
+    ) -> DbResult<Vec<SearchResult>> {
+        // Resolve the target to a concrete conversation set (or
+        // `None` for Global). We materialize the set into the
+        // query as a `ConversationGroup` so the existing
+        // `push_target_filter` SQL helper can take over without
+        // needing a parallel resolver-aware path.
+        let resolved = resolve_target_to_conversation_set_with_resolver(target, self.db, resolver)
+            .map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })?;
+        let mut narrowed = query.clone();
+        narrowed.target = match resolved {
+            None => SearchTarget::Global,
+            Some(set) => SearchTarget::ConversationGroup(
+                set.into_iter()
+                    .filter_map(|s| Uuid::parse_str(&s).ok())
+                    .collect(),
+            ),
+        };
+        self.execute_search_with_limit(&narrowed, scope, limit)
+    }
+
     /// Run a unified search and fan out to the personal archive
     /// via `cold_source` when [`SearchScope::IncludeCold`] is set.
     ///
@@ -307,9 +349,27 @@ impl<'a> QueryEngine<'a> {
         // If a conversation_filter is set, skip every bucket whose
         // conversation_id does not match.
         let conv_filter = query.conversation_filter.map(|c| c.to_string());
+        // Phase 8, batch-5 — also respect the SearchTarget scope:
+        // when the query carries an explicit non-Global target,
+        // skip every cold bucket whose conversation_id is outside
+        // the resolved target set. This keeps the cold fan-out
+        // honest to the same scoping the local pass enforces.
+        // Fall back to "no extra restriction" on a transient
+        // resolver error — the local pass has already
+        // returned a fail-closed result, so the cold pass
+        // matches by being maximally permissive without
+        // dropping local hits.
+        let target_set: Option<HashSet<String>> =
+            resolve_target_to_conversation_set(&query.effective_target(), self.db)
+                .unwrap_or_default();
         let buckets: Vec<(String, String)> = buckets
             .into_iter()
             .filter(|(c, _)| conv_filter.as_deref().is_none_or(|cf| cf == c.as_str()))
+            .filter(|(c, _)| {
+                target_set
+                    .as_ref()
+                    .is_none_or(|set| set.contains(c.as_str()))
+            })
             .collect();
         if buckets.is_empty() {
             return Ok(local);
@@ -1326,6 +1386,24 @@ pub fn resolve_target_to_conversation_set(
     target: &SearchTarget,
     db: &LocalStoreDb,
 ) -> SearchResultSet<Option<HashSet<String>>> {
+    resolve_target_to_conversation_set_with_resolver(
+        target,
+        db,
+        &crate::search::search_target::NoopConversationGroupResolver::new(),
+    )
+}
+
+/// Phase 8, batch-5 — resolution variant that consults a
+/// [`crate::search::search_target::ConversationGroupResolver`]
+/// for the new variants
+/// (`ConversationGroup` / `Channel` / `Starred` / `Unread`).
+/// Schema-backed variants ignore the resolver and continue to
+/// hit the same DB helpers as before.
+pub fn resolve_target_to_conversation_set_with_resolver(
+    target: &SearchTarget,
+    db: &LocalStoreDb,
+    resolver: &dyn crate::search::search_target::ConversationGroupResolver,
+) -> SearchResultSet<Option<HashSet<String>>> {
     use crate::SearchTarget as T;
     match target {
         T::Global => Ok(None),
@@ -1334,6 +1412,8 @@ pub fn resolve_target_to_conversation_set(
             s.insert(c.to_string());
             Ok(Some(s))
         }
+        T::ConversationGroup(group) => Ok(Some(group.iter().map(|c| c.to_string()).collect())),
+        T::Channel(channel_id) => Ok(Some(resolver.resolve_channel(channel_id)?)),
         T::Community(community) => {
             let convs = db
                 .list_conversations_by_community(&community.to_string())
@@ -1358,6 +1438,8 @@ pub fn resolve_target_to_conversation_set(
                 .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
+        T::Starred => Ok(Some(resolver.resolve_starred()?)),
+        T::Unread => Ok(Some(resolver.resolve_unread()?)),
     }
 }
 

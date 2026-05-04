@@ -126,6 +126,79 @@ impl SegmentBuildRequest {
             segment_type: SegmentType::Checkpoint,
         }
     }
+
+    /// Construct a [`SegmentType::MediaKeyDelta`] request. Carries
+    /// new `K_asset` wraps under the active epoch
+    /// `K_archive_root` for offloaded media in this
+    /// `(conversation_id, time_bucket)` window. The orchestration
+    /// layer encodes the wrapped-key blobs into [`ArchiveEvent`]
+    /// payloads before calling.
+    pub fn media_key_delta(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::MediaKeyDelta,
+        }
+    }
+
+    /// Construct a [`SegmentType::SearchTextIndex`] request.
+    /// Carries encrypted FTS / fuzzy index shard rows for the
+    /// `(conversation_id, time_bucket)` window. The orchestration
+    /// layer encodes shard rows into [`ArchiveEvent`] payloads
+    /// before calling.
+    pub fn search_text_index(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::SearchTextIndex,
+        }
+    }
+
+    /// Construct a [`SegmentType::SearchVectorIndex`] request.
+    /// Carries encrypted HNSW shard fragments / vector rows for
+    /// the `(conversation_id, time_bucket)` window. The
+    /// orchestration layer encodes vector rows into
+    /// [`ArchiveEvent`] payloads before calling.
+    pub fn search_vector_index(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::SearchVectorIndex,
+        }
+    }
+
+    /// Construct a [`SegmentType::MediaIndex`] request. Carries
+    /// OCR / transcript / caption rows for media in this
+    /// `(conversation_id, time_bucket)` window. The orchestration
+    /// layer encodes media-search-index rows into
+    /// [`ArchiveEvent`] payloads before calling.
+    pub fn media_index(
+        conversation_id: Uuid,
+        time_bucket: impl Into<String>,
+        events: Vec<ArchiveEvent>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            time_bucket: time_bucket.into(),
+            events,
+            segment_type: SegmentType::MediaIndex,
+        }
+    }
 }
 
 /// Output of [`ArchiveSegmentBuilder::build_segment`]: a sealed,
@@ -586,11 +659,17 @@ mod tests {
     #[test]
     fn segment_type_is_preserved_through_cbor_round_trip() {
         // Each archive variant must round-trip its discriminant
-        // through the build → decrypt cycle.
+        // through the build → decrypt cycle. Phase 3 batch-5
+        // (2026-05-04) extends this to all seven archive
+        // payload variants from `docs/PROPOSAL.md §5.1`.
         let conv = Uuid::now_v7();
         for variant in [
             SegmentType::MessageDelta,
             SegmentType::TimelineSkeleton,
+            SegmentType::MediaKeyDelta,
+            SegmentType::SearchTextIndex,
+            SegmentType::SearchVectorIndex,
+            SegmentType::MediaIndex,
             SegmentType::Checkpoint,
         ] {
             let req = SegmentBuildRequest {
@@ -600,8 +679,119 @@ mod tests {
                 segment_type: variant,
             };
             let k = [0x91; 32];
-            let built = ArchiveSegmentBuilder::new().build_segment(req, &k).unwrap();
+            let built = ArchiveSegmentBuilder::new()
+                .build_segment(req.clone(), &k)
+                .unwrap();
             assert_eq!(built.segment_type, variant, "variant must round-trip");
+            // And the payload must decrypt back to the same
+            // events list under the same key.
+            let payload = decrypt_segment(&built, &k).unwrap();
+            assert_eq!(payload.events, req.events);
+            assert_eq!(payload.conversation_id, conv.to_string());
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Phase 3 batch-5 — media_key_delta / search_text_index /
+    // search_vector_index / media_index round-trips
+    // -----------------------------------------------------------
+
+    #[test]
+    fn media_key_delta_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::media_key_delta(
+            conv,
+            "2026-04",
+            vec![event_at(conv, 1, ArchiveEventType::MediaReceived)],
+        );
+        let k = [0xA1; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::MediaKeyDelta);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+        assert_eq!(payload.time_bucket, "2026-04");
+    }
+
+    #[test]
+    fn search_text_index_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::search_text_index(
+            conv,
+            "2026-05",
+            vec![
+                event_at(conv, 1, ArchiveEventType::MessageReceived),
+                event_at(conv, 2, ArchiveEventType::MessageReceived),
+            ],
+        );
+        let k = [0xA2; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::SearchTextIndex);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+    }
+
+    #[test]
+    fn search_vector_index_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::search_vector_index(
+            conv,
+            "2026-06",
+            vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+        );
+        let k = [0xA3; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::SearchVectorIndex);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+    }
+
+    #[test]
+    fn media_index_segment_round_trips() {
+        let conv = Uuid::now_v7();
+        let req = SegmentBuildRequest::media_index(
+            conv,
+            "2026-07",
+            vec![event_at(conv, 1, ArchiveEventType::MediaReceived)],
+        );
+        let k = [0xA4; 32];
+        let built = ArchiveSegmentBuilder::new()
+            .build_segment(req.clone(), &k)
+            .unwrap();
+        assert_eq!(built.segment_type, SegmentType::MediaIndex);
+        let payload = decrypt_segment(&built, &k).unwrap();
+        assert_eq!(payload.events, req.events);
+    }
+
+    #[test]
+    fn build_segment_accepts_every_archive_segment_type() {
+        let conv = Uuid::now_v7();
+        let k = [0xB7; 32];
+        for variant in [
+            SegmentType::MessageDelta,
+            SegmentType::TimelineSkeleton,
+            SegmentType::MediaKeyDelta,
+            SegmentType::SearchTextIndex,
+            SegmentType::SearchVectorIndex,
+            SegmentType::MediaIndex,
+            SegmentType::Checkpoint,
+        ] {
+            let req = SegmentBuildRequest {
+                conversation_id: conv,
+                time_bucket: "2026-08".into(),
+                events: vec![event_at(conv, 1, ArchiveEventType::MessageReceived)],
+                segment_type: variant,
+            };
+            let built = ArchiveSegmentBuilder::new()
+                .build_segment(req, &k)
+                .unwrap_or_else(|e| panic!("variant {variant:?} must succeed: {e}"));
+            assert_eq!(built.segment_type, variant);
+            assert_eq!(built.event_count, 1);
         }
     }
 
