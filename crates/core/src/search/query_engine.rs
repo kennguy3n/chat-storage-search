@@ -564,6 +564,17 @@ impl<'a> QueryEngine<'a> {
     /// the skeleton-fetch projection does not include
     /// `body_state`.
     ///
+    /// `query.sender_filter`, `query.date_from`, `query.date_to`,
+    /// and `query.content_kind` apply uniformly to both lanes:
+    /// the FTS / fuzzy lane filters via `allowed_skeleton_ids`
+    /// during candidate building, and the semantic-only lane
+    /// re-runs `allowed_skeleton_ids` against the
+    /// `SemanticMatch::message_id` set before materializing
+    /// fresh `SearchResult`s. Without that guard a query like
+    /// `{ sender_filter: Some("alice"), date_from: Some(yesterday) }`
+    /// would surface alice's FTS hits plus arbitrary
+    /// semantic-only hits from any sender / any date.
+    ///
     /// `model_version` defaults to
     /// [`crate::models::embeddings::XLMR_MODEL_VERSION`] when
     /// `None` is passed.
@@ -618,6 +629,26 @@ impl<'a> QueryEngine<'a> {
             .filter(|h| !by_id.contains_key(&h.message_id))
             .map(|h| h.message_id.clone())
             .collect();
+        // Apply the structured filters (`sender_filter`,
+        // `date_from`, `date_to`, `content_kind`) to the
+        // semantic-only candidate set the same way the
+        // FTS / fuzzy pass does via `allowed_skeleton_ids`.
+        // FTS / fuzzy hits are already in `local` and were
+        // filtered by `execute_search_with_limit`; this guards
+        // the *semantic-only* path so a query like
+        // `{ sender_filter: Some("alice"),
+        //    date_from: Some(yesterday) }` cannot leak hits
+        // from other senders or outside the date window.
+        // `allowed_skeleton_ids` returns `None` when no
+        // structured filter is set — keep the candidate set
+        // intact in that case.
+        let new_ids: Vec<String> = match self.allowed_skeleton_ids(query, &new_ids)? {
+            Some(allowed) => new_ids
+                .into_iter()
+                .filter(|m| allowed.contains(m))
+                .collect(),
+            None => new_ids,
+        };
         let new_skeletons = if !new_ids.is_empty() {
             self.fetch_skeleton_columns_for_semantic(&new_ids)?
         } else {
@@ -2677,5 +2708,209 @@ mod tests {
             !row.is_cold,
             "LocalOnly scope must not stamp is_cold (got is_cold = true)",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Structured filters propagate to the semantic-only lane
+    // -----------------------------------------------------------------
+
+    /// Build two skeleton-only messages and plant identical mock
+    /// embeddings for both so semantic search returns both with
+    /// cosine ≈ 1.0. Returns `(allowed_uuid, blocked_uuid)`
+    /// — the caller pairs them with a filter to assert the
+    /// blocked one is dropped.
+    fn seed_two_semantic_only_hits(
+        db: &LocalStoreDb,
+        allowed: (&str, i64, &str, &str), // (sender, created_at_ms, kind, msg_id_str)
+        blocked: (&str, i64, &str, &str),
+        q_text: &str,
+    ) -> (Uuid, Uuid) {
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        insert_fixture(
+            db,
+            allowed.3,
+            &conv,
+            allowed.0,
+            allowed.1,
+            allowed.2,
+            None,
+            &mut conv_seen,
+        );
+        insert_fixture(
+            db,
+            blocked.3,
+            &conv,
+            blocked.0,
+            blocked.1,
+            blocked.2,
+            None,
+            &mut conv_seen,
+        );
+        let mock = MockTextEmbedder::default();
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(allowed.3, XLMR_MODEL_VERSION, &q_emb).unwrap();
+        cache.put(blocked.3, XLMR_MODEL_VERSION, &q_emb).unwrap();
+        (
+            Uuid::parse_str(allowed.3).unwrap(),
+            Uuid::parse_str(blocked.3).unwrap(),
+        )
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_sender_filter() {
+        // Regression: `execute_search_with_semantic` previously
+        // pushed every semantic-only hit onto `local` without
+        // running it through `allowed_skeleton_ids`, so a query
+        // with `sender_filter: Some("alice")` would surface
+        // bob's semantic-only hits too.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(301).to_string();
+        let blocked_mid = uuid_fixture(302).to_string();
+        let q_text = "needle";
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &allowed_mid),
+            ("bob", 11_000, "text", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        // With the sender filter set, only alice's semantic-only
+        // hit should surface.
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            sender_filter: Some("alice".into()),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "alice's semantic-only hit must pass the sender filter",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "bob's semantic-only hit must NOT leak through sender_filter = alice",
+        );
+
+        // Sanity: with no filter, both hits surface.
+        let q_no_filter = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_no_filter, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_date_window() {
+        // Regression: `date_from` / `date_to` must filter
+        // semantic-only hits, not just the FTS / fuzzy lane.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(303).to_string();
+        let blocked_mid = uuid_fixture(304).to_string();
+        let q_text = "needle";
+        // Allowed row inside the window, blocked row well below
+        // it.
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 5_000, "text", &allowed_mid),
+            ("alice", 1_000, "text", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            date_from: Some(4_000),
+            date_to: Some(6_000),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "in-window semantic-only hit must pass the date filter",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "out-of-window semantic-only hit must NOT leak through date_from / date_to",
+        );
+
+        // Sanity: with no filter, both hits surface.
+        let q_no_filter = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_no_filter, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_hit_respects_content_kind_filter() {
+        // Regression: `content_kind` must filter semantic-only
+        // hits. `ContentKind::Text` maps to skeleton kind
+        // `"text"`; `ContentKind::Image|Video|Audio|Document`
+        // map to `"media"`. The non-text path in
+        // `execute_fts_and_fuzzy_with_filters` short-circuits
+        // FTS for media kinds (line 270-272 above) and relies
+        // on `allowed_skeleton_ids` for filtering the
+        // structured-only / fuzzy / semantic legs.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let allowed_mid = uuid_fixture(305).to_string();
+        let blocked_mid = uuid_fixture(306).to_string();
+        let q_text = "needle";
+        let (allowed, blocked) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &allowed_mid),
+            ("alice", 11_000, "media", &blocked_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            content_kind: Some(ContentKind::Text),
+            ..Default::default()
+        };
+        let filtered = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(
+            filtered.iter().any(|r| r.message_id == allowed),
+            "text semantic-only hit must pass content_kind = Text",
+        );
+        assert!(
+            !filtered.iter().any(|r| r.message_id == blocked),
+            "media semantic-only hit must NOT leak through content_kind = Text",
+        );
+
+        // Sanity: with `ContentKind::Any`, both hits surface.
+        let q_any = SearchQuery {
+            query_string: q_text.into(),
+            content_kind: Some(ContentKind::Any),
+            ..Default::default()
+        };
+        let unfiltered = engine
+            .execute_search_with_semantic(&q_any, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+        assert!(unfiltered.iter().any(|r| r.message_id == allowed));
+        assert!(unfiltered.iter().any(|r| r.message_id == blocked));
     }
 }
