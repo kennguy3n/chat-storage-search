@@ -51,13 +51,17 @@
 //! contract.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use rusqlite::{params_from_iter, types::Value};
 use uuid::Uuid;
 
+use crate::config::TenantSearchPolicy;
+use crate::formats::search_shard::IndexType;
 use crate::local_store::db::{DbResult, LocalStoreDb};
 use crate::search::fuzzy_search::{FuzzySearchEngine, FuzzyTokenizer};
-use crate::search::shard_builder::{FtsRow, FuzzyRow};
+use crate::search::shard_builder::{BloomFilter, FtsRow, FuzzyRow};
+use crate::search::shard_cache::{CachedShard, ShardCache, ShardCacheKey};
 use crate::search::text_search::TextSearchEngine;
 use crate::search::tokenizer::{fuzzy_min_overlap, ScriptClass};
 use crate::{ContentKind, Error, SearchQuery, SearchResult, SearchScope, SearchTarget};
@@ -171,6 +175,195 @@ pub trait ColdShardSource {
         conversation_id: &str,
         time_bucket: &str,
     ) -> Result<Vec<FuzzyRow>, Error>;
+
+    /// Phase 8 (2026-05-04 batch 6) — fetch and decrypt the
+    /// bloom-filter shard for `(conversation_id, time_bucket)`.
+    ///
+    /// The bloom shard is consulted by the cold fan-out *before*
+    /// the (much larger) text and fuzzy shards: if the filter
+    /// rejects every query token the bucket is skipped without
+    /// any further transport calls.
+    ///
+    /// Implementations should return:
+    /// * `Ok(Some(filter))` on a successful round-trip,
+    /// * `Ok(None)` when the backend has no bloom shard for the
+    ///   pair (graceful degradation — the cold path falls
+    ///   through to the text / fuzzy fetches),
+    /// * `Err(_)` only for hard errors that should propagate.
+    ///
+    /// The default implementation returns `Ok(None)` so existing
+    /// `ColdShardSource` impls (and test fakes) keep compiling
+    /// without opting into the bloom path. Production
+    /// implementations override this to call
+    /// [`crate::transport::TransportClient::fetch_index_shards`]
+    /// for [`IndexType::Bloom`] and decrypt with
+    /// [`crate::search::shard_builder::restore_bloom_shard`].
+    fn fetch_bloom_shard(
+        &self,
+        _conversation_id: &str,
+        _time_bucket: &str,
+    ) -> Result<Option<BloomFilter>, Error> {
+        Ok(None)
+    }
+}
+
+/// Phase 8 (2026-05-04 batch 6) — does the YYYY-MM `time_bucket`
+/// string overlap the optional `[date_from, date_to]` window?
+///
+/// The bucket grammar matches what the personal-archive segment
+/// builder writes (`docs/PROPOSAL.md §5.2`): `YYYY-MM` for monthly
+/// buckets. The function parses the bucket into a half-open
+/// `[start_ms, end_ms)` range covering the entire month and
+/// returns `true` whenever the bucket and `[date_from, date_to]`
+/// overlap. Malformed or unparseable bucket strings fall back to
+/// `true` so the caller never silently drops a bucket whose
+/// timestamps it can't reason about — the caller's per-row
+/// `date_filter_matches` still has the final say.
+pub fn bucket_overlaps_date_range(
+    bucket: &str,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+) -> bool {
+    if date_from.is_none() && date_to.is_none() {
+        return true;
+    }
+    let Some((start_ms, end_ms_exclusive)) = parse_bucket_range_ms(bucket) else {
+        // Unrecognized bucket grammar — fall back to "include".
+        return true;
+    };
+    if let Some(to) = date_to {
+        if start_ms > to {
+            return false;
+        }
+    }
+    if let Some(from) = date_from {
+        // `end_ms_exclusive` is one millisecond past the last
+        // millisecond inside the bucket; a bucket ending at
+        // `end_ms_exclusive` whose `from` equals `end_ms_exclusive`
+        // contains zero in-range milliseconds.
+        if end_ms_exclusive <= from {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse a `YYYY-MM` bucket into its half-open millisecond
+/// range. Returns `None` for any malformed input.
+fn parse_bucket_range_ms(bucket: &str) -> Option<(i64, i64)> {
+    let (year_str, month_str) = bucket.split_once('-')?;
+    if year_str.len() != 4 || month_str.len() != 2 {
+        return None;
+    }
+    let year: i32 = year_str.parse().ok()?;
+    let month: u32 = month_str.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let start_ms = days_from_civil(year, month, 1) * 86_400_000;
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1u32)
+    } else {
+        (year, month + 1)
+    };
+    let end_ms_exclusive = days_from_civil(next_year, next_month, 1) * 86_400_000;
+    Some((start_ms, end_ms_exclusive))
+}
+
+/// Phase 8 (2026-05-04 batch 6) — wrap
+/// [`ColdShardSource::fetch_text_rows`] with a [`ShardCache`]
+/// lookup / populate cycle. On a cache hit no transport call is
+/// made; on a miss the rows are fetched, decrypted, and inserted
+/// into the cache before being returned to the caller.
+fn cold_source_fetch_text_with_cache(
+    src: &dyn ColdShardSource,
+    cache: Option<&Mutex<ShardCache>>,
+    conv: &str,
+    bucket: &str,
+) -> Result<Vec<FtsRow>, Error> {
+    let key = ShardCacheKey::new(conv, bucket, IndexType::Text);
+    if let Some(c) = cache {
+        if let Ok(mut guard) = c.lock() {
+            if let Some(CachedShard::Text(rows)) = guard.get(&key) {
+                return Ok(rows.clone());
+            }
+        }
+    }
+    let rows = src.fetch_text_rows(conv, bucket)?;
+    if let Some(c) = cache {
+        if let Ok(mut guard) = c.lock() {
+            guard.put(key, CachedShard::Text(rows.clone()));
+        }
+    }
+    Ok(rows)
+}
+
+/// Cache-aware twin of [`cold_source_fetch_text_with_cache`] for
+/// fuzzy shards.
+fn cold_source_fetch_fuzzy_with_cache(
+    src: &dyn ColdShardSource,
+    cache: Option<&Mutex<ShardCache>>,
+    conv: &str,
+    bucket: &str,
+) -> Result<Vec<FuzzyRow>, Error> {
+    let key = ShardCacheKey::new(conv, bucket, IndexType::Fuzzy);
+    if let Some(c) = cache {
+        if let Ok(mut guard) = c.lock() {
+            if let Some(CachedShard::Fuzzy(rows)) = guard.get(&key) {
+                return Ok(rows.clone());
+            }
+        }
+    }
+    let rows = src.fetch_fuzzy_rows(conv, bucket)?;
+    if let Some(c) = cache {
+        if let Ok(mut guard) = c.lock() {
+            guard.put(key, CachedShard::Fuzzy(rows.clone()));
+        }
+    }
+    Ok(rows)
+}
+
+/// Cache-aware twin of [`cold_source_fetch_text_with_cache`] for
+/// bloom shards. Returns `Ok(None)` for both "not in cache and
+/// transport says no shard" and "transport raised a soft error" —
+/// the bucket loop falls through to the full text/fuzzy fetches
+/// in either case (graceful degradation, per the trait contract).
+fn cold_source_fetch_bloom_with_cache(
+    src: &dyn ColdShardSource,
+    cache: Option<&Mutex<ShardCache>>,
+    conv: &str,
+    bucket: &str,
+) -> Result<Option<BloomFilter>, Error> {
+    let key = ShardCacheKey::new(conv, bucket, IndexType::Bloom);
+    if let Some(c) = cache {
+        if let Ok(mut guard) = c.lock() {
+            if let Some(CachedShard::Bloom(filter)) = guard.get(&key) {
+                return Ok(Some(filter.clone()));
+            }
+        }
+    }
+    let result = src.fetch_bloom_shard(conv, bucket)?;
+    if let Some(filter) = &result {
+        if let Some(c) = cache {
+            if let Ok(mut guard) = c.lock() {
+                guard.put(key, CachedShard::Bloom(filter.clone()));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Convert a (year, month, day) tuple to days since 1970-01-01
+/// using Howard Hinnant's `days_from_civil` algorithm. Avoids a
+/// chrono dependency in the search crate.
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = (y - era * 400) as u32;
+    let m = m as i32;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u32;
+    (era as i64) * 146_097 + (doe as i64) - 719_468
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +497,51 @@ impl<'a> QueryEngine<'a> {
         cold_source: &dyn ColdShardSource,
         limit: usize,
     ) -> Result<Vec<SearchResult>, Error> {
+        self.execute_search_with_cold_source_full(
+            query,
+            scope,
+            cold_source,
+            &TenantSearchPolicy::default(),
+            None,
+            limit,
+        )
+    }
+
+    /// Phase 8 (2026-05-04 batch 6) — full cold fan-out entry
+    /// point that threads a per-tenant
+    /// [`TenantSearchPolicy`] and an optional on-device
+    /// [`ShardCache`] through the bucket loop.
+    ///
+    /// Invariants on top of
+    /// [`Self::execute_search_with_cold_source_and_limit`]:
+    /// * `policy.allow_global_search == false` blocks
+    ///   [`SearchTarget::Global`] queries (returns local-only).
+    /// * `policy.max_cold_buckets_per_search` caps the per-query
+    ///   bucket fan-out after date pruning + bloom pre-check.
+    /// * `policy.require_bloom_shards == true` skips any bucket
+    ///   whose bloom shard is missing or fails to fetch.
+    /// * `policy.allow_cross_tenant_results` is enforced
+    ///   upstream of the engine: a non-Global `SearchTarget`
+    ///   already narrows the cold-bucket set, and a Global query
+    ///   under a B2B tenant's policy is expected to be rejected
+    ///   by `allow_global_search = false` rather than by an
+    ///   independent cross-tenant block. The field is preserved
+    ///   for forward compatibility with the per-bucket
+    ///   tenant-stamp scheme described in
+    ///   `docs/PROPOSAL.md §7.7`.
+    /// * `shard_cache`, when supplied, is consulted before each
+    ///   transport fetch and populated after each successful
+    ///   decrypt. The cache is keyed by
+    ///   `(conversation_id, time_bucket, IndexType)`.
+    pub fn execute_search_with_cold_source_full(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        cold_source: &dyn ColdShardSource,
+        policy: &TenantSearchPolicy,
+        shard_cache: Option<&Mutex<ShardCache>>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, Error> {
         // Local results first. mark_cold_results runs inside
         // execute_search_with_limit when scope is IncludeCold so
         // any local row whose body is offloaded already carries
@@ -339,6 +577,27 @@ impl<'a> QueryEngine<'a> {
             if !matches!(kind, ContentKind::Text | ContentKind::Any) {
                 return Ok(local);
             }
+        }
+
+        // Phase 8 (2026-05-04 batch 6) — TenantSearchPolicy
+        // enforcement #1: block Global queries when the active
+        // policy disallows them. We check this *before* paying
+        // for `cold_buckets()` so a forbidden Global search is
+        // cheap.
+        //
+        // `allow_cross_tenant_results` is enforced upstream of
+        // the engine: any non-Global `SearchTarget` already
+        // narrows the cold-bucket set through the resolver-based
+        // `target_set` filter below, so a `Tenant(t)` query
+        // cannot pull in other tenants' buckets even when the
+        // policy is left at its default. The field is therefore
+        // documentation / future-use only inside this engine —
+        // see the rustdoc on
+        // [`TenantSearchPolicy::allow_cross_tenant_results`].
+        let effective_target = query.effective_target();
+        let is_global_target = matches!(effective_target, SearchTarget::Global);
+        if is_global_target && !policy.allow_global_search {
+            return Ok(local);
         }
 
         let buckets = cold_source.cold_buckets()?;
@@ -402,10 +661,28 @@ impl<'a> QueryEngine<'a> {
                     .as_ref()
                     .is_none_or(|set| set.contains(c.as_str()))
             })
+            // Phase 8 (2026-05-04 batch 6) — Task 1: bucket-level
+            // date pruning. Drop any bucket whose YYYY-MM range
+            // falls entirely outside the query's date window
+            // before paying for a transport round-trip. This is a
+            // pure no-op when neither `date_from` nor `date_to` is
+            // set.
+            .filter(|(_, bucket)| {
+                bucket_overlaps_date_range(bucket.as_str(), query.date_from, query.date_to)
+            })
             .collect();
         if buckets.is_empty() {
             return Ok(local);
         }
+        // TenantSearchPolicy enforcement #3: cap the cold-bucket
+        // fan-out so a misbehaving query (e.g. a Global search
+        // over a tenant with thousands of buckets) cannot pin the
+        // device for minutes. We truncate after date pruning so
+        // the budget covers buckets that actually need fetching.
+        let buckets: Vec<(String, String)> = buckets
+            .into_iter()
+            .take(policy.max_cold_buckets_per_search)
+            .collect();
 
         let mut by_id: HashMap<String, SearchResult> = HashMap::new();
         for r in local {
@@ -439,8 +716,29 @@ impl<'a> QueryEngine<'a> {
         let q_count_fuzzy: f64 = q_by_script.values().map(|s| s.len()).sum::<usize>() as f64;
 
         for (conv, bucket) in buckets {
-            let fts_rows = cold_source.fetch_text_rows(&conv, &bucket)?;
-            let fuzzy_rows = cold_source.fetch_fuzzy_rows(&conv, &bucket)?;
+            // Phase 8 (2026-05-04 batch 6) — Task 2: bloom-filter
+            // pre-check. Consult the bloom shard for this bucket
+            // and skip the bucket entirely when it rejects every
+            // query token. Empty `q_words` (e.g. a query that
+            // tokenizes only into fuzzy tokens) bypasses the
+            // pre-check so we don't accidentally drop fuzzy-only
+            // hits.
+            let bloom =
+                cold_source_fetch_bloom_with_cache(cold_source, shard_cache, &conv, &bucket);
+            if policy.require_bloom_shards && !matches!(bloom, Ok(Some(_))) {
+                continue;
+            }
+            if let Ok(Some(filter)) = &bloom {
+                if !q_words.is_empty() && !q_words.iter().any(|w| filter.maybe_contains(w)) {
+                    continue;
+                }
+            }
+
+            // Cache lookup → fall back to transport on miss.
+            let fts_rows =
+                cold_source_fetch_text_with_cache(cold_source, shard_cache, &conv, &bucket)?;
+            let fuzzy_rows =
+                cold_source_fetch_fuzzy_with_cache(cold_source, shard_cache, &conv, &bucket)?;
 
             // Build a metadata lookup so fuzzy-only hits can
             // synthesise a SearchResult without re-fetching
@@ -3598,11 +3896,17 @@ mod tests {
 #[cfg(test)]
 mod phase8_target_tests {
     use super::*;
+    use std::cell::Cell;
+
     use crate::local_store::schema::Conversation;
     use crate::message::processor::{IngestedMessage, MessagePersister};
 
     fn fresh_db() -> LocalStoreDb {
         LocalStoreDb::open_in_memory(&[0xB8; 32]).unwrap()
+    }
+
+    fn cold_db() -> LocalStoreDb {
+        LocalStoreDb::open_in_memory(&[0xC1; 32]).unwrap()
     }
 
     fn seed_conv(
@@ -3820,5 +4124,464 @@ mod phase8_target_tests {
         assert_eq!(stored.community_id, community.to_string());
         assert_eq!(stored.tenant_id, "tenant-z");
         assert_eq!(stored.scope, "b2b");
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — Tasks 1, 2, 5
+    // -------------------------------------------------------------------
+
+    fn ms_for(year: i32, month: u32, day: u32) -> i64 {
+        super::days_from_civil(year, month, day) * 86_400_000
+    }
+
+    #[test]
+    fn bucket_overlaps_with_no_date_filters_returns_true() {
+        assert!(super::bucket_overlaps_date_range("2026-04", None, None));
+    }
+
+    #[test]
+    fn bucket_overlaps_rejects_bucket_before_date_from() {
+        // Bucket = March 2026 ends at 2026-04-01T00:00:00Z. A
+        // `date_from` set to April 1st must drop it.
+        assert!(!super::bucket_overlaps_date_range(
+            "2026-03",
+            Some(ms_for(2026, 4, 1)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn bucket_overlaps_rejects_bucket_after_date_to() {
+        // Bucket = May 2026 starts at 2026-05-01T00:00:00Z. A
+        // `date_to` set to April 30th must drop it.
+        assert!(!super::bucket_overlaps_date_range(
+            "2026-05",
+            None,
+            Some(ms_for(2026, 4, 30)),
+        ));
+    }
+
+    #[test]
+    fn bucket_overlaps_accepts_overlapping_bucket() {
+        // April 2026 bucket overlaps a window from April 10 to
+        // May 5: bucket end > from, bucket start <= to.
+        assert!(super::bucket_overlaps_date_range(
+            "2026-04",
+            Some(ms_for(2026, 4, 10)),
+            Some(ms_for(2026, 5, 5)),
+        ));
+    }
+
+    #[test]
+    fn bucket_overlaps_handles_malformed_bucket_gracefully() {
+        // Bogus bucket grammar must fall back to "include" so we
+        // never silently drop hits we cannot reason about.
+        assert!(super::bucket_overlaps_date_range(
+            "not-a-bucket",
+            Some(ms_for(2026, 4, 1)),
+            Some(ms_for(2026, 4, 30)),
+        ));
+        assert!(super::bucket_overlaps_date_range(
+            "2026-13",
+            Some(ms_for(2026, 4, 1)),
+            None,
+        ));
+    }
+
+    /// Bloom-aware fake cold source. Tracks how many text /
+    /// fuzzy fetches were served; exposes a knob for "force
+    /// fetch_bloom_shard to fail".
+    struct BloomFakeColdSource {
+        buckets: Vec<(String, String)>,
+        text: HashMap<(String, String), Vec<FtsRow>>,
+        fuzzy: HashMap<(String, String), Vec<FuzzyRow>>,
+        bloom: HashMap<(String, String), BloomFilter>,
+        bloom_should_fail: bool,
+        text_calls: Cell<usize>,
+        fuzzy_calls: Cell<usize>,
+        bloom_calls: Cell<usize>,
+    }
+    impl BloomFakeColdSource {
+        fn new() -> Self {
+            Self {
+                buckets: Vec::new(),
+                text: HashMap::new(),
+                fuzzy: HashMap::new(),
+                bloom: HashMap::new(),
+                bloom_should_fail: false,
+                text_calls: Cell::new(0),
+                fuzzy_calls: Cell::new(0),
+                bloom_calls: Cell::new(0),
+            }
+        }
+        fn with_text(mut self, conv: &str, bucket: &str, rows: Vec<FtsRow>) -> Self {
+            let key = (conv.to_string(), bucket.to_string());
+            if !self.buckets.contains(&key) {
+                self.buckets.push(key.clone());
+            }
+            self.text.insert(key, rows);
+            self
+        }
+        fn with_bloom(mut self, conv: &str, bucket: &str, words: &[&str]) -> Self {
+            let key = (conv.to_string(), bucket.to_string());
+            if !self.buckets.contains(&key) {
+                self.buckets.push(key.clone());
+            }
+            let owned: Vec<String> = words.iter().map(|s| s.to_lowercase()).collect();
+            let filter = BloomFilter::from_words(&owned, owned.len().max(8));
+            self.bloom.insert(key, filter);
+            self
+        }
+        fn with_bloom_failure(mut self) -> Self {
+            self.bloom_should_fail = true;
+            self
+        }
+    }
+    impl ColdShardSource for BloomFakeColdSource {
+        fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
+            Ok(self.buckets.clone())
+        }
+        fn fetch_text_rows(&self, conv: &str, bucket: &str) -> Result<Vec<FtsRow>, Error> {
+            self.text_calls.set(self.text_calls.get() + 1);
+            Ok(self
+                .text
+                .get(&(conv.to_string(), bucket.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn fetch_fuzzy_rows(&self, conv: &str, bucket: &str) -> Result<Vec<FuzzyRow>, Error> {
+            self.fuzzy_calls.set(self.fuzzy_calls.get() + 1);
+            Ok(self
+                .fuzzy
+                .get(&(conv.to_string(), bucket.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn fetch_bloom_shard(
+            &self,
+            conv: &str,
+            bucket: &str,
+        ) -> Result<Option<BloomFilter>, Error> {
+            self.bloom_calls.set(self.bloom_calls.get() + 1);
+            if self.bloom_should_fail {
+                return Err(Error::Search("simulated transport failure".into()));
+            }
+            Ok(self
+                .bloom
+                .get(&(conv.to_string(), bucket.to_string()))
+                .cloned())
+        }
+    }
+
+    fn cold_text_row(conv: &str, mid: &str, text: &str) -> FtsRow {
+        FtsRow {
+            message_id: mid.to_string(),
+            conversation_id: conv.to_string(),
+            sender_id: "alice".to_string(),
+            created_at_ms: ms_for(2026, 4, 15),
+            text_content: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn bloom_precheck_skips_bucket_when_all_tokens_rejected() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        let source = BloomFakeColdSource::new()
+            .with_text(&conv, "2026-04", vec![cold_text_row(&conv, &mid, "lighthouse beacon")])
+            // The bloom shard advertises words that have nothing
+            // to do with the query; pre-check must reject the
+            // bucket before we call fetch_text_rows.
+            .with_bloom(&conv, "2026-04", &["alpha", "beta", "gamma"]);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        let _ = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &source)
+            .unwrap();
+        assert_eq!(source.bloom_calls.get(), 1, "bloom must be consulted");
+        assert_eq!(
+            source.text_calls.get(),
+            0,
+            "bloom rejection must short-circuit text fetch"
+        );
+    }
+
+    #[test]
+    fn bloom_precheck_passes_bucket_when_any_token_matches() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        let source = BloomFakeColdSource::new()
+            .with_text(
+                &conv,
+                "2026-04",
+                vec![cold_text_row(&conv, &mid, "lighthouse beacon")],
+            )
+            .with_bloom(&conv, "2026-04", &["alpha", "lighthouse", "gamma"]);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &source)
+            .unwrap();
+        assert_eq!(source.bloom_calls.get(), 1);
+        assert_eq!(source.text_calls.get(), 1);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn bloom_precheck_falls_through_when_bloom_shard_missing() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        // No `with_bloom(...)` call → fetch_bloom_shard returns
+        // Ok(None). The pre-check must not skip the bucket.
+        let source = BloomFakeColdSource::new().with_text(
+            &conv,
+            "2026-04",
+            vec![cold_text_row(&conv, &mid, "lighthouse beacon")],
+        );
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &source)
+            .unwrap();
+        assert_eq!(source.bloom_calls.get(), 1);
+        assert_eq!(source.text_calls.get(), 1, "fall-through to text fetch");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn bloom_precheck_falls_through_on_transport_error() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        let source = BloomFakeColdSource::new()
+            .with_text(
+                &conv,
+                "2026-04",
+                vec![cold_text_row(&conv, &mid, "lighthouse beacon")],
+            )
+            .with_bloom_failure();
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        // A failing bloom fetch must not abort the search; the
+        // cold path falls through to the full shards and the
+        // call still returns the one matching row.
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &source)
+            .unwrap();
+        assert_eq!(source.bloom_calls.get(), 1);
+        assert_eq!(source.text_calls.get(), 1);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn cold_search_with_date_range_skips_irrelevant_buckets() {
+        // Two buckets: 2026-01 (out of range) and 2026-04 (in
+        // range). The query's date_from / date_to must drop the
+        // first bucket without ever fetching its text / fuzzy
+        // shards.
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid_jan = Uuid::now_v7().to_string();
+        let mid_apr = Uuid::now_v7().to_string();
+        let mut row_jan = cold_text_row(&conv, &mid_jan, "lighthouse keeper");
+        row_jan.created_at_ms = ms_for(2026, 1, 15);
+        let mut row_apr = cold_text_row(&conv, &mid_apr, "lighthouse beacon");
+        row_apr.created_at_ms = ms_for(2026, 4, 15);
+        let source = BloomFakeColdSource::new()
+            .with_text(&conv, "2026-01", vec![row_jan])
+            .with_text(&conv, "2026-04", vec![row_apr]);
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            date_from: Some(ms_for(2026, 4, 1)),
+            date_to: Some(ms_for(2026, 4, 30)),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &source)
+            .unwrap();
+        assert_eq!(
+            source.text_calls.get(),
+            1,
+            "only the in-range bucket is fetched"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id.to_string(), mid_apr);
+    }
+
+    #[test]
+    fn tenant_policy_blocks_global_search_when_disabled() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        let source = BloomFakeColdSource::new().with_text(
+            &conv,
+            "2026-04",
+            vec![cold_text_row(&conv, &mid, "lighthouse")],
+        );
+        let policy = TenantSearchPolicy {
+            allow_global_search: false,
+            ..TenantSearchPolicy::default()
+        };
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            target: SearchTarget::Global,
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+            )
+            .unwrap();
+        assert!(results.is_empty(), "global search must be blocked");
+        assert_eq!(source.text_calls.get(), 0);
+    }
+
+    #[test]
+    fn tenant_policy_caps_cold_bucket_count() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mut source = BloomFakeColdSource::new();
+        for month in 1..=6 {
+            let bucket = format!("2026-{month:02}");
+            let mid = Uuid::now_v7().to_string();
+            let mut row = cold_text_row(&conv, &mid, "lighthouse");
+            row.created_at_ms = ms_for(2026, month, 15);
+            source = source.with_text(&conv, &bucket, vec![row]);
+        }
+        let policy = TenantSearchPolicy {
+            // Allow Global so the cap is what we're testing.
+            allow_global_search: true,
+            allow_cross_tenant_results: true,
+            max_cold_buckets_per_search: 2,
+            require_bloom_shards: false,
+        };
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            target: SearchTarget::Global,
+            ..Default::default()
+        };
+        let _ = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            source.text_calls.get(),
+            2,
+            "policy must cap fan-out at 2 buckets"
+        );
+    }
+
+    #[test]
+    fn tenant_policy_requires_bloom_when_configured() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        // Bucket without a bloom shard — under
+        // require_bloom_shards = true the bucket is skipped.
+        let source = BloomFakeColdSource::new().with_text(
+            &conv,
+            "2026-04",
+            vec![cold_text_row(&conv, &mid, "lighthouse")],
+        );
+        let policy = TenantSearchPolicy {
+            allow_global_search: true,
+            allow_cross_tenant_results: true,
+            max_cold_buckets_per_search: 50,
+            require_bloom_shards: true,
+        };
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            target: SearchTarget::Global,
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                None,
+                200,
+            )
+            .unwrap();
+        assert!(results.is_empty(), "missing bloom must skip bucket");
+        assert_eq!(source.text_calls.get(), 0);
+    }
+
+    #[test]
+    fn shard_cache_hit_avoids_transport_fetch() {
+        let db = cold_db();
+        let engine = QueryEngine::new(&db);
+        let conv = Uuid::now_v7().to_string();
+        let mid = Uuid::now_v7().to_string();
+        let source = BloomFakeColdSource::new().with_text(
+            &conv,
+            "2026-04",
+            vec![cold_text_row(&conv, &mid, "lighthouse")],
+        );
+        let cache = std::sync::Mutex::new(ShardCache::new(usize::MAX));
+        let policy = TenantSearchPolicy::default();
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            ..Default::default()
+        };
+        // First call populates cache.
+        let _ = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                Some(&cache),
+                200,
+            )
+            .unwrap();
+        let after_first = source.text_calls.get();
+        // Second call must be a pure cache hit.
+        let _ = engine
+            .execute_search_with_cold_source_full(
+                &q,
+                &SearchScope::IncludeCold,
+                &source,
+                &policy,
+                Some(&cache),
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            source.text_calls.get(),
+            after_first,
+            "repeated search must not refetch text shard"
+        );
     }
 }

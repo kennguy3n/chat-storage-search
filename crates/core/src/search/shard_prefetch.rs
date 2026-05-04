@@ -34,7 +34,7 @@ use crate::archive::privacy::{compute_padding_count, pad_with_dummy_requests, sh
 use crate::config::KChatCoreConfig;
 use crate::formats::search_shard::IndexType;
 use crate::transport::TransportClient;
-use crate::Error;
+use crate::{Error, SearchTarget};
 
 /// Default ordering of shard types fetched by
 /// [`batch_prefetch_shards`]. Stable so the test suite can pin
@@ -139,11 +139,73 @@ pub fn batch_prefetch_shards_with_padding(
     bucket: &str,
     config: &KChatCoreConfig,
 ) -> Result<Vec<PrefetchedShard>, Error> {
+    batch_prefetch_shards_with_padding_for_target(
+        transport,
+        conversation_hash,
+        bucket,
+        config,
+        &SearchTarget::Conversation(uuid::Uuid::nil()),
+    )
+}
+
+/// Phase 8 (2026-05-04 batch 6) — scope-proportional dummy
+/// padding multiplier.
+///
+/// Wider search scopes leak more access-pattern signal per
+/// query: a `Conversation` query touches a single bucket but a
+/// `Global` query may touch dozens. To keep the cover-traffic
+/// ratio constant across scopes, the multiplier scales linearly
+/// in the number of conversations the scope can implicate:
+///
+/// | Scope                                    | Multiplier |
+/// |------------------------------------------|------------|
+/// | `Conversation`, `ConversationGroup`,     |            |
+/// |   `Channel`, `Starred`, `Unread`         | 1          |
+/// | `Community`, `Domain`                    | 2          |
+/// | `Tenant`, `B2cAll`                       | 3          |
+/// | `Global`                                 | 4          |
+///
+/// The multiplier is applied on top of the base padding count
+/// from [`compute_padding_count`]; see
+/// [`batch_prefetch_shards_with_padding_for_target`].
+pub fn compute_scope_padding_multiplier(target: &SearchTarget) -> usize {
+    match target {
+        SearchTarget::Conversation(_)
+        | SearchTarget::ConversationGroup(_)
+        | SearchTarget::Channel(_)
+        | SearchTarget::Starred
+        | SearchTarget::Unread => 1,
+        SearchTarget::Community(_) | SearchTarget::Domain(_) => 2,
+        SearchTarget::Tenant(_) | SearchTarget::B2cAll => 3,
+        SearchTarget::Global => 4,
+    }
+}
+
+/// Phase 8 (2026-05-04 batch 6) —
+/// [`batch_prefetch_shards_with_padding`] variant that scales
+/// the dummy-request count by
+/// [`compute_scope_padding_multiplier`] for the supplied
+/// [`SearchTarget`].
+///
+/// At `privacy_level = High` the call generates
+/// `compute_padding_count(1) * compute_scope_padding_multiplier(target)`
+/// dummy `(conversation_hash, bucket)` requests in addition to
+/// the real one. At `Standard` the multiplier is a no-op (the
+/// `should_pad` short-circuit returns the unpadded
+/// `batch_prefetch_shards`).
+pub fn batch_prefetch_shards_with_padding_for_target(
+    transport: &dyn TransportClient,
+    conversation_hash: &str,
+    bucket: &str,
+    config: &KChatCoreConfig,
+    target: &SearchTarget,
+) -> Result<Vec<PrefetchedShard>, Error> {
     if !should_pad(config) {
         return batch_prefetch_shards(transport, conversation_hash, bucket);
     }
     let real_hashes = vec![conversation_hash.to_string()];
-    let dummy_count = compute_padding_count(real_hashes.len());
+    let base = compute_padding_count(real_hashes.len());
+    let dummy_count = base.saturating_mul(compute_scope_padding_multiplier(target));
     let interleaved = pad_with_dummy_requests(&real_hashes, dummy_count);
     let mut out: Vec<PrefetchedShard> = Vec::with_capacity(PREFETCH_ORDER.len());
     for hash in &interleaved {
@@ -444,5 +506,84 @@ mod tests {
             batch_prefetch_shards_with_padding(&t_padded, "hash", "2026-04", &cfg).expect("padded");
         let unpadded = batch_prefetch_shards(&t_unpadded, "hash", "2026-04").expect("unpadded");
         assert_eq!(padded, unpadded, "padding must not alter returned shards");
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — Task 6: scope-proportional padding
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn scope_padding_multiplier_conversation_is_1() {
+        let target = SearchTarget::Conversation(uuid::Uuid::nil());
+        assert_eq!(compute_scope_padding_multiplier(&target), 1);
+    }
+
+    #[test]
+    fn scope_padding_multiplier_global_is_4() {
+        assert_eq!(compute_scope_padding_multiplier(&SearchTarget::Global), 4);
+    }
+
+    #[test]
+    fn scope_padding_multiplier_climbs_monotonically_with_scope() {
+        // Sanity check that wider scopes never get a smaller
+        // multiplier than narrower ones.
+        let convo =
+            compute_scope_padding_multiplier(&SearchTarget::Conversation(uuid::Uuid::nil()));
+        let community =
+            compute_scope_padding_multiplier(&SearchTarget::Community(uuid::Uuid::nil()));
+        let domain = compute_scope_padding_multiplier(&SearchTarget::Domain(uuid::Uuid::nil()));
+        let tenant = compute_scope_padding_multiplier(&SearchTarget::Tenant("t".into()));
+        let b2c = compute_scope_padding_multiplier(&SearchTarget::B2cAll);
+        let global = compute_scope_padding_multiplier(&SearchTarget::Global);
+        assert!(convo <= community);
+        assert!(community <= domain);
+        assert!(domain <= tenant);
+        assert_eq!(tenant, b2c);
+        assert!(tenant <= global);
+        assert!(global > convo);
+    }
+
+    #[test]
+    fn batch_prefetch_with_global_scope_generates_more_dummies_than_conversation_scope() {
+        let cfg = fresh_config(PrivacyLevel::High);
+
+        let t_conv = RecordingTransport::default();
+        t_conv.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
+        let _ = batch_prefetch_shards_with_padding_for_target(
+            &t_conv,
+            "hash",
+            "2026-04",
+            &cfg,
+            &SearchTarget::Conversation(uuid::Uuid::nil()),
+        )
+        .expect("conv prefetch");
+
+        let t_global = RecordingTransport::default();
+        t_global.seed("hash", "2026-04", "text", b"text-bytes".to_vec());
+        let _ = batch_prefetch_shards_with_padding_for_target(
+            &t_global,
+            "hash",
+            "2026-04",
+            &cfg,
+            &SearchTarget::Global,
+        )
+        .expect("global prefetch");
+
+        let conv_calls = t_conv.calls().len();
+        let global_calls = t_global.calls().len();
+        assert!(
+            global_calls > conv_calls,
+            "global ({global_calls}) must emit more transport calls than \
+             conversation ({conv_calls}) under the same privacy level"
+        );
+
+        // Tighter check: the multiplier difference between
+        // Conversation (1×) and Global (4×) means the dummy
+        // count quadruples; the real-target call burst stays at
+        // PREFETCH_ORDER.len() in both cases.
+        let n = PREFETCH_ORDER.len();
+        let base = compute_padding_count(1);
+        assert_eq!(conv_calls, n + base * n);
+        assert_eq!(global_calls, n + base * 4 * n);
     }
 }

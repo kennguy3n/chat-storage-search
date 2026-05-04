@@ -66,6 +66,23 @@ enum ContentKind {
   "Any",
 };
 
+// Phase 8 (2026-05-04 batch 6) — Task 8: scoped search target.
+// Mirrors `kchat_core::SearchTarget`. UUID-bearing variants pass
+// the id(s) as String because UDL has no native UUID type.
+[Enum]
+interface SearchTarget {
+  Conversation(string conversation_id);
+  ConversationGroup(sequence<string> conversation_ids);
+  Channel(string channel_id);
+  Community(string community_id);
+  Domain(string domain_id);
+  Tenant(string tenant_id);
+  B2cAll();
+  Starred();
+  Unread();
+  Global();
+};
+
 dictionary SearchQuery {
   string query_string;
   string? sender_filter;
@@ -74,6 +91,10 @@ dictionary SearchQuery {
   i64? date_from;
   i64? date_to;
   ContentKind? content_kind;
+  // Phase 8 (2026-05-04 batch 6) — Task 8: optional scoping.
+  // null preserves the legacy `SearchTarget::Global` default so
+  // existing Swift call sites stay source-compatible.
+  SearchTarget? target;
 };
 
 dictionary SearchResult {

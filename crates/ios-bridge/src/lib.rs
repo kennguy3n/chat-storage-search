@@ -233,6 +233,72 @@ impl From<ContentKind> for kchat_core::ContentKind {
     }
 }
 
+/// Phase 8 (2026-05-04 batch 6) — Task 8: FFI-shaped mirror of
+/// [`kchat_core::SearchTarget`].
+///
+/// UDL emits this as a tagged enum. Variants that carry a UUID
+/// or a UUID list pass the id(s) as `String` because the UDL
+/// type system has no native `Uuid`. Tenant ids are arbitrary
+/// strings and are passed through unchanged.
+#[derive(Debug, Clone, Default)]
+pub enum SearchTarget {
+    /// Single-conversation filter.
+    Conversation { conversation_id: String },
+    /// Explicit conversation-id list.
+    ConversationGroup { conversation_ids: Vec<String> },
+    /// Channel-level filter (resolver-delegated).
+    Channel { channel_id: String },
+    /// Community-level filter.
+    Community { community_id: String },
+    /// Domain-level filter.
+    Domain { domain_id: String },
+    /// Tenant-level filter.
+    Tenant { tenant_id: String },
+    /// Every B2C conversation.
+    B2cAll,
+    /// Every starred conversation (resolver-delegated).
+    Starred,
+    /// Every conversation with unread messages (resolver-delegated).
+    Unread,
+    /// No filter — search every conversation. Default.
+    #[default]
+    Global,
+}
+
+impl SearchTarget {
+    fn into_core(self) -> Result<kchat_core::SearchTarget> {
+        Ok(match self {
+            SearchTarget::Conversation { conversation_id } => {
+                kchat_core::SearchTarget::Conversation(parse_uuid(
+                    "conversation_id",
+                    &conversation_id,
+                )?)
+            }
+            SearchTarget::ConversationGroup { conversation_ids } => {
+                let mut out = Vec::with_capacity(conversation_ids.len());
+                for id in conversation_ids {
+                    out.push(parse_uuid("conversation_id", &id)?);
+                }
+                kchat_core::SearchTarget::ConversationGroup(out)
+            }
+            SearchTarget::Channel { channel_id } => {
+                kchat_core::SearchTarget::Channel(parse_uuid("channel_id", &channel_id)?)
+            }
+            SearchTarget::Community { community_id } => {
+                kchat_core::SearchTarget::Community(parse_uuid("community_id", &community_id)?)
+            }
+            SearchTarget::Domain { domain_id } => {
+                kchat_core::SearchTarget::Domain(parse_uuid("domain_id", &domain_id)?)
+            }
+            SearchTarget::Tenant { tenant_id } => kchat_core::SearchTarget::Tenant(tenant_id),
+            SearchTarget::B2cAll => kchat_core::SearchTarget::B2cAll,
+            SearchTarget::Starred => kchat_core::SearchTarget::Starred,
+            SearchTarget::Unread => kchat_core::SearchTarget::Unread,
+            SearchTarget::Global => kchat_core::SearchTarget::Global,
+        })
+    }
+}
+
 /// FFI-shaped mirror of [`kchat_core::SearchQuery`].
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
@@ -242,10 +308,20 @@ pub struct SearchQuery {
     pub date_from: Option<i64>,
     pub date_to: Option<i64>,
     pub content_kind: Option<ContentKind>,
+    /// Phase 8 (2026-05-04 batch 6) — Task 8: optional
+    /// SearchTarget. `None` preserves the legacy default
+    /// (`SearchTarget::Global`), keeping every Swift caller
+    /// that constructed a [`SearchQuery`] before this field
+    /// existed source-compatible.
+    pub target: Option<SearchTarget>,
 }
 
 impl SearchQuery {
     fn into_core(self) -> Result<CoreSearchQuery> {
+        let target = match self.target {
+            Some(t) => t.into_core()?,
+            None => Default::default(),
+        };
         Ok(CoreSearchQuery {
             query_string: self.query_string,
             sender_filter: self.sender_filter,
@@ -253,7 +329,7 @@ impl SearchQuery {
             date_from: self.date_from,
             date_to: self.date_to,
             content_kind: self.content_kind.map(Into::into),
-            target: Default::default(),
+            target,
         })
     }
 }
@@ -640,6 +716,7 @@ mod tests {
             date_from: None,
             date_to: None,
             content_kind: Some(ContentKind::Text),
+            target: None,
         };
         let core_q = q.into_core().expect("into_core");
         assert_eq!(core_q.conversation_filter, Some(conv));
@@ -655,10 +732,94 @@ mod tests {
             date_from: None,
             date_to: None,
             content_kind: None,
+            target: None,
         };
         assert!(matches!(
             q.into_core().unwrap_err(),
             KChatError::InvalidArgument { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — Task 8: SearchTarget bridge tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn ios_bridge_search_target_round_trip() {
+        // Every UDL variant must convert into the matching
+        // kchat_core::SearchTarget.
+        let conv = Uuid::now_v7();
+        let group = vec![Uuid::now_v7(), Uuid::now_v7()];
+        let channel = Uuid::now_v7();
+        let community = Uuid::now_v7();
+        let domain = Uuid::now_v7();
+
+        let cases: Vec<(SearchTarget, kchat_core::SearchTarget)> = vec![
+            (
+                SearchTarget::Conversation {
+                    conversation_id: conv.to_string(),
+                },
+                kchat_core::SearchTarget::Conversation(conv),
+            ),
+            (
+                SearchTarget::ConversationGroup {
+                    conversation_ids: group.iter().map(|u| u.to_string()).collect(),
+                },
+                kchat_core::SearchTarget::ConversationGroup(group.clone()),
+            ),
+            (
+                SearchTarget::Channel {
+                    channel_id: channel.to_string(),
+                },
+                kchat_core::SearchTarget::Channel(channel),
+            ),
+            (
+                SearchTarget::Community {
+                    community_id: community.to_string(),
+                },
+                kchat_core::SearchTarget::Community(community),
+            ),
+            (
+                SearchTarget::Domain {
+                    domain_id: domain.to_string(),
+                },
+                kchat_core::SearchTarget::Domain(domain),
+            ),
+            (
+                SearchTarget::Tenant {
+                    tenant_id: "tenant-z".into(),
+                },
+                kchat_core::SearchTarget::Tenant("tenant-z".into()),
+            ),
+            (SearchTarget::B2cAll, kchat_core::SearchTarget::B2cAll),
+            (SearchTarget::Starred, kchat_core::SearchTarget::Starred),
+            (SearchTarget::Unread, kchat_core::SearchTarget::Unread),
+            (SearchTarget::Global, kchat_core::SearchTarget::Global),
+        ];
+        for (udl, expected) in cases {
+            let core = udl.clone().into_core().expect("into_core");
+            assert_eq!(
+                core, expected,
+                "udl variant {udl:?} must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ios_bridge_search_defaults_to_global() {
+        // `target = None` must convert into
+        // `SearchTarget::Global` so existing Swift call sites
+        // that don't yet thread a target stay on the legacy path.
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            sender_filter: None,
+            conversation_filter: None,
+            date_from: None,
+            date_to: None,
+            content_kind: None,
+            target: None,
+        };
+        let core = q.into_core().expect("into_core");
+        assert!(matches!(core.target, kchat_core::SearchTarget::Global));
     }
 }

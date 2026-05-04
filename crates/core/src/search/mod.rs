@@ -16,6 +16,7 @@ pub mod query_engine;
 pub mod search_target;
 pub mod semantic_search;
 pub mod shard_builder;
+pub mod shard_cache;
 pub mod shard_prefetch;
 pub mod text_search;
 pub mod tokenizer;

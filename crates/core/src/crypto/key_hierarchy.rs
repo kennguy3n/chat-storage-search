@@ -53,6 +53,22 @@ pub mod info {
     /// Phase-3 epoch-rotated archive key. `info` =
     /// `b"kchat-archive-epoch-v1" || epoch_id`.
     pub const ARCHIVE_EPOCH: &[u8] = b"kchat-archive-epoch-v1";
+
+    // -----------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+    // -----------------------------------------------------------------
+
+    /// Root for a single B2B tenant's key subtree. `info` =
+    /// `b"kchat-b2b-tenant-root-v1" || tenant_id`.
+    pub const B2B_TENANT_ROOT: &[u8] = b"kchat-b2b-tenant-root-v1";
+
+    /// Per-tenant epoch-rotated archive key. `info` =
+    /// `b"kchat-b2b-archive-epoch-v1" || tenant_id || epoch_id`.
+    pub const B2B_ARCHIVE_EPOCH: &[u8] = b"kchat-b2b-archive-epoch-v1";
+
+    /// Per-tenant text-index shard key. `info` =
+    /// `b"kchat-b2b-text-index-shard-v1" || tenant_id || shard_id`.
+    pub const B2B_TEXT_INDEX_SHARD: &[u8] = b"kchat-b2b-text-index-shard-v1";
 }
 
 /// Owned, zeroizing 32-byte key material. Dropping a [`KeyMaterial`]
@@ -218,6 +234,83 @@ pub fn derive_bloom_index_shard(
     shard_id: &[u8],
 ) -> CryptoResult<KeyMaterial> {
     derive_with_id(search_root.as_bytes(), info::BLOOM_INDEX_SHARD, shard_id)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+// ---------------------------------------------------------------------------
+
+fn derive_with_two_ids(
+    parent: &[u8],
+    label: &[u8],
+    id_a: &[u8],
+    id_b: &[u8],
+) -> CryptoResult<KeyMaterial> {
+    let mut buf = Vec::with_capacity(label.len() + id_a.len() + id_b.len());
+    buf.extend_from_slice(label);
+    buf.extend_from_slice(id_a);
+    buf.extend_from_slice(id_b);
+    derive(parent, &buf)
+}
+
+/// Derive `K_b2b_tenant_root(tenant_id)` from `K_user_master`.
+///
+/// `info = info::B2B_TENANT_ROOT || tenant_id.as_bytes()`.
+///
+/// Each B2B tenant gets a dedicated key subtree so the orchestration
+/// layer can hold encrypted segments / shards for tenant **A**
+/// without ever exposing key material that could decrypt tenant
+/// **B**'s data — even when both tenants share the same
+/// `K_user_master` (e.g. the same end user is a member of multiple
+/// tenants).
+pub fn derive_b2b_tenant_root(
+    k_user_master: &KeyMaterial,
+    tenant_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_id(
+        k_user_master.as_bytes(),
+        info::B2B_TENANT_ROOT,
+        tenant_id.as_bytes(),
+    )
+}
+
+/// Derive `K_b2b_archive_epoch(tenant_id, epoch_id)` from a
+/// per-tenant root produced by [`derive_b2b_tenant_root`].
+///
+/// `info = info::B2B_ARCHIVE_EPOCH || tenant_id.as_bytes() || epoch_id.as_bytes()`.
+pub fn derive_b2b_archive_epoch(
+    k_tenant_root: &KeyMaterial,
+    tenant_id: &str,
+    epoch_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_two_ids(
+        k_tenant_root.as_bytes(),
+        info::B2B_ARCHIVE_EPOCH,
+        tenant_id.as_bytes(),
+        epoch_id.as_bytes(),
+    )
+}
+
+/// Derive `K_b2b_text_index_shard(tenant_id, shard_id)` from a
+/// `K_search_root` (or any per-tenant search subtree).
+///
+/// `info = info::B2B_TEXT_INDEX_SHARD || tenant_id.as_bytes() || shard_id.as_bytes()`.
+///
+/// The dedicated `info` string keeps every derived shard key in a
+/// disjoint key space from the B2C `K_text_index_shard` family, so
+/// a leaked B2C shard key cannot decrypt a B2B shard with the
+/// same `shard_id` and vice-versa.
+pub fn derive_b2b_text_index_shard(
+    k_search_root: &KeyMaterial,
+    tenant_id: &str,
+    shard_id: &str,
+) -> CryptoResult<KeyMaterial> {
+    derive_with_two_ids(
+        k_search_root.as_bytes(),
+        info::B2B_TEXT_INDEX_SHARD,
+        tenant_id.as_bytes(),
+        shard_id.as_bytes(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -466,5 +559,83 @@ mod tests {
         assert_ne!(bloom.as_bytes(), text.as_bytes());
         assert_ne!(bloom.as_bytes(), vector.as_bytes());
         assert_ne!(text.as_bytes(), vector.as_bytes());
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn derive_b2b_tenant_root_is_deterministic() {
+        let m = master();
+        let a = derive_b2b_tenant_root(&m, "tenant-acme").unwrap();
+        let b = derive_b2b_tenant_root(&m, "tenant-acme").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn different_tenant_ids_produce_different_roots() {
+        let m = master();
+        let acme = derive_b2b_tenant_root(&m, "tenant-acme").unwrap();
+        let initech = derive_b2b_tenant_root(&m, "tenant-initech").unwrap();
+        assert_ne!(acme.as_bytes(), initech.as_bytes());
+    }
+
+    #[test]
+    fn b2b_tenant_root_differs_from_b2c_archive_root() {
+        let m = master();
+        // B2B tenant root for a tenant id that happens to collide
+        // with the B2C archive-root info string would still derive
+        // a disjoint key because the info strings differ.
+        let tenant_root = derive_b2b_tenant_root(&m, "tenant-acme").unwrap();
+        let archive_root = derive_archive_root(&m).unwrap();
+        assert_ne!(tenant_root.as_bytes(), archive_root.as_bytes());
+    }
+
+    #[test]
+    fn derive_b2b_archive_epoch_is_deterministic() {
+        let m = master();
+        let tenant_root = derive_b2b_tenant_root(&m, "tenant-acme").unwrap();
+        let a = derive_b2b_archive_epoch(&tenant_root, "tenant-acme", "2026-04").unwrap();
+        let b = derive_b2b_archive_epoch(&tenant_root, "tenant-acme", "2026-04").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let other = derive_b2b_archive_epoch(&tenant_root, "tenant-acme", "2026-05").unwrap();
+        assert_ne!(a.as_bytes(), other.as_bytes());
+    }
+
+    #[test]
+    fn derive_b2b_text_index_shard_is_deterministic() {
+        let m = master();
+        let search_root = derive_search_root(&m).unwrap();
+        let a = derive_b2b_text_index_shard(&search_root, "tenant-acme", "shard-1").unwrap();
+        let b = derive_b2b_text_index_shard(&search_root, "tenant-acme", "shard-1").unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        let other_shard =
+            derive_b2b_text_index_shard(&search_root, "tenant-acme", "shard-2").unwrap();
+        assert_ne!(a.as_bytes(), other_shard.as_bytes());
+    }
+
+    #[test]
+    fn b2b_shard_key_differs_from_b2c_shard_key_for_same_shard_id() {
+        // The B2C `derive_text_index_shard` and the B2B
+        // `derive_b2b_text_index_shard` use distinct `info`
+        // strings, so two different tenants — or one B2C user
+        // and one B2B tenant — that happen to assign the same
+        // `shard_id` derive disjoint keys.
+        let m = master();
+        let search_root = derive_search_root(&m).unwrap();
+        let b2c = derive_text_index_shard(&search_root, b"shard-1").unwrap();
+        let b2b = derive_b2b_text_index_shard(&search_root, "tenant-acme", "shard-1").unwrap();
+        assert_ne!(b2c.as_bytes(), b2b.as_bytes());
+    }
+
+    #[test]
+    fn different_b2b_tenants_produce_disjoint_shard_keys_for_same_shard_id() {
+        let m = master();
+        let search_root = derive_search_root(&m).unwrap();
+        let acme = derive_b2b_text_index_shard(&search_root, "tenant-acme", "shard-1").unwrap();
+        let initech =
+            derive_b2b_text_index_shard(&search_root, "tenant-initech", "shard-1").unwrap();
+        assert_ne!(acme.as_bytes(), initech.as_bytes());
     }
 }

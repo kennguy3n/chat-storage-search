@@ -66,6 +66,12 @@ pub enum TaskType {
     /// Pre-warm on-device models so search-result-tap latency
     /// stays under the §12 budget.
     ModelWarmup,
+    /// Phase 8 (2026-05-04 batch 6) — pre-warm the on-device
+    /// `ShardCache` with the cold shards belonging to the
+    /// most-recently-searched conversations. Runs at idle
+    /// priority (P5) on charging + Wi-Fi only so it never
+    /// competes with foreground work.
+    ShardCacheWarming,
 }
 
 impl TaskType {
@@ -79,6 +85,7 @@ impl TaskType {
             TaskType::IndexMaintenance => "kchat.scheduler.index_maintenance",
             TaskType::MediaCacheEviction => "kchat.scheduler.media_cache_eviction",
             TaskType::ModelWarmup => "kchat.scheduler.model_warmup",
+            TaskType::ShardCacheWarming => "kchat.scheduler.shard_cache_warming",
         }
     }
 }
@@ -368,6 +375,7 @@ mod tests {
             TaskType::IndexMaintenance,
             TaskType::MediaCacheEviction,
             TaskType::ModelWarmup,
+            TaskType::ShardCacheWarming,
         ];
         for t in cases {
             let json = serde_json::to_string(&t).expect("encode");
@@ -402,11 +410,12 @@ mod tests {
             TaskType::IndexMaintenance,
             TaskType::MediaCacheEviction,
             TaskType::ModelWarmup,
+            TaskType::ShardCacheWarming,
         ]
         .into_iter()
         .map(TaskType::default_task_id)
         .collect();
-        assert_eq!(ids.len(), 5, "every TaskType must have a unique task_id");
+        assert_eq!(ids.len(), 6, "every TaskType must have a unique task_id");
         for id in ids {
             assert!(
                 id.starts_with("kchat.scheduler."),
