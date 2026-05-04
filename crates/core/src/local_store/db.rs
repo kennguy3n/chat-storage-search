@@ -961,6 +961,25 @@ impl LocalStoreDb {
         Ok(())
     }
 
+    /// Remove the `search_vector` row for `message_id`. Idempotent —
+    /// a missing row is not an error.
+    ///
+    /// The Phase 6 ingest path writes embeddings to `search_vector`
+    /// via the cross-pipeline embedding cache. Per-message delete
+    /// and edit paths must invoke this helper alongside
+    /// [`Self::delete_fts_row`] to keep semantic search consistent
+    /// with FTS / fuzzy: otherwise a deleted message still surfaces
+    /// as a [`crate::search::semantic_search::SemanticMatch`], and
+    /// an edited message's vector row carries the pre-edit text's
+    /// embedding.
+    pub fn delete_vector_row(&self, message_id: &str) -> DbResult<()> {
+        self.conn.execute(
+            "DELETE FROM search_vector WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
     /// Update the conversation row's `last_message_id` and
     /// `last_activity_ms` columns. Used by
     /// [`crate::message::processor::MessagePersister`] after

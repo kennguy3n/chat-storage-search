@@ -555,6 +555,15 @@ impl<'a> QueryEngine<'a> {
     /// [`crate::Error::NotImplemented`]), the engine falls back
     /// to the FTS-only path.
     ///
+    /// `is_cold` is stamped against the **merged** result set
+    /// when `scope == IncludeCold`. Semantic-only hits whose
+    /// owning skeleton has `body_state = 'remote_archive_only'`
+    /// are flagged so the `HydrationQueue` can enqueue the cold
+    /// body for hydration at `SearchResultTap` priority — the
+    /// initial materialization defaults `is_cold: false` because
+    /// the skeleton-fetch projection does not include
+    /// `body_state`.
+    ///
     /// `model_version` defaults to
     /// [`crate::models::embeddings::XLMR_MODEL_VERSION`] when
     /// `None` is passed.
@@ -684,6 +693,21 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.message_id.cmp(&b.message_id))
         });
         local.truncate(limit);
+        // Re-stamp `is_cold` against the merged set. Semantic-
+        // only rows pushed onto `local` were materialized with
+        // `is_cold: false` because `fetch_skeleton_columns_for_semantic`
+        // doesn't read `body_state`; without this pass an
+        // offloaded message (`body_state = 'remote_archive_only'`)
+        // whose vector still lives in `search_vector` would
+        // surface with `is_cold = false`, and the
+        // `HydrationQueue` would never enqueue it for
+        // `SearchResultTap`-priority body fetch. The FTS / fuzzy
+        // rows in `local` were already marked once by
+        // `execute_search_with_limit`; `mark_cold_results` is
+        // idempotent.
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.mark_cold_results(&mut local)?;
+        }
         Ok(local)
     }
 
@@ -2539,6 +2563,119 @@ mod tests {
             stale_score < recent_score,
             "stale hit should rank strictly below anchor: \
              stale {stale_score:.4} vs anchor {recent_score:.4}",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_marks_cold_for_offloaded_body() {
+        // Regression test: `execute_search_with_semantic`
+        // materializes semantic-only hits with `is_cold: false`
+        // because `fetch_skeleton_columns_for_semantic` does not
+        // project `body_state`. Without a final cold-marking
+        // pass against the merged set, an offloaded message
+        // (`body_state = 'remote_archive_only'`) whose vector
+        // still lives in `search_vector` would surface with
+        // `is_cold = false` and the `HydrationQueue` would
+        // never enqueue it for `SearchResultTap`-priority
+        // hydration.
+        //
+        // This test seeds a single skeleton-only message,
+        // flips its `body_state` to `remote_archive_only`,
+        // plants a matching mock embedding, and asserts the
+        // returned `SearchResult` has `is_cold = true` under
+        // `SearchScope::IncludeCold`.
+
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        let mid = uuid_fixture(201).to_string();
+
+        insert_fixture(
+            &db,
+            &mid,
+            &conv,
+            "alice",
+            10_000,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        flip_to_remote_archive_only(&db, &mid);
+
+        let mock = MockTextEmbedder::default();
+        let q_text = "needle in cold archive";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::IncludeCold, &mock, None, 50)
+            .unwrap();
+
+        let target = Uuid::parse_str(&mid).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.message_id == target)
+            .expect("offloaded semantic-only hit should surface under IncludeCold");
+        assert!(
+            row.is_cold,
+            "semantic-only hit for `remote_archive_only` body must carry is_cold = true \
+             so HydrationQueue can enqueue it",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_stays_warm_under_local_only_scope() {
+        // Even when a body has been offloaded, `LocalOnly`
+        // searches must NOT stamp `is_cold = true` — the
+        // hydration queue is intentionally bypassed in that
+        // scope, and stamping cold would mislead callers about
+        // whether the result needs a network round trip.
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+        let mid = uuid_fixture(202).to_string();
+
+        insert_fixture(
+            &db,
+            &mid,
+            &conv,
+            "alice",
+            10_000,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        flip_to_remote_archive_only(&db, &mid);
+
+        let mock = MockTextEmbedder::default();
+        let q_text = "warm-only scope skips cold marking";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+
+        let target = Uuid::parse_str(&mid).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.message_id == target)
+            .expect("semantic-only hit should still surface under LocalOnly");
+        assert!(
+            !row.is_cold,
+            "LocalOnly scope must not stamp is_cold (got is_cold = true)",
         );
     }
 }
