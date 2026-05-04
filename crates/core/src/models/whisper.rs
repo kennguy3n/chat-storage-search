@@ -283,6 +283,143 @@ mod non_apple_silicon {
 pub use non_apple_silicon::MlxAppleSiliconProbe;
 
 // ---------------------------------------------------------------------------
+// WhisperTranscriber trait — Phase 6, Task 1 (this batch)
+//
+// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
+// can stash an installed transcriber inside
+// `Mutex<Option<Box<dyn WhisperTranscriber>>>` and run a
+// best-effort transcription pass during media ingest. The trait
+// is intentionally backend-agnostic — MLX or ONNX implementations
+// supply their own state — so callers can swap engines without
+// touching `send_media`.
+// ---------------------------------------------------------------------------
+
+use crate::Result;
+
+/// One contiguous timed segment of a Whisper transcription
+/// result.
+///
+/// `docs/PROPOSAL.md §7.6` — Whisper emits per-segment
+/// timestamps that the caller can render alongside the audio
+/// timeline. Times are wall-clock-relative milliseconds from
+/// the start of the audio buffer (NOT epoch-relative).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptionSegment {
+    /// Inclusive lower-bound timestamp in milliseconds, relative
+    /// to the start of the audio buffer (NOT epoch-relative).
+    pub start_ms: u64,
+    /// Inclusive upper-bound timestamp in milliseconds, relative
+    /// to the start of the audio buffer.
+    pub end_ms: u64,
+    /// Plaintext for this segment.
+    pub text: String,
+}
+
+/// Result of [`WhisperTranscriber::transcribe`].
+///
+/// `text` is the concatenated transcript; `language` is the
+/// BCP-47 / ISO-639 tag the decoder reported (`"en"`, `"es"`,
+/// `"zh"`, …) when available; `segments` is the per-segment
+/// timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptionResult {
+    /// Concatenated transcript text.
+    pub text: String,
+    /// Detected language tag (`None` when the decoder did not
+    /// report one).
+    pub language: Option<String>,
+    /// Per-segment timeline.
+    pub segments: Vec<TranscriptionSegment>,
+}
+
+/// On-device Whisper transcription seam used by media ingest
+/// (`docs/PROPOSAL.md §7.6` / §7.7, Phase 6, Task 1 of this
+/// batch).
+///
+/// Implementations MUST be object-safe and `Send + Sync` so the
+/// `CoreImpl` can park them behind a `Mutex<Option<Box<dyn _>>>`
+/// and reuse the same transcriber across every audio message.
+/// `mime_type` is the source MIME hint
+/// (`"audio/mpeg"`, `"audio/wav"`, `"audio/mp4"`, …).
+/// Implementations SHOULD reject non-audio MIME types with
+/// [`crate::Error::Model`] rather than returning a degenerate
+/// transcription.
+pub trait WhisperTranscriber: std::fmt::Debug + Send + Sync {
+    /// Run Whisper inference over `audio_data` and return the
+    /// transcription. Failures should be returned, not panicked;
+    /// the caller (`CoreImpl::send_media`) absorbs them so
+    /// non-fatal inference errors never lose a message.
+    fn transcribe(&self, audio_data: &[u8], mime_type: &str) -> Result<TranscriptionResult>;
+}
+
+/// Always-`NotImplemented` [`WhisperTranscriber`] for builds
+/// without a real MLX or ONNX Whisper bridge wired in.
+///
+/// `transcribe` returns
+/// [`crate::Error::NotImplemented("whisper_transcriber")`](crate::Error::NotImplemented).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopWhisperTranscriber;
+
+impl WhisperTranscriber for NoopWhisperTranscriber {
+    fn transcribe(&self, _audio_data: &[u8], _mime_type: &str) -> Result<TranscriptionResult> {
+        Err(crate::Error::NotImplemented("whisper_transcriber"))
+    }
+}
+
+/// Deterministic test [`WhisperTranscriber`] that derives a
+/// reproducible transcription from a BLAKE3 hash of
+/// `(mime_type, audio_data)`.
+///
+/// Used by the Phase 6 unit / integration tests to stand in for
+/// a real Whisper engine. Same construction as
+/// [`crate::models::embeddings::MockTextEmbedder`]: the hash
+/// seeds the synthetic transcript so identical inputs always
+/// yield identical outputs and distinct inputs always diverge.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MockWhisperTranscriber;
+
+impl WhisperTranscriber for MockWhisperTranscriber {
+    fn transcribe(&self, audio_data: &[u8], mime_type: &str) -> Result<TranscriptionResult> {
+        if !mime_type.starts_with("audio/") {
+            return Err(crate::Error::Model(format!(
+                "MockWhisperTranscriber rejects non-audio mime_type: {mime_type}"
+            )));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(mime_type.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(audio_data);
+        let hash = hasher.finalize();
+        let hex = hash.to_hex();
+        let prefix: String = hex.as_str().chars().take(16).collect();
+        // Two synthetic segments so the per-segment timeline
+        // has something to assert against. Total span is
+        // proportional to the input length so longer audio
+        // produces longer transcripts.
+        let span_ms = (audio_data.len() as u64).saturating_mul(10).max(20);
+        let mid = span_ms / 2;
+        let text = format!("mock transcription [{prefix}]");
+        let segments = vec![
+            TranscriptionSegment {
+                start_ms: 0,
+                end_ms: mid,
+                text: format!("mock segment 1 [{prefix}]"),
+            },
+            TranscriptionSegment {
+                start_ms: mid,
+                end_ms: span_ms,
+                text: format!("mock segment 2 [{prefix}]"),
+            },
+        ];
+        Ok(TranscriptionResult {
+            text,
+            language: Some("en".to_string()),
+            segments,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — exercise `select_whisper_backend` exhaustively. The
 // real MLX / ONNX inference loops are not unit-testable without
 // a real MLX runtime + a real .onnx fixture, so they are
@@ -387,5 +524,51 @@ mod tests {
         let probe: &dyn AppleSiliconProbe = &StubProbe(false);
         let report = select_whisper_backend(probe);
         assert_eq!(report.backend, WhisperBackend::Onnx);
+    }
+
+    // ----- Phase 6, Task 1: WhisperTranscriber coverage --------------
+
+    #[test]
+    fn noop_whisper_transcriber_returns_not_implemented() {
+        let t = NoopWhisperTranscriber;
+        let err = t.transcribe(b"audio-bytes", "audio/wav").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::NotImplemented("whisper_transcriber")
+        ));
+    }
+
+    #[test]
+    fn mock_whisper_transcriber_is_deterministic() {
+        let t = MockWhisperTranscriber;
+        let a = t.transcribe(b"hello-audio", "audio/wav").expect("a");
+        let b = t.transcribe(b"hello-audio", "audio/wav").expect("b");
+        assert_eq!(a, b, "deterministic transcript for identical inputs");
+        // Distinct inputs diverge.
+        let c = t.transcribe(b"different-audio", "audio/wav").expect("c");
+        assert_ne!(a.text, c.text);
+        // Segments are populated.
+        assert_eq!(a.segments.len(), 2);
+        assert!(a.segments[0].end_ms <= a.segments[1].start_ms.max(a.segments[0].end_ms));
+        // Language is set on mock output.
+        assert_eq!(a.language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn mock_whisper_transcriber_rejects_non_audio_mime() {
+        let t = MockWhisperTranscriber;
+        let err = t.transcribe(b"bytes", "text/plain").unwrap_err();
+        assert!(matches!(err, crate::Error::Model(_)));
+    }
+
+    #[test]
+    fn whisper_transcriber_trait_is_object_safe() {
+        // Compile-time + runtime sanity: a `&dyn WhisperTranscriber`
+        // can be created and invoked. If the trait stops being
+        // object-safe, this fails to compile.
+        let mock = MockWhisperTranscriber;
+        let dynref: &dyn WhisperTranscriber = &mock;
+        let result = dynref.transcribe(b"X", "audio/mpeg").unwrap();
+        assert!(!result.text.is_empty());
     }
 }

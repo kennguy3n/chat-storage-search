@@ -203,7 +203,7 @@ fn map_sql(e: rusqlite::Error) -> crate::Error {
     crate::Error::Storage(format!("semantic_search: {e}"))
 }
 
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
+pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm < 1e-12 {
         return v.to_vec();
@@ -211,7 +211,7 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();

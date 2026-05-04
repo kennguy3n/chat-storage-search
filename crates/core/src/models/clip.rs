@@ -48,6 +48,17 @@ pub const MOBILECLIP_S2_MODEL_VERSION: &str = "mobileclip_s2@v1";
 /// catch dimension drift across encoder upgrades.
 pub const MOBILECLIP_S2_EMBEDDING_DIM: usize = 512;
 
+/// Canonical on-disk filename for the INT8 MobileCLIP-S2
+/// artifact. Phase 6, Task 5 (2026-05-04 batch). The trailing
+/// `.onnx` suffix lets `ModelManager::resolve_destination` work
+/// uniformly across encoders.
+pub const MOBILECLIP_S2_INT8_FILENAME: &str = "mobileclip_s2-v1-int8.onnx";
+
+/// Canonical on-disk filename for the INT4 (`MatMulNBits`)
+/// MobileCLIP-S2 artifact shipped to tight-storage devices.
+/// Phase 6, Task 5 (2026-05-04 batch).
+pub const MOBILECLIP_S2_INT4_FILENAME: &str = "mobileclip_s2-v1-int4.onnx";
+
 #[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
 mod windows_directml {
     use super::{OnnxExecutionProvider, OnnxProviderReport, OrtDirectMlProbe, OrtSessionResult};
@@ -133,6 +144,41 @@ mod posix_cpu {
 
 #[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
 pub use posix_cpu::create_mobileclip_session;
+
+/// Phase 6, Task 5 (2026-05-04 batch): INT4 (`MatMulNBits`)
+/// flavor of [`create_mobileclip_session`].
+///
+/// The actual `MatMulNBits` graph optimization in `ort` is
+/// applied automatically at session-load time when the `.onnx`
+/// model file already carries `MatMulNBits` nodes (which our
+/// INT4 export pipeline produces). This helper is therefore
+/// structurally identical to [`create_mobileclip_session`] —
+/// the EP-selection state machine and CPU fallback are the
+/// same. The function exists as a named seam so future graph-
+/// optimization tweaks (`SessionBuilder::with_optimization_level`
+/// /  `with_intra_threads`) can land without touching the
+/// INT8 path.
+#[cfg(feature = "onnx-runtime")]
+pub fn create_mobileclip_session_int4(
+    model_path: &std::path::Path,
+) -> crate::models::embeddings_onnx::OrtSessionResult<(
+    ort::session::Session,
+    crate::models::embeddings_onnx::OnnxProviderReport,
+)> {
+    create_mobileclip_session(model_path)
+}
+
+/// Phase 6, Task 5 (2026-05-04 batch): INT4 session-creator
+/// stub for builds without the `onnx-runtime` cargo feature.
+///
+/// Returns [`crate::Error::NotImplemented`] so callers can
+/// pre-flight `feature = "onnx-runtime"` without a `cfg`-fence.
+#[cfg(not(feature = "onnx-runtime"))]
+pub fn create_mobileclip_session_int4(_model_path: &std::path::Path) -> crate::Result<()> {
+    Err(crate::Error::NotImplemented(
+        "create_mobileclip_session_int4 requires onnx-runtime feature",
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // ImageEmbedder trait — Phase 6, Task 9

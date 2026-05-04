@@ -1356,3 +1356,146 @@ fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
     verify_manifest_chain(&chain, &signer.verifying_key())
         .expect("chain must verify after manifest-upload retry");
 }
+
+// ===========================================================================
+// Phase 7, Task 6 (2026-05-04 batch) — offline + interrupted scenarios.
+// ===========================================================================
+//
+// These tests exercise the `OfflineDetector` wiring on the
+// `KChatCore::run_incremental_backup` and `KChatCore::hydrate_message`
+// paths. They use `CoreImpl::new_in_memory` plus a `ToggleOfflineDetector`
+// so the same in-memory core can flip between "offline" and "online"
+// inside a single test.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use kchat_core::config::Platform;
+use kchat_core::local_store::schema::{
+    Conversation as DbConversation, MessageKind as DbMessageKind,
+    MessageSkeleton as DbMessageSkeleton,
+};
+use kchat_core::local_store::state_machines::{ArchiveState, BackupState, BodyState};
+use kchat_core::transport::offline::{
+    AlwaysOfflineDetector, NoopOfflineDetector, ToggleOfflineDetector,
+};
+use kchat_core::{CoreImpl, KChatCore, KChatCoreConfig};
+
+const OFFLINE_TEST_KEY: [u8; 32] = [0x53; 32];
+
+fn offline_test_config() -> KChatCoreConfig {
+    KChatCoreConfig::new(
+        PathBuf::from("/tmp/kchat-offline-tests"),
+        Platform::MacOs,
+        "tenant-offline-tests",
+    )
+}
+
+#[test]
+fn offline_during_backup_defers_upload_and_succeeds_on_reconnect() {
+    let core =
+        CoreImpl::new_in_memory(offline_test_config(), OFFLINE_TEST_KEY).expect("core spawns");
+
+    // First run: device is offline. The wrapper short-circuits
+    // before any segment-build / upload work, returns
+    // `BackupResult { deferred: true, .. }`, and the detector's
+    // `is_online()` shim reports `false`.
+    let detector = Arc::new(ToggleOfflineDetector::new(false));
+    core.install_offline_detector(detector.clone())
+        .expect("install offline detector");
+    assert!(!core.is_online(), "detector reports offline");
+    let deferred = core
+        .run_incremental_backup("scheduled")
+        .expect("offline backup defers cleanly");
+    assert!(deferred.deferred, "offline backup must set deferred = true");
+    assert_eq!(
+        deferred.segments_built, 0,
+        "deferred run must not build segments",
+    );
+    assert_eq!(
+        deferred.events_segmented, 0,
+        "deferred run must not segment events",
+    );
+
+    // Second run: device reconnects. The same core instance —
+    // no segments were lost because the wrapper never touched
+    // the journal. With no events pending the inner pipeline
+    // is a no-op (`segments_built = 0`) and `deferred = false`.
+    detector.set_online(true);
+    assert!(core.is_online(), "detector reports back online");
+    let result = core
+        .run_incremental_backup("scheduled")
+        .expect("online backup succeeds");
+    assert!(
+        !result.deferred,
+        "reconnected backup must clear the deferred flag"
+    );
+}
+
+#[test]
+fn offline_during_hydration_returns_cold_with_offline_flag() {
+    let core =
+        CoreImpl::new_in_memory(offline_test_config(), OFFLINE_TEST_KEY).expect("core spawns");
+
+    // Seed a conversation + a message-skeleton row whose body
+    // lives only in the remote archive (no local body row).
+    // `hydrate_message` should report `is_cold = true` and —
+    // because the detector is offline — `offline = true`.
+    let conv_id = uuid::Uuid::now_v7();
+    let msg_id = uuid::Uuid::now_v7();
+    core.with_db(|db| {
+        let conv = DbConversation {
+            conversation_id: conv_id.to_string(),
+            title_cipher: None,
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms: 1,
+        };
+        db.insert_conversation(&conv).expect("insert conv");
+        let skel = DbMessageSkeleton {
+            message_id: msg_id.to_string(),
+            conversation_id: conv_id.to_string(),
+            sender_id: "u-offline".into(),
+            created_at_ms: 100,
+            received_at_ms: 100,
+            kind: DbMessageKind::Text,
+            body_state: BodyState::RemoteArchiveOnly,
+            media_state: None,
+            archive_state: ArchiveState::ArchiveVerified,
+            backup_state: BackupState::BackupManifestCommitted,
+            reply_to: None,
+            edited_at_ms: None,
+            deleted_at_ms: None,
+        };
+        db.insert_message_skeleton(&skel).expect("insert skel");
+    });
+
+    core.install_offline_detector(Arc::new(AlwaysOfflineDetector))
+        .expect("install detector");
+    assert!(!core.is_online());
+    let h = core
+        .hydrate_message(msg_id, "search_result_tap")
+        .expect("hydrate returns");
+    assert!(h.is_cold, "remote-archive-only body must surface as cold");
+    assert!(
+        h.offline,
+        "offline detector must propagate to HydratedMessage.offline",
+    );
+    assert!(
+        h.text_content.is_none(),
+        "offline cold hit must not leak any text content",
+    );
+
+    // Sanity check: with no detector (or with a noop detector
+    // whose `is_online()` returns true) the same message
+    // hydrates as cold but `offline = false`, so the flag is
+    // genuinely gated on the detector.
+    core.install_offline_detector(Arc::new(NoopOfflineDetector))
+        .expect("swap to noop detector");
+    let h2 = core
+        .hydrate_message(msg_id, "search_result_tap")
+        .expect("hydrate returns");
+    assert!(h2.is_cold);
+    assert!(!h2.offline, "online detector must clear the offline flag",);
+}

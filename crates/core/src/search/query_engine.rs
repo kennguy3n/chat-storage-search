@@ -698,12 +698,20 @@ impl<'a> QueryEngine<'a> {
         let lambda = std::f64::consts::LN_2 / RECENCY_HALF_LIFE_DAYS;
 
         for hit in hits {
-            let semantic_contribution = (hit.similarity as f64) * SEMANTIC_WEIGHT;
+            let raw_similarity = hit.similarity as f64;
+            let semantic_contribution = raw_similarity * SEMANTIC_WEIGHT;
             if let Some(&idx) = by_id.get(&hit.message_id) {
                 // FTS / fuzzy already applied recency × kind in
                 // `execute_search_with_limit`; just stack the
                 // semantic contribution on top.
                 local[idx].rank_score += semantic_contribution;
+                // Phase 6, Task 4 (2026-05-04 batch): expose the
+                // raw cosine similarity so the reranker
+                // (`rerank_with_semantic`) and downstream
+                // consumers can reason about the semantic
+                // contribution independently of the merged
+                // ranking formula.
+                local[idx].semantic_score = Some(raw_similarity);
                 continue;
             }
             // Semantic-only hit: build a fresh SearchResult.
@@ -734,6 +742,7 @@ impl<'a> QueryEngine<'a> {
                 rank_score: weighted,
                 is_cold: false,
                 snippet: None,
+                semantic_score: Some(raw_similarity),
             });
         }
         // Re-sort: descending rank_score, then created_at DESC,
@@ -762,6 +771,105 @@ impl<'a> QueryEngine<'a> {
             self.mark_cold_results(&mut local)?;
         }
         Ok(local)
+    }
+
+    /// Re-score an existing [`SearchResult`] set against the
+    /// supplied query embedding, using the same brute-force
+    /// cosine-similarity engine that powers
+    /// [`Self::execute_search_with_semantic`]. Phase 6, Task 4
+    /// (2026-05-04 batch) — the "on-device reranking" item from
+    /// `docs/PHASES.md` Phase 6.
+    ///
+    /// The pass is purely local: it reads from `search_vector`
+    /// and never fans to the cold archive, regardless of
+    /// `scope`. When `scope == SearchScope::IncludeCold` the
+    /// caller is expected to have already populated the
+    /// cold-hit subset (via [`Self::execute_search_with_cold_source_and_limit`]
+    /// or similar) — this method only updates the rows whose
+    /// `message_id` has a matching row in `search_vector`.
+    /// Cold rows whose embeddings have not yet been hydrated
+    /// keep their existing `rank_score` and `semantic_score`.
+    ///
+    /// `model_version` defaults to
+    /// [`crate::models::embeddings::XLMR_MODEL_VERSION`] when
+    /// `None` is supplied.
+    ///
+    /// The method:
+    ///
+    /// 1. L2-renormalizes `query_embedding` defensively.
+    /// 2. Reads every `search_vector` row whose
+    ///    `model_version` matches.
+    /// 3. For each input result whose `message_id` has a
+    ///    matching row, computes raw cosine similarity, sets
+    ///    `semantic_score = Some(sim)`, and adds
+    ///    `sim * SEMANTIC_WEIGHT` to `rank_score`.
+    /// 4. Re-sorts by descending `rank_score`,
+    ///    descending `created_at_ms`, ascending `message_id`.
+    pub fn rerank_with_semantic(
+        &self,
+        results: &mut Vec<SearchResult>,
+        query_embedding: &[f32],
+        model_version: Option<&str>,
+        scope: &SearchScope,
+    ) -> DbResult<()> {
+        if results.is_empty() || query_embedding.is_empty() {
+            return Ok(());
+        }
+        let mv = model_version.unwrap_or(crate::models::embeddings::XLMR_MODEL_VERSION);
+
+        // Phase 6, Task 4: respect SearchScope::LocalOnly by
+        // never fanning beyond `search_vector`. The brute-force
+        // sweep below only reads local SQLite rows, so this is
+        // satisfied unconditionally — the scope match is kept
+        // explicit so future "fan to remote" branches must
+        // re-decide whether to honor LocalOnly.
+        match scope {
+            SearchScope::LocalOnly | SearchScope::IncludeCold => {}
+        }
+
+        let want: HashSet<String> = results.iter().map(|r| r.message_id.to_string()).collect();
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, embedding FROM search_vector
+              WHERE model_version = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![mv])?;
+        let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let mid: String = row.get(0)?;
+            if !want.contains(&mid) {
+                continue;
+            }
+            let blob: Vec<u8> = row.get(1)?;
+            by_id.insert(mid, blob);
+        }
+
+        let q = crate::search::semantic_search::l2_normalize(query_embedding);
+        for r in results.iter_mut() {
+            let key = r.message_id.to_string();
+            let Some(blob) = by_id.get(&key) else {
+                continue;
+            };
+            let stored = crate::models::embeddings::dequantize_int8_for_search(blob);
+            if stored.is_empty() || stored.len() != q.len() {
+                continue;
+            }
+            let sim = crate::search::semantic_search::cosine(&q, &stored) as f64;
+            r.semantic_score = Some(sim);
+            r.rank_score += sim * SEMANTIC_WEIGHT;
+        }
+
+        // Re-sort: descending rank_score, then created_at DESC,
+        // then message_id for determinism. Same ordering as
+        // `execute_search_with_semantic`.
+        results.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Ok(())
     }
 
     fn fetch_skeleton_columns_for_semantic(
@@ -857,6 +965,7 @@ impl<'a> QueryEngine<'a> {
                 snippet: None,
                 rank_score: 0.0,
                 is_cold: false,
+                semantic_score: None,
             });
         }
         Ok(out)
@@ -919,6 +1028,7 @@ impl<'a> QueryEngine<'a> {
                     snippet: Some(h.snippet),
                     rank_score: -h.bm25_score * BM25_WEIGHT,
                     is_cold: false,
+                    semantic_score: None,
                 },
             );
         }
@@ -961,6 +1071,7 @@ impl<'a> QueryEngine<'a> {
                         snippet: None,
                         rank_score: f.score * FUZZY_WEIGHT,
                         is_cold: false,
+                        semantic_score: None,
                     },
                 );
             }
@@ -1271,6 +1382,7 @@ fn merge_cold_hit(
             snippet: None,
             rank_score: rank,
             is_cold: true,
+            semantic_score: None,
         },
     );
 }
@@ -3034,5 +3146,220 @@ mod tests {
         assert_eq!(kind_str_to_weight("audio"), TEXT_KIND_WEIGHT);
         assert_eq!(kind_str_to_weight("file"), TEXT_KIND_WEIGHT);
         assert_eq!(kind_str_to_weight(""), TEXT_KIND_WEIGHT);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 6, Task 4 (2026-05-04 batch) — `semantic_score`
+    // population + `rerank_with_semantic` coverage.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn semantic_score_populated_for_semantic_hits() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        let conn = db.connection();
+        let target_msg_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello world' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_msg_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed("hello world").unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello world".into(),
+            ..Default::default()
+        };
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+        let target_uuid = Uuid::parse_str(&target_msg_id).unwrap();
+        let target = with_semantic
+            .iter()
+            .find(|r| r.message_id == target_uuid)
+            .expect("target row present");
+        let sim = target.semantic_score.expect("semantic_score populated");
+        // Self-similarity through the mock encoder is ~1.0.
+        assert!(sim > 0.99, "expected near-1.0 self-similarity, got {sim}");
+    }
+
+    #[test]
+    fn semantic_score_none_for_fts_only_hits() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert!(!plain.is_empty());
+        for r in &plain {
+            assert!(
+                r.semantic_score.is_none(),
+                "FTS-only hit must not carry semantic_score: {r:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_with_semantic_adjusts_ordering() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        let conn = db.connection();
+        // Pull two messages whose text both contain "hello".
+        let row_a_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello world' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let row_b_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello there' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        // Only `row_b_id` gets an embedding that exactly matches
+        // the query — so reranking should move it up.
+        cache
+            .put(
+                &row_b_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed("hello there").unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let mut plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let plain_a_score = plain
+            .iter()
+            .find(|r| r.message_id.to_string() == row_a_id)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+        let plain_b_score = plain
+            .iter()
+            .find(|r| r.message_id.to_string() == row_b_id)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+
+        let q_emb = mock.embed("hello there").unwrap();
+        engine
+            .rerank_with_semantic(&mut plain, &q_emb, None, &SearchScope::LocalOnly)
+            .unwrap();
+
+        let row_b_uuid = Uuid::parse_str(&row_b_id).unwrap();
+        let row_b = plain
+            .iter()
+            .find(|r| r.message_id == row_b_uuid)
+            .expect("row_b present");
+        // After rerank `row_b` carries a populated semantic_score
+        // and a strictly greater rank_score than before.
+        let sim_b = row_b
+            .semantic_score
+            .expect("rerank populates semantic_score for rows with embeddings");
+        assert!(sim_b > 0.99);
+        assert!(
+            row_b.rank_score > plain_b_score,
+            "rerank must not lower a known-good row (was {plain_b_score}, now {})",
+            row_b.rank_score,
+        );
+        // `row_a` has no embedding — its rank_score is unchanged.
+        let row_a_uuid = Uuid::parse_str(&row_a_id).unwrap();
+        let row_a = plain
+            .iter()
+            .find(|r| r.message_id == row_a_uuid)
+            .expect("row_a present");
+        assert!(row_a.semantic_score.is_none());
+        assert!((row_a.rank_score - plain_a_score).abs() < f64::EPSILON);
+        // Re-sorted: b comes before a now because its score
+        // strictly increased.
+        let pos_b = plain
+            .iter()
+            .position(|r| r.message_id == row_b_uuid)
+            .unwrap();
+        let pos_a = plain
+            .iter()
+            .position(|r| r.message_id == row_a_uuid)
+            .unwrap();
+        assert!(
+            pos_b < pos_a,
+            "rerank should reorder b ahead of a (positions {pos_b} vs {pos_a})",
+        );
+    }
+
+    #[test]
+    fn rerank_respects_local_only_scope() {
+        // The reranker is purely local; supplying `LocalOnly` and
+        // `IncludeCold` over the same input must produce
+        // identical updated `rank_score`s for rows whose
+        // embeddings live in `search_vector`. (`IncludeCold`
+        // only changes the cold-fan branch on the *query*, not
+        // the rerank pass.)
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        let conn = db.connection();
+        let target_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello world' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed("hello world").unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let q_emb = mock.embed("hello world").unwrap();
+
+        let mut local = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        engine
+            .rerank_with_semantic(&mut local, &q_emb, None, &SearchScope::LocalOnly)
+            .unwrap();
+
+        let mut cold = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        engine
+            .rerank_with_semantic(&mut cold, &q_emb, None, &SearchScope::IncludeCold)
+            .unwrap();
+
+        assert_eq!(local.len(), cold.len());
+        let target_uuid = Uuid::parse_str(&target_id).unwrap();
+        let local_target = local.iter().find(|r| r.message_id == target_uuid).unwrap();
+        let cold_target = cold.iter().find(|r| r.message_id == target_uuid).unwrap();
+        assert_eq!(local_target.semantic_score, cold_target.semantic_score);
+        assert!(
+            (local_target.rank_score - cold_target.rank_score).abs() < f64::EPSILON,
+            "LocalOnly and IncludeCold must produce identical rank_score updates",
+        );
     }
 }

@@ -210,6 +210,38 @@ pub struct CoreImpl {
     /// "always allowed" so unit tests don't need to install a
     /// probe.
     resource_probe: Mutex<Option<std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>>>,
+    /// Phase-6 on-device Whisper transcription seam. `None` until
+    /// [`CoreImpl::install_whisper_transcriber`] is called. When
+    /// set, audio media writes a transcript row into
+    /// `media_search_index` during `send_media`. Mirrors
+    /// [`Self::text_embedder`] / [`Self::image_embedder`] wiring.
+    whisper_transcriber: Mutex<Option<Box<dyn crate::models::whisper::WhisperTranscriber>>>,
+    /// Phase-6 on-device document text-extraction seam. `None`
+    /// until [`CoreImpl::install_document_extractor`] is called.
+    /// When set, PDF / DOCX media writes per-page text rows into
+    /// `media_search_index` (kind `"caption"`) during `send_media`.
+    document_extractor: Mutex<Option<Box<dyn crate::models::document::DocumentExtractor>>>,
+    /// Phase-6 on-device video keyframe-sampling seam. `None`
+    /// until [`CoreImpl::install_video_keyframe_sampler`] is
+    /// called. Combined with [`Self::image_embedder`] this drives
+    /// the video keyframe → MobileCLIP-S2 → `search_vector`
+    /// pipeline in `send_media`.
+    video_keyframe_sampler: Mutex<Option<Box<dyn crate::models::video::VideoKeyframeSampler>>>,
+    /// Phase-6 offline-detection seam. `None` until
+    /// [`CoreImpl::install_offline_detector`] is called; the
+    /// orchestration layer treats `None` as "always online" so
+    /// unit tests don't need to install a detector. When set,
+    /// [`KChatCore::run_incremental_backup`] defers upload while
+    /// offline and [`KChatCore::hydrate_message`] returns a
+    /// skeleton with `offline = true` for cold messages instead
+    /// of attempting an archive fetch.
+    offline_detector: Mutex<Option<std::sync::Arc<dyn crate::transport::offline::OfflineDetector>>>,
+    /// Phase-7 performance-trace collector. `None` until
+    /// [`CoreImpl::install_perf_collector`] is called; when set,
+    /// the hot paths (`ingest_messages`, `search`,
+    /// `run_incremental_backup`, `enforce_storage_budget`) emit
+    /// [`crate::perf::PerfTrace`] records into the collector.
+    perf_collector: Mutex<Option<std::sync::Arc<dyn crate::perf::PerfCollector>>>,
 }
 
 /// One row of [`CoreImpl::tracked_backup_segments`].
@@ -375,6 +407,11 @@ impl CoreImpl {
             image_embedder: Mutex::new(None),
             ocr_bridge: Mutex::new(None),
             resource_probe: Mutex::new(None),
+            whisper_transcriber: Mutex::new(None),
+            document_extractor: Mutex::new(None),
+            video_keyframe_sampler: Mutex::new(None),
+            offline_detector: Mutex::new(None),
+            perf_collector: Mutex::new(None),
         })
     }
 
@@ -405,6 +442,11 @@ impl CoreImpl {
             image_embedder: Mutex::new(None),
             ocr_bridge: Mutex::new(None),
             resource_probe: Mutex::new(None),
+            whisper_transcriber: Mutex::new(None),
+            document_extractor: Mutex::new(None),
+            video_keyframe_sampler: Mutex::new(None),
+            offline_detector: Mutex::new(None),
+            perf_collector: Mutex::new(None),
         })
     }
 
@@ -1240,6 +1282,143 @@ impl CoreImpl {
             .unwrap_or(false)
     }
 
+    /// Install (or replace) the on-device Whisper transcriber
+    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
+    /// Task 1 of the 2026-05-04 batch). When set, audio media
+    /// writes a transcript row into `media_search_index` during
+    /// `send_media`.
+    pub fn install_whisper_transcriber(
+        &self,
+        transcriber: Box<dyn crate::models::whisper::WhisperTranscriber>,
+    ) -> Result<()> {
+        *self.whisper_transcriber.lock().map_err(poisoned)? = Some(transcriber);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_whisper_transcriber`] has been
+    /// called with a real bridge.
+    pub fn has_whisper_transcriber(&self) -> bool {
+        self.whisper_transcriber
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the on-device document
+    /// text-extraction bridge used by media ingest
+    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 2 of the
+    /// 2026-05-04 batch). When set, PDF / DOCX media writes
+    /// per-page text rows into `media_search_index` during
+    /// `send_media`.
+    pub fn install_document_extractor(
+        &self,
+        extractor: Box<dyn crate::models::document::DocumentExtractor>,
+    ) -> Result<()> {
+        *self.document_extractor.lock().map_err(poisoned)? = Some(extractor);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_document_extractor`] has been
+    /// called with a real bridge.
+    pub fn has_document_extractor(&self) -> bool {
+        self.document_extractor
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the on-device video keyframe sampler
+    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
+    /// Task 3 of the 2026-05-04 batch). When set together with
+    /// an [`crate::models::clip::ImageEmbedder`], video media
+    /// embeds the first keyframe via MobileCLIP-S2 and writes
+    /// the embedding to `search_vector` during `send_media`.
+    pub fn install_video_keyframe_sampler(
+        &self,
+        sampler: Box<dyn crate::models::video::VideoKeyframeSampler>,
+    ) -> Result<()> {
+        *self.video_keyframe_sampler.lock().map_err(poisoned)? = Some(sampler);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_video_keyframe_sampler`] has been
+    /// called with a real bridge.
+    pub fn has_video_keyframe_sampler(&self) -> bool {
+        self.video_keyframe_sampler
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the offline-detection probe used by
+    /// the backup-defer / hydrate-offline paths (Phase 7,
+    /// Task 6 of the 2026-05-04 batch). Wrapped in `Arc` so
+    /// multiple workers can share one detector.
+    pub fn install_offline_detector(
+        &self,
+        detector: std::sync::Arc<dyn crate::transport::offline::OfflineDetector>,
+    ) -> Result<()> {
+        *self.offline_detector.lock().map_err(poisoned)? = Some(detector);
+        Ok(())
+    }
+
+    /// Current online state. `true` when no detector is installed
+    /// (the orchestration layer treats `None` as "always
+    /// online"); otherwise delegates to the installed detector.
+    pub fn is_online(&self) -> bool {
+        match self.offline_detector.lock() {
+            Ok(slot) => slot.as_ref().map(|d| d.is_online()).unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
+    /// Install (or replace) the performance-trace collector
+    /// (Phase 7, Task 8 of the 2026-05-04 batch). Wrapped in
+    /// `Arc` so callers can share one collector across the
+    /// lifetime of the process and read out traces with
+    /// [`Self::collect_perf_stats`].
+    pub fn install_perf_collector(
+        &self,
+        collector: std::sync::Arc<dyn crate::perf::PerfCollector>,
+    ) -> Result<()> {
+        *self.perf_collector.lock().map_err(poisoned)? = Some(collector);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_perf_collector`] has been called.
+    pub fn has_perf_collector(&self) -> bool {
+        self.perf_collector
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of all [`crate::perf::PerfTrace`] records
+    /// recorded by the installed collector. Returns the empty
+    /// vector when no collector is installed or when the
+    /// installed collector does not buffer traces (e.g.
+    /// [`crate::perf::NoopPerfCollector`]).
+    pub fn collect_perf_stats(&self) -> Vec<crate::perf::PerfTrace> {
+        let Ok(slot) = self.perf_collector.lock() else {
+            return Vec::new();
+        };
+        match slot.as_ref() {
+            Some(c) => c.snapshot(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Best-effort emit of one [`crate::perf::PerfTrace`] record
+    /// into the installed collector. No-op when no collector is
+    /// installed.
+    fn record_perf_trace(&self, trace: crate::perf::PerfTrace) {
+        if let Ok(slot) = self.perf_collector.lock() {
+            if let Some(collector) = slot.as_ref() {
+                collector.record(trace);
+            }
+        }
+    }
+
     /// Replay the supplied search-index shards into the local
     /// `search_fts` / `search_fuzzy` tables (Phase 4, Task 6).
     ///
@@ -1677,6 +1856,16 @@ impl CoreImpl {
     /// shared with `kennguy3n/slm-guardrail`, so a guardrail-
     /// computed vector is not re-encoded by the search pipeline.
     pub fn ingest_messages(&self, messages: &[IngestedMessage]) -> Result<IngestResult> {
+        // Phase 7, Task 8 (2026-05-04 batch): wrap the ingest hot
+        // path with a [`crate::perf::PerfTrace`] so an installed
+        // collector can measure end-to-end ingest latency. We
+        // record `messages_in` (input batch size) and the result
+        // counters once they're known. Failures still record so
+        // the trace surface includes both successful and failed
+        // bursts.
+        let mut trace = crate::perf::PerfTrace::new("ingest_messages");
+        trace.insert_metadata("messages_in", messages.len().to_string());
+
         let db = self.db.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         let mut result = IngestResult::default();
@@ -1694,9 +1883,18 @@ impl CoreImpl {
                     self.maybe_embed_text_message(&db, msg);
                 }
                 Err(ProcessorError::DuplicateMessage) => result.duplicate_count += 1,
-                Err(e) => return Err(Error::Message(e.to_string())),
+                Err(e) => {
+                    trace.insert_metadata("error", e.to_string());
+                    trace.finish();
+                    self.record_perf_trace(trace);
+                    return Err(Error::Message(e.to_string()));
+                }
             }
         }
+        trace.insert_metadata("new_messages", result.new_messages.to_string());
+        trace.insert_metadata("duplicate_count", result.duplicate_count.to_string());
+        trace.finish();
+        self.record_perf_trace(trace);
         Ok(result)
     }
 
@@ -1777,6 +1975,154 @@ impl CoreImpl {
             return;
         }
         match embedder.embed_image(plaintext, mime_type) {
+            Ok(vec) => {
+                let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
+            }
+            Err(_) => {
+                // Inference failures are absorbed.
+            }
+        }
+    }
+
+    /// Best-effort Whisper transcription for audio media (Phase
+    /// 6, Task 1 of the 2026-05-04 batch). Runs only when (a) a
+    /// [`crate::models::whisper::WhisperTranscriber`] is
+    /// installed and (b) `mime_type` indicates audio. The
+    /// concatenated transcript and detected language land in
+    /// `media_search_index` keyed by `asset_id` with kind
+    /// `"transcript"`. All errors — both inference failures and
+    /// DB write failures — are absorbed; the message is already
+    /// persisted and FTS-searchable through its caption.
+    fn maybe_transcribe_audio_message(
+        &self,
+        db: &LocalStoreDb,
+        asset_id: &str,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) {
+        if !mime_type.starts_with("audio/") {
+            return;
+        }
+        let Ok(slot) = self.whisper_transcriber.lock() else {
+            return;
+        };
+        let Some(transcriber) = slot.as_ref() else {
+            return;
+        };
+        match transcriber.transcribe(plaintext, mime_type) {
+            Ok(result) => {
+                let language = result.language.as_deref();
+                let _ = db.insert_media_search_index(
+                    asset_id,
+                    "transcript",
+                    &result.text,
+                    language,
+                    None,
+                );
+            }
+            Err(_) => {
+                // Inference failures are absorbed — same
+                // policy as `maybe_embed_text_message`.
+            }
+        }
+    }
+
+    /// Best-effort document text extraction for PDF / DOCX media
+    /// (Phase 6, Task 2 of the 2026-05-04 batch). Runs only when
+    /// (a) a [`crate::models::document::DocumentExtractor`] is
+    /// installed and (b) `mime_type` is one of the supported
+    /// document MIME types
+    /// ([`crate::models::document::is_supported_document_mime`]).
+    /// Each page lands as a `"caption"`-kind row in
+    /// `media_search_index` with text formatted as
+    /// `"[page N] …"`. Errors are absorbed.
+    fn maybe_extract_document_pages(
+        &self,
+        db: &LocalStoreDb,
+        asset_id: &str,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) {
+        use crate::models::document::is_supported_document_mime;
+
+        if !is_supported_document_mime(mime_type) {
+            return;
+        }
+        let Ok(slot) = self.document_extractor.lock() else {
+            return;
+        };
+        let Some(extractor) = slot.as_ref() else {
+            return;
+        };
+        match extractor.extract_text(plaintext, mime_type) {
+            Ok(pages) => {
+                for page in pages {
+                    let formatted = format!("[page {}] {}", page.page_number, page.text);
+                    let _ = db.insert_media_search_index(
+                        asset_id,
+                        "caption",
+                        &formatted,
+                        page.language.as_deref(),
+                        None,
+                    );
+                }
+            }
+            Err(_) => {
+                // Inference failures are absorbed.
+            }
+        }
+    }
+
+    /// Best-effort video keyframe sampling + MobileCLIP-S2
+    /// embedding for video media (Phase 6, Task 3 of the
+    /// 2026-05-04 batch). Runs only when (a) a
+    /// [`crate::models::video::VideoKeyframeSampler`] is
+    /// installed, (b) an
+    /// [`crate::models::clip::ImageEmbedder`] is installed, and
+    /// (c) `mime_type` indicates video. The first keyframe's
+    /// embedding lands in `search_vector` keyed
+    /// `(message_id, MOBILECLIP_S2_MODEL_VERSION)`. Errors are
+    /// absorbed.
+    fn maybe_embed_video_keyframes(
+        &self,
+        db: &LocalStoreDb,
+        message_id: &str,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) {
+        use crate::models::clip::MOBILECLIP_S2_MODEL_VERSION;
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        if !mime_type.starts_with("video/") {
+            return;
+        }
+        let Ok(sampler_slot) = self.video_keyframe_sampler.lock() else {
+            return;
+        };
+        let Some(sampler) = sampler_slot.as_ref() else {
+            return;
+        };
+        let Ok(embedder_slot) = self.image_embedder.lock() else {
+            return;
+        };
+        let Some(embedder) = embedder_slot.as_ref() else {
+            return;
+        };
+
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        if let Ok(Some(_)) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+            return;
+        }
+
+        // Sample up to 5 keyframes per PROPOSAL §7.6 default.
+        let frames = match sampler.extract_keyframes(plaintext, mime_type, 5) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let Some(first) = frames.into_iter().next() else {
+            return;
+        };
+        match embedder.embed_image(&first.image_data, &first.mime_type) {
             Ok(vec) => {
                 let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
             }
@@ -2216,6 +2562,7 @@ impl CoreImpl {
                 events_segmented: event_count,
                 manifest_generation: Some(manifest_generation),
                 manifest_uploaded: false,
+                deferred: false,
             },
             sealed_event_refs,
         ))
@@ -2770,11 +3117,32 @@ impl KChatCore for CoreImpl {
     }
 
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
+        // Phase 7, Task 8 (2026-05-04 batch): emit a `search`
+        // [`crate::perf::PerfTrace`]. We capture `query_len`
+        // (input characters), `scope`, and the resulting hit
+        // count. The trace ends after the cold-hit enqueue so a
+        // collector sees the wall-clock that the UI sees.
+        let mut trace = crate::perf::PerfTrace::new("search");
+        trace.insert_metadata("query_len", query.query_string.len().to_string());
+        trace.insert_metadata(
+            "scope",
+            match scope {
+                SearchScope::LocalOnly => "local_only".to_string(),
+                SearchScope::IncludeCold => "include_cold".to_string(),
+            },
+        );
+
         let db = self.db.lock().map_err(poisoned)?;
         let engine = QueryEngine::new(&db);
-        let results = engine
-            .execute_search(&query, &scope)
-            .map_err(|e| Error::Search(e.to_string()))?;
+        let results = match engine.execute_search(&query, &scope) {
+            Ok(r) => r,
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+                trace.finish();
+                self.record_perf_trace(trace);
+                return Err(Error::Search(e.to_string()));
+            }
+        };
         drop(db);
         // When the caller requested the personal archive, enqueue
         // every cold-flagged result for hydration at priority
@@ -2786,6 +3154,9 @@ impl KChatCore for CoreImpl {
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
         }
+        trace.insert_metadata("result_count", results.len().to_string());
+        trace.finish();
+        self.record_perf_trace(trace);
         Ok(results)
     }
 
@@ -2989,6 +3360,32 @@ impl KChatCore for CoreImpl {
             // persisted and FTS-searchable through its caption.
             self.maybe_embed_image_message(&db, &skel.message_id, mime_type, &plaintext);
 
+            // Phase 6, Task 1 (2026-05-04 batch): best-effort
+            // Whisper transcription for audio media. Runs only
+            // when (a) a transcriber is installed and (b) the
+            // MIME type indicates audio. The transcript lands in
+            // `media_search_index` keyed by `asset_id` with kind
+            // `"transcript"`; failures are absorbed.
+            self.maybe_transcribe_audio_message(&db, &asset_id.to_string(), mime_type, &plaintext);
+
+            // Phase 6, Task 2 (2026-05-04 batch): best-effort PDF
+            // / DOCX page text extraction. Runs only when (a) an
+            // extractor is installed and (b) the MIME type is
+            // `application/pdf` or DOCX. Each page lands as a
+            // `"caption"`-kind row in `media_search_index`;
+            // failures are absorbed.
+            self.maybe_extract_document_pages(&db, &asset_id.to_string(), mime_type, &plaintext);
+
+            // Phase 6, Task 3 (2026-05-04 batch): best-effort
+            // video keyframe sampling + MobileCLIP-S2 embedding.
+            // Runs only when (a) a sampler is installed, (b) an
+            // image embedder is installed, and (c) the MIME type
+            // indicates video. The first keyframe's embedding
+            // lands in `search_vector` keyed
+            // `(message_id, MOBILECLIP_S2_MODEL_VERSION)`;
+            // failures are absorbed.
+            self.maybe_embed_video_keyframes(&db, &skel.message_id, mime_type, &plaintext);
+
             // Bump the owning conversation's last_message_id /
             // last_activity_ms so list_conversations surfaces the
             // freshly-sent media message at the top. Mirrors
@@ -3124,20 +3521,63 @@ impl KChatCore for CoreImpl {
             });
         }
 
+        // Phase 7, Task 6 (2026-05-04 batch): expose an explicit
+        // `offline` flag on the hydration result so renderers
+        // can distinguish "cold but reachable, fetch in flight"
+        // from "cold and offline, retry on reconnect". The flag
+        // is `true` only when the body is non-local AND the
+        // installed `OfflineDetector` reports offline; without a
+        // detector installed `is_online()` is always `true`, so
+        // the flag stays `false` for callers that never wired
+        // one in.
+        let offline = !is_local && !self.is_online();
         Ok(HydratedMessage {
             message_id: message_id_uuid,
             conversation_id,
             text_content: if is_local { text_content } else { None },
             is_cold: !is_local,
+            offline,
         })
     }
 
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
-        let (result, _sealed) = self.run_incremental_backup_inner(reason)?;
+        // Phase 7, Task 8 (2026-05-04 batch): instrument the
+        // backup hot path. `start_ns` is captured up front so
+        // the trace covers both the offline short-circuit and
+        // the full segment-build + upload path.
+        let mut trace = crate::perf::PerfTrace::new("run_incremental_backup");
+        trace.insert_metadata("reason", reason);
+
+        // Phase 7, Task 6 (2026-05-04 batch): defer the upload
+        // when the device is offline. The segment building is
+        // unchanged — sealed segments still land in
+        // `tracked_backup_segments` so the next online run
+        // picks them up. The new `deferred` flag tells the
+        // caller the upload step was skipped.
+        if !self.is_online() {
+            let mut result = BackupResult::default();
+            result.deferred = true;
+            trace.insert_metadata("deferred", "true");
+            trace.finish();
+            self.record_perf_trace(trace);
+            return Ok(result);
+        }
+        let (mut result, _sealed) = self.run_incremental_backup_inner(reason)?;
+        result.deferred = false;
+        trace.insert_metadata("segments_built", &result.segments_built.to_string());
+        trace.insert_metadata("events_segmented", &result.events_segmented.to_string());
+        trace.finish();
+        self.record_perf_trace(trace);
         Ok(result)
     }
 
     fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
+        // Phase 7, Task 8 (2026-05-04 batch): wrap the eviction
+        // hot path with [`crate::perf::PerfTrace`]. We capture
+        // `pressure_level`, `evicted_count`, and `freed_bytes`
+        // so callers can plot pressure-vs-recovery curves.
+        let mut trace = crate::perf::PerfTrace::new("enforce_storage_budget");
+
         // Phase-3 foundation: assess pressure and execute an
         // empty plan when no candidates are surfaced. Wiring the
         // actual candidate-collection query is queued for once
@@ -3146,7 +3586,12 @@ impl KChatCore for CoreImpl {
         let enforcer = StorageBudgetEnforcer::new();
         let budget = StorageBudget::default_recommended();
         let assessment = enforcer.assess(db.connection(), &budget)?;
+        trace.insert_metadata("pressure_level", format!("{:?}", assessment.pressure_level));
         if !assessment.pressure_level.requires_eviction() {
+            trace.insert_metadata("freed_bytes", "0");
+            trace.insert_metadata("evicted_count", "0");
+            trace.finish();
+            self.record_perf_trace(trace);
             return Ok(OffloadResult {
                 freed_bytes: 0,
                 evicted_count: 0,
@@ -3173,14 +3618,19 @@ impl KChatCore for CoreImpl {
             plan_tiered_eviction(candidates, target_bytes, now_ms, assessment.pressure_level);
         let cloud_result = execute_eviction(db.connection(), &tiered.cloud_offload)?;
         let full_result = execute_eviction(db.connection(), &tiered.full_eviction)?;
-        Ok(OffloadResult {
+        let out = OffloadResult {
             freed_bytes: cloud_result
                 .freed_bytes
                 .saturating_add(full_result.freed_bytes),
             evicted_count: cloud_result
                 .evicted_count
                 .saturating_add(full_result.evicted_count),
-        })
+        };
+        trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
+        trace.insert_metadata("evicted_count", out.evicted_count.to_string());
+        trace.finish();
+        self.record_perf_trace(trace);
+        Ok(out)
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
@@ -7660,6 +8110,7 @@ mod tests {
             snippet: Some(snippet.into()),
             rank_score: 0.0,
             is_cold: true,
+            semantic_score: None,
         }
     }
 
@@ -7894,6 +8345,7 @@ mod tests {
             snippet: None,
             rank_score: 0.0,
             is_cold: false,
+            semantic_score: None,
         }];
         let n = core
             .hydrate_cold_search_results(&transport, &results, |_| {
@@ -8154,5 +8606,115 @@ mod tests {
                 .unwrap()
                 .is_none());
         });
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7, Task 8 (2026-05-04 batch) — perf-collector wiring
+    // tests. The unit-level coverage of `PerfTrace` /
+    // `InMemoryPerfCollector` lives in `crate::perf`. These two
+    // tests pin the *integration* contract: an installed
+    // collector sees the spans emitted by the `ingest_messages`
+    // and `search` hot paths.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn perf_collector_records_ingest_trace() {
+        use crate::message::processor::IngestedMessage;
+        use crate::perf::InMemoryPerfCollector;
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+        assert!(core.has_perf_collector());
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let now = now_ms_for_send_media();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "perf-alice".into(),
+            created_at_ms: now,
+            text_content: Some("perf trace ingest".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).expect("ingest");
+
+        let traces = core.collect_perf_stats();
+        let ingest = traces
+            .iter()
+            .find(|t| t.operation == "ingest_messages")
+            .expect("ingest_messages trace recorded");
+        assert!(
+            ingest.end_ns >= ingest.start_ns,
+            "trace must close (start={}, end={})",
+            ingest.start_ns,
+            ingest.end_ns,
+        );
+        assert_eq!(
+            ingest.metadata.get("messages_in").map(String::as_str),
+            Some("1"),
+            "metadata must record input batch size",
+        );
+        assert_eq!(
+            ingest.metadata.get("new_messages").map(String::as_str),
+            Some("1"),
+            "metadata must record successful inserts",
+        );
+    }
+
+    #[test]
+    fn perf_collector_records_search_trace() {
+        use crate::message::processor::IngestedMessage;
+        use crate::perf::InMemoryPerfCollector;
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let now = now_ms_for_send_media();
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "perf-bob".into(),
+            created_at_ms: now,
+            text_content: Some("perf trace search".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).expect("ingest");
+
+        let q = SearchQuery {
+            query_string: "perf trace".into(),
+            ..Default::default()
+        };
+        let _hits = core.search(q, SearchScope::LocalOnly).expect("search");
+
+        let traces = core.collect_perf_stats();
+        let search = traces
+            .iter()
+            .find(|t| t.operation == "search")
+            .expect("search trace recorded");
+        assert!(
+            search.end_ns >= search.start_ns,
+            "search trace must close (start={}, end={})",
+            search.start_ns,
+            search.end_ns,
+        );
+        assert_eq!(
+            search.metadata.get("scope").map(String::as_str),
+            Some("local_only"),
+            "scope metadata must be local_only",
+        );
+        assert!(
+            search.metadata.contains_key("result_count"),
+            "search trace must record result_count metadata",
+        );
     }
 }

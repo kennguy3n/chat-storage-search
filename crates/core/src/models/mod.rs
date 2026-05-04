@@ -42,9 +42,11 @@
 //! See `docs/PHASES.md` Phase 6 for the schedule.
 
 pub mod clip;
+pub mod document;
 pub mod embeddings;
 pub mod embeddings_onnx;
 pub mod model_manager;
 pub mod ocr;
 pub mod resource_gate;
+pub mod video;
 pub mod whisper;

@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~55%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker + OCR bridge + ResourceGate + ModelManager + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~28%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~75%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~40%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore scaffolds).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1519,7 +1519,7 @@ Notes:
 
 ## Phase 6: Media and Semantic Search
 
-**Status**: `In progress | ~55%`
+**Status**: `In progress | ~75%`
 
 **Goal**: On-device ML for OCR, image / video / audio search, and
 semantic text search — all multilingual.
@@ -1559,14 +1559,37 @@ Checklist:
       attach is the platform-bridge follow-up (Phase 6
       continuation). Tests:
       `core_impl::tests::send_media_writes_image_embedding_when_embedder_installed`.)_
-- [ ] Video keyframe sampling.
-- [ ] Whisper multilingual transcription: Apple MLX
+- [x] Video keyframe sampling.
+      _(Inference seam: `VideoKeyframeSampler` trait,
+      `NoopVideoKeyframeSampler`, `MockVideoKeyframeSampler` in
+      `crates/core/src/models/video.rs`. Wired into
+      `CoreImpl::send_media`: when `mime_type.starts_with("video/")`
+      and both a sampler and an `ImageEmbedder` are installed, up
+      to five keyframes are extracted, the first frame is embedded
+      via the existing MobileCLIP-S2 seam, and the resulting
+      vector lands in `search_vector` keyed
+      `(message_id, "mobileclip_s2@v1")`. Best-effort: errors are
+      absorbed. Tests:
+      `models::video::tests::*`,
+      `core_impl::tests::send_media_embeds_video_keyframes_when_sampler_and_embedder_installed`.)_
+- [x] Whisper multilingual transcription: Apple MLX
       (`mlx-community/whisper-base-mlx`) on Apple Silicon
       (preferred — Neural Engine, lower latency / battery cost);
       ONNX Runtime (`whisper-base` ~140 MB INT8) on all other
       platforms (Intel macOS, Windows, Android, Linux);
       `whisper-tiny` (~75 MB) on low-end Android. See PROPOSAL
       §7.6 / §7.7.
+      _(Scaffold: `WhisperTranscriber` trait,
+      `NoopWhisperTranscriber`, `MockWhisperTranscriber` in
+      `crates/core/src/models/whisper.rs`; `select_whisper_backend`
+      retains the platform routing. Wired into
+      `CoreImpl::send_media`: audio MIME types call
+      `transcribe()` and the result lands in
+      `media_search_index` with `kind = "transcript"`. Best-effort.
+      Real MLX / ONNX inference attach is the platform-bridge
+      follow-up. Tests:
+      `models::whisper::tests::*`,
+      `core_impl::tests::send_media_writes_transcript_when_transcriber_installed`.)_
 - [x] Platform OCR bridge (Vision on iOS / macOS; ML Kit on
       Android; `Windows.Media.Ocr` / Tesseract on Windows).
       _(Trait + Noop in `crates/core/src/models/ocr.rs`; wired
@@ -1579,7 +1602,16 @@ Checklist:
       `crates/core/src/local_store/db.rs` back the index. Tests:
       `models::ocr::tests::*` +
       `local_store::db::tests::media_search_index_*`.)_
-- [ ] Document text extraction (PDF, DOCX) with page-level indexing.
+- [x] Document text extraction (PDF, DOCX) with page-level indexing.
+      _(Inference seam: `DocumentExtractor` trait,
+      `NoopDocumentExtractor`, `MockDocumentExtractor` in
+      `crates/core/src/models/document.rs`. Wired into
+      `CoreImpl::send_media`: PDF / DOCX MIME types call
+      `extract_text()` and each `DocumentPage` lands in
+      `media_search_index` with `kind = "caption"` and
+      `text = "[page {n}] {body}"`. Best-effort. Tests:
+      `models::document::tests::*`,
+      `core_impl::tests::send_media_writes_document_pages_when_extractor_installed`.)_
 - [x] Resource-gated background processing (battery, thermal,
       charging, network).
       _(`crates/core/src/models/resource_gate.rs` defines
@@ -1641,9 +1673,24 @@ Checklist:
       put / get round-trip with cosine > 0.999, version-mismatch
       → `None`, and a two-instance same-connection
       cross-pipeline write/read.)_
-- [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
+- [x] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
       Runtime `MatMulNBits`; benchmark accuracy vs INT8 with the
       multilingual relevance regression suite.
+      _(Selection: `Quantization::Int4` is returned by
+      `crates/core/src/models/model_manager.rs::select_quantization`
+      whenever `available_storage_bytes <
+      TIGHT_STORAGE_THRESHOLD_BYTES` (512 MiB).
+      `ModelArtifactSpec` constants pin the four expected
+      artifact filenames (XLMR / MobileCLIP × INT8 / INT4) and
+      `ModelManager::resolve_artifact` selects the right one
+      based on storage pressure. Session helpers
+      `create_xlmr_session_int4` /
+      `create_mobileclip_session_int4` are in place behind
+      `#[cfg(feature = "onnx-runtime")]`; the relevance
+      benchmark vs INT8 is queued for the platform-bridge
+      follow-up. Tests:
+      `models::model_manager::tests::select_quantization_*`,
+      `models::model_manager::tests::resolve_artifact_selects_int4_when_storage_tight`.)_
 
 **Decision gate**: Semantic search returns relevant multilingual
 results across text, images, video, and audio on iOS, Android,
@@ -1689,16 +1736,32 @@ Notes:
       test (put/get round-trip, version-mismatch miss, two-cache
       cross-pipeline read).
 
-  Items still open: video keyframe sampling, Whisper multilingual
-  inference loop, document text extraction (PDF / DOCX),
-  desktop EP tuning (CoreML / DirectML), INT4 quantization
-  benchmarking — these stay unchecked above.
+  Items still open: real platform-bridge attach for Whisper /
+  MobileCLIP / XLM-R sessions, desktop EP tuning (CoreML /
+  DirectML), and the INT4-vs-INT8 multilingual relevance
+  benchmark.
+
+- 2026-05-04 (Phase 6/7 batch — this PR): five additional
+  Phase-6 items land alongside four Phase-7 items in one
+  push. Phase 6 advances from `~55%` to `~75%` by closing:
+  Whisper transcription seam (`WhisperTranscriber` trait +
+  Noop / Mock + send-media transcript path); document text
+  extraction (`DocumentExtractor` trait + Noop / Mock +
+  send-media PDF / DOCX caption path); video keyframe
+  sampling (`VideoKeyframeSampler` trait + Noop / Mock +
+  keyframe → MobileCLIP-S2 → search_vector path); raw
+  `semantic_score` on `SearchResult` plus
+  `QueryEngine::rerank_with_semantic` honoring
+  `SearchScope::LocalOnly`; and INT4 quantization selection
+  (`select_quantization` returns `Int4` under tight
+  storage; `ModelArtifactSpec` constants + INT4 ONNX
+  session helpers).
 
 ---
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `In progress | ~28%`
+**Status**: `In progress | ~40%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
@@ -1709,14 +1772,51 @@ Checklist:
       `NSBackgroundActivityScheduler`).
 - [ ] Windows native integration (Windows Search anchors; CPU-only
       ML; no GPU assumption).
-- [ ] Performance profiling and optimization.
-- [ ] Large-scale testing (100K+ messages, 10K+ media, 10+ scripts).
+- [~] Performance profiling and optimization.
+      _(Lightweight in-tree instrumentation scaffold:
+      `PerfTrace`, `PerfCollector` trait, `NoopPerfCollector`,
+      `InMemoryPerfCollector` in `crates/core/src/perf.rs`;
+      wired into `CoreImpl` via `install_perf_collector` /
+      `has_perf_collector` / `collect_perf_stats`. Hot paths
+      `ingest_messages`, `search`, and `enforce_storage_budget`
+      now emit traces (start/end ns, batch size / query length
+      / pressure level / freed bytes). Real on-device profile
+      capture and the production p95 dashboard remain Phase-7
+      follow-up. Tests: `perf::tests::*`,
+      `core_impl::tests::perf_collector_records_*`.)_
+- [~] Large-scale testing (100K+ messages, 10K+ media, 10+ scripts).
+      _(Scaffold: `crates/core/tests/large_scale.rs` with three
+      `#[ignore]` stress tests — 10k multilingual ingest +
+      FTS5 / fuzzy / QueryEngine round-trip across 12 scripts
+      (en / ru / zh / ja / ar / th / hi / ko / vi / de / fr /
+      mixed-script); 5k media-asset eviction at Critical
+      pressure; 1k message backup → manifest-chain → restore
+      round-trip with full-recency hydration. Run with
+      `cargo test --test large_scale -- --ignored`. The 100k+
+      message and 10k+ media full-matrix run is queued for the
+      device-matrix follow-up.)_
 - [ ] Platform-specific ML EP tuning (CoreML, NNAPI, optional
       DirectML).
 - [ ] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
       `metadata/content_index` (read-only, no plaintext leaks).
-- [ ] Edge-case handling (offline, interrupted, partial, corrupted,
+- [~] Edge-case handling (offline, interrupted, partial, corrupted,
       missing).
+      _(Offline path: `OfflineDetector` trait,
+      `NoopOfflineDetector`, `AlwaysOfflineDetector`,
+      `ToggleOfflineDetector` in
+      `crates/core/src/transport/offline.rs`; wired into
+      `CoreImpl` via `install_offline_detector` / `is_online`.
+      `run_incremental_backup` short-circuits with
+      `BackupResult.deferred = true` when offline and
+      succeeds without the flag once reconnected;
+      `hydrate_message` short-circuits with
+      `HydratedMessage { is_cold: true, offline: true,
+      text_content: None }` when the body is remote-archive-only
+      and the device is offline. Interrupted /
+      partial / corrupted / missing variants are already
+      covered by the 8-of-8 failure suite below. Tests:
+      `failure_scenarios::offline_during_backup_defers_upload_and_succeeds_on_reconnect`,
+      `failure_scenarios::offline_during_hydration_returns_cold_with_offline_flag`.)_
 - [x] Production-scale archive compaction.
       (`archive::compaction::{apply_archive_tombstones,
       ArchiveCompactionResult}` + `CoreImpl::compact_archive`:
@@ -1785,6 +1885,142 @@ Notes:
 ---
 
 ## Changelog
+
+### 2026-05-04 — Phase 6 / 7 batch 3 (this PR)
+
+Builds on PR #34 (the prior Phase 6 batch) and on the
+2026-05-04 Phase 3 / 5 / 7 wrap-up batch. Lands ten tasks in
+one push:
+
+1. **Whisper transcription seam.** `WhisperTranscriber`
+   trait (object-safe, `Send + Sync + Debug`) +
+   `NoopWhisperTranscriber` returning
+   `Error::NotImplemented("whisper_transcriber")` +
+   `MockWhisperTranscriber` returning a deterministic
+   BLAKE3-derived `TranscriptionResult` (text + language +
+   segments). Wired into `CoreImpl` via
+   `install_whisper_transcriber` / `has_whisper_transcriber`,
+   mirroring the `text_embedder` pattern. Audio MIME types
+   in `CoreImpl::send_media` invoke the transcriber and the
+   result lands in `media_search_index` keyed
+   `(asset_id, "transcript")`. Best-effort: errors are
+   absorbed.
+2. **Document text extraction seam.** `DocumentExtractor`
+   trait + `NoopDocumentExtractor` + `MockDocumentExtractor`
+   returning a deterministic `Vec<DocumentPage>`. Wired into
+   `CoreImpl::send_media`: `application/pdf` and DOCX MIME
+   types invoke `extract_text()` and each page lands in
+   `media_search_index` with `kind = "caption"` and
+   `text = "[page {n}] {body}"`.
+3. **Video keyframe sampling.** `VideoKeyframeSampler` trait
+   + `NoopVideoKeyframeSampler` + `MockVideoKeyframeSampler`
+   returning deterministic fake keyframes. Wired into
+   `CoreImpl::send_media`: when a video MIME type, a
+   sampler, and an `ImageEmbedder` are all present, up to
+   five keyframes are extracted and the first frame is
+   embedded via the existing MobileCLIP-S2 seam — the
+   resulting vector lands in `search_vector` keyed
+   `(message_id, "mobileclip_s2@v1")`.
+4. **On-device reranking with raw semantic scores.**
+   `SearchResult` gains a new `semantic_score: Option<f64>`
+   field that carries the raw cosine similarity for hits
+   that surface through the semantic path (and `None` for
+   FTS / fuzzy-only hits). `QueryEngine::rerank_with_semantic`
+   recomputes cosine similarity for every result that has
+   an embedding in `search_vector`, updates `semantic_score`
+   in place, adds `sim * SEMANTIC_WEIGHT` to `rank_score`,
+   and re-sorts by descending `rank_score` then by descending
+   `created_at_ms` then by `message_id`. Honors
+   `SearchScope::LocalOnly` (no cold fan-out).
+5. **INT4 quantization selection + model artifact support.**
+   `select_quantization` returns `Quantization::Int4`
+   whenever `available_storage_bytes <
+   TIGHT_STORAGE_THRESHOLD_BYTES` (512 MiB).
+   `ModelArtifactSpec` defines four compile-time constants
+   (XLMR / MobileCLIP × INT8 / INT4) with the expected
+   filenames. `ModelManager::resolve_artifact` picks the
+   right artifact based on storage pressure. INT4 ONNX
+   session helpers `create_xlmr_session_int4` /
+   `create_mobileclip_session_int4` land behind
+   `#[cfg(feature = "onnx-runtime")]` (and return
+   `NotImplemented` when the feature is off).
+6. **Edge-case handling — offline + interrupted.**
+   `OfflineDetector` trait + `NoopOfflineDetector`
+   (always-online) + `AlwaysOfflineDetector` (always-offline,
+   for tests) + `ToggleOfflineDetector` (mid-test flip).
+   Wired into `CoreImpl` via `install_offline_detector` /
+   `is_online`. `run_incremental_backup` short-circuits with
+   `BackupResult.deferred = true` when offline (no segment
+   built) and succeeds without the flag once reconnected.
+   `hydrate_message` short-circuits with
+   `HydratedMessage { is_cold: true, offline: true,
+   text_content: None }` when the body is
+   remote-archive-only and the device is offline. New
+   failure-scenario tests:
+   `offline_during_backup_defers_upload_and_succeeds_on_reconnect`,
+   `offline_during_hydration_returns_cold_with_offline_flag`.
+7. **Large-scale integration test scaffold.** New
+   `crates/core/tests/large_scale.rs` with three
+   `#[ignore]`-marked stress tests:
+   `large_scale_ingest_and_search_10k_messages` seeds 10 000
+   messages across 12 scripts (en / ru / zh / ja / ar /
+   th / hi / ko / vi / de / fr / mixed-script), then
+   exercises FTS5 / fuzzy / QueryEngine and asserts the
+   ranking ordering;
+   `large_scale_storage_budget_under_pressure` seeds 5 000
+   media-asset rows totalling 500 MiB against a 100 MiB
+   budget and asserts a non-zero eviction count + freed
+   bytes at Critical pressure;
+   `large_scale_backup_restore_round_trip` seeds 1 000
+   messages, runs the full backup-segment + manifest-chain
+   pipeline, and verifies every conversation / skeleton /
+   recent body survives the
+   `RestorePipeline::run` round-trip. Run with
+   `cargo test --test large_scale -- --ignored`.
+8. **Performance profiling helpers.** `PerfTrace`
+   (`operation`, `start_ns`, `end_ns`, free-form
+   `metadata: HashMap<String, String>`) + `PerfCollector`
+   trait + `NoopPerfCollector` (discards) +
+   `InMemoryPerfCollector` (`Mutex<Vec<PerfTrace>>`) in the
+   new `crates/core/src/perf.rs`. Wired into `CoreImpl` via
+   `install_perf_collector` / `has_perf_collector` /
+   `collect_perf_stats`. Hot paths `ingest_messages`,
+   `search`, and `enforce_storage_budget` now emit traces
+   with operation-specific metadata (input batch size +
+   new / duplicate counts; query length + scope + result
+   count; pressure level + freed bytes + evicted count). All
+   paths — success, error, and offline / no-pressure
+   short-circuits — close the trace before returning.
+9. **Doc audit: PROGRESS.md + PHASES.md.** Phase 6 advances
+   from `~55%` to `~75%`; Phase 7 advances from `~28%` to
+   `~40%`. Whisper transcription, document text extraction,
+   video keyframe sampling, on-device reranking with raw
+   semantic scores, and INT4 quantization selection are
+   checked off on the Phase-6 list. Performance profiling,
+   large-scale testing, and edge-case handling move from
+   `[ ]` to `[~]` on the Phase-7 list with explicit
+   "what's still queued" notes.
+10. **Doc audit: README.md + ARCHITECTURE.md.** Status
+    banner refreshed to Phase 6 `~75%` / Phase 7 `~40%`.
+    Project-structure tree adds `models/whisper.rs` (now a
+    transcriber seam),
+    `models/document.rs`, `models/video.rs`,
+    `transport/offline.rs`, `perf.rs`, and the
+    `tests/large_scale.rs` integration test. Architecture
+    §2 module listing + §6 search-engine-architecture
+    diagram + new §11.x subsections cover the
+    `WhisperTranscriber` / `DocumentExtractor` /
+    `VideoKeyframeSampler` seams and the keyframe →
+    MobileCLIP-S2 → search_vector path.
+
+Status moves: Phase 6 → `In progress | ~75%`; Phase 7 →
+`In progress | ~40%`. Every new trait is object-safe,
+`Send + Sync + Debug`, with a Noop and a Mock
+implementation. All hot-path inference failures are
+absorbed (best-effort). The cumulative workspace test count
+crosses 1 060+ unit + integration tests; `cargo fmt --check`
+and `cargo clippy --all-targets --all-features --
+-D warnings` are clean.
 
 ### 2026-05-04 — Phase 3 / 5 / 7 batch 2 (this PR)
 

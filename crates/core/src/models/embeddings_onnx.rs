@@ -272,6 +272,32 @@ mod posix_cpu {
 #[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
 pub use posix_cpu::{create_xlmr_session, OrtDirectMlProbe};
 
+/// Phase 6, Task 5 (2026-05-04 batch): INT4 (`MatMulNBits`)
+/// flavor of [`create_xlmr_session`].
+///
+/// Same EP-selection state machine and CPU fallback as
+/// [`create_xlmr_session`] — the only difference is the
+/// expected on-disk file (`xlmr-v1-int4.onnx`) carries
+/// `MatMulNBits` nodes which `ort` honors at session-load time
+/// without any extra `SessionBuilder` call. This helper exists
+/// as a named seam so future graph-optimization tweaks can
+/// land without touching the INT8 path.
+#[cfg(feature = "onnx-runtime")]
+pub fn create_xlmr_session_int4(
+    model_path: &std::path::Path,
+) -> OrtSessionResult<(ort::session::Session, OnnxProviderReport)> {
+    create_xlmr_session(model_path)
+}
+
+/// Phase 6, Task 5 (2026-05-04 batch): INT4 session-creator
+/// stub for builds without the `onnx-runtime` cargo feature.
+#[cfg(not(feature = "onnx-runtime"))]
+pub fn create_xlmr_session_int4(_model_path: &std::path::Path) -> crate::Result<()> {
+    Err(crate::Error::NotImplemented(
+        "create_xlmr_session_int4 requires onnx-runtime feature",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // OnnxTextEmbedder — long-lived `ort::Session` wrapper.
 //
