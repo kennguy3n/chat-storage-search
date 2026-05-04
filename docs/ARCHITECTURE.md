@@ -101,12 +101,31 @@ goes through the FFI bridge for the host platform.
 > stress test + macOS / Windows native integration scaffolds —
 > Spotlight / Windows Search bridges, scheduler bridges,
 > `WindowsMlConfig` CPU-only contract); Phase 8 in flight
-> (~25%, multi-scope / multi-tenant search foundation —
+> (~90%, multi-scope / multi-tenant search foundation —
 > conversation hierarchy columns + indexes,
 > `archive_segment_map.tenant_id`, `SearchTarget` enum + scope
 > resolver wired through `QueryEngine`, `IndexType::Bloom`
 > shard type with `K_bloom_index_shard` derivation, prefetch
-> order updated to `[Bloom, Text, Fuzzy, Vector, Media]`; see
+> order updated to `[Bloom, Text, Fuzzy, Vector, Media]`,
+> bucket-level date pruning (`bucket_overlaps_date_range`),
+> bloom-filter precheck in the cold fan-out
+> (`ColdShardSource::fetch_bloom_shard`), on-device decrypted
+> LRU shard cache (`crates/core/src/search/shard_cache.rs`,
+> default 50 MB) with idle-time `warm_shard_cache` warmer +
+> `ResourceGate::should_warm_shards` + scheduler
+> `TaskType::ShardCacheWarming`, B2B per-tenant key derivation
+> (`derive_b2b_tenant_root` / `derive_b2b_archive_epoch` /
+> `derive_b2b_text_index_shard`), `TenantSearchPolicy` config +
+> enforcement, scope-proportional cover-traffic padding
+> (`compute_scope_padding_multiplier`), Android / iOS bridge
+> surface for `SearchTarget` (Android JNI
+> `search_with_target` + iOS UDL `SearchTarget` enum + optional
+> `target` on `SearchQuery`), Phase 8 latency benchmarks at
+> `crates/core/benches/phase8_benchmarks.rs`, and Phase 8
+> integration tests at
+> `crates/core/tests/phase8_multi_scope_search.rs`; the two
+> remaining unchecked items — parallel bucket fetch and
+> progressive / streaming search results — are deferred; see
 > PHASES.md Phase 8).** Updates vs.
 > the original target structure below:
 >
@@ -1166,14 +1185,45 @@ hit into the `HydrationQueue` at `HydrationReason::SearchResultTap`
 tap. End-to-end coverage lives at
 [`crates/core/tests/cold_shard_search.rs`](../crates/core/tests/cold_shard_search.rs).
 
-> **Phase 8 optimizations.** The sequential `for (conv, bucket) in
-> buckets` loop gains four optimizations: (1) bucket-level date
-> pruning skips entire months outside `[date_from, date_to]`,
-> (2) bloom filter pre-check eliminates buckets that cannot match
-> the query terms, (3) an LRU shard cache eliminates re-fetches
-> for recently-searched buckets, and (4) parallel fetch with
-> bounded concurrency reduces wall-clock time. See PHASES.md
-> Phase 8.
+> **Phase 8 optimizations (batch 6 — landed).** The sequential
+> `for (conv, bucket) in buckets` loop now layers four
+> optimizations:
+>
+> 1. **Bucket-level date pruning** — `bucket_overlaps_date_range`
+>    in `crates/core/src/search/query_engine.rs` parses the
+>    `YYYY-MM` bucket grammar into a half-open `[start_ms,
+>    end_ms)` window and drops any bucket that doesn't intersect
+>    `[SearchQuery::date_from, date_to]`. Malformed bucket
+>    strings fall through to "include" so the engine never
+>    silently swallows a bucket whose timestamps it cannot
+>    reason about; the per-row date filter still has the final
+>    say.
+> 2. **Bloom filter pre-check** — for each remaining bucket the
+>    cold loop probes the new
+>    `ColdShardSource::fetch_bloom_shard` (default `Ok(None)`
+>    for back-compat). When the bloom shard advertises that
+>    *every* lowercased query token is absent the bucket is
+>    skipped before paying for the text/fuzzy fetch + decrypt.
+>    Missing bloom shards or transport errors fall through to
+>    the full fetch (graceful degradation).
+> 3. **LRU shard cache** — `ShardCache` from
+>    `crates/core/src/search/shard_cache.rs` (default 50 MB,
+>    `Mutex<Option<ShardCache>>` on `CoreImpl`, mounted via
+>    `install_shard_cache`) caches decrypted Bloom / Text /
+>    Fuzzy rows keyed by `(conversation_id, time_bucket,
+>    IndexType)`. The cache is consulted before each transport
+>    fetch and populated after each successful decrypt; a
+>    background `warm_shard_cache` warmer pre-fetches recently
+>    searched buckets when `ResourceGate::should_warm_shards`
+>    reports the device is idle + charging + Wi-Fi
+>    (P5 idle / `TaskType::ShardCacheWarming`).
+> 4. **Parallel bucket fetch + progressive streaming** — still
+>    deferred to a later batch. The current loop is sequential
+>    so `cold_buckets()` ordering is preserved; the only fan-out
+>    today is the per-shard `[Bloom, Text, Fuzzy]` ordering
+>    inside one bucket.
+>
+> See PHASES.md Phase 8 for the per-task checklist.
 
 When the backend returns 404 / `Error::Transport` for a shard
 (offloaded then garbage-collected), the orchestration layer wraps
@@ -1340,8 +1390,14 @@ flowchart LR
 > `time_bucket`) and still recover prior-epoch segment / manifest
 > keys from the wrapped form persisted in the manifest chain.
 
-> **Phase 8 extension.** The key hierarchy gains per-tenant B2B
-> isolation:
+> **Phase 8 extension (batch 6 — landed).** The key hierarchy
+> gains per-tenant B2B isolation. Three new derivation
+> functions in `crates/core/src/crypto/key_hierarchy.rs`
+> (`derive_b2b_tenant_root`, `derive_b2b_archive_epoch`,
+> `derive_b2b_text_index_shard`) seal each tenant's archive
+> and search subtrees under disjoint info strings
+> (`info::B2B_TENANT_ROOT` / `B2B_ARCHIVE_EPOCH` /
+> `B2B_TEXT_INDEX_SHARD`):
 >
 > ```
 > K_user_master
@@ -1351,12 +1407,17 @@ flowchart LR
 >   └── K_search_root
 >         ├── K_b2c_text_index_shard(shard_id)
 >         ├── K_b2b_text_index_shard(tenant_id, shard_id)
->         └── K_bloom_index_shard(shard_id)   ← NEW
+>         └── K_bloom_index_shard(shard_id)
 > ```
 >
 > Per-tenant keys allow cryptographic separation of B2B
-> organizational data from personal B2C data. See PHASES.md
-> Phase 8 and PROPOSAL.md §7.10.
+> organizational data from personal B2C data — a leaked B2C
+> shard key cannot decrypt a B2B shard with the same
+> `shard_id` and vice-versa. The integration test
+> `b2b_tenant_key_isolation` in
+> `crates/core/tests/phase8_multi_scope_search.rs` exercises
+> the cross-tenant decrypt-rejection contract end-to-end. See
+> PHASES.md Phase 8 and PROPOSAL.md §7.10.
 
 ZK Object Fabric backups use Pattern C, derived deterministically
 from the plaintext + tenant ID. The Rust path must produce

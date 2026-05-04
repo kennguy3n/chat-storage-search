@@ -224,6 +224,41 @@ impl KChatBridgeHandle {
         Ok(serde_json::to_string(&hits)?)
     }
 
+    /// Phase 8 (2026-05-04 batch 6) — Task 8: Android `searchWithTarget`
+    /// JNI entry point.
+    ///
+    /// Equivalent to
+    /// `Java_com_kchat_core_KChatBridge_searchWithTarget`.
+    /// Accepts the [`SearchQuery`] JSON plus a separate
+    /// JSON-serialized [`SearchTarget`]. The target is grafted
+    /// onto the query before dispatch — useful for callers that
+    /// build the query and the target through different code
+    /// paths (e.g. a Compose ViewModel that owns the search
+    /// string and a NavGraph that owns the active community /
+    /// tenant filter).
+    ///
+    /// Backward compatibility: `target_json` may be `null` or
+    /// the empty string, in which case the query's existing
+    /// `target` field is preserved (defaulting to
+    /// [`SearchTarget::Global`]).
+    pub fn search_with_target(
+        &self,
+        query_json: &str,
+        target_json: Option<&str>,
+        scope: &str,
+    ) -> BridgeResult<String> {
+        let mut query: SearchQuery = serde_json::from_str(query_json)?;
+        if let Some(t) = target_json {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() && trimmed != "null" {
+                let target: kchat_core::SearchTarget = serde_json::from_str(trimmed)?;
+                query.target = target;
+            }
+        }
+        let json = serde_json::to_string(&query)?;
+        self.search(&json, scope)
+    }
+
     /// Equivalent to `Java_com_kchat_core_KChatBridge_editMessage`.
     pub fn edit_message(&self, message_id: &str, new_text: &str) -> BridgeResult<()> {
         let mid = parse_uuid("message_id", message_id)?;
@@ -803,6 +838,90 @@ mod tests {
             .unwrap_or("")
             .to_lowercase()
             .contains("alpha"));
+    }
+
+    #[test]
+    fn android_bridge_search_with_global_target_default() {
+        // Phase 8 (2026-05-04 batch 6) — Task 8: when
+        // target_json is None, the search defaults to the
+        // SearchTarget::Global behaviour preserved by SearchQuery's
+        // serde default.
+        let bridge = fresh_bridge();
+        let conv = Uuid::now_v7();
+        bridge.create_conversation(conv, None, 1).unwrap();
+        bridge
+            .send_text(&conv.to_string(), "alpha bravo", None)
+            .unwrap();
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        let hits_json = bridge
+            .search_with_target(&json, None, "local_only")
+            .expect("search");
+        let hits: Vec<SearchResult> = serde_json::from_str(&hits_json).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn android_bridge_search_with_conversation_target() {
+        // Phase 8 (2026-05-04 batch 6) — Task 8: a Conversation
+        // target restricts hits to that conversation even when
+        // the query string would have matched messages in other
+        // conversations.
+        let bridge = fresh_bridge();
+        let conv_a = Uuid::now_v7();
+        let conv_b = Uuid::now_v7();
+        bridge.create_conversation(conv_a, None, 1).unwrap();
+        bridge.create_conversation(conv_b, None, 1).unwrap();
+        bridge
+            .send_text(&conv_a.to_string(), "needle in conv a", None)
+            .unwrap();
+        bridge
+            .send_text(&conv_b.to_string(), "needle in conv b", None)
+            .unwrap();
+        let q = SearchQuery {
+            query_string: "needle".into(),
+            ..SearchQuery::default()
+        };
+        let q_json = serde_json::to_string(&q).unwrap();
+        let target = kchat_core::SearchTarget::Conversation(conv_a);
+        let target_json = serde_json::to_string(&target).unwrap();
+        let hits_json = bridge
+            .search_with_target(&q_json, Some(&target_json), "local_only")
+            .expect("search");
+        let hits: Vec<SearchResult> = serde_json::from_str(&hits_json).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].conversation_id, conv_a);
+    }
+
+    #[test]
+    fn android_bridge_search_with_community_target() {
+        // Phase 8 (2026-05-04 batch 6) — Task 8: a Community
+        // target with no matching conversations short-circuits
+        // to zero hits (the engine resolves the empty
+        // target_set).
+        let bridge = fresh_bridge();
+        let conv = Uuid::now_v7();
+        bridge.create_conversation(conv, None, 1).unwrap();
+        bridge.send_text(&conv.to_string(), "needle", None).unwrap();
+        let q = SearchQuery {
+            query_string: "needle".into(),
+            ..SearchQuery::default()
+        };
+        let q_json = serde_json::to_string(&q).unwrap();
+        let community = Uuid::now_v7();
+        let target = kchat_core::SearchTarget::Community(community);
+        let target_json = serde_json::to_string(&target).unwrap();
+        let hits_json = bridge
+            .search_with_target(&q_json, Some(&target_json), "local_only")
+            .expect("search");
+        let hits: Vec<SearchResult> = serde_json::from_str(&hits_json).unwrap();
+        assert!(
+            hits.is_empty(),
+            "community with no matching conversations must return 0 hits"
+        );
     }
 
     #[test]

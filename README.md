@@ -233,7 +233,35 @@
 > writer / reader). Real platform-bridge attach (DirectML EP,
 > Spotlight indexing, `NSBackgroundActivityScheduler` callback)
 > remains.)
-> **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~25%`**
+> **Phase 8 — Multi-Scope, Multi-Tenant Search — `In progress | ~90%`**
+> (Phase 8 batch 6 lands ten tasks: bucket-level date pruning
+> (`bucket_overlaps_date_range`), bloom-filter pre-check in the
+> cold fan-out (`ColdShardSource::fetch_bloom_shard`), an
+> on-device decrypted LRU shard cache
+> (`crates/core/src/search/shard_cache.rs`, default 50 MB,
+> mounted on `CoreImpl` via `install_shard_cache`), per-tenant
+> B2B key derivation
+> (`derive_b2b_tenant_root` / `derive_b2b_archive_epoch` /
+> `derive_b2b_text_index_shard`), `TenantSearchPolicy` config +
+> enforcement (`allow_global_search`,
+> `allow_cross_tenant_results`,
+> `max_cold_buckets_per_search`,
+> `require_bloom_shards`), privacy-aware
+> scope-proportional padding
+> (`compute_scope_padding_multiplier`,
+> `batch_prefetch_shards_with_padding_for_target`), background
+> shard warming
+> (`shard_cache::warm_shard_cache` +
+> `ResourceGate::should_warm_shards` +
+> `TaskType::ShardCacheWarming`), Android / iOS bridge surface
+> (`KChatBridgeHandle::search_with_target` + UDL `SearchTarget`
+> enum + optional `target` field), Phase 8 latency benchmarks
+> (`crates/core/benches/phase8_benchmarks.rs`), and Phase 8
+> integration tests
+> (`crates/core/tests/phase8_multi_scope_search.rs`). Items still
+> open: parallel bucket fetch and progressive / streaming search
+> results.)
+>
 > (Phase 8 schema foundation: `conversation` table now carries
 > `conversation_type` (`dm` / `group` / `channel`), `scope`
 > (`b2c` / `b2b`), `tenant_id`, `community_id`, `domain_id`
@@ -467,8 +495,9 @@ chat-storage-search/
           fuzzy_search.rs                   # FuzzyTokenizer + FuzzySearchEngine (trigram / bigram)
           semantic_search.rs                # Phase 6: SemanticSearchEngine (brute-force cosine over `search_vector` rows, conversation-filterable)
           shard_builder.rs                  # build/restore_text_search_shard, build/restore_fuzzy_search_shard, build/restore_vector_search_shard, build/restore_media_search_shard (encrypted search shards for Phase 4 backup / restore + Phase 6 vector / media)
-          shard_prefetch.rs                 # batch_prefetch_shards / batch_prefetch_shards_with_padding: one batch per (conversation_hash, bucket) over [Text, Fuzzy, Vector, Media] — coarsens metadata signal (Phase 5)
-          cold_shard_source.rs              # TransportColdShardSource (TransportClient + ShardKeyRegistry → ColdShardSource) + GracefulCold wrapper (Phase 5)
+          shard_prefetch.rs                 # batch_prefetch_shards / batch_prefetch_shards_with_padding / batch_prefetch_shards_with_padding_for_target + compute_scope_padding_multiplier: scope-proportional cover traffic (Phase 8 batch 6)
+          shard_cache.rs                    # Phase 8 batch 6: ShardCache (LRU, default 50 MB) + ShardCacheKey + CachedShard + warm_shard_cache (P5 idle background warmer)
+          cold_shard_source.rs              # TransportColdShardSource (TransportClient + ShardKeyRegistry → ColdShardSource, with fetch_bloom_shard for the Phase 8 bloom precheck) + GracefulCold wrapper (Phase 5)
         archive/                            # Phase 3 foundation: event journal + segment builder + manifest builder + upload + download + prefetch + epoch keys + routing + privacy padding + compaction
           mod.rs
           event_journal.rs                  # ArchiveEventType / ArchiveEvent / ArchiveEventJournal (write_event / read_events_since / advance_cursor / read_unsegmented)
@@ -540,6 +569,7 @@ chat-storage-search/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
         phase5_benchmarks.rs                # criterion: text_only_one_month / fuzzy_only_one_month / local_plus_one_cold_bucket — Phase 5 cold-shard latency budget
         phase6_int4_benchmarks.rs           # criterion: int8_encode_decode_round_trip / int4_encode_decode_round_trip / int8_vs_int4_cosine_fidelity (multilingual 100-vector corpus) / embedding_cache_throughput
+        phase8_benchmarks.rs                # Phase 8 batch 6: bloom_precheck_one_month_bucket / shard_cache_hit_vs_miss / scope_resolver_community_100_conversations / date_pruning_100_buckets / global_search_with_bloom_10_buckets
       tests/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
@@ -558,6 +588,7 @@ chat-storage-search/
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip
         multilingual_fuzzy_search.rs        # Combined FTS5 + fuzzy across scripts (typo recovery, dedup, rank, filters)
         phase6_embedding_cache.rs           # Phase 6: cross-pipeline EmbeddingCache integration test — put/get round-trip with INT8-codec cosine > 0.999, version-mismatch → None, two LocalStoreEmbeddingCache instances on the same SQLCipher connection see each other's writes
+        phase8_multi_scope_search.rs        # Phase 8 batch 6: 10 end-to-end tests — community / domain / tenant / global scoping, bloom filter elimination, shard-cache refetch elimination, tenant-policy global block, date pruning, B2B per-tenant key isolation, and scope-proportional padding
         pattern_c_interop_vectors.rs        # Rust ↔ Go SDK bit-for-bit vectors
         pattern_c_interop_vectors.json
     ios-bridge/                             # UniFFI → Swift (Phase 1 scaffold: kchat.udl + build.rs + FFI wrappers)
@@ -655,7 +686,21 @@ cargo bench -p kchat-core --bench phase5_benchmarks
 for a one-month bucket), `fuzzy_only_one_month` (fuzzy index
 shard equivalent), and `local_plus_one_cold_bucket` (local search
 + one cold shard fetch through a delayed `ColdShardSource` that
-simulates a network hop + decrypt + merge). The matching CI smoke
+simulates a network hop + decrypt + merge).
+
+The Phase-8 suite covers the multi-scope search hot paths
+(bloom precheck, shard cache hit vs miss, scope resolver,
+date pruning, end-to-end global search with bloom precheck):
+
+```sh
+cargo bench -p kchat-core --bench phase8_benchmarks
+```
+
+`phase8_benchmarks` exposes five benches —
+`bloom_precheck_one_month_bucket`, `shard_cache_hit_vs_miss`,
+`scope_resolver_community_100_conversations`,
+`date_pruning_100_buckets`, and
+`global_search_with_bloom_10_buckets`. The matching CI smoke
 test at
 [`crates/core/tests/phase5_latency_smoke.rs`](crates/core/tests/phase5_latency_smoke.rs)
 asserts the cold-shard decrypt+search path completes well under

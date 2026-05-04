@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~85%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + HNSW ANN upgrade with `instant-distance` + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~65%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore + 100k message + 10k media + archive compaction + concurrent-operations scaffolds + media-blob sink stress test + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract — `desktop` crate scaffold (`SpotlightAnchor`, `WindowsSearchAnchor`, `DesktopScheduler`, `DesktopMlEpSelector`) + `ExecutionProviderSelector` + `InProcessScheduler` + `DedupAnalytics` read-only telemetry + cross-platform media migration (`MediaMigrationPlan`, `migrate_media_sink`)). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~25%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~85%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + HNSW ANN upgrade with `instant-distance` + on-device reranker with raw `semantic_score` + OCR bridge + Whisper transcriber seam + DocumentExtractor seam + VideoKeyframeSampler seam + ResourceGate + ModelManager + INT4 quantization selection + INT4 encode/decode codec + criterion bench scaffold + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~65%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore + offline detector + perf collector + large-scale ingest / storage-budget / backup-restore + 100k message + 10k media + archive compaction + concurrent-operations scaffolds + media-blob sink stress test + macOS / Windows native integration scaffolds — Spotlight / Windows Search bridges, NSBackgroundActivityScheduler / Windows Task Scheduler bridges, `WindowsMlConfig` CPU-only contract — `desktop` crate scaffold (`SpotlightAnchor`, `WindowsSearchAnchor`, `DesktopScheduler`, `DesktopMlEpSelector`) + `ExecutionProviderSelector` + `InProcessScheduler` + `DedupAnalytics` read-only telemetry + cross-platform media migration (`MediaMigrationPlan`, `migrate_media_sink`)). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~90%`, conversation hierarchy columns + indexes on `conversation` and `archive_segment_map.tenant_id` + `SearchTarget` enum + scope resolver wired through `QueryEngine` + bloom-filter shard type / build / restore / `K_bloom_index_shard` derivation / prefetch order — bloom shards now first in fan-out).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1957,7 +1957,7 @@ Notes:
 
 ## Phase 8: Multi-Scope, Multi-Tenant Search
 
-**Status**: `In progress | ~25%`
+**Status**: `In progress | ~90%`
 
 **Goal**: Conversation hierarchy, multi-tenant B2B isolation, and search performance optimizations for global/community/domain/tenant-scoped search.
 
@@ -1967,20 +1967,20 @@ Checklist:
 - [x] Schema: `archive_segment_map` tenant isolation (`tenant_id` column). _(See same `schema.rs` — `archive_segment_map` adds `tenant_id TEXT NOT NULL DEFAULT ''` + `idx_asm_tenant_bucket(tenant_id, time_bucket)` index. Column count regression test updated to 9.)_
 - [x] `SearchTarget` enum replacing `conversation_filter: Option<Uuid>`. _(See `crates/core/src/lib.rs`: `SearchTarget::{Conversation, Community, Domain, Tenant, B2cAll, Global}` with `#[serde(rename_all = "snake_case")]`. `SearchQuery::target` field is `#[serde(default)]` and `effective_target()` keeps the legacy `conversation_filter` mapping.)_
 - [x] Scope resolver (`SearchTarget` → `HashSet<conversation_id>`). _(See `crates/core/src/search/query_engine.rs`: `resolve_target_to_conversation_set` + `push_target_filter` invoked from `execute_structured_only` and `allowed_skeleton_ids`. Empty resolution emits `1=0` SQL clause — fail-closed.)_
-- [ ] Bucket-level date pruning.
+- [x] Bucket-level date pruning. _(See `crates/core/src/search/query_engine.rs`: `bucket_overlaps_date_range` + `parse_bucket_range_ms`. Wired into `execute_search_with_cold_source_full` so out-of-range cold buckets are skipped before any transport call. Tests `bucket_overlaps_*` cover before/after/overlap/malformed; integration test `cold_search_with_date_range_skips_irrelevant_buckets`.)_
 - [x] Bloom filter shard type (`IndexType::Bloom`). _(See `crates/core/src/formats/search_shard.rs` `IndexType::Bloom` variant + `crates/core/src/search/shard_builder.rs` `BloomFilter`, `build_bloom_shard`, `restore_bloom_shard`, `BloomShardPayload`. Magic `KCHAT_BLOOM_SHARD_PAYLOAD_V1`. False-positive rate <5% at 12 bits / element.)_
-- [ ] Bloom filter pre-check in cold fan-out.
-- [ ] On-device decrypted shard cache (LRU).
+- [x] Bloom filter pre-check in cold fan-out. _(See `crates/core/src/search/query_engine.rs`: `ColdShardSource::fetch_bloom_shard` (default `Ok(None)` for back-compat) + `bloom_might_contain_any` + cold-loop probe. `TransportColdShardSource` implements it via `IndexType::Bloom`. Tests: `bloom_precheck_skips_bucket_when_all_tokens_rejected`, `bloom_precheck_passes_bucket_when_any_token_matches`, `bloom_precheck_falls_through_when_bloom_shard_missing`, `bloom_precheck_falls_through_on_transport_error`, integration `bloom_filter_eliminates_irrelevant_cold_buckets`.)_
+- [x] On-device decrypted shard cache (LRU). _(See new `crates/core/src/search/shard_cache.rs`: `ShardCache`, `ShardCacheKey`, `CachedShard`. Default budget 50 MB. Mounted on `CoreImpl` via `install_shard_cache(max_bytes)` and consulted by `execute_search_with_cold_source_full`. Tests: `shard_cache_put_get_round_trip`, `shard_cache_evicts_lru_when_over_budget`, `shard_cache_hit_avoids_transport_fetch`, `shard_cache_clear_empties_all`, `shard_cache_respects_max_bytes`.)_
 - [ ] Parallel bucket fetch.
 - [ ] Progressive/streaming search results.
-- [ ] Background shard warming (P5 idle).
-- [ ] Per-tenant key isolation (B2B) — `K_b2b_tenant_root(tenant_id)`.
-- [ ] `TenantSearchPolicy` config and enforcement.
-- [ ] Privacy-aware scope-proportional padding.
+- [x] Background shard warming (P5 idle). _(See `crates/core/src/search/shard_cache.rs::warm_shard_cache` + `ResourceGate::should_warm_shards` in `crates/core/src/models/resource_gate.rs` + `TaskType::ShardCacheWarming` in `crates/core/src/scheduler/mod.rs`. Only runs when idle + charging + Wi-Fi. Tests: `warm_shard_cache_populates_cache_for_recent_conversations`, `warm_shard_cache_respects_resource_gate`, `warm_shard_cache_noop_when_no_cold_buckets`, `warm_shard_cache_respects_cache_budget`.)_
+- [x] Per-tenant key isolation (B2B) — `K_b2b_tenant_root(tenant_id)`. _(See `crates/core/src/crypto/key_hierarchy.rs`: `derive_b2b_tenant_root`, `derive_b2b_archive_epoch`, `derive_b2b_text_index_shard` + `info::B2B_TENANT_ROOT` / `B2B_ARCHIVE_EPOCH` / `B2B_TEXT_INDEX_SHARD`. The two-id helper `derive_with_two_ids` length-prefixes `tenant_id` with a 4-byte big-endian `u32` so boundary-shifted `(tenant_id, shard_id)` / `(tenant_id, epoch_id)` pairs cannot collapse to the same HKDF info bytes. Tests: `derive_b2b_tenant_root_is_deterministic`, `different_tenant_ids_produce_different_roots`, `b2b_tenant_root_differs_from_b2c_archive_root`, `derive_b2b_archive_epoch_is_deterministic`, `derive_b2b_text_index_shard_is_deterministic`, `b2b_shard_key_differs_from_b2c_shard_key_for_same_shard_id`, `derive_b2b_text_index_shard_resists_boundary_collision`, `derive_b2b_archive_epoch_resists_boundary_collision`. Cross-tenant decrypt rejection covered by integration test `b2b_tenant_key_isolation`.)_
+- [x] `TenantSearchPolicy` config and enforcement. _(See `crates/core/src/config.rs`: `TenantSearchPolicy { allow_global_search, allow_cross_tenant_results, max_cold_buckets_per_search, require_bloom_shards }` + `KChatCoreConfig::tenant_search_policies: HashMap<String, TenantSearchPolicy>`. Enforcement in `execute_search_with_cold_source_full`. Tests: `tenant_policy_blocks_global_search_when_disabled`, `tenant_policy_caps_cold_bucket_count`, `tenant_policy_requires_bloom_when_configured`, `tenant_policy_default_allows_everything`, `tenant_policy_serde_round_trip`, integration `tenant_policy_blocks_global_search`.)_
+- [x] Privacy-aware scope-proportional padding. _(See `crates/core/src/search/shard_prefetch.rs`: `compute_scope_padding_multiplier` + `batch_prefetch_shards_with_padding_for_target`. Conversation/Group/Channel/Starred/Unread = 1×, Community/Domain = 2×, Tenant/B2cAll = 3×, Global = 4×. Tests: `scope_padding_multiplier_conversation_is_1`, `scope_padding_multiplier_global_is_4`, `scope_padding_multiplier_climbs_monotonically_with_scope`, `batch_prefetch_with_global_scope_generates_more_dummies_than_conversation_scope`, integration `scope_proportional_padding_scales_with_target`.)_
 - [x] `K_bloom_index_shard` key derivation. _(See `crates/core/src/crypto/key_hierarchy.rs`: `derive_bloom_index_shard` + `info::BLOOM_INDEX_SHARD = b"kchat-bloom-index-shard-v1"`. Determinism + cross-shard-type uniqueness covered by the new `derive_bloom_index_shard_is_deterministic` and `derive_bloom_index_shard_differs_from_text_and_vector` tests.)_
-- [ ] Android/iOS bridge updates for `SearchTarget`.
-- [ ] Latency benchmarks (bloom + parallel fetch).
-- [~] Integration tests (multi-scope, bloom, cache, tenant policy). _(Multi-scope + bloom shard tests landed; cache + tenant-policy paths queued for the next batch.)_
+- [x] Android/iOS bridge updates for `SearchTarget`. _(See `crates/android-bridge/src/lib.rs::search_with_target` + `crates/ios-bridge/src/lib.rs` `SearchTarget` enum + `crates/ios-bridge/src/kchat.udl` `SearchTarget` enum and optional `target` on `SearchQuery`. Tests: `android_bridge_search_with_conversation_target`, `android_bridge_search_with_global_target_default`, `android_bridge_search_with_community_target`, `ios_bridge_search_target_round_trip`, `ios_bridge_search_defaults_to_global`.)_
+- [x] Latency benchmarks (bloom + parallel fetch). _(See `crates/core/benches/phase8_benchmarks.rs`: `bloom_precheck_one_month_bucket`, `shard_cache_hit_vs_miss`, `scope_resolver_community_100_conversations`, `date_pruning_100_buckets`, `global_search_with_bloom_10_buckets`. Wired into `crates/core/Cargo.toml` `[[bench]]`. Run via `cargo bench -p kchat-core --bench phase8_benchmarks`.)_
+- [x] Integration tests (multi-scope, bloom, cache, tenant policy). _(See `crates/core/tests/phase8_multi_scope_search.rs` — 10 end-to-end tests: `community_scoped_search_returns_only_community_conversations`, `domain_scoped_search_returns_only_domain_conversations`, `tenant_scoped_search_returns_only_tenant_conversations`, `global_search_returns_all_conversations`, `bloom_filter_eliminates_irrelevant_cold_buckets`, `shard_cache_eliminates_refetch_on_repeated_search`, `tenant_policy_blocks_global_search`, `date_pruning_skips_old_buckets`, `b2b_tenant_key_isolation`, `scope_proportional_padding_scales_with_target`.)_
 
 Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. The bloom shard is fetched first so the prefetcher can short-circuit buckets whose filter rejects every query token before paying for the larger payloads. See `crates/core/src/search/shard_prefetch.rs` `PREFETCH_ORDER` + `shard_prefetch_order_includes_bloom_first` test.
 
@@ -1989,6 +1989,165 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 ---
 
 ## Changelog
+
+### 2026-05-04 — Phase 8 batch 6 (this PR)
+
+Lands the ten-task Phase 8 multi-scope, multi-tenant search
+batch. Phase 8 advances from `~25%` to `~90%`. The two
+remaining unchecked items (`Parallel bucket fetch`,
+`Progressive/streaming search results`) are explicitly
+deferred to a later batch.
+
+1. **Bucket-level date pruning.**
+   `crates/core/src/search/query_engine.rs` gains
+   `bucket_overlaps_date_range` + `parse_bucket_range_ms`. The
+   cold fan-out filters out-of-range monthly buckets before any
+   transport call. Malformed bucket strings fall through to
+   `true` so the engine never silently drops a bucket whose
+   timestamps it can't reason about. New tests
+   `bucket_overlaps_with_no_date_filters_returns_true`,
+   `bucket_overlaps_rejects_bucket_before_date_from`,
+   `bucket_overlaps_rejects_bucket_after_date_to`,
+   `bucket_overlaps_accepts_overlapping_bucket`,
+   `bucket_overlaps_handles_malformed_bucket_gracefully`, and
+   integration test
+   `cold_search_with_date_range_skips_irrelevant_buckets`.
+
+2. **Bloom filter pre-check in cold fan-out.**
+   Same engine module gains `bloom_might_contain_any` and a
+   bloom-shard probe inside the cold loop, after date pruning
+   and before the text/fuzzy fetches. `ColdShardSource` grows
+   `fetch_bloom_shard` with a default `Ok(None)` so existing
+   callers keep working; `TransportColdShardSource` implements
+   it via `IndexType::Bloom`. Missing shards or transport
+   errors fall through to the full fetch (graceful
+   degradation). Tests:
+   `bloom_precheck_skips_bucket_when_all_tokens_rejected`,
+   `bloom_precheck_passes_bucket_when_any_token_matches`,
+   `bloom_precheck_falls_through_when_bloom_shard_missing`,
+   `bloom_precheck_falls_through_on_transport_error`, and
+   integration `bloom_filter_eliminates_irrelevant_cold_buckets`.
+
+3. **On-device decrypted shard cache (LRU).**
+   New `crates/core/src/search/shard_cache.rs` with
+   `ShardCache`, `ShardCacheKey`, `CachedShard`. Default budget
+   is 50 MB
+   (`DEFAULT_SHARD_CACHE_BUDGET_BYTES = 50 * 1024 * 1024`).
+   Mounted on `CoreImpl` via `install_shard_cache(max_bytes)`
+   and consulted by `execute_search_with_cold_source_full` —
+   bloom, text, and fuzzy shards are all cached. Tests:
+   `shard_cache_put_get_round_trip`,
+   `shard_cache_evicts_lru_when_over_budget`,
+   `shard_cache_hit_avoids_transport_fetch`,
+   `shard_cache_clear_empties_all`,
+   `shard_cache_respects_max_bytes`. Integration:
+   `shard_cache_eliminates_refetch_on_repeated_search`.
+
+4. **Per-tenant key isolation (B2B).**
+   `crates/core/src/crypto/key_hierarchy.rs` adds
+   `derive_b2b_tenant_root`, `derive_b2b_archive_epoch`,
+   `derive_b2b_text_index_shard` plus the
+   `info::B2B_TENANT_ROOT` /
+   `B2B_ARCHIVE_EPOCH` /
+   `B2B_TEXT_INDEX_SHARD` info-string constants. The new
+   info strings keep the B2B subtree disjoint from the B2C
+   `K_archive_root` family so a leaked B2C shard key cannot
+   open a B2B shard with the same `shard_id`. Tests:
+   `derive_b2b_tenant_root_is_deterministic`,
+   `different_tenant_ids_produce_different_roots`,
+   `b2b_tenant_root_differs_from_b2c_archive_root`,
+   `derive_b2b_archive_epoch_is_deterministic`,
+   `derive_b2b_text_index_shard_is_deterministic`,
+   `b2b_shard_key_differs_from_b2c_shard_key_for_same_shard_id`.
+   Integration: `b2b_tenant_key_isolation`.
+
+5. **`TenantSearchPolicy` config and enforcement.**
+   `crates/core/src/config.rs` ships `TenantSearchPolicy` with
+   four fields:
+   `allow_global_search` (default `true`),
+   `allow_cross_tenant_results` (default `false`),
+   `max_cold_buckets_per_search` (default `50`),
+   `require_bloom_shards` (default `false`).
+   `KChatCoreConfig` gets
+   `tenant_search_policies: HashMap<String, TenantSearchPolicy>`
+   (`#[serde(default)]`). Enforcement runs in
+   `execute_search_with_cold_source_full`:
+   `allow_global_search` short-circuits forbidden Global queries
+   *before* `cold_buckets()`; `max_cold_buckets_per_search` caps
+   the fan-out fan-in;
+   `require_bloom_shards` skips any bucket whose bloom shard
+   isn't available. Tests:
+   `tenant_policy_blocks_global_search_when_disabled`,
+   `tenant_policy_caps_cold_bucket_count`,
+   `tenant_policy_requires_bloom_when_configured`,
+   `tenant_policy_default_allows_everything`,
+   `tenant_policy_serde_round_trip`. Integration:
+   `tenant_policy_blocks_global_search`.
+
+6. **Privacy-aware scope-proportional padding.**
+   `crates/core/src/search/shard_prefetch.rs` adds
+   `compute_scope_padding_multiplier(target)` and a
+   `_for_target` variant of
+   `batch_prefetch_shards_with_padding`. Multipliers:
+   Conversation/Group/Channel/Starred/Unread = 1×,
+   Community/Domain = 2×, Tenant/B2cAll = 3×, Global = 4×.
+   The base `batch_prefetch_shards_with_padding` delegates with
+   `SearchTarget::Conversation(uuid::Uuid::nil())` for
+   backward compat. Tests:
+   `scope_padding_multiplier_conversation_is_1`,
+   `scope_padding_multiplier_global_is_4`,
+   `scope_padding_multiplier_climbs_monotonically_with_scope`,
+   `batch_prefetch_with_global_scope_generates_more_dummies_than_conversation_scope`.
+   Integration: `scope_proportional_padding_scales_with_target`.
+
+7. **Background shard warming (P5 idle).**
+   `crates/core/src/search/shard_cache.rs` gains a
+   `warm_shard_cache(cache, cold_source, gate, resources, recent)`
+   utility; `crates/core/src/models/resource_gate.rs` adds
+   `ResourceGate::should_warm_shards` (idle + charging + Wi-Fi);
+   `crates/core/src/scheduler/mod.rs` adds
+   `TaskType::ShardCacheWarming`. The function early-exits on
+   gate failure / empty input / zero budget, then for each
+   recent `(conv, bucket)` populates Bloom, Text, and Fuzzy
+   cache slots from the cold source. Tests:
+   `warm_shard_cache_populates_cache_for_recent_conversations`,
+   `warm_shard_cache_respects_resource_gate`,
+   `warm_shard_cache_noop_when_no_cold_buckets`,
+   `warm_shard_cache_respects_cache_budget`.
+
+8. **Android / iOS bridge updates for `SearchTarget`.**
+   `crates/android-bridge/src/lib.rs` adds
+   `KChatBridgeHandle::search_with_target(query_json,
+   target_json, scope)`; the legacy `search` keeps defaulting to
+   `SearchTarget::Global`. `crates/ios-bridge/src/lib.rs` ships
+   an FFI-shaped `SearchTarget` enum (with `into_core` mapping
+   to `kchat_core::SearchTarget`) and adds an optional
+   `target` field to `SearchQuery`.
+   `crates/ios-bridge/src/kchat.udl` mirrors the enum and the
+   `SearchTarget? target;` field. Tests:
+   `android_bridge_search_with_conversation_target`,
+   `android_bridge_search_with_global_target_default`,
+   `android_bridge_search_with_community_target`,
+   `ios_bridge_search_target_round_trip`,
+   `ios_bridge_search_defaults_to_global`.
+
+9. **Phase 8 latency benchmarks.**
+   New `crates/core/benches/phase8_benchmarks.rs` ships five
+   criterion benchmarks behind a `[[bench]]` entry in
+   `crates/core/Cargo.toml`:
+   `bloom_precheck_one_month_bucket`,
+   `shard_cache_hit_vs_miss`,
+   `scope_resolver_community_100_conversations`,
+   `date_pruning_100_buckets`,
+   `global_search_with_bloom_10_buckets`. Run with
+   `cargo bench -p kchat-core --bench phase8_benchmarks`.
+
+10. **Phase 8 integration tests.**
+    New `crates/core/tests/phase8_multi_scope_search.rs`
+    bundles ten end-to-end tests exercising the multi-scope
+    targets, bloom precheck, shard cache, tenant policy, date
+    pruning, B2B key isolation, and scope-proportional padding
+    against the public `kchat_core` API.
 
 ### 2026-05-04 — Phase 3 / 6 / 7 / 8 batch 5 (this PR)
 

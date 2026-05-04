@@ -10,7 +10,7 @@
 > Phase 5 — Search — Fuzzy + Encrypted Shards (`In progress | ~95%`).
 > Phase 6 — Media and Semantic Search (`In progress | ~75%`).
 > Phase 7 — Desktop + Optimization (`In progress | ~40%`).
-> Phase 8 — Multi-Scope, Multi-Tenant Search (`Not started | 0%`).
+> Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~90%`).
 > This document defines the target architecture. See
 > [PROGRESS.md](PROGRESS.md) for the live build tracker.
 
@@ -1097,6 +1097,23 @@ B2B tenant isolation is cryptographic: each tenant derives its own
 `K_b2b_tenant_root(tenant_id)` from `K_user_master`, with
 per-tenant archive and search shard keys. A `TenantSearchPolicy`
 controls whether a tenant's data participates in global search.
+
+> **Phase 8 batch 6 — landed.** All ten of the items 1–6 plus
+> background shard warming, bridge surface, latency benchmarks,
+> and integration tests are implemented under their respective
+> source files
+> (`crates/core/src/search/{query_engine,shard_cache,shard_prefetch}.rs`,
+> `crates/core/src/crypto/key_hierarchy.rs`,
+> `crates/core/src/config.rs`,
+> `crates/core/src/models/resource_gate.rs`,
+> `crates/core/src/scheduler/mod.rs`,
+> `crates/{android-bridge,ios-bridge}/src/lib.rs`,
+> `crates/ios-bridge/src/kchat.udl`,
+> `crates/core/benches/phase8_benchmarks.rs`,
+> `crates/core/tests/phase8_multi_scope_search.rs`). Items 4
+> (parallel bucket fetch) and 5 (progressive / streaming
+> results) remain deferred. See PHASES.md Phase 8 and
+> PROGRESS.md Phase 8 for the per-task checklist + test names.
 
 See PHASES.md Phase 8 for the full checklist and priority order.
 

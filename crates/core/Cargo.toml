@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "phase6_int4_benchmarks"
 harness = false
+
+[[bench]]
+name = "phase8_benchmarks"
+harness = false

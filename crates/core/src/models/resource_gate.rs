@@ -189,6 +189,38 @@ impl ResourceGate {
         true
     }
 
+    /// Phase 8 (2026-05-04 batch 6) — whether the cold shard
+    /// cache may be warmed in the background.
+    ///
+    /// Cache warming is a P5 idle task: it pulls encrypted
+    /// search-index shards over the network and decrypts them
+    /// into RAM. We want it to happen only when the device is
+    /// genuinely idle so it never competes with a user-visible
+    /// search. The gate requires:
+    ///
+    /// * `is_charging == true` — never drain the battery,
+    /// * `network_type` reports unmetered (Wi-Fi or Ethernet),
+    /// * `thermal_state` at most `Fair` — leave thermal headroom
+    ///   for foreground work,
+    /// * `battery_level >= policy.min_battery` — defense in
+    ///   depth in case `is_charging` is mis-reported as `true`
+    ///   on a depleted battery.
+    pub fn should_warm_shards(&self, r: &DeviceResources) -> bool {
+        if !r.is_charging {
+            return false;
+        }
+        if !r.network_type.is_unmetered() {
+            return false;
+        }
+        if r.thermal_state > ThermalState::Fair {
+            return false;
+        }
+        if r.battery_level < self.policy.min_battery {
+            return false;
+        }
+        true
+    }
+
     /// Whether a model-download transfer should kick off.
     ///
     /// Defaults: Wi-Fi (or Ethernet) only, charging required,

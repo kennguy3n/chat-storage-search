@@ -5,6 +5,7 @@
 //! ML model directory, search budget, etc.) without breaking the
 //! existing fields.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,69 @@ pub struct KChatCoreConfig {
     /// [`PrivacyLevel::High`] enables dummy-request padding per
     /// `docs/PROPOSAL.md §5.6`.
     pub privacy_level: PrivacyLevel,
+    /// Phase 8 (2026-05-04 batch 6) — per-tenant search policy
+    /// overrides keyed by `tenant_id`. The orchestration layer
+    /// looks the active tenant up in this map and feeds the
+    /// resulting [`TenantSearchPolicy`] into the cold fan-out;
+    /// tenants without a registered override fall back to
+    /// [`TenantSearchPolicy::default`] (which allows everything
+    /// the legacy Phase-1..Phase-7 search engine allowed).
+    pub tenant_search_policies: HashMap<String, TenantSearchPolicy>,
+}
+
+/// Phase 8 (2026-05-04 batch 6) — per-tenant search policy.
+///
+/// `docs/PROPOSAL.md §7` introduces multi-scope search: a single
+/// query can target a single conversation, a community, a
+/// domain, an entire tenant, or the global B2C archive. Some
+/// deployments need to **forbid** the wider scopes — a B2B
+/// tenant typically wants `allow_global_search = false` so its
+/// users can never accidentally fan out to other tenants' cold
+/// shards, even if the UI somehow constructed a
+/// [`crate::SearchTarget::Global`] query.
+///
+/// All limits are enforced inside the cold fan-out path of
+/// [`crate::search::query_engine::QueryEngine::execute_search_with_cold_source`].
+/// The local FTS / fuzzy path is unaffected — the policy only
+/// shapes which **cold** buckets are eligible for fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantSearchPolicy {
+    /// Whether the tenant is allowed to issue a
+    /// [`crate::SearchTarget::Global`] query. Default: `true`.
+    /// Set to `false` for B2B tenants that must never see
+    /// results from outside their own tenant.
+    pub allow_global_search: bool,
+    /// Whether cold buckets that resolve to a *different*
+    /// tenant than the query target are eligible for fetch.
+    /// Default: `false` — most B2B deployments keep tenants
+    /// disjoint at the bucket level. Setting this to `true`
+    /// lets the cold fan-out cross tenant boundaries, which is
+    /// the legacy Phase-5 behaviour.
+    pub allow_cross_tenant_results: bool,
+    /// Maximum number of cold `(conversation_id, time_bucket)`
+    /// pairs the fan-out is allowed to fetch for a single
+    /// query. Default: `50`. Used as a defense-in-depth budget
+    /// against pathological queries (e.g. a Global search over
+    /// a tenant with thousands of cold buckets).
+    pub max_cold_buckets_per_search: usize,
+    /// Whether the orchestration layer requires every cold
+    /// bucket to ship a bloom shard before the full text /
+    /// fuzzy shards may be fetched. Default: `false` (legacy
+    /// behaviour: bloom is best-effort). Setting this to
+    /// `true` skips any bucket whose bloom shard is missing or
+    /// fails to decrypt.
+    pub require_bloom_shards: bool,
+}
+
+impl Default for TenantSearchPolicy {
+    fn default() -> Self {
+        Self {
+            allow_global_search: true,
+            allow_cross_tenant_results: false,
+            max_cold_buckets_per_search: 50,
+            require_bloom_shards: false,
+        }
+    }
 }
 
 impl KChatCoreConfig {
@@ -154,7 +218,30 @@ impl KChatCoreConfig {
             archive_backend: ArchiveBackend::default(),
             media_blob_sink: None,
             privacy_level: PrivacyLevel::default(),
+            tenant_search_policies: HashMap::new(),
         }
+    }
+
+    /// Register / override the [`TenantSearchPolicy`] for a tenant.
+    /// Builder-style for ergonomic configuration in tests.
+    #[must_use]
+    pub fn with_tenant_search_policy(
+        mut self,
+        tenant_id: impl Into<String>,
+        policy: TenantSearchPolicy,
+    ) -> Self {
+        self.tenant_search_policies.insert(tenant_id.into(), policy);
+        self
+    }
+
+    /// Look up the [`TenantSearchPolicy`] for a tenant. Falls back
+    /// to [`TenantSearchPolicy::default`] when no override is
+    /// registered.
+    pub fn tenant_search_policy_for(&self, tenant_id: &str) -> TenantSearchPolicy {
+        self.tenant_search_policies
+            .get(tenant_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Builder-style override for [`Self::archive_backend`].
@@ -305,5 +392,64 @@ mod tests {
             cfg.media_blob_sink,
             Some(StorageSink::ZkObjectFabric { .. })
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 8 (2026-05-04 batch 6) — TenantSearchPolicy
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn tenant_policy_default_allows_everything() {
+        let p = TenantSearchPolicy::default();
+        assert!(p.allow_global_search);
+        assert!(!p.allow_cross_tenant_results);
+        assert_eq!(p.max_cold_buckets_per_search, 50);
+        assert!(!p.require_bloom_shards);
+    }
+
+    #[test]
+    fn tenant_policy_serde_round_trip() {
+        let p = TenantSearchPolicy {
+            allow_global_search: false,
+            allow_cross_tenant_results: true,
+            max_cold_buckets_per_search: 17,
+            require_bloom_shards: true,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: TenantSearchPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn tenant_policy_lookup_falls_back_to_default_for_unknown_tenant() {
+        let cfg = KChatCoreConfig::new(
+            PathBuf::from("/tmp/kchat-cfg-test"),
+            Platform::MacOs,
+            "tenant-test",
+        );
+        let p = cfg.tenant_search_policy_for("missing");
+        assert_eq!(p, TenantSearchPolicy::default());
+    }
+
+    #[test]
+    fn tenant_policy_lookup_returns_registered_override() {
+        let cfg = KChatCoreConfig::new(
+            PathBuf::from("/tmp/kchat-cfg-test"),
+            Platform::MacOs,
+            "tenant-test",
+        )
+        .with_tenant_search_policy(
+            "tenant-acme",
+            TenantSearchPolicy {
+                allow_global_search: false,
+                allow_cross_tenant_results: false,
+                max_cold_buckets_per_search: 10,
+                require_bloom_shards: true,
+            },
+        );
+        let p = cfg.tenant_search_policy_for("tenant-acme");
+        assert!(!p.allow_global_search);
+        assert_eq!(p.max_cold_buckets_per_search, 10);
+        assert!(p.require_bloom_shards);
     }
 }
