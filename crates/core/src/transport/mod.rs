@@ -29,6 +29,8 @@
 //! The shape of this module's public re-exports is intentionally
 //! narrow so it can grow without breaking downstream callers.
 
+pub mod offline;
+
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};

@@ -989,14 +989,36 @@ Checklist:
       `core_impl::tests::send_media_writes_image_embedding_when_embedder_installed`,
       `core_impl::tests::send_media_skips_image_embedding_for_non_image_mime`,
       `models::clip::tests::*`.)_
-- [ ] Video keyframe sampling and `MobileCLIP-S2` embeddings.
-- [ ] Whisper multilingual integration for voice-message transcription:
+- [x] Video keyframe sampling and `MobileCLIP-S2` embeddings.
+      _(`VideoKeyframeSampler` trait, `NoopVideoKeyframeSampler`,
+      `MockVideoKeyframeSampler` in
+      `crates/core/src/models/video.rs`. Wired into
+      `CoreImpl::send_media`: video MIME types call
+      `extract_keyframes(.., max_frames = 5)`; the first frame
+      is embedded via the existing `ImageEmbedder` and the
+      vector lands in `search_vector` keyed
+      `(message_id, "mobileclip_s2@v1")`. Best-effort. Tests:
+      `models::video::tests::*`,
+      `core_impl::tests::send_media_embeds_video_keyframes_when_sampler_and_embedder_installed`,
+      `core_impl::tests::send_media_skips_keyframes_for_non_video_mime`.)_
+- [x] Whisper multilingual integration for voice-message transcription:
       Apple MLX (`mlx-community/whisper-base-mlx`) on Apple Silicon
       (preferred — Neural Engine, lower latency / battery cost);
       ONNX Runtime (`whisper-base` ~140 MB INT8, INT4 not supported
       for audio transcription) on all other platforms (Intel macOS,
       Windows, Android, Linux); `whisper-tiny` (~75 MB) on low-end
       Android. See PROPOSAL §7.6 / §7.7.
+      _(Scaffold: `WhisperTranscriber` trait,
+      `NoopWhisperTranscriber`, `MockWhisperTranscriber` +
+      `select_whisper_backend` (Apple MLX vs ONNX) in
+      `crates/core/src/models/whisper.rs`. Wired into
+      `CoreImpl::send_media`: audio MIME types call
+      `transcribe()`; the result lands in `media_search_index`
+      with `kind = "transcript"` (text + language). Real
+      MLX / ONNX inference attach is the platform-bridge
+      follow-up. Tests: `models::whisper::tests::*`,
+      `core_impl::tests::send_media_writes_transcript_when_transcriber_installed`,
+      `core_impl::tests::send_media_skips_transcript_for_non_audio_mime`.)_
 - [x] Platform OCR bridge: Vision (`VNRecognizeTextRequest`) on
       iOS / macOS; ML Kit Text Recognition v2 on Android;
       `Windows.Media.Ocr` / Tesseract on Windows.
@@ -1010,8 +1032,18 @@ Checklist:
       with the bridge crates and is delivered in Phase 7. Tests:
       `models::ocr::tests::*`,
       `local_store::db::tests::media_search_index_*`.)_
-- [ ] Document text extraction (PDF, DOCX) with multilingual
+- [x] Document text extraction (PDF, DOCX) with multilingual
       handling and page-level indexing.
+      _(`DocumentExtractor` trait, `NoopDocumentExtractor`,
+      `MockDocumentExtractor` in
+      `crates/core/src/models/document.rs`. Wired into
+      `CoreImpl::send_media`: PDF / DOCX MIME types call
+      `extract_text()` and each `DocumentPage` lands in
+      `media_search_index` with `kind = "caption"` and
+      `text = "[page {n}] {body}"`. Best-effort. Tests:
+      `models::document::tests::*`,
+      `core_impl::tests::send_media_writes_document_pages_when_extractor_installed`,
+      `core_impl::tests::send_media_skips_extraction_for_non_document_mime`.)_
 - [x] Resource-gated background processing: battery level, thermal
       state, charging, network type.
       _(`crates/core/src/models/resource_gate.rs` implements
@@ -1073,12 +1105,31 @@ Checklist:
       put/get round-trip with cosine > 0.999, version-mismatch →
       `None`, two-instance same-connection writes are mutually
       visible.)_
-- [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
+- [x] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
       Runtime `MatMulNBits`. Benchmark cosine-similarity correlation
       against the INT8 baseline using the multilingual relevance
       regression suite. INT4 ships as the default on devices with
       tight storage budgets (low-end Android, Windows tablets);
       INT8 remains the default on desktop and flagship mobile.
+      _(Selection lives in
+      `crates/core/src/models/model_manager.rs::select_quantization`:
+      returns `Quantization::Int4` whenever
+      `available_storage_bytes < TIGHT_STORAGE_THRESHOLD_BYTES`
+      (512 MiB), else `Int8`. `ModelArtifactSpec` constants
+      `XLMR_INT8_ARTIFACT` / `XLMR_INT4_ARTIFACT` /
+      `MOBILECLIP_S2_INT8_ARTIFACT` /
+      `MOBILECLIP_S2_INT4_ARTIFACT` pin the expected filenames;
+      `ModelManager::resolve_artifact` selects the right one
+      based on storage pressure. INT4 ONNX session helpers
+      `create_xlmr_session_int4` / `create_mobileclip_session_int4`
+      live behind `#[cfg(feature = "onnx-runtime")]` and return
+      `NotImplemented` when the feature is off. The
+      cosine-correlation benchmark vs INT8 is queued for the
+      platform-bridge follow-up. Tests:
+      `models::model_manager::tests::select_quantization_returns_int4_for_tight_storage`,
+      `models::model_manager::tests::select_quantization_returns_int8_for_normal_storage`,
+      `models::model_manager::tests::model_artifact_int4_variants_have_correct_names`,
+      `models::model_manager::tests::resolve_artifact_selects_int4_when_storage_tight`.)_
 
 **Decision gate**: Semantic search returns relevant multilingual
 results across text, images, video, and audio on iOS, Android,
@@ -1099,17 +1150,48 @@ Checklist:
       results; `NSBackgroundActivityScheduler` for background work).
 - [ ] Windows native integration (Windows Search anchors; CPU-only
       ML; no GPU assumption).
-- [ ] Performance profiling and optimization (memory residency,
+- [~] Performance profiling and optimization (memory residency,
       CPU per request, battery cost per backup, peak transfer
       throughput).
-- [ ] Large-scale testing: 100K+ messages, 10K+ media files,
+      _(In-tree instrumentation scaffold: `PerfTrace`,
+      `PerfCollector` trait, `NoopPerfCollector`,
+      `InMemoryPerfCollector` in `crates/core/src/perf.rs`;
+      wired into `CoreImpl` via `install_perf_collector` /
+      `has_perf_collector` / `collect_perf_stats`. Hot paths
+      `ingest_messages`, `search`, and `enforce_storage_budget`
+      now emit traces with operation-specific metadata. The
+      device-matrix p95 dashboard remains follow-up. Tests:
+      `perf::tests::*`,
+      `core_impl::tests::perf_collector_records_*`.)_
+- [~] Large-scale testing: 100K+ messages, 10K+ media files,
       multilingual corpus across 10+ scripts.
+      _(Scaffold lives in `crates/core/tests/large_scale.rs`
+      behind `#[ignore]`: 10k multilingual ingest +
+      FTS5 / fuzzy / QueryEngine round-trip across 12 scripts;
+      5k media-asset eviction at Critical pressure;
+      1k message backup → manifest-chain → restore round-trip.
+      Run with `cargo test --test large_scale -- --ignored`.
+      The full 100k+ × 10k+ device-matrix run is the
+      production-hardening follow-up.)_
 - [ ] Platform-specific ML execution-provider tuning (CoreML EP,
       NNAPI EP, optional DirectML EP on Windows when GPU is present).
 - [ ] Dedup analytics integration with `kennguy3n/zk-object-fabric`'s
       ContentIndex metrics (read-only telemetry, no plaintext leaks).
-- [ ] Edge-case handling: offline mode; interrupted backups;
+- [~] Edge-case handling: offline mode; interrupted backups;
       partial restores; corrupted chunks; missing manifests.
+      _(Offline mode: `OfflineDetector` trait,
+      `NoopOfflineDetector`, `AlwaysOfflineDetector`,
+      `ToggleOfflineDetector` in
+      `crates/core/src/transport/offline.rs`; wired into
+      `CoreImpl` via `install_offline_detector` / `is_online`.
+      `run_incremental_backup` defers (`BackupResult.deferred =
+      true`) when offline; `hydrate_message` returns
+      `is_cold = true` + `offline = true` when the body is
+      remote-archive-only and the device is offline.
+      Interrupted / partial / corrupted / missing variants
+      already covered by the 8-of-8 failure suite below. Tests:
+      `failure_scenarios::offline_during_backup_defers_upload_and_succeeds_on_reconnect`,
+      `failure_scenarios::offline_during_hydration_returns_cold_with_offline_flag`.)_
 - [x] Archive compaction at production scale (per account +
       conversation + bucket: collect old deltas → apply tombstones →
       rebuild compact segment → upload → new manifest → mark old

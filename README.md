@@ -102,7 +102,7 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
-> **Phase 6 — Media and Semantic Search — `In progress | ~55%`**
+> **Phase 6 — Media and Semantic Search — `In progress | ~75%`**
 > (ONNX Runtime session lifecycle in
 > `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
 > seam — `TextEmbedder` trait + `NoopTextEmbedder` /
@@ -115,12 +115,31 @@
 > `crates/core/src/models/clip.rs`, wired through
 > `CoreImpl::send_media` and gated on
 > `mime_type.starts_with("image/")` plus the cross-pipeline cache
-> key `(message_id, "mobileclip_s2@v1")`; brute-force semantic
-> search engine over the per-conversation `search_vector` corpus
-> (`crates/core/src/search/semantic_search.rs`); on-device
-> reranker — `SEMANTIC_WEIGHT = 1.5` between BM25 / fuzzy
+> key `(message_id, "mobileclip_s2@v1")`; **Whisper transcription
+> seam** — `WhisperTranscriber` / `NoopWhisperTranscriber` /
+> `MockWhisperTranscriber` in
+> `crates/core/src/models/whisper.rs`, wired into
+> `CoreImpl::send_media` so audio MIME types land in
+> `media_search_index` with `kind = "transcript"`;
+> **document text extraction seam** — `DocumentExtractor` /
+> `NoopDocumentExtractor` / `MockDocumentExtractor` in
+> `crates/core/src/models/document.rs`, wired into
+> `CoreImpl::send_media` so PDF / DOCX MIME types fan each page
+> into `media_search_index` with `kind = "caption"`;
+> **video keyframe sampling seam** — `VideoKeyframeSampler` /
+> `NoopVideoKeyframeSampler` / `MockVideoKeyframeSampler` in
+> `crates/core/src/models/video.rs`, wired into
+> `CoreImpl::send_media` so video MIME types embed up to five
+> sampled keyframes through MobileCLIP-S2 and write the first
+> frame to `search_vector`; brute-force semantic search engine
+> over the per-conversation `search_vector` corpus
+> (`crates/core/src/search/semantic_search.rs`); **on-device
+> reranker with raw `semantic_score`** —
+> `SearchResult.semantic_score: Option<f64>` carries raw cosine
+> similarity, `QueryEngine::rerank_with_semantic` re-sorts a
+> result set under `SEMANTIC_WEIGHT = 1.5` (between BM25 / fuzzy
 > contributions, merged in
-> `QueryEngine::execute_search_with_semantic`; OCR bridge —
+> `QueryEngine::execute_search_with_semantic`); OCR bridge —
 > `OcrBridge` trait + `NoopOcrBridge` in
 > `crates/core/src/models/ocr.rs` plus
 > `LocalStoreDb::insert_media_search_index` /
@@ -128,8 +147,14 @@
 > processing — `ResourceGate` / `ResourcePolicy` /
 > `ResourceProbe` in `crates/core/src/models/resource_gate.rs`;
 > model manager — `ModelManager` / `ModelDownloader` /
-> `Quantization` in `crates/core/src/models/model_manager.rs`;
-> encrypted vector and media shards through
+> `Quantization` in `crates/core/src/models/model_manager.rs`,
+> with **INT4 quantization selection** (`select_quantization`
+> returns `Int4` whenever `available_storage_bytes <
+> TIGHT_STORAGE_THRESHOLD_BYTES = 512 MiB`),
+> `ModelArtifactSpec` constants for the four expected artifacts
+> (XLMR / MobileCLIP × INT8 / INT4), and INT4 ONNX session
+> helpers behind `#[cfg(feature = "onnx-runtime")]`; encrypted
+> vector and media shards through
 > `crates/core/src/search/shard_builder.rs::{build,restore}_{vector,media}_search_shard`
 > with new key-derivation helpers
 > `crypto::key_hierarchy::derive_{vector,media}_index_shard`;
@@ -138,10 +163,10 @@
 > at `crates/core/tests/phase6_embedding_cache.rs` that asserts
 > put / get cosine fidelity > 0.999, version-mismatch → `None`,
 > and two-instance same-connection cross-pipeline visibility.
-> Items still open: video keyframe sampling, Whisper multilingual
-> inference loop, document text extraction, desktop EP tuning,
-> INT4 benchmarking.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~28%`**
+> Items still open: real platform-bridge attach for Whisper /
+> MobileCLIP / XLM-R sessions, desktop EP tuning, and the
+> INT4-vs-INT8 multilingual relevance benchmark.)
+> **Phase 7 — Desktop + Optimization — `In progress | ~40%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -152,8 +177,30 @@
 > actual hashes (plus deepest-link variant), MLS-removed
 > device, missing search shard graceful degrade, low-storage
 > resumable error during restore, manifest upload interrupted
-> mid-write retries without chain break. Desktop integration,
-> ML EP tuning, and large-scale testing remain.)
+> mid-write retries without chain break. **Offline edge-case
+> handling** — `OfflineDetector` trait,
+> `NoopOfflineDetector`, `AlwaysOfflineDetector`,
+> `ToggleOfflineDetector` in
+> `crates/core/src/transport/offline.rs`; wired into `CoreImpl`
+> via `install_offline_detector` / `is_online`.
+> `run_incremental_backup` short-circuits with
+> `BackupResult.deferred = true` while offline;
+> `hydrate_message` returns `is_cold = true` + `offline = true`
+> when the body is remote-archive-only and the device is
+> offline. **Performance profiling scaffold** — `PerfTrace` +
+> `PerfCollector` trait + `NoopPerfCollector` +
+> `InMemoryPerfCollector` in `crates/core/src/perf.rs`; wired
+> into `CoreImpl` via `install_perf_collector` /
+> `has_perf_collector` / `collect_perf_stats`. Hot paths
+> `ingest_messages`, `search`, and `enforce_storage_budget`
+> emit traces with operation-specific metadata. **Large-scale
+> integration scaffold** — `crates/core/tests/large_scale.rs`
+> with three `#[ignore]` stress tests (10k multilingual ingest;
+> 5k media-asset eviction at Critical pressure; 1k message
+> backup → manifest-chain → restore round-trip; run with
+> `cargo test --test large_scale -- --ignored`).
+> Desktop integration and platform-specific ML EP tuning
+> remain.)
 >
 > Landed in Phase 0: Rust workspace scaffold, crypto module (BLAKE3,
 > HKDF-SHA256 hierarchy, XChaCha20-Poly1305 / AES-256-GCM AEAD,
@@ -402,10 +449,13 @@ chat-storage-search/
         models/                             # Phase 6: on-device ML seams
           mod.rs                            # re-exports
           embeddings.rs                     # TextEmbedder trait + NoopTextEmbedder + MockTextEmbedder + EmbeddingCache trait + LocalStoreEmbeddingCache + INT8 codec + XLMR_MODEL_VERSION / XLMR_EMBEDDING_DIM
-          embeddings_onnx.rs                # ONNX Runtime session lifecycle (gated `#[cfg(feature = "onnx-runtime")]`); EP-selection state machine + Error::Model mapping
-          clip.rs                           # ImageEmbedder trait + NoopImageEmbedder + MockImageEmbedder + MOBILECLIP_S2_MODEL_VERSION / MOBILECLIP_S2_EMBEDDING_DIM
+          embeddings_onnx.rs                # ONNX Runtime session lifecycle (gated `#[cfg(feature = "onnx-runtime")]`); EP-selection state machine + Error::Model mapping + create_xlmr_session_int4 (INT4 MatMulNBits)
+          clip.rs                           # ImageEmbedder trait + NoopImageEmbedder + MockImageEmbedder + MOBILECLIP_S2_MODEL_VERSION / MOBILECLIP_S2_EMBEDDING_DIM + create_mobileclip_session_int4
+          whisper.rs                        # Phase 6: WhisperTranscriber trait + NoopWhisperTranscriber + MockWhisperTranscriber + TranscriptionResult / TranscriptionSegment + select_whisper_backend (Apple MLX vs ONNX) + WHISPER_BASE_MLX_MODEL_VERSION
+          document.rs                       # Phase 6: DocumentExtractor trait + NoopDocumentExtractor + MockDocumentExtractor + DocumentPage (PDF / DOCX page-level extraction)
+          video.rs                          # Phase 6: VideoKeyframeSampler trait + NoopVideoKeyframeSampler + MockVideoKeyframeSampler + Keyframe (timestamp_ms + image_data + mime_type)
           ocr.rs                            # OcrBridge trait (Send+Sync, object-safe) + NoopOcrBridge + OcrResult + BoundingBox
-          model_manager.rs                  # ModelManager + ModelArtifact + ModelManagerConfig + Quantization (Int8 / Int4 / Float32) + ModelDownloader trait + NoopModelDownloader + select_quantization
+          model_manager.rs                  # ModelManager + ModelArtifact + ModelManagerConfig + Quantization (Int8 / Int4 / Float32) + ModelDownloader trait + NoopModelDownloader + select_quantization (Int4 when available_storage_bytes < TIGHT_STORAGE_THRESHOLD_BYTES = 512 MiB) + ModelArtifactSpec (XLMR / MobileCLIP × INT8 / INT4 filenames) + resolve_artifact
           resource_gate.rs                  # ResourceGate + ResourcePolicy + DeviceResources + ThermalState + NetworkType + ResourceProbe trait + NoopResourceProbe
         offload/                            # Phase 3 foundation: budget + scoring + eviction + hydration
           mod.rs
@@ -420,7 +470,10 @@ chat-storage-search/
           pipeline.rs                       # RestorePipeline: conversation list → skeletons → search shards → recent bodies → enable lazy media; persists every RestoreState transition
           key_recovery.rs                   # RecoveryKey (AES-256-KW wrap of K_user_master, hex display) + DeviceTransferPayload (XChaCha20-Poly1305 seal of K_user_master + 3 derived roots, transfer-code-derived AEAD key)
         scheduler/                          # Phase 5 / 7: BackgroundScheduler trait (Send+Sync, object-safe), TaskType (IncrementalBackup / ArchiveCompaction / IndexMaintenance / MediaCacheEviction / ModelWarmup), ScheduledTask, NoopScheduler, IosBgTaskBridge / AndroidWorkManagerBridge platform bridges + Noop stubs
-        transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient
+        transport/                          # Phase 1: DeliveryClient + TransportClient + NoopTransportClient + MockDeliveryClient + Phase 7: offline.rs
+          mod.rs
+          offline.rs                        # Phase 7: OfflineDetector trait (Send+Sync+Debug, object-safe) + NoopOfflineDetector (always-online fail-open) + AlwaysOfflineDetector (test) + ToggleOfflineDetector (mid-test flip)
+        perf.rs                             # Phase 7: PerfTrace + PerfCollector trait (Send+Sync+Debug, object-safe) + NoopPerfCollector + InMemoryPerfCollector — wired into CoreImpl via install_perf_collector / has_perf_collector / collect_perf_stats; ingest_messages / search / enforce_storage_budget hot paths emit start/end ns + free-form metadata
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
         phase5_benchmarks.rs                # criterion: text_only_one_month / fuzzy_only_one_month / local_plus_one_cold_bucket — Phase 5 cold-shard latency budget
@@ -431,7 +484,8 @@ chat-storage-search/
         archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance, plus archive_pipeline_epoch_rotation_and_cross_epoch_compaction (2-epoch rotation + manifest carry-through) and archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore (3-epoch chain decode after a simulated fresh-device restore via EpochKeyManager::ingest_wrapped_prior_epoch_key)
         backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test; search-shard restore round-trip
         backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
-        failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage plus the end-to-end resume gate low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete; manifest upload interrupted mid-write retries without chain break
+        failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage plus the end-to-end resume gate low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete; manifest upload interrupted mid-write retries without chain break; offline_during_backup_defers_upload_and_succeeds_on_reconnect (BackupResult.deferred = true while OfflineDetector reports offline, no segments built; reconnect produces a non-deferred run); offline_during_hydration_returns_cold_with_offline_flag (HydratedMessage { is_cold: true, offline: true, text_content: None } when body is RemoteArchiveOnly + offline)
+        large_scale.rs                      # Phase 7 large-scale stress scaffold (#[ignore]): large_scale_ingest_and_search_10k_messages — 10k messages × 12 scripts (en / ru / zh / ja / ar / th / hi / ko / vi / de / fr / mixed-script), FTS5 + fuzzy + QueryEngine round-trip with rank-ordering check; large_scale_storage_budget_under_pressure — 5k media-asset rows totalling 500 MiB against 100 MiB budget at Critical pressure; large_scale_backup_restore_round_trip — 1k message backup → manifest-chain → RestorePipeline::run round-trip; run with `cargo test --test large_scale -- --ignored`
         cold_shard_search.rs                # Phase 5: encrypted shard fetch via ColdShardSource → on-device decrypt → FTS5 + fuzzy → merge with local hits → SearchScope::IncludeCold marks is_cold = true
         mixed_language_query.rs             # Phase 5: segment_by_script fan-out across Latin × CJK / Cyrillic × Latin / pure-CJK fuzzy fallback / mixed-script promotion / unrelated-row exclusion
         phase5_latency_smoke.rs             # Phase 5: cold-shard decrypt + search smoke test (debug-build smoke gate; plus the p95 latency gate phase5_cold_shard_p95_latency_under_1_5s_budget that drives 20 iterations on a 1 000-message multilingual one-month bucket and asserts the end-to-end shard fetch + AEAD decrypt + FTS5 / fuzzy search p95 stays under the 1.5 s Phase-5 budget; on-device device-matrix p95 ≤ 1.5 s gate runs in the device-matrix bench)
@@ -476,6 +530,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```sh
 cargo test --workspace --verbose
 ```
+
+The Phase-7 large-scale stress tests at
+[`crates/core/tests/large_scale.rs`](crates/core/tests/large_scale.rs)
+are marked `#[ignore]` so they stay out of the default `cargo
+test` matrix. Run them explicitly:
+
+```sh
+cargo test --test large_scale -- --ignored
+```
+
+Each test seeds either 10 000 multilingual messages (FTS5 +
+fuzzy + QueryEngine round-trip), 5 000 media-asset rows
+totalling 500 MiB against a 100 MiB budget at Critical
+pressure, or a 1 000-message backup → manifest-chain →
+restore round-trip.
 
 The criterion benchmarks live under
 [`crates/core/benches/`](crates/core/benches/) and run with

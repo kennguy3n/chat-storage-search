@@ -106,6 +106,69 @@ impl Default for ModelManagerConfig {
 /// `docs/PROPOSAL.md §7.6`.
 pub const TIGHT_STORAGE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Static descriptor for a model artifact. Phase 6, Task 5
+/// (2026-05-04 batch).
+///
+/// Unlike [`ModelArtifact`] (which carries dynamic on-disk state
+/// — file path, size, sha256), this is a compile-time constant
+/// describing the *expected* shape of the artifact:
+/// `(model_id, model_version, filename, quantization)`. The
+/// platform downloader bridge resolves the spec to a concrete
+/// [`ModelArtifact`] by downloading `filename` to a per-device
+/// path and computing the sha256.
+///
+/// The four `XLMR_INT4_ARTIFACT` / `XLMR_INT8_ARTIFACT` /
+/// `MOBILECLIP_S2_INT4_ARTIFACT` / `MOBILECLIP_S2_INT8_ARTIFACT`
+/// constants below are the source of truth for what each
+/// encoder ships at each quantization tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelArtifactSpec {
+    /// Encoder family (`"xlmr"`, `"mobileclip_s2"`).
+    pub model_id: &'static str,
+    /// Cache-invalidation tag (`"xlmr@v1"`, `"mobileclip_s2@v1"`).
+    pub model_version: &'static str,
+    /// Canonical on-disk filename (`"xlmr-v1-int8.onnx"`, …).
+    pub filename: &'static str,
+    /// Quantization tier this spec describes.
+    pub quantization: Quantization,
+}
+
+/// XLM-R INT8 artifact descriptor — the default tier shipped to
+/// devices with normal storage headroom.
+pub const XLMR_INT8_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
+    model_id: "xlmr",
+    model_version: crate::models::embeddings::XLMR_MODEL_VERSION,
+    filename: crate::models::embeddings::XLMR_INT8_FILENAME,
+    quantization: Quantization::Int8,
+};
+
+/// XLM-R INT4 artifact descriptor — the tight-storage tier
+/// (`docs/PROPOSAL.md §7.6`, ONNX `MatMulNBits`).
+pub const XLMR_INT4_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
+    model_id: "xlmr",
+    model_version: crate::models::embeddings::XLMR_MODEL_VERSION,
+    filename: crate::models::embeddings::XLMR_INT4_FILENAME,
+    quantization: Quantization::Int4,
+};
+
+/// MobileCLIP-S2 INT8 artifact descriptor — the default tier
+/// shipped to devices with normal storage headroom.
+pub const MOBILECLIP_S2_INT8_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
+    model_id: "mobileclip_s2",
+    model_version: crate::models::clip::MOBILECLIP_S2_MODEL_VERSION,
+    filename: crate::models::clip::MOBILECLIP_S2_INT8_FILENAME,
+    quantization: Quantization::Int8,
+};
+
+/// MobileCLIP-S2 INT4 artifact descriptor — the tight-storage
+/// tier (`docs/PROPOSAL.md §7.6`).
+pub const MOBILECLIP_S2_INT4_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
+    model_id: "mobileclip_s2",
+    model_version: crate::models::clip::MOBILECLIP_S2_MODEL_VERSION,
+    filename: crate::models::clip::MOBILECLIP_S2_INT4_FILENAME,
+    quantization: Quantization::Int4,
+};
+
 /// Object-safe seam for the platform downloader bridge.
 ///
 /// The Rust core never speaks HTTP itself — the iOS / Android /
@@ -277,6 +340,36 @@ impl ModelManager {
     /// Whether the registry is below the configured soft cap.
     pub fn is_cache_under_limit(&self) -> bool {
         self.total_cache_bytes() <= self.config.max_cache_bytes
+    }
+
+    /// Pick the correct [`ModelArtifactSpec`] for `model_id`
+    /// given the device's free `available_storage`. Phase 6,
+    /// Task 5 (2026-05-04 batch).
+    ///
+    /// Defers the storage-tier decision to
+    /// [`Self::select_quantization`] and looks up the matching
+    /// pre-canned spec
+    /// ([`XLMR_INT4_ARTIFACT`] / [`XLMR_INT8_ARTIFACT`] /
+    /// [`MOBILECLIP_S2_INT4_ARTIFACT`] /
+    /// [`MOBILECLIP_S2_INT8_ARTIFACT`]).
+    ///
+    /// Returns `None` when `model_id` is not one of the known
+    /// encoders.
+    pub fn resolve_artifact(
+        &self,
+        model_id: &str,
+        available_storage: u64,
+    ) -> Option<ModelArtifactSpec> {
+        let q = self.select_quantization(model_id, available_storage);
+        match (model_id, q) {
+            ("xlmr", Quantization::Int4) => Some(XLMR_INT4_ARTIFACT),
+            ("xlmr", Quantization::Int8) => Some(XLMR_INT8_ARTIFACT),
+            ("xlmr", Quantization::Float32) => Some(XLMR_INT8_ARTIFACT),
+            ("mobileclip_s2", Quantization::Int4) => Some(MOBILECLIP_S2_INT4_ARTIFACT),
+            ("mobileclip_s2", Quantization::Int8) => Some(MOBILECLIP_S2_INT8_ARTIFACT),
+            ("mobileclip_s2", Quantization::Float32) => Some(MOBILECLIP_S2_INT8_ARTIFACT),
+            _ => None,
+        }
     }
 
     /// Default destination filename for `(model_id,
@@ -453,5 +546,96 @@ mod tests {
         let p = mgr.resolve_destination("xlmr", "xlmr@v1");
         assert!(p.to_string_lossy().contains("xlmr_v1"));
         assert!(!p.to_string_lossy().contains('@'));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 6, Task 5 (2026-05-04 batch) — INT4 selection +
+    // ModelArtifactSpec coverage.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn select_quantization_returns_int4_for_tight_storage() {
+        let mgr = ModelManager::default();
+        // 1 MiB free is well below the 512 MiB threshold.
+        assert_eq!(
+            mgr.select_quantization("xlmr", 1024 * 1024),
+            Quantization::Int4
+        );
+        // Right at the threshold (still less than) returns Int4.
+        assert_eq!(
+            mgr.select_quantization("xlmr", TIGHT_STORAGE_THRESHOLD_BYTES - 1),
+            Quantization::Int4
+        );
+    }
+
+    #[test]
+    fn select_quantization_returns_int8_for_normal_storage() {
+        let mgr = ModelManager::default();
+        // Exactly at the threshold falls into the comfortable
+        // bucket because the comparison is `<` (strict).
+        assert_eq!(
+            mgr.select_quantization("xlmr", TIGHT_STORAGE_THRESHOLD_BYTES),
+            Quantization::Int8
+        );
+        assert_eq!(
+            mgr.select_quantization("xlmr", 8u64 * 1024 * 1024 * 1024),
+            Quantization::Int8
+        );
+    }
+
+    #[test]
+    fn model_artifact_int4_variants_have_correct_names() {
+        assert_eq!(XLMR_INT4_ARTIFACT.model_id, "xlmr");
+        assert_eq!(
+            XLMR_INT4_ARTIFACT.filename,
+            crate::models::embeddings::XLMR_INT4_FILENAME
+        );
+        assert_eq!(XLMR_INT4_ARTIFACT.quantization, Quantization::Int4);
+        assert!(XLMR_INT4_ARTIFACT.filename.contains("int4"));
+
+        assert_eq!(MOBILECLIP_S2_INT4_ARTIFACT.model_id, "mobileclip_s2");
+        assert_eq!(
+            MOBILECLIP_S2_INT4_ARTIFACT.filename,
+            crate::models::clip::MOBILECLIP_S2_INT4_FILENAME
+        );
+        assert_eq!(MOBILECLIP_S2_INT4_ARTIFACT.quantization, Quantization::Int4);
+        assert!(MOBILECLIP_S2_INT4_ARTIFACT.filename.contains("int4"));
+
+        // INT8 / INT4 specs differ on quantization + filename.
+        assert_ne!(XLMR_INT4_ARTIFACT.filename, XLMR_INT8_ARTIFACT.filename);
+        assert_ne!(
+            XLMR_INT4_ARTIFACT.quantization,
+            XLMR_INT8_ARTIFACT.quantization
+        );
+    }
+
+    #[test]
+    fn resolve_artifact_selects_int4_when_storage_tight() {
+        let mgr = ModelManager::default();
+
+        let xlmr_tight = mgr
+            .resolve_artifact("xlmr", 100 * 1024 * 1024)
+            .expect("xlmr resolves");
+        assert_eq!(xlmr_tight, XLMR_INT4_ARTIFACT);
+
+        let clip_tight = mgr
+            .resolve_artifact("mobileclip_s2", 100 * 1024 * 1024)
+            .expect("clip resolves");
+        assert_eq!(clip_tight, MOBILECLIP_S2_INT4_ARTIFACT);
+
+        // Comfortable storage gets the INT8 spec.
+        let xlmr_normal = mgr
+            .resolve_artifact("xlmr", 4u64 * 1024 * 1024 * 1024)
+            .expect("xlmr resolves");
+        assert_eq!(xlmr_normal, XLMR_INT8_ARTIFACT);
+        let clip_normal = mgr
+            .resolve_artifact("mobileclip_s2", 4u64 * 1024 * 1024 * 1024)
+            .expect("clip resolves");
+        assert_eq!(clip_normal, MOBILECLIP_S2_INT8_ARTIFACT);
+
+        // Unknown encoders → None.
+        assert!(mgr
+            .resolve_artifact("unknown", 1024 * 1024 * 1024)
+            .is_none());
     }
 }

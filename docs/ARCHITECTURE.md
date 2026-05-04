@@ -90,8 +90,14 @@ goes through the FFI bridge for the host platform.
 > **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
 > (~95%); Phase 3 in flight (~97%); Phase 4 in flight (~90%);
 > Phase 5 in flight (~95%, cold-shard fetch + restore + p95
-> latency gate landed); Phase 7 in flight (~28%, failure suite at
-> 8 of 8).** Updates vs. the original target structure below:
+> latency gate landed); Phase 6 in flight (~75%, ML inference
+> seams for XLM-R / MobileCLIP-S2 / Whisper /
+> DocumentExtractor / VideoKeyframeSampler + on-device
+> reranker with raw `semantic_score` + INT4 quantization
+> selection); Phase 7 in flight (~40%, failure suite at 8 of 8 +
+> offline detector + perf collector + large-scale ingest /
+> storage-budget / backup-restore scaffold).** Updates vs. the
+> original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
 >   CBOR wire-format types (segment frames, manifest spec, media
@@ -946,9 +952,39 @@ which:
    the HNSW upgrade is held in reserve for the corpus size where
    brute-force becomes unappealing);
 3. merges semantic hits into the candidate set, summing
-   contributions for rows that hit both surfaces;
+   contributions for rows that hit both surfaces, and stamps
+   `SearchResult.semantic_score: Option<f64>` with the **raw
+   cosine similarity** for hits that surfaced through the
+   semantic path (`None` for FTS / fuzzy-only hits);
 4. weights surviving candidates by the recency × content-kind
    factor and re-sorts.
+
+The Phase-6 batch additionally lands a dedicated reranking
+entry point: `QueryEngine::rerank_with_semantic` takes a result
+set + a query embedding, recomputes cosine similarity for every
+result that has a vector in `search_vector`, updates
+`semantic_score` in place, adds `sim × SEMANTIC_WEIGHT` to
+`rank_score`, and re-sorts by descending `rank_score` then by
+descending `created_at_ms` then by `message_id`.
+`SearchScope::LocalOnly` is honored — no cold fan-out is
+issued during the rerank pass.
+
+The same `media_search_index` table that backs the OCR bridge
+also carries the **Phase-6 batch additions**: the
+`WhisperTranscriber` seam writes audio MIME results with
+`kind = "transcript"` (text + language); the
+`DocumentExtractor` seam writes PDF / DOCX page-level extracts
+with `kind = "caption"` and `text = "[page {n}] {body}"`.
+`media_search_index` rows participate in the same FTS5 search
+surface as message bodies, so transcripts and document pages
+become directly searchable through `QueryEngine::execute_search`
+and the OCR / structured filters. Video MIME types take a
+different route: the `VideoKeyframeSampler` seam extracts up to
+five keyframes, the first frame is embedded through the
+existing `ImageEmbedder` (MobileCLIP-S2), and the resulting
+512-dim vector lands in `search_vector` keyed
+`(message_id, "mobileclip_s2@v1")` so the row participates in
+the semantic-search fan-out alongside still images.
 
 The embedding cache is populated by both the guardrail pipeline
 (`kennguy3n/slm-guardrail`) and the search pipeline. A message's
@@ -2110,6 +2146,119 @@ The HNSW upgrade is held in reserve for the corpus size where
 brute-force cosine becomes unappealing — Phase 6 ships
 brute-force because the per-conversation `search_vector`
 population is bounded.
+
+### 11.9 ML seams (continued): `WhisperTranscriber` / `DocumentExtractor` / `VideoKeyframeSampler`
+
+Three additional Phase-6 inference seams round out the
+multilingual media-search surface. All three follow the exact
+shape of §11.5 — object-safe `Send + Sync + Debug` traits in
+`crates/core/src/models/`, with a `Noop*` returning
+`Error::NotImplemented` and a `Mock*` returning a deterministic
+BLAKE3-derived result for tests, plus an
+`install_*` / `has_*` pair on `CoreImpl`.
+
+* `models::whisper::WhisperTranscriber` — `fn transcribe(&self,
+  audio_data: &[u8], mime_type: &str) ->
+  Result<TranscriptionResult>` where
+  `TranscriptionResult { text, language: Option<String>,
+  segments: Vec<TranscriptionSegment> }` and
+  `TranscriptionSegment { start_ms, end_ms, text }`.
+  `select_whisper_backend` (Apple MLX
+  `whisper-base-mlx` on Apple Silicon, ONNX Runtime
+  `whisper-base` ~140 MB INT8 elsewhere, `whisper-tiny` ~75 MB
+  on low-end Android) lives next to the trait. Wired into
+  `CoreImpl::send_media`: when `mime_type.starts_with("audio/")`
+  and a transcriber is installed, the result lands in
+  `media_search_index` keyed `(asset_id, "transcript")`.
+  Best-effort.
+* `models::document::DocumentExtractor` — `fn extract_text(&self,
+  data: &[u8], mime_type: &str) -> Result<Vec<DocumentPage>>`
+  where `DocumentPage { page_number, text, language }`. Wired
+  into `CoreImpl::send_media`: when `mime_type` is
+  `application/pdf` or
+  `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+  and an extractor is installed, each page lands in
+  `media_search_index` keyed `(asset_id, "caption")` with
+  `text = "[page {n}] {body}"`. Best-effort.
+* `models::video::VideoKeyframeSampler` — `fn extract_keyframes(&self,
+  video_data: &[u8], mime_type: &str, max_frames: usize) ->
+  Result<Vec<Keyframe>>` where
+  `Keyframe { timestamp_ms, image_data, mime_type }`. Wired
+  into `CoreImpl::send_media`: when `mime_type.starts_with("video/")`
+  and both a sampler and an `ImageEmbedder` are installed, up
+  to five keyframes are extracted; the first frame is embedded
+  through the existing MobileCLIP-S2 seam and the resulting
+  512-dim vector lands in `search_vector` keyed
+  `(message_id, "mobileclip_s2@v1")` so videos participate in
+  the same semantic-search fan-out as still images.
+  Best-effort.
+
+All three paths absorb inference failures (logged, never
+propagated) — the same contract as `maybe_embed_text_message` /
+`maybe_embed_image_message`. `media_search_index` is the
+shared text-search surface for transcripts, document pages, and
+OCR; `search_vector` is the shared vector surface for image and
+video embeddings.
+
+### 11.10 Quantization selection: INT4 vs INT8
+
+`crates/core/src/models/model_manager.rs::select_quantization`
+returns `Quantization::Int4` whenever
+`available_storage_bytes < TIGHT_STORAGE_THRESHOLD_BYTES`
+(512 MiB), else `Quantization::Int8`. `ModelArtifactSpec`
+defines four compile-time constants — `XLMR_INT8_ARTIFACT`,
+`XLMR_INT4_ARTIFACT`, `MOBILECLIP_S2_INT8_ARTIFACT`,
+`MOBILECLIP_S2_INT4_ARTIFACT` — pinning the expected ONNX
+filenames so artifact integrity check + on-disk lookup stay
+deterministic across platform builds.
+`ModelManager::resolve_artifact(model_id, quant)` maps the
+`(model, quantization)` pair to the right `ModelArtifactSpec`
+so `ensure_model` can pick the right file at lazy-download
+time. `embeddings_onnx::create_xlmr_session_int4` and
+`clip::create_mobileclip_session_int4` configure the ONNX
+session with `MatMulNBits` optimization behind
+`#[cfg(feature = "onnx-runtime")]`; without the feature both
+helpers return `Error::NotImplemented`. The
+`INT4`-vs-`INT8` cosine-correlation benchmark using the
+multilingual relevance regression suite is queued for the
+platform-bridge follow-up.
+
+### 11.11 Phase-7 seams: `OfflineDetector` and `PerfCollector`
+
+Two object-safe traits in the Phase-7 layer round out the
+runtime-policy surface. Both follow the §11.5 contract
+(`Send + Sync + Debug`, object-safe, `install_*` / `has_*` on
+`CoreImpl`).
+
+* `transport::offline::OfflineDetector` — `fn is_online(&self)
+  -> bool`. Implementations: `NoopOfflineDetector` (always
+  online — fail-open), `AlwaysOfflineDetector` (always
+  offline, for tests), `ToggleOfflineDetector` (mid-test
+  flip). Wired into `CoreImpl` via
+  `install_offline_detector` / `is_online`.
+  `CoreImpl::run_incremental_backup` short-circuits with
+  `BackupResult.deferred = true` when offline (no segment is
+  built; no upload is attempted) and produces a non-deferred
+  result on the next call once the detector reports online.
+  `CoreImpl::hydrate_message` short-circuits with
+  `HydratedMessage { is_cold: true, offline: true,
+  text_content: None }` when the body is `RemoteArchiveOnly`
+  and the device is offline. Both paths are exercised by
+  `tests/failure_scenarios.rs::offline_during_backup_*` and
+  `tests/failure_scenarios.rs::offline_during_hydration_*`.
+* `perf::PerfCollector` — `fn record(&self, trace: PerfTrace)`.
+  `PerfTrace { operation: String, start_ns: u64, end_ns: u64,
+  metadata: HashMap<String, String> }`. Implementations:
+  `NoopPerfCollector` (discards), `InMemoryPerfCollector`
+  (`Mutex<Vec<PerfTrace>>` for tests). Wired into `CoreImpl`
+  via `install_perf_collector` / `has_perf_collector` /
+  `collect_perf_stats`. Hot paths `ingest_messages`, `search`,
+  and `enforce_storage_budget` emit traces with operation-
+  specific metadata: input batch size + new / duplicate
+  counts; query length + scope + result count; pressure level
+  + freed bytes + evicted count. Every code path — success,
+  error, offline / no-pressure short-circuit — closes the
+  trace before returning.
 
 ---
 

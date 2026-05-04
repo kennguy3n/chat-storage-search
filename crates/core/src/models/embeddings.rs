@@ -47,6 +47,15 @@ pub const XLMR_MODEL_VERSION: &str = "xlmr@v1";
 /// upgrades.
 pub const XLMR_EMBEDDING_DIM: usize = 384;
 
+/// Canonical on-disk filename for the INT8 XLM-R artifact.
+/// Phase 6, Task 5 (2026-05-04 batch).
+pub const XLMR_INT8_FILENAME: &str = "xlmr-v1-int8.onnx";
+
+/// Canonical on-disk filename for the INT4 (`MatMulNBits`)
+/// XLM-R artifact shipped to tight-storage devices. Phase 6,
+/// Task 5 (2026-05-04 batch).
+pub const XLMR_INT4_FILENAME: &str = "xlmr-v1-int4.onnx";
+
 // ---------------------------------------------------------------------------
 // EmbeddingCache trait
 // ---------------------------------------------------------------------------

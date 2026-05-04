@@ -49,6 +49,7 @@ pub mod media;
 pub mod message;
 pub mod models;
 pub mod offload;
+pub mod perf;
 pub mod restore;
 pub mod scheduler;
 pub mod search;
@@ -207,6 +208,14 @@ pub struct SearchResult {
     /// (`is_cold = true`) or from the local store
     /// (`is_cold = false`).
     pub is_cold: bool,
+    /// Raw cosine similarity between the query embedding and the
+    /// row's stored embedding, when this hit went through the
+    /// semantic-search engine. `None` for pure FTS / fuzzy hits.
+    /// Phase 6, Task 4 (2026-05-04 batch). The reranker
+    /// ([`crate::search::query_engine::QueryEngine::rerank_with_semantic`])
+    /// reads this field for ordering decisions.
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
 }
 
 /// Why the rehydration / restore path is loading a body or media
@@ -312,6 +321,15 @@ pub struct HydratedMessage {
     /// queued; the renderer should display the skeleton in a cold
     /// state until the archive fetch lands.
     pub is_cold: bool,
+    /// `true` when the hydration request was answered while the
+    /// device was offline — the body is not available locally,
+    /// the archive fetch was skipped because the
+    /// [`crate::transport::offline::OfflineDetector`] reported
+    /// offline, and the renderer should display an offline cold
+    /// state until reconnection retriggers hydration. Phase 7,
+    /// Task 6 (2026-05-04 batch).
+    #[serde(default)]
+    pub offline: bool,
 }
 
 /// Result of [`KChatCore::send_media`].
@@ -363,6 +381,14 @@ pub struct BackupResult {
     /// through the configured transport.
     #[serde(default)]
     pub manifest_uploaded: bool,
+    /// `true` when the run was deferred because the device was
+    /// offline at the time
+    /// [`KChatCore::run_incremental_backup`] was called. The
+    /// segments (if any) were sealed locally; the upload step
+    /// was skipped and is expected to retry on reconnection.
+    /// Phase 7, Task 6 (2026-05-04 batch).
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// Result of [`KChatCore::enforce_storage_budget`].
@@ -690,6 +716,7 @@ mod tests {
             snippet: Some("hello".into()),
             rank_score: 0.875,
             is_cold: false,
+            semantic_score: Some(0.4),
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: SearchResult = serde_json::from_str(&json).unwrap();
