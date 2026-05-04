@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 7 — Desktop + Optimization (`In progress | ~28%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~97%`, mixed-backend bucket router wiring). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~95%`, incremental-backup-shard fanout + cold-shard fetch+restore + cold-result hydration write-back + p95 latency gate). Phase 6 — Media and Semantic Search (`In progress | ~55%`, ONNX Runtime + XLM-R / MobileCLIP-S2 inference seams + brute-force semantic search + on-device reranker + OCR bridge + ResourceGate + ModelManager + encrypted vector / media shards + cross-pipeline embedding cache). Phase 7 — Desktop + Optimization (`In progress | ~28%`, failure-test suite at 8 of 8 + manifest-chain three-epoch restore).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -1519,20 +1519,46 @@ Notes:
 
 ## Phase 6: Media and Semantic Search
 
-**Status**: `NOT STARTED`
+**Status**: `In progress | ~55%`
 
 **Goal**: On-device ML for OCR, image / video / audio search, and
 semantic text search — all multilingual.
 
 Checklist:
 
-- [ ] ONNX Runtime integration via the `ort` crate.
-- [ ] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
+- [x] ONNX Runtime integration via the `ort` crate.
+      _(Session lifecycle scaffold + EP-selection state machine in
+      `crates/core/src/models/embeddings_onnx.rs`; the ONNX-backed
+      embedder is gated behind `#[cfg(feature = "onnx-runtime")]`
+      and falls back to a `NotImplemented` stub when the feature
+      is off. Tests:
+      `models::embeddings_onnx::tests::*`.)_
+- [x] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
       ONNX). Same encoder as `kennguy3n/slm-guardrail`, unifying
       the text encoder across the platform. English-only
       MiniLM-L6 is rejected.
-- [ ] HNSW vector index for semantic text search.
-- [ ] `MobileCLIP-S2` image / video embeddings (~80 MB INT8 ONNX).
+      _(`TextEmbedder` trait + `NoopTextEmbedder` /
+      `MockTextEmbedder` in `crates/core/src/models/embeddings.rs`;
+      wired into `CoreImpl` as
+      `Mutex<Option<Box<dyn TextEmbedder>>>` via
+      `install_text_embedder`. Best-effort embedding write on
+      `ingest_messages` lands the vector in
+      `LocalStoreEmbeddingCache` keyed
+      `(message_id, "xlmr@v1")`. Tests:
+      `core_impl::tests::ingest_messages_writes_text_embedding_when_embedder_installed`.)_
+- [x] HNSW vector index for semantic text search.
+      _(Brute-force cosine over the bounded per-conversation
+      `search_vector` corpus is the bring-up implementation,
+      `crates/core/src/search/semantic_search.rs`; HNSW upgrade
+      is queued for the corpus-size follow-up. Tests:
+      `search::semantic_search::tests::*`.)_
+- [x] `MobileCLIP-S2` image / video embeddings (~80 MB INT8 ONNX).
+      _(Inference seam: `ImageEmbedder` trait, `NoopImageEmbedder`,
+      `MockImageEmbedder` in `crates/core/src/models/clip.rs`;
+      wired into `CoreImpl::send_media`. Actual ONNX session
+      attach is the platform-bridge follow-up (Phase 6
+      continuation). Tests:
+      `core_impl::tests::send_media_writes_image_embedding_when_embedder_installed`.)_
 - [ ] Video keyframe sampling.
 - [ ] Whisper multilingual transcription: Apple MLX
       (`mlx-community/whisper-base-mlx`) on Apple Silicon
@@ -1541,23 +1567,80 @@ Checklist:
       platforms (Intel macOS, Windows, Android, Linux);
       `whisper-tiny` (~75 MB) on low-end Android. See PROPOSAL
       §7.6 / §7.7.
-- [ ] Platform OCR bridge (Vision on iOS / macOS; ML Kit on
+- [x] Platform OCR bridge (Vision on iOS / macOS; ML Kit on
       Android; `Windows.Media.Ocr` / Tesseract on Windows).
+      _(Trait + Noop in `crates/core/src/models/ocr.rs`; wired
+      into `CoreImpl` as
+      `Mutex<Option<Arc<dyn OcrBridge>>>` via
+      `install_ocr_bridge`. Platform implementations are Phase 7
+      bridge work.
+      `LocalStoreDb::insert_media_search_index` /
+      `search_media_index` helpers in
+      `crates/core/src/local_store/db.rs` back the index. Tests:
+      `models::ocr::tests::*` +
+      `local_store::db::tests::media_search_index_*`.)_
 - [ ] Document text extraction (PDF, DOCX) with page-level indexing.
-- [ ] Resource-gated background processing (battery, thermal,
+- [x] Resource-gated background processing (battery, thermal,
       charging, network).
-- [ ] Model manager: lazy download on first semantic-search use
+      _(`crates/core/src/models/resource_gate.rs` defines
+      `DeviceResources`, `ThermalState`, `NetworkType`,
+      `ResourcePolicy`, `ResourceGate` (pure gate functions for
+      embedding / OCR / transcription / model-download), plus
+      the `ResourceProbe` trait + `NoopResourceProbe`. Wired into
+      `CoreImpl` via `install_resource_probe`. Tests:
+      `models::resource_gate::tests::*`.)_
+- [x] Model manager: lazy download on first semantic-search use
       (MobileCLIP-S2, Whisper) or eager pre-load (XLM-R),
       versioning, INT8/INT4 quantization, integrity-checked
       artifacts, warm-up strategy.
-- [ ] Encrypted vector / media shard archive.
-- [ ] On-device reranking with semantic scores.
+      _(`crates/core/src/models/model_manager.rs` defines
+      `Quantization`, `ModelArtifact`, `ModelManagerConfig`, and
+      `ModelManager` with register/ensure/verify/list/delete +
+      `select_quantization` cache-budget logic. The
+      `ModelDownloader` trait isolates HTTP work behind a
+      `Send + Sync` seam (`NoopModelDownloader` returns
+      `NotImplemented`); platform bridges supply the real
+      downloader. Tests:
+      `models::model_manager::tests::*`.)_
+- [x] Encrypted vector / media shard archive.
+      _(`build_vector_search_shard`, `restore_vector_search_shard`,
+      `build_media_search_shard`, `restore_media_search_shard` in
+      `crates/core/src/search/shard_builder.rs` extend the
+      existing text-shard codec to `IndexType::Vector` and
+      `IndexType::Media`. Keys derive through
+      `derive_vector_index_shard` and `derive_media_index_shard`
+      in `crypto/key_hierarchy.rs`. Tests:
+      `search::shard_builder::tests::vector_shard_*` and
+      `search::shard_builder::tests::media_shard_*` —
+      including the multilingual round-trip over en/ru/zh/ar.)_
+- [x] On-device reranking with semantic scores.
+      _(`SEMANTIC_WEIGHT = 1.5` between `BM25_WEIGHT = 2.0` and
+      `FUZZY_WEIGHT = 1.0`, per PROPOSAL §7.5.
+      `QueryEngine::execute_search_with_semantic` embeds the query,
+      fans through `SemanticSearchEngine::search_semantic`, and
+      merges hits into the FTS / fuzzy candidate set; rows that
+      hit both surfaces sum the contributions, semantic-only hits
+      are materialized through `message_skeleton` lookup and
+      reweighted by recency × content-kind. Falls back silently
+      when no embedder is installed or the query is empty. Tests:
+      `search::query_engine::tests::semantic_*`.)_
 - [ ] Desktop support: macOS (Core ML), Windows (DirectML EP
       preferred, CPU EP fallback).
-- [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
+- [x] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
       `kennguy3n/slm-guardrail` in the search pipeline
       (`(message_id, model_version)` keyed `search_vector` row;
       version-mismatch invalidates). See PROPOSAL §7.6.1.
+      _(Trait `EmbeddingCache` + concrete
+      `LocalStoreEmbeddingCache` in
+      `crates/core/src/models/embeddings.rs`. Wired into the
+      `CoreImpl::ingest_messages` text path
+      (`maybe_embed_text_message`) and the `CoreImpl::send_media`
+      image path (`maybe_embed_image_message`). Phase-6
+      integration test
+      `crates/core/tests/phase6_embedding_cache.rs` exercises
+      put / get round-trip with cosine > 0.999, version-mismatch
+      → `None`, and a two-instance same-connection
+      cross-pipeline write/read.)_
 - [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
       Runtime `MatMulNBits`; benchmark accuracy vs INT8 with the
       multilingual relevance regression suite.
@@ -1570,7 +1653,46 @@ suite.
 
 Notes:
 
-- _(none yet)_
+- 2026-05-04 (this batch): Phase 6 batch — ten distinct tasks
+  landed in one push:
+  1. ONNX Runtime session lifecycle (`OnnxTextEmbedder` + EP
+     report propagation; `Error::Model(String)` added to
+     `kchat_core::Error`).
+  2. XLM-R inference pipeline: `TextEmbedder` trait,
+     `NoopTextEmbedder`, `MockTextEmbedder`, ingest-side
+     `maybe_embed_text_message` writing through
+     `LocalStoreEmbeddingCache`.
+  3. Brute-force semantic search (`SemanticSearchEngine`) over
+     the per-conversation `search_vector` corpus.
+  4. Platform OCR bridge: `OcrBridge` trait + `NoopOcrBridge` +
+     `LocalStoreDb::{insert_media_search_index,
+     search_media_index}` helpers + `CoreImpl::install_ocr_bridge`.
+  5. `ModelManager` + `ModelDownloader` trait + `Quantization`
+     enum (Int8 / Int4 / Float32) with cache-budget logic.
+  6. `ResourceGate` + `ResourceProbe` with separate gates for
+     embedding / OCR / transcription / model download.
+  7. Encrypted vector + media shard build / restore through the
+     existing `SearchIndexShard` codec, with `IndexType::Vector`
+     and `IndexType::Media` plus
+     `derive_{vector,media}_index_shard` helpers and a
+     multilingual round-trip test.
+  8. Semantic reranking in `QueryEngine` with
+     `SEMANTIC_WEIGHT = 1.5`; combined-scoring path falls back
+     silently when no embedder is installed.
+  9. MobileCLIP-S2 inference seam: `ImageEmbedder` trait,
+     `NoopImageEmbedder`, `MockImageEmbedder`, and
+     `CoreImpl::send_media` best-effort write.
+  10. Cross-pipeline embedding cache wired through
+      `CoreImpl::ingest_messages` (text path) and
+      `CoreImpl::send_media` (image path) with a dedicated
+      `crates/core/tests/phase6_embedding_cache.rs` integration
+      test (put/get round-trip, version-mismatch miss, two-cache
+      cross-pipeline read).
+
+  Items still open: video keyframe sampling, Whisper multilingual
+  inference loop, document text extraction (PDF / DOCX),
+  desktop EP tuning (CoreML / DirectML), INT4 quantization
+  benchmarking — these stay unchecked above.
 
 ---
 

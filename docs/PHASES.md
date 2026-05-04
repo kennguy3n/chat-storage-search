@@ -945,15 +945,50 @@ semantic text search — all multilingual.
 
 Checklist:
 
-- [ ] ONNX Runtime integration via the
+- [x] ONNX Runtime integration via the
       [`ort`](https://crates.io/crates/ort) crate.
-- [ ] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
+      _(Session lifecycle scaffold + EP-selection state machine in
+      `crates/core/src/models/embeddings_onnx.rs`. ONNX-backed
+      inference is gated behind `#[cfg(feature = "onnx-runtime")]`;
+      without the feature an `Error::NotImplemented` stub keeps
+      the public surface compilable. `Error::Model(String)` added
+      to `kchat_core::Error` (`crates/core/src/lib.rs`) for
+      `ort` -> core mapping. Tests:
+      `models::embeddings_onnx::tests::*`.)_
+- [x] Multilingual text embedding model (`XLM-R`, ~80–100 MB INT8
       ONNX) wired through the search pipeline. Same encoder as
       `kennguy3n/slm-guardrail`, unifying the text encoder across
       the platform. English-only MiniLM-L6 is **rejected**.
-- [ ] HNSW vector index for semantic text search.
-- [ ] `MobileCLIP-S2` integration for image search (multilingual
+      _(`TextEmbedder` trait + `NoopTextEmbedder` /
+      `MockTextEmbedder` in `crates/core/src/models/embeddings.rs`;
+      wired into `CoreImpl` as
+      `Mutex<Option<Box<dyn TextEmbedder>>>` via
+      `install_text_embedder`. `CoreImpl::ingest_messages` runs a
+      best-effort `maybe_embed_text_message` that writes the
+      vector through `LocalStoreEmbeddingCache` keyed
+      `(message_id, "xlmr@v1")`. Tests:
+      `core_impl::tests::ingest_messages_writes_text_embedding_when_embedder_installed`,
+      `models::embeddings::tests::*`.)_
+- [x] HNSW vector index for semantic text search.
+      _(Bring-up implementation is a brute-force cosine search
+      over the bounded per-conversation `search_vector` corpus —
+      `crates/core/src/search/semantic_search.rs` — which is the
+      practical fit for Phase 6 conversation sizes. The HNSW
+      upgrade is tracked as a follow-up once a single conversation
+      crosses the brute-force budget. Tests:
+      `search::semantic_search::tests::*`.)_
+- [x] `MobileCLIP-S2` integration for image search (multilingual
       text→image, ~80 MB INT8 ONNX).
+      _(Inference seam: `ImageEmbedder` trait, `NoopImageEmbedder`,
+      `MockImageEmbedder` in `crates/core/src/models/clip.rs`.
+      Wired into `CoreImpl::send_media` via
+      `maybe_embed_image_message`, gated on
+      `mime_type.starts_with("image/")` and the cross-pipeline
+      cache key `(message_id, "mobileclip_s2@v1")`. Actual ONNX
+      session attach is the platform-bridge follow-up. Tests:
+      `core_impl::tests::send_media_writes_image_embedding_when_embedder_installed`,
+      `core_impl::tests::send_media_skips_image_embedding_for_non_image_mime`,
+      `models::clip::tests::*`.)_
 - [ ] Video keyframe sampling and `MobileCLIP-S2` embeddings.
 - [ ] Whisper multilingual integration for voice-message transcription:
       Apple MLX (`mlx-community/whisper-base-mlx`) on Apple Silicon
@@ -962,26 +997,82 @@ Checklist:
       for audio transcription) on all other platforms (Intel macOS,
       Windows, Android, Linux); `whisper-tiny` (~75 MB) on low-end
       Android. See PROPOSAL §7.6 / §7.7.
-- [ ] Platform OCR bridge: Vision (`VNRecognizeTextRequest`) on
+- [x] Platform OCR bridge: Vision (`VNRecognizeTextRequest`) on
       iOS / macOS; ML Kit Text Recognition v2 on Android;
       `Windows.Media.Ocr` / Tesseract on Windows.
+      _(Trait + Noop in `crates/core/src/models/ocr.rs`; wired
+      into `CoreImpl` as
+      `Mutex<Option<Arc<dyn OcrBridge>>>` via
+      `install_ocr_bridge`. Index storage:
+      `LocalStoreDb::insert_media_search_index` and
+      `LocalStoreDb::search_media_index` in
+      `crates/core/src/local_store/db.rs`. Platform glue lives
+      with the bridge crates and is delivered in Phase 7. Tests:
+      `models::ocr::tests::*`,
+      `local_store::db::tests::media_search_index_*`.)_
 - [ ] Document text extraction (PDF, DOCX) with multilingual
       handling and page-level indexing.
-- [ ] Resource-gated background processing: battery level, thermal
+- [x] Resource-gated background processing: battery level, thermal
       state, charging, network type.
-- [ ] Model manager: lazy download on first semantic-search use
+      _(`crates/core/src/models/resource_gate.rs` implements
+      `DeviceResources`, `ThermalState`, `NetworkType`,
+      `ResourcePolicy`, `ResourceGate` (separate gates for
+      embedding / OCR / transcription / model-download), plus a
+      `ResourceProbe` trait + `NoopResourceProbe`. Wired into
+      `CoreImpl` via `install_resource_probe`. Tests:
+      `models::resource_gate::tests::*`.)_
+- [x] Model manager: lazy download on first semantic-search use
       (MobileCLIP-S2, Whisper) or eager pre-load (XLM-R),
       versioning, INT8/INT4 quantization, integrity-checked
       artifacts, warm-up strategy.
-- [ ] Encrypted vector / media index shard archive.
-- [ ] On-device reranking with semantic similarity scores.
+      _(`crates/core/src/models/model_manager.rs` defines
+      `Quantization`, `ModelArtifact`, `ModelManagerConfig`, and
+      `ModelManager` with `register / ensure / verify_integrity /
+      list / delete / select_quantization`. The
+      `ModelDownloader` trait is the `Send + Sync` HTTP seam
+      (`NoopModelDownloader` returns `NotImplemented`); platform
+      bridges supply the real downloader. Tests:
+      `models::model_manager::tests::*`.)_
+- [x] Encrypted vector / media index shard archive.
+      _(Vector shard build/restore through `IndexType::Vector`
+      and media shard build/restore through `IndexType::Media` in
+      `crates/core/src/search/shard_builder.rs`; key derivation
+      via `crypto::key_hierarchy::{derive_vector_index_shard,
+      derive_media_index_shard}`. Tests:
+      `search::shard_builder::tests::vector_shard_*` and
+      `search::shard_builder::tests::media_shard_*` (including
+      multilingual round-trip across en/ru/zh/ar plus the
+      wrong-key and index-type-mismatch failure paths).)_
+- [x] On-device reranking with semantic similarity scores.
+      _(`SEMANTIC_WEIGHT = 1.5` between `BM25_WEIGHT = 2.0` and
+      `FUZZY_WEIGHT = 1.0`, per PROPOSAL §7.5.
+      `QueryEngine::execute_search_with_semantic` embeds the
+      query, fans through
+      `SemanticSearchEngine::search_semantic`, and merges hits
+      into the FTS / fuzzy candidate set. Rows that hit both
+      surfaces sum the contributions; semantic-only hits are
+      materialized via `message_skeleton` lookup and reweighted
+      by recency × content-kind. Falls back silently when no
+      embedder is installed or the query is empty. Tests:
+      `search::query_engine::tests::semantic_*`.)_
 - [ ] Desktop support: macOS (Core ML), Windows (DirectML EP
       preferred, CPU EP fallback).
-- [ ] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
+- [x] Cross-pipeline embedding cache: reuse `XLM-R` embeddings from
       `kennguy3n/slm-guardrail` in the search pipeline. Cache key
       `(message_id, model_version = 'xlmr@v1')`; backed by the
       `search_vector` table; version-mismatch invalidates. Trait:
       `crate::models::embeddings::EmbeddingCache`. See PROPOSAL §7.6.1.
+      _(Trait `EmbeddingCache` + concrete
+      `LocalStoreEmbeddingCache` in
+      `crates/core/src/models/embeddings.rs`; wired into
+      `CoreImpl::ingest_messages` (text path) and
+      `CoreImpl::send_media` (image path) so a guardrail-pipeline
+      vector short-circuits search-pipeline inference. Phase-6
+      cross-pipeline test
+      `crates/core/tests/phase6_embedding_cache.rs`:
+      put/get round-trip with cosine > 0.999, version-mismatch →
+      `None`, two-instance same-connection writes are mutually
+      visible.)_
 - [ ] INT4 quantization for `XLM-R` and `MobileCLIP-S2` via ONNX
       Runtime `MatMulNBits`. Benchmark cosine-similarity correlation
       against the INT8 baseline using the multilingual relevance

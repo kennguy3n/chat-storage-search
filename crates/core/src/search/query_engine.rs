@@ -70,6 +70,15 @@ pub(crate) const BM25_WEIGHT: f64 = 2.0;
 /// (`docs/PROPOSAL.md §7.5`).
 pub(crate) const FUZZY_WEIGHT: f64 = 1.0;
 
+/// Semantic / cosine-similarity contribution weight in the merged
+/// rank score (`docs/PROPOSAL.md §7.5`). Sits between BM25 (`2.0`)
+/// and fuzzy (`1.0`) so the on-device reranker leans on
+/// surface-form matches when both signals are available, but
+/// still surfaces semantic-only hits when FTS misses.
+///
+/// Phase 6, Task 8.
+pub(crate) const SEMANTIC_WEIGHT: f64 = 1.5;
+
 /// Recency-decay weight in the merged rank score
 /// (`docs/PROPOSAL.md §7.5` — `recency_boost`).
 pub(crate) const RECENCY_WEIGHT: f64 = 0.5;
@@ -86,6 +95,16 @@ pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 pub(crate) const TEXT_KIND_WEIGHT: f64 = 1.0;
 /// See [`TEXT_KIND_WEIGHT`].
 pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
+
+/// Skeleton-row projection used by
+/// [`QueryEngine::execute_search_with_semantic`] to materialize
+/// semantic-only hits.
+#[derive(Debug, Clone)]
+struct SemanticSkeletonInfo {
+    conversation_id: String,
+    sender_id: String,
+    created_at_ms: i64,
+}
 
 /// Source of decrypted search-shard rows for cold
 /// (`body_state = 'remote_archive_only'`) buckets.
@@ -492,6 +511,181 @@ impl<'a> QueryEngine<'a> {
             }
         }
         Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Semantic reranking (Phase 6, Task 8)
+    // ----------------------------------------------------------------
+
+    /// Run a unified search and merge in cosine-similarity hits
+    /// from the on-device `search_vector` table.
+    ///
+    /// `text_embedder` is the [`TextEmbedder`] previously
+    /// installed via
+    /// [`crate::core_impl::CoreImpl::install_text_embedder`].
+    /// When `text_embedder.embed` succeeds, the engine fans the
+    /// query embedding through
+    /// [`crate::search::semantic_search::SemanticSearchEngine`]
+    /// and merges the hits into the FTS / fuzzy candidate set:
+    ///
+    /// * Rows that already had an FTS or fuzzy hit have
+    ///   `cosine * SEMANTIC_WEIGHT` added to `rank_score`.
+    /// * Rows that **only** appear via semantic search are added
+    ///   to the result set with `rank_score =
+    ///   cosine * SEMANTIC_WEIGHT * recency_factor *
+    ///   kind_weight` (the existing recency-and-kind multiplier
+    ///   is applied so semantic-only hits don't outrank a strong
+    ///   FTS hit on a stale message).
+    ///
+    /// When `text_embedder.embed` fails (or the query is
+    /// empty / `embed` returns
+    /// [`crate::Error::NotImplemented`]), the engine falls back
+    /// to the FTS-only path.
+    ///
+    /// `model_version` defaults to
+    /// [`crate::models::embeddings::XLMR_MODEL_VERSION`] when
+    /// `None` is passed.
+    pub fn execute_search_with_semantic(
+        &self,
+        query: &SearchQuery,
+        scope: &SearchScope,
+        text_embedder: &dyn crate::models::embeddings::TextEmbedder,
+        model_version: Option<&str>,
+        limit: usize,
+    ) -> DbResult<Vec<SearchResult>> {
+        let mut local = self.execute_search_with_limit(query, scope, limit)?;
+        let trimmed = query.query_string.trim();
+        if trimmed.is_empty() {
+            return Ok(local);
+        }
+        // Embed the query. If the embedder is a Noop / failure,
+        // fall back to the FTS-only path silently.
+        let q_emb = match text_embedder.embed(trimmed) {
+            Ok(v) => v,
+            Err(_) => return Ok(local),
+        };
+        let mv = model_version.unwrap_or(crate::models::embeddings::XLMR_MODEL_VERSION);
+        let conn = self.db.connection();
+        let semantic = crate::search::semantic_search::SemanticSearchEngine::new(conn);
+        let conv_filter_str = query.conversation_filter.map(|c| c.to_string());
+        let hits = match semantic.search_semantic(
+            &q_emb,
+            conv_filter_str.as_deref(),
+            limit.max(1),
+            Some(mv),
+        ) {
+            Ok(h) => h,
+            Err(_) => return Ok(local),
+        };
+        if hits.is_empty() {
+            return Ok(local);
+        }
+
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        for (idx, r) in local.iter().enumerate() {
+            by_id.insert(r.message_id.to_string(), idx);
+        }
+
+        // Bulk-fetch skeleton metadata for any semantic-only hit
+        // we'll need to materialize as a fresh SearchResult.
+        let new_ids: Vec<String> = hits
+            .iter()
+            .filter(|h| !by_id.contains_key(&h.message_id))
+            .map(|h| h.message_id.clone())
+            .collect();
+        let new_skeletons = if !new_ids.is_empty() {
+            self.fetch_skeleton_columns_for_semantic(&new_ids)?
+        } else {
+            HashMap::new()
+        };
+
+        for hit in hits {
+            let semantic_contribution = (hit.similarity as f64) * SEMANTIC_WEIGHT;
+            if let Some(&idx) = by_id.get(&hit.message_id) {
+                local[idx].rank_score += semantic_contribution;
+                continue;
+            }
+            // Semantic-only hit: build a fresh SearchResult.
+            let Some(meta) = new_skeletons.get(&hit.message_id) else {
+                continue;
+            };
+            let Ok(message_uuid) = Uuid::parse_str(&hit.message_id) else {
+                continue;
+            };
+            let Ok(conv_uuid) = Uuid::parse_str(&meta.conversation_id) else {
+                continue;
+            };
+            let mut sr = SearchResult {
+                message_id: message_uuid,
+                conversation_id: conv_uuid,
+                sender_id: meta.sender_id.clone(),
+                created_at_ms: meta.created_at_ms,
+                rank_score: semantic_contribution,
+                is_cold: false,
+                snippet: None,
+            };
+            // Reapply recency × content-kind to the fresh row.
+            // The bulk path already ran for FTS/fuzzy hits, so
+            // applying it here gives semantic-only hits the same
+            // treatment.
+            self.apply_recency_and_kind_weight(std::slice::from_mut(&mut sr))?;
+            local.push(sr);
+        }
+        // Re-sort: descending rank_score, then created_at DESC,
+        // then message_id for determinism.
+        local.sort_by(|a, b| {
+            b.rank_score
+                .partial_cmp(&a.rank_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at_ms.cmp(&a.created_at_ms))
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        local.truncate(limit);
+        Ok(local)
+    }
+
+    fn fetch_skeleton_columns_for_semantic(
+        &self,
+        ids: &[String],
+    ) -> DbResult<HashMap<String, SemanticSkeletonInfo>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id, conversation_id, sender_id, created_at_ms
+               FROM message_skeleton
+              WHERE message_id IN ({placeholders})"
+        );
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
+        for id in ids {
+            binds.push(Value::Text(id.clone()));
+        }
+        let mut out: HashMap<String, SemanticSkeletonInfo> = HashMap::new();
+        for r in stmt.query_map(params_from_iter(binds.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (mid, conv, sender, ts) = r?;
+            out.insert(
+                mid,
+                SemanticSkeletonInfo {
+                    conversation_id: conv,
+                    sender_id: sender,
+                    created_at_ms: ts,
+                },
+            );
+        }
+        Ok(out)
     }
 
     // ----------------------------------------------------------------
@@ -2032,6 +2226,150 @@ mod tests {
         assert!(
             pos_text < pos_media,
             "text outranks media at equal recency / equal FTS hit",
+        );
+    }
+
+    // ----- Phase 6, Task 8: semantic reranking ----------------------
+
+    use crate::models::embeddings::{
+        EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, NoopTextEmbedder, TextEmbedder,
+        XLMR_MODEL_VERSION,
+    };
+
+    #[test]
+    fn semantic_weight_constant_matches_proposal() {
+        // PROPOSAL §7.5 ranking formula constants. Kept as
+        // runtime asserts (rather than `const { … }` blocks) so a
+        // future tweak to the constants surfaces as a normal
+        // test failure with a useful diff.
+        let bm25: f64 = BM25_WEIGHT;
+        let fuzzy: f64 = FUZZY_WEIGHT;
+        let semantic: f64 = SEMANTIC_WEIGHT;
+        assert!((bm25 - 2.0).abs() < f64::EPSILON);
+        assert!((fuzzy - 1.0).abs() < f64::EPSILON);
+        assert!((semantic - 1.5).abs() < f64::EPSILON);
+        assert!(semantic > fuzzy);
+        assert!(semantic < bm25);
+    }
+
+    #[test]
+    fn semantic_reranker_falls_back_when_embedder_is_noop() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello".into(),
+            ..Default::default()
+        };
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let noop = NoopTextEmbedder;
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &noop, None, 200)
+            .unwrap();
+        let plain_ids: Vec<Uuid> = plain.iter().map(|r| r.message_id).collect();
+        let semantic_ids: Vec<Uuid> = with_semantic.iter().map(|r| r.message_id).collect();
+        assert_eq!(plain_ids, semantic_ids);
+    }
+
+    #[test]
+    fn semantic_reranker_short_circuits_on_empty_query() {
+        let db = populated_db();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery::default();
+        let mock = MockTextEmbedder::default();
+        let res = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 10)
+            .unwrap();
+        // Same as the plain-FTS empty-query path: structured-only.
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        assert_eq!(res.len(), plain.len());
+    }
+
+    #[test]
+    fn semantic_reranker_surfaces_semantic_only_hits() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        // Pick the message that the mock encoder will rank highest
+        // for the query "good morning team": the message itself.
+        // Insert a vector for that message into search_vector.
+        let conn = db.connection();
+        let target_text = "good morning team";
+        let target_msg_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = ?1 LIMIT 1",
+                rusqlite::params![target_text],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_msg_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed(target_text).unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        // Query that misses on FTS but matches semantically — use
+        // the same mock embedding so cosine ~ 1.0.
+        let q = SearchQuery {
+            query_string: target_text.into(),
+            ..Default::default()
+        };
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+        let target_uuid = Uuid::parse_str(&target_msg_id).unwrap();
+        assert!(with_semantic.iter().any(|r| r.message_id == target_uuid));
+    }
+
+    #[test]
+    fn semantic_reranker_combines_scores_for_dual_hits() {
+        let db = populated_db();
+        let mock = MockTextEmbedder::default();
+        let conn = db.connection();
+        // Pick a message whose text contains "hello".
+        let target_msg_id: String = conn
+            .query_row(
+                "SELECT m.message_id FROM message_skeleton m
+                 JOIN message_body b ON b.message_id = m.message_id
+                 WHERE b.text_content = 'hello world' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let cache = LocalStoreEmbeddingCache::new(conn);
+        cache
+            .put(
+                &target_msg_id,
+                XLMR_MODEL_VERSION,
+                &mock.embed("hello world").unwrap(),
+            )
+            .unwrap();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "hello world".into(),
+            ..Default::default()
+        };
+        let plain = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+        let target_uuid = Uuid::parse_str(&target_msg_id).unwrap();
+        let plain_score = plain
+            .iter()
+            .find(|r| r.message_id == target_uuid)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+        let merged_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == target_uuid)
+            .map(|r| r.rank_score)
+            .unwrap_or(0.0);
+        assert!(
+            merged_score > plain_score,
+            "semantic contribution should raise the dual-hit row's rank ({merged_score} vs {plain_score})",
         );
     }
 }

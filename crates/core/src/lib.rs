@@ -99,6 +99,14 @@ pub enum Error {
     #[error("transport: {0}")]
     Transport(String),
 
+    /// An on-device ML model call failed (ONNX Runtime session
+    /// create / inference, tokenizer, image decode, …). Phase 6 —
+    /// `docs/PROPOSAL.md §7.6 / §7.7`. Wraps the upstream `ort` /
+    /// tokenizer / image-codec error message verbatim so callers
+    /// can surface it in telemetry without parsing free-form text.
+    #[error("model: {0}")]
+    Model(String),
+
     /// The requested API is part of the public trait surface but its
     /// implementation has not landed yet. The string is the method
     /// name (e.g. `"send_media"`) so callers can pattern-match on
@@ -743,6 +751,8 @@ mod tests {
         assert!(format!("{e}").contains("message:"));
         let e = Error::Transport("t".into());
         assert!(format!("{e}").contains("transport:"));
+        let e = Error::Model("xlmr".into());
+        assert!(format!("{e}").contains("model: xlmr"));
         let e = Error::NotImplemented("send_media");
         assert!(format!("{e}").contains("not yet implemented: send_media"));
     }

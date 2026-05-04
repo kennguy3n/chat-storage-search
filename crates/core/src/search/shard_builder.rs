@@ -80,6 +80,47 @@ pub struct FuzzyRow {
     pub message_id: String,
 }
 
+/// One row of `search_vector` ready to seal into a vector
+/// shard. Phase 6, Task 7.
+///
+/// `embedding` is the raw INT8-quantized blob — *not* the
+/// dequantized `Vec<f32>`. Keeping the wire format identical to
+/// the on-device cache layout means restore is a straight
+/// byte-for-byte INSERT into `search_vector`; the dequantize +
+/// re-quantize round trip would amplify the i8 boundary error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorRow {
+    /// Message identifier this embedding belongs to.
+    pub message_id: String,
+    /// INT8-quantized embedding blob (`[scale: f32 LE, 4
+    /// bytes][q: i8, dim bytes]` — see
+    /// [`crate::models::embeddings::LocalStoreEmbeddingCache`]
+    /// for the codec).
+    #[serde(with = "serde_bytes")]
+    pub embedding: Vec<u8>,
+    /// Encoder revision tag (`"xlmr@v1"`,
+    /// `"mobileclip_s2@v1"`, …). Carried verbatim so the
+    /// restore path can preserve the cross-pipeline cache
+    /// version-mismatch invariant.
+    pub model_version: String,
+}
+
+/// One row of `media_search_index` ready to seal into a media
+/// shard. Phase 6, Task 7.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaIndexRow {
+    /// `media_asset.asset_id` for the row.
+    pub asset_id: String,
+    /// `'ocr' | 'caption' | 'transcript' | 'tag'`.
+    pub kind: String,
+    /// Recognized text.
+    pub text: String,
+    /// BCP-47 language tag, when the recognizer reported one.
+    pub language: Option<String>,
+    /// Per-row confidence, when the recognizer reported one.
+    pub confidence: Option<f32>,
+}
+
 // ---------------------------------------------------------------------------
 // Payload shapes (CBOR-sealed inside the shard ciphertext)
 // ---------------------------------------------------------------------------
@@ -89,6 +130,17 @@ pub const TEXT_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_TEXT_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`FuzzyShardPayload`].
 pub const FUZZY_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_FUZZY_SHARD_PAYLOAD_V1";
+
+/// Domain-separation magic for [`VectorShardPayload`].
+///
+/// Phase 6, Task 7. Distinct from the text / fuzzy magics so a
+/// malicious sealer cannot retag a vector shard as text (and
+/// vice-versa) — the restore path checks the magic against the
+/// expected discriminator before deserializing.
+pub const VECTOR_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_VECTOR_SHARD_PAYLOAD_V1";
+
+/// Domain-separation magic for [`MediaShardPayload`].
+pub const MEDIA_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_MEDIA_SHARD_PAYLOAD_V1";
 
 /// CBOR-sealed plaintext of a text [`SearchIndexShard`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +160,28 @@ pub struct FuzzyShardPayload {
     pub magic: Vec<u8>,
     /// Fuzzy n-gram rows packed in this shard.
     pub rows: Vec<FuzzyRow>,
+}
+
+/// CBOR-sealed plaintext of a vector [`SearchIndexShard`]
+/// (Phase 6, Task 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorShardPayload {
+    /// Always [`VECTOR_SHARD_PAYLOAD_MAGIC`].
+    #[serde(with = "serde_bytes")]
+    pub magic: Vec<u8>,
+    /// `search_vector` rows packed in this shard.
+    pub rows: Vec<VectorRow>,
+}
+
+/// CBOR-sealed plaintext of a media [`SearchIndexShard`]
+/// (Phase 6, Task 7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaShardPayload {
+    /// Always [`MEDIA_SHARD_PAYLOAD_MAGIC`].
+    #[serde(with = "serde_bytes")]
+    pub magic: Vec<u8>,
+    /// `media_search_index` rows packed in this shard.
+    pub rows: Vec<MediaIndexRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +408,115 @@ pub fn restore_fuzzy_search_shard(
     Ok(payload.rows)
 }
 
+/// Build an encrypted vector shard from the supplied rows.
+/// Phase 6, Task 7.
+///
+/// `k_vector_index_shard` is the per-shard AEAD key, typically
+/// `K_vector_index_shard(shard_id)` from
+/// [`crate::crypto::key_hierarchy::derive_vector_index_shard`].
+/// As with the text / fuzzy shard builders, the orchestrator
+/// stores the returned `k_shard` next to the [`SearchIndexShard`]
+/// so it can re-open the seal without re-deriving.
+pub fn build_vector_search_shard(
+    rows: Vec<VectorRow>,
+    conversation_id: &str,
+    time_bucket: impl Into<String>,
+    k_vector_index_shard: &KeyMaterial,
+    conversation_hash_key: &KeyMaterial,
+) -> Result<BuiltShard, Error> {
+    let payload = VectorShardPayload {
+        magic: VECTOR_SHARD_PAYLOAD_MAGIC.to_vec(),
+        rows: rows.clone(),
+    };
+    let cbor = serde_cbor::to_vec(&payload)
+        .map_err(|e| Error::Storage(format!("vector shard cbor encode: {e}")))?;
+    let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
+    let shard = seal_shard(
+        cbor,
+        IndexType::Vector,
+        conversation_id_hash,
+        time_bucket.into(),
+        rows.len() as u64,
+        k_vector_index_shard,
+    )?;
+    Ok(BuiltShard {
+        shard,
+        k_shard: k_vector_index_shard.clone(),
+    })
+}
+
+/// Decrypt + decompress + decode a vector [`SearchIndexShard`]
+/// previously built by [`build_vector_search_shard`].
+pub fn restore_vector_search_shard(
+    shard: &SearchIndexShard,
+    k_vector_index_shard: &KeyMaterial,
+) -> Result<Vec<VectorRow>, Error> {
+    if shard.index_type != IndexType::Vector {
+        return Err(Error::Storage(format!(
+            "restore_vector_search_shard: index_type {:?} != Vector",
+            shard.index_type
+        )));
+    }
+    let cbor = open_shard(shard, k_vector_index_shard)?;
+    let payload: VectorShardPayload = serde_cbor::from_slice(&cbor)
+        .map_err(|e| Error::Storage(format!("vector shard cbor decode: {e}")))?;
+    if payload.magic != VECTOR_SHARD_PAYLOAD_MAGIC {
+        return Err(Error::Storage("vector shard payload magic mismatch".into()));
+    }
+    Ok(payload.rows)
+}
+
+/// Build an encrypted media shard from the supplied rows.
+/// Phase 6, Task 7.
+pub fn build_media_search_shard(
+    rows: Vec<MediaIndexRow>,
+    conversation_id: &str,
+    time_bucket: impl Into<String>,
+    k_media_index_shard: &KeyMaterial,
+    conversation_hash_key: &KeyMaterial,
+) -> Result<BuiltShard, Error> {
+    let payload = MediaShardPayload {
+        magic: MEDIA_SHARD_PAYLOAD_MAGIC.to_vec(),
+        rows: rows.clone(),
+    };
+    let cbor = serde_cbor::to_vec(&payload)
+        .map_err(|e| Error::Storage(format!("media shard cbor encode: {e}")))?;
+    let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
+    let shard = seal_shard(
+        cbor,
+        IndexType::Media,
+        conversation_id_hash,
+        time_bucket.into(),
+        rows.len() as u64,
+        k_media_index_shard,
+    )?;
+    Ok(BuiltShard {
+        shard,
+        k_shard: k_media_index_shard.clone(),
+    })
+}
+
+/// Decrypt + decompress + decode a media [`SearchIndexShard`]
+/// previously built by [`build_media_search_shard`].
+pub fn restore_media_search_shard(
+    shard: &SearchIndexShard,
+    k_media_index_shard: &KeyMaterial,
+) -> Result<Vec<MediaIndexRow>, Error> {
+    if shard.index_type != IndexType::Media {
+        return Err(Error::Storage(format!(
+            "restore_media_search_shard: index_type {:?} != Media",
+            shard.index_type
+        )));
+    }
+    let cbor = open_shard(shard, k_media_index_shard)?;
+    let payload: MediaShardPayload = serde_cbor::from_slice(&cbor)
+        .map_err(|e| Error::Storage(format!("media shard cbor decode: {e}")))?;
+    if payload.magic != MEDIA_SHARD_PAYLOAD_MAGIC {
+        return Err(Error::Storage("media shard payload magic mismatch".into()));
+    }
+    Ok(payload.rows)
+}
+
 fn open_shard(shard: &SearchIndexShard, k: &KeyMaterial) -> Result<Vec<u8>, Error> {
     if !shard.has_valid_header() {
         return Err(Error::Storage(
@@ -527,6 +710,180 @@ mod tests {
         let err = restore_text_search_shard(&built.shard, &built.k_shard).unwrap_err();
         assert!(
             matches!(&err, Error::Storage(msg) if msg.contains("aad_hash")),
+            "got {err:?}"
+        );
+    }
+
+    // ----- Phase 6, Task 7: vector + media shards --------------
+
+    use crate::crypto::key_hierarchy::{derive_media_index_shard, derive_vector_index_shard};
+
+    fn fresh_vector_shard_key() -> KeyMaterial {
+        let identity = KeyMaterial::from_bytes([0xAB; 32]);
+        let search_root = derive_search_root(&identity).expect("derive search root");
+        derive_vector_index_shard(&search_root, &Uuid::now_v7().into_bytes())
+            .expect("derive vector shard key")
+    }
+
+    fn fresh_media_shard_key() -> KeyMaterial {
+        let identity = KeyMaterial::from_bytes([0xAB; 32]);
+        let search_root = derive_search_root(&identity).expect("derive search root");
+        derive_media_index_shard(&search_root, &Uuid::now_v7().into_bytes())
+            .expect("derive media shard key")
+    }
+
+    fn sample_vector_rows(n: usize) -> Vec<VectorRow> {
+        (0..n)
+            .map(|i| VectorRow {
+                message_id: format!("msg-v-{i}"),
+                embedding: vec![(i as u8).wrapping_mul(7); 4 + 384],
+                model_version: "xlmr@v1".into(),
+            })
+            .collect()
+    }
+
+    fn sample_media_rows(n: usize) -> Vec<MediaIndexRow> {
+        (0..n)
+            .map(|i| MediaIndexRow {
+                asset_id: format!("asset-{i}"),
+                kind: if i % 2 == 0 {
+                    "ocr".into()
+                } else {
+                    "caption".into()
+                },
+                text: format!("recognized text {i}"),
+                language: Some("en".into()),
+                confidence: Some(0.5 + (i as f32 * 0.01)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_shard_build_and_restore_round_trip() {
+        let key = fresh_vector_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_vector_rows(6);
+        let built = build_vector_search_shard(rows.clone(), "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        assert!(built.shard.has_valid_header());
+        assert_eq!(built.shard.index_type, IndexType::Vector);
+        assert_eq!(built.shard.doc_count, 6);
+        let restored = restore_vector_search_shard(&built.shard, &built.k_shard).expect("restore");
+        assert_eq!(restored, rows);
+    }
+
+    #[test]
+    fn vector_shard_wrong_key_fails() {
+        let key = fresh_vector_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_vector_rows(3);
+        let built =
+            build_vector_search_shard(rows, "conv-A", "2026-04", &key, &conv_key).expect("build");
+        let bogus = KeyMaterial::from_bytes([0xFF; 32]);
+        let err = restore_vector_search_shard(&built.shard, &bogus).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_vector_shard_round_trips() {
+        let key = fresh_vector_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let built = build_vector_search_shard(Vec::new(), "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        assert_eq!(built.shard.doc_count, 0);
+        let restored = restore_vector_search_shard(&built.shard, &built.k_shard).expect("restore");
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn vector_shard_index_type_mismatch_rejected() {
+        let key = fresh_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_text_rows(2);
+        let built =
+            build_text_search_shard(rows, "conv-A", "2026-04", &key, &conv_key).expect("build");
+        let err = restore_vector_search_shard(&built.shard, &built.k_shard).unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(msg) if msg.contains("Vector")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn media_shard_build_and_restore_round_trip() {
+        let key = fresh_media_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_media_rows(5);
+        let built = build_media_search_shard(rows.clone(), "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        assert_eq!(built.shard.index_type, IndexType::Media);
+        assert_eq!(built.shard.doc_count, 5);
+        let restored = restore_media_search_shard(&built.shard, &built.k_shard).expect("restore");
+        assert_eq!(restored, rows);
+    }
+
+    #[test]
+    fn media_shard_wrong_key_fails() {
+        let key = fresh_media_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_media_rows(3);
+        let built =
+            build_media_search_shard(rows, "conv-A", "2026-04", &key, &conv_key).expect("build");
+        let bogus = KeyMaterial::from_bytes([0xFF; 32]);
+        let err = restore_media_search_shard(&built.shard, &bogus).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn media_shard_multilingual_round_trip() {
+        let key = fresh_media_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = vec![
+            MediaIndexRow {
+                asset_id: "a-en".into(),
+                kind: "ocr".into(),
+                text: "hello world".into(),
+                language: Some("en".into()),
+                confidence: Some(0.95),
+            },
+            MediaIndexRow {
+                asset_id: "a-ru".into(),
+                kind: "ocr".into(),
+                text: "Привет, мир".into(),
+                language: Some("ru".into()),
+                confidence: Some(0.88),
+            },
+            MediaIndexRow {
+                asset_id: "a-zh".into(),
+                kind: "caption".into(),
+                text: "你好世界".into(),
+                language: Some("zh".into()),
+                confidence: None,
+            },
+            MediaIndexRow {
+                asset_id: "a-ar".into(),
+                kind: "transcript".into(),
+                text: "مرحبا بالعالم".into(),
+                language: Some("ar".into()),
+                confidence: Some(0.71),
+            },
+        ];
+        let built = build_media_search_shard(rows.clone(), "conv-A", "2026-04", &key, &conv_key)
+            .expect("build");
+        let restored = restore_media_search_shard(&built.shard, &built.k_shard).expect("restore");
+        assert_eq!(restored, rows);
+    }
+
+    #[test]
+    fn media_shard_index_type_mismatch_rejected() {
+        let key = fresh_shard_key();
+        let conv_key = fresh_conv_hash_key();
+        let rows = sample_text_rows(2);
+        let built =
+            build_text_search_shard(rows, "conv-A", "2026-04", &key, &conv_key).expect("build");
+        let err = restore_media_search_shard(&built.shard, &built.k_shard).unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(msg) if msg.contains("Media")),
             "got {err:?}"
         );
     }

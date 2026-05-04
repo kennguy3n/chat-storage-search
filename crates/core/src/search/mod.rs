@@ -13,6 +13,7 @@
 pub mod cold_shard_source;
 pub mod fuzzy_search;
 pub mod query_engine;
+pub mod semantic_search;
 pub mod shard_builder;
 pub mod shard_prefetch;
 pub mod text_search;

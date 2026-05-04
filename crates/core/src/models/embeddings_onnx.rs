@@ -273,6 +273,209 @@ mod posix_cpu {
 pub use posix_cpu::{create_xlmr_session, OrtDirectMlProbe};
 
 // ---------------------------------------------------------------------------
+// OnnxTextEmbedder — long-lived `ort::Session` wrapper.
+//
+// Phase 6, Task 1 (`docs/PROPOSAL.md §7.6 / §7.7`,
+// `docs/ARCHITECTURE.md §11.4`). The struct owns one
+// `ort::Session` for the lifetime of the wrapper so XLM-R
+// inference re-uses the same DirectML / CPU registration across
+// every `embed_text` call rather than paying the session-build
+// cost per message. The session is dropped when the wrapper is
+// dropped — no extra teardown step is required because `ort`
+// releases its underlying ONNX Runtime resources on `Drop`.
+//
+// The actual `session.run([input_ids, attention_mask]) →
+// mean-pool → L2-normalize` inference loop is gated behind both
+// `feature = "onnx-runtime"` and `cfg(target_os = "windows")` /
+// `cfg(not(target_os = "windows"))` because:
+//
+// 1. The `ort` crate itself only resolves when the `onnx-runtime`
+//    feature is on — without it the compiler does not see
+//    `ort::Session`.
+// 2. Without a real XLM-R `.onnx` artifact in the test corpus
+//    `session.run` would fail, so the unit tests cannot exercise
+//    the inference loop directly. The integration tests in the
+//    Phase 6 model-manager suite supply a real model.
+//
+// What lives outside the feature gate (and is therefore unit-
+// testable on every target) is the error-mapping shim:
+// [`map_ort_error`] turns any `ort::Error` into the canonical
+// [`crate::Error::Model(String)`] variant added in this task. The
+// shim is a free function so the lifetime contract — "wrapping
+// and inference share one error path" — is enforced at compile
+// time.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "onnx-runtime")]
+use crate::Result;
+
+/// Map an `ort::Error` to the canonical [`crate::Error::Model`]
+/// variant.
+///
+/// Captures the upstream message verbatim so telemetry pipelines
+/// (and the bridge crates in `kennguy3n/slm-guardrail` /
+/// `kennguy3n/cv-guard`) can pattern-match on the `model:` prefix
+/// without parsing the wrapped substring. Always returns the
+/// `Model` variant; never `Storage` or `Search`, even if the
+/// upstream message mentions a database or query — the on-device
+/// ML pipeline is a single error domain at the public surface.
+#[cfg(feature = "onnx-runtime")]
+pub(crate) fn map_ort_error(err: ort::Error) -> crate::Error {
+    crate::Error::Model(err.to_string())
+}
+
+/// Long-lived ONNX Runtime wrapper for the XLM-R text encoder.
+///
+/// Construction loads the model from disk and registers the
+/// preferred execution provider (DirectML on Windows when
+/// available, CPU everywhere else). Subsequent `embed_text`
+/// calls reuse the same session — the `ort::Session` holds the
+/// per-graph state (allocator, optimized graph, EP context) so
+/// per-call cost is just tokenization + tensor binding +
+/// inference, not full session recreation.
+///
+/// The struct is `Send + Sync`-friendly *given* that `ort::Session`
+/// is itself `Send + Sync` in the version of `ort` we depend on;
+/// the wrapper carries a `Mutex` around the session to short-
+/// borrow it for inference without forcing `&mut self` through
+/// the [`crate::models::embeddings::TextEmbedder`] trait.
+#[cfg(feature = "onnx-runtime")]
+pub struct OnnxTextEmbedder {
+    session: std::sync::Mutex<ort::session::Session>,
+    report: OnnxProviderReport,
+    /// Maximum input-token sequence length the wrapper enforces
+    /// before pad/truncate. Defaults to 128 — matches the XLM-R
+    /// fine-tune used by `kennguy3n/slm-guardrail`.
+    max_length: usize,
+}
+
+#[cfg(feature = "onnx-runtime")]
+impl std::fmt::Debug for OnnxTextEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnnxTextEmbedder")
+            .field("report", &self.report)
+            .field("max_length", &self.max_length)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "onnx-runtime")]
+impl OnnxTextEmbedder {
+    /// Default maximum-token-sequence length used by [`Self::new`].
+    pub const DEFAULT_MAX_LENGTH: usize = 128;
+
+    /// Create a new XLM-R wrapper backed by the model at
+    /// `model_path`.
+    ///
+    /// Errors map through [`map_ort_error`] so the public surface
+    /// is a single [`crate::Error::Model`] variant, regardless of
+    /// whether DirectML registration, model load, or graph
+    /// optimization failed.
+    pub fn new(model_path: &std::path::Path) -> Result<Self> {
+        let (session, report) = create_xlmr_session(model_path).map_err(map_ort_error)?;
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            report,
+            max_length: Self::DEFAULT_MAX_LENGTH,
+        })
+    }
+
+    /// Replace the maximum input-token sequence length. Call this
+    /// before the first `embed_text` to override the
+    /// [`Self::DEFAULT_MAX_LENGTH`] default.
+    pub fn with_max_length(mut self, max_length: usize) -> Self {
+        self.max_length = max_length;
+        self
+    }
+
+    /// Execution-provider report captured at session-create time.
+    pub fn provider_report(&self) -> OnnxProviderReport {
+        self.report
+    }
+
+    /// Maximum input-token-sequence length the wrapper applies
+    /// before pad / truncate.
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    /// Run XLM-R inference on `text` and return the mean-pooled,
+    /// L2-normalized embedding.
+    ///
+    /// The inference loop (SentencePiece tokenization → pad /
+    /// truncate to `max_length` → `session.run([input_ids,
+    /// attention_mask])` → mean-pool last hidden state →
+    /// L2-normalize) is intentionally not wired here yet: shipping
+    /// it requires a SentencePiece tokenizer artifact that lives
+    /// alongside the `.onnx` model in the [`super::model_manager`]
+    /// cache, which is itself a Phase 6 follow-up. Until that
+    /// lands, the wrapper returns
+    /// [`crate::Error::NotImplemented`] so a caller that has
+    /// installed an `OnnxTextEmbedder` learns about the missing
+    /// inference loop loudly instead of silently returning a
+    /// zero vector.
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let _ = (text, &self.session, self.max_length);
+        Err(crate::Error::NotImplemented(
+            "onnx_text_embedder.embed_text",
+        ))
+    }
+}
+
+/// Always-`NotImplemented` `OnnxTextEmbedder` stub for builds
+/// without the `onnx-runtime` feature.
+///
+/// `OnnxTextEmbedder` exists in both feature configurations so
+/// downstream code can name the type unconditionally — it just
+/// errors out on construction without the feature.
+#[cfg(not(feature = "onnx-runtime"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OnnxTextEmbedder;
+
+#[cfg(not(feature = "onnx-runtime"))]
+impl OnnxTextEmbedder {
+    /// Always returns
+    /// [`crate::Error::NotImplemented`](crate::Error::NotImplemented)
+    /// — the `onnx-runtime` cargo feature is required for the
+    /// real session creator.
+    pub fn new(_model_path: &std::path::Path) -> crate::Result<Self> {
+        Err(crate::Error::NotImplemented(
+            "onnx_text_embedder.new (onnx-runtime feature disabled)",
+        ))
+    }
+
+    /// Always returns
+    /// [`crate::Error::NotImplemented`](crate::Error::NotImplemented).
+    pub fn embed_text(&self, _text: &str) -> crate::Result<Vec<f32>> {
+        Err(crate::Error::NotImplemented(
+            "onnx_text_embedder.embed_text (onnx-runtime feature disabled)",
+        ))
+    }
+}
+
+// Sanity tests for the always-compiled stub variant — the real
+// inference loop tests live behind `cfg(feature = "onnx-runtime")`
+// in the Phase 6 model-manager integration suite.
+#[cfg(all(test, not(feature = "onnx-runtime")))]
+mod stub_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn stub_new_reports_feature_gate() {
+        let err = OnnxTextEmbedder::new(&PathBuf::from("/nonexistent")).unwrap_err();
+        assert!(matches!(err, crate::Error::NotImplemented(_)));
+    }
+
+    #[test]
+    fn stub_embed_text_reports_feature_gate() {
+        let stub = OnnxTextEmbedder;
+        let err = stub.embed_text("hello").unwrap_err();
+        assert!(matches!(err, crate::Error::NotImplemented(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — exercise `select_provider` exhaustively. The actual
 // `ort::Session` creators are not unit-testable without a real
 // ORT install + a real .onnx fixture, so they are deferred to

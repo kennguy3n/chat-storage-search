@@ -88,6 +88,9 @@ pub enum KChatError {
     /// Bridges [`kchat_core::Error::NotImplemented`].
     #[error("not yet implemented: {method}")]
     NotImplemented { method: String },
+    /// Bridges [`kchat_core::Error::Model`].
+    #[error("model: {message}")]
+    Model { message: String },
     /// Argument validation failure inside the bridge layer (e.g. a
     /// malformed UUID string or wrong-length key).
     #[error("invalid argument: {message}")]
@@ -107,6 +110,7 @@ impl From<kchat_core::Error> for KChatError {
             kchat_core::Error::NotImplemented(m) => KChatError::NotImplemented {
                 method: m.to_string(),
             },
+            kchat_core::Error::Model(s) => KChatError::Model { message: s },
         }
     }
 }

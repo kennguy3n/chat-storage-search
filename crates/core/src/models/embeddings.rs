@@ -235,6 +235,142 @@ fn dequantize_int8(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Crate-private accessor for [`dequantize_int8`].
+///
+/// Phase 6, Task 3: the brute-force semantic-search engine in
+/// [`crate::search::semantic_search`] needs to dequantize raw
+/// `search_vector.embedding` blobs without going through the
+/// [`EmbeddingCache::get`] entry point (the engine fetches all
+/// rows in one statement and dequantizes per-row in memory).
+/// Lives here so the codec stays a single source of truth.
+pub(crate) fn dequantize_int8_for_search(blob: &[u8]) -> Vec<f32> {
+    dequantize_int8(blob)
+}
+
+// ---------------------------------------------------------------------------
+// TextEmbedder trait — Phase 6, Task 2
+// ---------------------------------------------------------------------------
+
+/// On-device text-embedding seam used by the semantic-search and
+/// message-ingest pipelines.
+///
+/// `docs/PROPOSAL.md §7.6 / §7.6.1` and Phase 6, Task 2. The trait
+/// is intentionally tiny so any encoder (XLM-R, a future
+/// multilingual replacement, a deterministic mock, …) can plug in.
+/// Implementations MUST return an L2-normalized vector of length
+/// [`XLMR_EMBEDDING_DIM`] for the canonical encoder; consumers
+/// SHOULD assert on length before mixing the vector into the
+/// cosine-similarity reranker (see
+/// [`crate::search::semantic_search::SemanticSearchEngine`]).
+///
+/// Object-safety + `Send + Sync`: `CoreImpl` stores the embedder
+/// inside a `Mutex<Option<Box<dyn TextEmbedder>>>`, mirroring the
+/// pattern used for [`crate::transport::DeliveryClient`].
+pub trait TextEmbedder: std::fmt::Debug + Send + Sync {
+    /// Run the encoder over `text` and return the embedding.
+    ///
+    /// Implementations are expected to be deterministic for a
+    /// fixed input (modulo numerical noise from quantization /
+    /// EP selection); the cross-pipeline embedding cache in
+    /// [`EmbeddingCache`] relies on this so the guardrail and
+    /// search pipelines share one inference per message.
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+/// `TextEmbedder` placeholder for builds without a real encoder.
+///
+/// `embed` always returns
+/// [`crate::Error::NotImplemented("text_embedder")`](crate::Error::NotImplemented)
+/// so a misconfigured `CoreImpl` (one that called
+/// [`crate::core_impl::CoreImpl::install_text_embedder`] with the
+/// noop) learns about the missing inference loop loudly instead
+/// of silently writing zero vectors into the embedding cache.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopTextEmbedder;
+
+impl TextEmbedder for NoopTextEmbedder {
+    fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+        Err(crate::Error::NotImplemented("text_embedder"))
+    }
+}
+
+/// Deterministic test [`TextEmbedder`] that hashes `text` into a
+/// reproducible, L2-normalized vector.
+///
+/// Used by the Phase 6 unit tests and integration tests to stand
+/// in for an actual ONNX-backed XLM-R encoder. The output is
+/// stable across runs and across processes for a given input —
+/// that is what lets the semantic-search tests assert "the same
+/// query returns the same nearest neighbor".
+///
+/// Implementation: BLAKE3 over the UTF-8 bytes of `text` seeds an
+/// LCG; each LCG step produces one f32 lane in `[-1, 1]`; the
+/// resulting `dim`-length vector is L2-normalized so cosine
+/// similarity matches dot product downstream.
+#[derive(Debug, Clone, Copy)]
+pub struct MockTextEmbedder {
+    dim: usize,
+}
+
+impl Default for MockTextEmbedder {
+    fn default() -> Self {
+        Self {
+            dim: XLMR_EMBEDDING_DIM,
+        }
+    }
+}
+
+impl MockTextEmbedder {
+    /// Build a [`MockTextEmbedder`] that emits `dim`-length
+    /// vectors. The default constructor uses
+    /// [`XLMR_EMBEDDING_DIM`].
+    pub fn with_dim(dim: usize) -> Self {
+        assert!(dim > 0, "MockTextEmbedder dim must be > 0");
+        Self { dim }
+    }
+
+    /// Embedding dimensionality the mock emits.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+impl TextEmbedder for MockTextEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        // Seed an LCG from BLAKE3(text). Using the first four
+        // bytes of the hash as a u32 seed gives us a fully
+        // deterministic, well-spread starting point — different
+        // inputs that happen to share a short prefix still seed
+        // disjoint LCG paths because BLAKE3 is collision-resistant.
+        let hash = blake3::hash(text.as_bytes());
+        let seed_bytes = &hash.as_bytes()[..4];
+        let mut x =
+            u32::from_le_bytes([seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3]]);
+        // Avoid the all-zero seed → all-zero embedding edge case
+        // (e.g. an LCG that lands on x = 0 + multiplier 0 stays
+        // at 0). Numerical-Recipes constants give a full-period
+        // 2^32 cycle so we walk every state regardless of seed.
+        if x == 0 {
+            x = 1;
+        }
+        let mut raw: Vec<f32> = Vec::with_capacity(self.dim);
+        for _ in 0..self.dim {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            raw.push((x as i32) as f32 / i32::MAX as f32);
+        }
+        // L2-normalize so cosine similarity reduces to dot
+        // product downstream — matches what a real XLM-R encoder
+        // outputs after the model's built-in normalization layer.
+        let norm: f32 = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > QUANT_EPS {
+            for v in &mut raw {
+                *v /= norm;
+            }
+        }
+        Ok(raw)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -403,5 +539,60 @@ mod tests {
             err,
             crate::Error::NotImplemented("embedding_cache.put")
         ));
+    }
+
+    // ----- Phase 6, Task 2: TextEmbedder trait coverage --------------
+
+    #[test]
+    fn noop_text_embedder_returns_not_implemented() {
+        let emb = NoopTextEmbedder;
+        let err = emb.embed("hello").unwrap_err();
+        assert!(matches!(err, crate::Error::NotImplemented("text_embedder")));
+    }
+
+    #[test]
+    fn mock_text_embedder_is_deterministic_for_same_input() {
+        let emb = MockTextEmbedder::default();
+        let a = emb.embed("hello world").expect("embed a");
+        let b = emb.embed("hello world").expect("embed b");
+        assert_eq!(a, b, "MockTextEmbedder must be deterministic");
+        assert_eq!(a.len(), XLMR_EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn mock_text_embedder_different_inputs_diverge() {
+        let emb = MockTextEmbedder::default();
+        let a = emb.embed("hello world").expect("embed a");
+        let b = emb.embed("привет мир").expect("embed b");
+        // Two distinct inputs should yield distinct embeddings —
+        // exact equality would mean the hash seeded the same
+        // LCG which would be a real bug.
+        assert_ne!(a, b);
+        // Both still L2-normalized.
+        let na: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((na - 1.0).abs() < 1e-3, "left vector not normalized: {na}");
+        assert!((nb - 1.0).abs() < 1e-3, "right vector not normalized: {nb}");
+    }
+
+    #[test]
+    fn mock_text_embedder_respects_custom_dim() {
+        let emb = MockTextEmbedder::with_dim(64);
+        let v = emb.embed("dim test").expect("embed");
+        assert_eq!(v.len(), 64);
+        assert_eq!(emb.dim(), 64);
+    }
+
+    #[test]
+    fn text_embedder_trait_is_object_safe() {
+        // Compile-time check: a `dyn TextEmbedder` reference can
+        // be constructed and called. CoreImpl wires the trait
+        // through `Box<dyn TextEmbedder>`, so this test would
+        // fail to compile if the trait drifted out of object-
+        // safe shape.
+        let mock = MockTextEmbedder::default();
+        let dynref: &dyn TextEmbedder = &mock;
+        let v = dynref.embed("trait dispatch").expect("dyn embed");
+        assert_eq!(v.len(), XLMR_EMBEDDING_DIM);
     }
 }

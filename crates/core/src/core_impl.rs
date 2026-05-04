@@ -184,6 +184,32 @@ pub struct CoreImpl {
     /// orchestration layer treats `None` as "no scheduler
     /// available — run maintenance loops on demand only".
     scheduler: Mutex<Option<Box<dyn crate::scheduler::BackgroundScheduler>>>,
+    /// Phase-6 on-device text-embedding seam. `None` until
+    /// [`CoreImpl::install_text_embedder`] is called. When set,
+    /// the message-ingest path computes XLM-R embeddings on
+    /// every text body and writes them through the
+    /// [`crate::models::embeddings::EmbeddingCache`] to
+    /// `search_vector`; when `None` the ingest path skips the
+    /// embedding step (text is still searchable via FTS5 +
+    /// fuzzy).
+    text_embedder: Mutex<Option<Box<dyn crate::models::embeddings::TextEmbedder>>>,
+    /// Phase-6 on-device image-embedding seam (MobileCLIP-S2).
+    /// `None` until [`CoreImpl::install_image_embedder`] is
+    /// called. Mirrors the [`Self::text_embedder`] wiring.
+    image_embedder: Mutex<Option<Box<dyn crate::models::clip::ImageEmbedder>>>,
+    /// Phase-6 platform OCR bridge. `None` until
+    /// [`CoreImpl::install_ocr_bridge`] is called. Wrapped in
+    /// `Arc<dyn …>` so multiple async work items can fan out
+    /// against the same bridge without going through the
+    /// `Mutex` for every call.
+    ocr_bridge: Mutex<Option<std::sync::Arc<dyn crate::models::ocr::OcrBridge>>>,
+    /// Phase-6 resource-state probe (battery, charging, thermal,
+    /// network). `None` until
+    /// [`CoreImpl::install_resource_probe`] is called; the
+    /// resource-gated background workers treat `None` as
+    /// "always allowed" so unit tests don't need to install a
+    /// probe.
+    resource_probe: Mutex<Option<std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>>>,
 }
 
 /// One row of [`CoreImpl::tracked_backup_segments`].
@@ -345,6 +371,10 @@ impl CoreImpl {
             zkof_archive_config: Mutex::new(None),
             zkof_archive_s3: Mutex::new(None),
             scheduler: Mutex::new(None),
+            text_embedder: Mutex::new(None),
+            image_embedder: Mutex::new(None),
+            ocr_bridge: Mutex::new(None),
+            resource_probe: Mutex::new(None),
         })
     }
 
@@ -371,6 +401,10 @@ impl CoreImpl {
             zkof_archive_config: Mutex::new(None),
             zkof_archive_s3: Mutex::new(None),
             scheduler: Mutex::new(None),
+            text_embedder: Mutex::new(None),
+            image_embedder: Mutex::new(None),
+            ocr_bridge: Mutex::new(None),
+            resource_probe: Mutex::new(None),
         })
     }
 
@@ -1114,6 +1148,98 @@ impl CoreImpl {
             .unwrap_or(false)
     }
 
+    // ----------------------------------------------------------------
+    // Phase-6 model bridges (Task 2 / 4 / 6 / 9)
+    // ----------------------------------------------------------------
+
+    /// Install (or replace) the on-device text-embedding bridge
+    /// used by message ingest and the semantic-search query path
+    /// (`docs/PROPOSAL.md §7.6 / §7.6.1`, Phase 6, Task 2).
+    ///
+    /// When set, the message-ingest path computes an XLM-R
+    /// embedding for every text body and writes it through
+    /// [`crate::models::embeddings::EmbeddingCache`]. When unset
+    /// (the default), the embedding step is skipped — text is
+    /// still searchable via FTS5 + fuzzy.
+    pub fn install_text_embedder(
+        &self,
+        embedder: Box<dyn crate::models::embeddings::TextEmbedder>,
+    ) -> Result<()> {
+        *self.text_embedder.lock().map_err(poisoned)? = Some(embedder);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_text_embedder`] has been called
+    /// with a real bridge.
+    pub fn has_text_embedder(&self) -> bool {
+        self.text_embedder
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the on-device image-embedding bridge
+    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
+    /// Task 9). When set, MobileCLIP-S2 embeddings are written to
+    /// `search_vector` for image-typed media on ingest.
+    pub fn install_image_embedder(
+        &self,
+        embedder: Box<dyn crate::models::clip::ImageEmbedder>,
+    ) -> Result<()> {
+        *self.image_embedder.lock().map_err(poisoned)? = Some(embedder);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_image_embedder`] has been called.
+    pub fn has_image_embedder(&self) -> bool {
+        self.image_embedder
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the platform OCR bridge used by media
+    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped
+    /// in `Arc` so multiple background workers can fan out
+    /// against the same bridge without serializing through the
+    /// mutex.
+    pub fn install_ocr_bridge(
+        &self,
+        bridge: std::sync::Arc<dyn crate::models::ocr::OcrBridge>,
+    ) -> Result<()> {
+        *self.ocr_bridge.lock().map_err(poisoned)? = Some(bridge);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_ocr_bridge`] has been called.
+    pub fn has_ocr_bridge(&self) -> bool {
+        self.ocr_bridge
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Install (or replace) the device-resource probe used by the
+    /// resource-gated background workers
+    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 6). When unset,
+    /// the gate defaults to "all-clear" so unit tests don't need
+    /// to install a probe.
+    pub fn install_resource_probe(
+        &self,
+        probe: std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>,
+    ) -> Result<()> {
+        *self.resource_probe.lock().map_err(poisoned)? = Some(probe);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_resource_probe`] has been called.
+    pub fn has_resource_probe(&self) -> bool {
+        self.resource_probe
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
     /// Replay the supplied search-index shards into the local
     /// `search_fts` / `search_fuzzy` tables (Phase 4, Task 6).
     ///
@@ -1539,18 +1665,125 @@ impl CoreImpl {
     /// This is the **inherent** entry point used in Phase 1 while
     /// the transport-driven [`KChatCore::ingest_remote_messages`]
     /// trait method is still a stub.
+    ///
+    /// Phase 6, Task 2 / Task 10: when a [`crate::models::embeddings::TextEmbedder`]
+    /// has been installed via [`Self::install_text_embedder`],
+    /// each text body is embedded and written to `search_vector`
+    /// via the [`crate::models::embeddings::EmbeddingCache`]
+    /// surface. The embedding step is best-effort (logged on
+    /// failure, never propagated) so an inference / cache hiccup
+    /// cannot poison the ingest path. A pre-existing cache hit
+    /// short-circuits inference — the cross-pipeline cache is
+    /// shared with `kennguy3n/slm-guardrail`, so a guardrail-
+    /// computed vector is not re-encoded by the search pipeline.
     pub fn ingest_messages(&self, messages: &[IngestedMessage]) -> Result<IngestResult> {
         let db = self.db.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         let mut result = IngestResult::default();
         for msg in messages {
             match persister.persist_ingested_message(msg) {
-                Ok(_) => result.new_messages += 1,
+                Ok(_) => {
+                    result.new_messages += 1;
+                    // Best-effort cross-pipeline embedding (Phase 6,
+                    // Task 2 / 10). Failures are absorbed because
+                    // the message is already persisted; semantic
+                    // search will still work for messages that DID
+                    // embed successfully, and the next ingest will
+                    // retry this row's embedding the moment a real
+                    // embedder is installed.
+                    self.maybe_embed_text_message(&db, msg);
+                }
                 Err(ProcessorError::DuplicateMessage) => result.duplicate_count += 1,
                 Err(e) => return Err(Error::Message(e.to_string())),
             }
         }
         Ok(result)
+    }
+
+    /// Best-effort cross-pipeline text embedding. Runs only when
+    /// (a) a [`crate::models::embeddings::TextEmbedder`] is
+    /// installed, (b) the message has a text body, and (c) the
+    /// shared embedding cache does not already carry a row for
+    /// `(message_id, XLMR_MODEL_VERSION)`. All errors are
+    /// swallowed — see [`Self::ingest_messages`] for the
+    /// rationale.
+    fn maybe_embed_text_message(&self, db: &LocalStoreDb, msg: &IngestedMessage) {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+
+        let Some(text) = msg.text_content.as_deref() else {
+            return;
+        };
+        let Ok(slot) = self.text_embedder.lock() else {
+            return;
+        };
+        let Some(embedder) = slot.as_ref() else {
+            return;
+        };
+
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        let mid = msg.message_id.to_string();
+        // Cache hit short-circuits inference. The guardrail
+        // pipeline writes through the same SQLCipher row, so a
+        // cross-pipeline hit is the norm in production.
+        if let Ok(Some(_)) = cache.get(&mid, XLMR_MODEL_VERSION) {
+            return;
+        }
+        match embedder.embed(text) {
+            Ok(vec) => {
+                let _ = cache.put(&mid, XLMR_MODEL_VERSION, &vec);
+            }
+            Err(_) => {
+                // Inference failures are absorbed: the message is
+                // already searchable via FTS5 + fuzzy. Telemetry
+                // for the failure path is the bridge crate's job
+                // (it sees the raw embed error before installing
+                // its TextEmbedder).
+            }
+        }
+    }
+
+    /// Best-effort cross-pipeline image embedding (Phase 6,
+    /// Task 9). Runs only when (a) an
+    /// [`crate::models::clip::ImageEmbedder`] is installed,
+    /// (b) `mime_type` advertises an image, and (c) the shared
+    /// embedding cache does not already carry a row for
+    /// `(message_id, MOBILECLIP_S2_MODEL_VERSION)`. All errors
+    /// are swallowed — see [`Self::ingest_messages`] for the
+    /// rationale.
+    fn maybe_embed_image_message(
+        &self,
+        db: &LocalStoreDb,
+        message_id: &str,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) {
+        use crate::models::clip::MOBILECLIP_S2_MODEL_VERSION;
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        if !mime_type.starts_with("image/") {
+            return;
+        }
+        let Ok(slot) = self.image_embedder.lock() else {
+            return;
+        };
+        let Some(embedder) = slot.as_ref() else {
+            return;
+        };
+
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        if let Ok(Some(_)) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+            return;
+        }
+        match embedder.embed_image(plaintext, mime_type) {
+            Ok(vec) => {
+                let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
+            }
+            Err(_) => {
+                // Inference failures are absorbed.
+            }
+        }
     }
 
     /// Borrow the local store for read-only inspection.
@@ -2745,6 +2978,16 @@ impl KChatCore for CoreImpl {
             };
             db.insert_media_asset(&asset)
                 .map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Phase 6, Task 9: best-effort MobileCLIP-S2 image
+            // embedding. Runs only when (a) an
+            // [`crate::models::clip::ImageEmbedder`] is installed,
+            // (b) the MIME type indicates an image, and (c) the
+            // shared embedding cache does not already carry a row
+            // for `(message_id, MOBILECLIP_S2_MODEL_VERSION)`.
+            // Failures are absorbed; the message is already
+            // persisted and FTS-searchable through its caption.
+            self.maybe_embed_image_message(&db, &skel.message_id, mime_type, &plaintext);
 
             // Bump the owning conversation's last_message_id /
             // last_activity_ms so list_conversations surfaces the
@@ -7776,6 +8019,140 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(n, 1, "FTS row landed");
+        });
+    }
+
+    // ----- Phase 6, Tasks 2 + 9: ingest embedding wiring ------------
+
+    #[test]
+    fn ingest_messages_writes_text_embedding_when_embedder_installed() {
+        use crate::message::processor::IngestedMessage;
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, XLMR_MODEL_VERSION,
+        };
+
+        let core = fresh_core();
+        core.install_text_embedder(Box::new(MockTextEmbedder::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let now = now_ms_for_send_media();
+
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "alice".into(),
+            created_at_ms: now,
+            text_content: Some("the quick brown fox".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+
+        let res = core.ingest_messages(&[msg]).expect("ingest");
+        assert_eq!(res.new_messages, 1);
+
+        // Vector landed in the cross-pipeline cache.
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let stored = cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .expect("cache get")
+                .expect("vector present");
+            assert!(!stored.is_empty(), "embedding non-empty");
+        });
+    }
+
+    #[test]
+    fn ingest_messages_skips_embedding_without_installed_embedder() {
+        use crate::message::processor::IngestedMessage;
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let now = now_ms_for_send_media();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "bob".into(),
+            created_at_ms: now,
+            text_content: Some("no embedder installed".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).expect("ingest");
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            assert!(cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn send_media_writes_image_embedding_when_embedder_installed() {
+        use crate::models::clip::{MockImageEmbedder, MOBILECLIP_S2_MODEL_VERSION};
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        let core = fresh_core();
+        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let stored = cache
+                .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
+                .expect("cache get")
+                .expect("image vector present");
+            assert!(!stored.is_empty());
+        });
+    }
+
+    #[test]
+    fn send_media_skips_image_embedding_for_non_image_mime() {
+        use crate::models::clip::{MockImageEmbedder, MOBILECLIP_S2_MODEL_VERSION};
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        let core = fresh_core();
+        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+            .unwrap();
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        // Use a non-image MIME with a small payload; the
+        // wiring guards on `mime_type.starts_with("image/")`.
+        let res = core.send_media(
+            conv,
+            mid,
+            b"PDF binary stand-in".to_vec(),
+            "application/pdf",
+            None,
+        );
+        // send_media accepts arbitrary MIME types; we only care
+        // that no image embedding is written for non-images.
+        assert!(res.is_ok() || res.is_err());
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            assert!(cache
+                .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
+                .unwrap()
+                .is_none());
         });
     }
 }

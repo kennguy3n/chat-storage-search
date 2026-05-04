@@ -822,6 +822,78 @@ impl LocalStoreDb {
         Ok(rows)
     }
 
+    // ----------------------------------------------------------------
+    // media_search_index helpers — Phase 6, Task 4
+    // ----------------------------------------------------------------
+
+    /// Insert one row into the `media_search_index` table.
+    ///
+    /// `kind` is the discriminator on the table (`"ocr"`,
+    /// `"caption"`, `"transcript"`, `"tag"`); see
+    /// [`crate::local_store::schema::SCHEMA_SQL`]. `language`
+    /// is the BCP-47 tag the recognizer reported (when one was
+    /// reported); `confidence` is in `[0.0, 1.0]`.
+    ///
+    /// The PK is `(asset_id, kind, text)`, so re-inserting the
+    /// same recognized text for the same asset is a no-op
+    /// (`INSERT OR IGNORE`). The OCR fan-out is best-effort —
+    /// duplicate hits across re-runs should not error.
+    pub fn insert_media_search_index(
+        &self,
+        asset_id: &str,
+        kind: &str,
+        text: &str,
+        language: Option<&str>,
+        confidence: Option<f32>,
+    ) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO media_search_index(asset_id, kind, text, language, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![asset_id, kind, text, language, confidence],
+        )?;
+        Ok(())
+    }
+
+    /// Search `media_search_index` rows whose `text` contains
+    /// `query` (case-insensitive `LIKE`).
+    ///
+    /// `kind == Some(_)` restricts the search to one
+    /// discriminator (e.g. only OCR hits, only transcripts);
+    /// `None` returns rows from every discriminator.
+    ///
+    /// Returns rows in unspecified order — the caller is
+    /// expected to merge media hits into the master ranking
+    /// pipeline (`docs/PROPOSAL.md §7.5` ranking formula),
+    /// which applies its own ordering.
+    pub fn search_media_index(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+    ) -> DbResult<Vec<MediaSearchResult>> {
+        let needle = format!("%{}%", query);
+        let rows: Vec<MediaSearchResult> = match kind {
+            Some(k) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT asset_id, kind, text, language, confidence
+                       FROM media_search_index
+                      WHERE kind = ?1 AND text LIKE ?2 COLLATE NOCASE",
+                )?;
+                let it = stmt.query_map(params![k, needle], row_to_media_search_result)?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT asset_id, kind, text, language, confidence
+                       FROM media_search_index
+                      WHERE text LIKE ?1 COLLATE NOCASE",
+                )?;
+                let it = stmt.query_map(params![needle], row_to_media_search_result)?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
     /// Replace `message_body.text_content` for `message_id`.
     ///
     /// Used by the edit pipeline. The FTS row has to be maintained
@@ -1249,6 +1321,40 @@ impl LocalStoreDb {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// MediaSearchResult — Phase 6, Task 4
+// ---------------------------------------------------------------------------
+
+/// One row returned by [`LocalStoreDb::search_media_index`].
+///
+/// Mirrors the shape of `media_search_index` (see
+/// [`crate::local_store::schema::SCHEMA_SQL`]): the OCR /
+/// caption / transcript / tag pipeline writes into the same
+/// table, so the returned rows are discriminated by `kind`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaSearchResult {
+    /// `media_asset.asset_id` for the row.
+    pub asset_id: String,
+    /// `'ocr' | 'caption' | 'transcript' | 'tag'`.
+    pub kind: String,
+    /// Recognized text.
+    pub text: String,
+    /// BCP-47 language tag, when the recognizer reported one.
+    pub language: Option<String>,
+    /// Per-row confidence, when the recognizer reported one.
+    pub confidence: Option<f32>,
+}
+
+fn row_to_media_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaSearchResult> {
+    Ok(MediaSearchResult {
+        asset_id: row.get(0)?,
+        kind: row.get(1)?,
+        text: row.get(2)?,
+        language: row.get(3)?,
+        confidence: row.get(4)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2851,6 +2957,91 @@ mod tests {
             .is_empty());
         assert!(db
             .list_media_assets_by_message("m-does-not-exist")
+            .unwrap()
+            .is_empty());
+    }
+
+    // ----- Phase 6, Task 4: media_search_index helpers --------------
+
+    fn seed_media_asset_for_index(db: &LocalStoreDb, mid: &str, conv: &str, asset_id: &str) {
+        seed_skeleton_with_body(db, mid, conv, "ignored");
+        let asset = MediaAsset {
+            asset_id: asset_id.into(),
+            message_id: mid.into(),
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1024,
+            bytes_local: 1024,
+            media_state: MediaState::ThumbnailOnly,
+            wrapped_k_asset: vec![0xAB; 40],
+            chunk_count: 4,
+            merkle_root: vec![0xCD; 32],
+            blob_id: format!("blob-{asset_id}"),
+            storage_sink: "kchat_backend".into(),
+        };
+        db.insert_media_asset(&asset).unwrap();
+    }
+
+    #[test]
+    fn media_search_index_round_trip_with_kind_filter() {
+        let db = fresh_db();
+        seed_media_asset_for_index(&db, "m-1", "c-1", "asset-1");
+        seed_media_asset_for_index(&db, "m-2", "c-2", "asset-2");
+
+        db.insert_media_search_index("asset-1", "ocr", "Hello, world", Some("en"), Some(0.9))
+            .unwrap();
+        db.insert_media_search_index(
+            "asset-2",
+            "transcript",
+            "hello there",
+            Some("en"),
+            Some(0.7),
+        )
+        .unwrap();
+
+        let ocr_hits = db.search_media_index("hello", Some("ocr")).unwrap();
+        assert_eq!(ocr_hits.len(), 1);
+        assert_eq!(ocr_hits[0].asset_id, "asset-1");
+        assert_eq!(ocr_hits[0].kind, "ocr");
+
+        let any_kind = db.search_media_index("hello", None).unwrap();
+        assert_eq!(any_kind.len(), 2);
+    }
+
+    #[test]
+    fn media_search_index_insert_is_idempotent() {
+        let db = fresh_db();
+        seed_media_asset_for_index(&db, "m-1", "c-1", "asset-1");
+        // Re-insert the same (asset_id, kind, text) PK twice — the
+        // INSERT OR IGNORE codepath must absorb the duplicate.
+        db.insert_media_search_index("asset-1", "ocr", "duplicate", None, None)
+            .unwrap();
+        db.insert_media_search_index("asset-1", "ocr", "duplicate", None, None)
+            .unwrap();
+        let hits = db.search_media_index("duplicate", None).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn media_search_index_query_is_case_insensitive() {
+        let db = fresh_db();
+        seed_media_asset_for_index(&db, "m-1", "c-1", "asset-1");
+        db.insert_media_search_index("asset-1", "caption", "Sunset over Tokyo", Some("en"), None)
+            .unwrap();
+        let upper = db.search_media_index("TOKYO", None).unwrap();
+        let lower = db.search_media_index("tokyo", None).unwrap();
+        assert_eq!(upper.len(), 1);
+        assert_eq!(lower.len(), 1);
+        assert_eq!(upper[0].asset_id, "asset-1");
+    }
+
+    #[test]
+    fn media_search_index_returns_empty_on_no_match() {
+        let db = fresh_db();
+        seed_media_asset_for_index(&db, "m-1", "c-1", "asset-1");
+        db.insert_media_search_index("asset-1", "ocr", "anything", None, None)
+            .unwrap();
+        assert!(db
+            .search_media_index("never appears", None)
             .unwrap()
             .is_empty());
     }
