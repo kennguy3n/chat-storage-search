@@ -41,13 +41,111 @@
 //! [`crate::media::routing::route_media_upload`] /
 //! [`crate::media::routing::route_media_download`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::crypto::content_hash::HASH_LEN;
 use crate::local_store::db::{DbResult, LocalStoreDb};
 use crate::local_store::schema::MediaAsset;
 use crate::media::sinks::{MediaBlobReference, MediaBlobSink};
 use crate::Error;
+
+/// Internal abstraction over the two `LocalStoreDb` operations
+/// [`migrate_one`] performs (idempotency probe + storage-sink
+/// update). The trait exists so the executor can lock the DB
+/// **per call** on the production path — see
+/// [`LockingDbHandle`] — instead of holding the lock across the
+/// network I/O the [`MediaBlobSink`] trait performs.
+///
+/// The default impl on [`LocalStoreDb`] makes the existing test
+/// callers (which pass `&db` directly with no surrounding mutex)
+/// continue to work; production code wraps the shared
+/// `Mutex<LocalStoreDb>` in [`LockingDbHandle`].
+pub trait MigrationDbHandle {
+    /// Idempotency probe: read the current `media_asset` row
+    /// (or `None` when the row was never persisted).
+    fn get_media_asset(&self, asset_id: &str) -> Result<Option<MediaAsset>, Error>;
+    /// Storage-sink rewrite: update `media_asset.storage_sink` /
+    /// `media_asset.blob_id` after a successful target-side
+    /// upload + roundtrip verification.
+    fn update_media_storage_sink(
+        &self,
+        asset_id: &str,
+        storage_sink: &str,
+        blob_id: &str,
+    ) -> Result<(), Error>;
+}
+
+impl MigrationDbHandle for LocalStoreDb {
+    fn get_media_asset(&self, asset_id: &str) -> Result<Option<MediaAsset>, Error> {
+        LocalStoreDb::get_media_asset(self, asset_id).map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    fn update_media_storage_sink(
+        &self,
+        asset_id: &str,
+        storage_sink: &str,
+        blob_id: &str,
+    ) -> Result<(), Error> {
+        LocalStoreDb::update_media_storage_sink(self, asset_id, storage_sink, blob_id)
+            .map(|_| ())
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+}
+
+/// Production-path [`MigrationDbHandle`] adapter that locks the
+/// shared [`Mutex`] **per call** so the migration executor never
+/// holds the DB lock across [`MediaBlobSink`] I/O. For a
+/// 10 000-asset migration with real iCloud / Google Drive / ZKOF
+/// backends this is the difference between a few ms of total
+/// lock-out and many minutes of lock-out.
+///
+/// Each [`MigrationDbHandle`] method:
+///
+/// 1. takes the lock,
+/// 2. runs the single DB call,
+/// 3. drops the guard before returning.
+///
+/// The chunk-fetch / chunk-upload / roundtrip-verify phases of
+/// [`migrate_one`] therefore run with the DB lock released.
+#[derive(Debug)]
+pub struct LockingDbHandle<'a> {
+    db: &'a Mutex<LocalStoreDb>,
+}
+
+impl<'a> LockingDbHandle<'a> {
+    /// Wrap a borrowed `Mutex<LocalStoreDb>` so the migration
+    /// executor can locks it per-call.
+    pub fn new(db: &'a Mutex<LocalStoreDb>) -> Self {
+        Self { db }
+    }
+}
+
+impl<'a> MigrationDbHandle for LockingDbHandle<'a> {
+    fn get_media_asset(&self, asset_id: &str) -> Result<Option<MediaAsset>, Error> {
+        let guard = self
+            .db
+            .lock()
+            .map_err(|_| Error::Storage("LocalStoreDb mutex poisoned".into()))?;
+        LocalStoreDb::get_media_asset(&guard, asset_id).map_err(|e| Error::Storage(e.to_string()))
+        // `guard` drops at end of scope — lock is released here.
+    }
+
+    fn update_media_storage_sink(
+        &self,
+        asset_id: &str,
+        storage_sink: &str,
+        blob_id: &str,
+    ) -> Result<(), Error> {
+        let guard = self
+            .db
+            .lock()
+            .map_err(|_| Error::Storage("LocalStoreDb mutex poisoned".into()))?;
+        LocalStoreDb::update_media_storage_sink(&guard, asset_id, storage_sink, blob_id)
+            .map(|_| ())
+            .map_err(|e| Error::Storage(e.to_string()))
+        // `guard` drops at end of scope.
+    }
+}
 
 /// One scheduled cross-sink migration item.
 #[derive(Debug, Clone)]
@@ -232,11 +330,11 @@ pub fn plan_media_migration(
 /// fails the migration is still reported as
 /// [`MigrationItemOutcome::Migrated`] because the local store
 /// already points at the new sink.
-pub fn execute_media_migration(
+pub fn execute_media_migration<H: MigrationDbHandle>(
     plan: &MediaMigrationPlan,
     source: &dyn MediaBlobSink,
     target: &dyn MediaBlobSink,
-    db: &LocalStoreDb,
+    db: &H,
     progress: &dyn MigrationProgress,
     delete_source_after_success: bool,
 ) -> Result<MigrationReport, Error> {
@@ -261,18 +359,21 @@ pub fn execute_media_migration(
     Ok(report)
 }
 
-fn migrate_one(
+fn migrate_one<H: MigrationDbHandle>(
     item: &MediaMigrationItem,
     source_sink: &str,
     target_sink: &str,
     source: &dyn MediaBlobSink,
     target: &dyn MediaBlobSink,
-    db: &LocalStoreDb,
+    db: &H,
     delete_source_after_success: bool,
 ) -> MigrationItemOutcome {
     // Idempotency: re-runs after a partial failure see the local
     // row already pointing at `target_sink`. Skip the upload and
     // report `AlreadyOnTarget`.
+    // Phase A — idempotency probe. On the production path this
+    // takes the DB lock briefly and then drops it before any
+    // network I/O runs.
     match db.get_media_asset(&item.asset_id) {
         Ok(Some(MediaAsset { storage_sink, .. })) if storage_sink == target_sink => {
             return MigrationItemOutcome::AlreadyOnTarget;
@@ -349,8 +450,10 @@ fn migrate_one(
         );
     }
 
-    // 4. Update the local store. Wrap the update in a savepoint
-    // via the `transaction` helper on `Connection`.
+    // Phase B — update the local store. On the production path
+    // this is the second (and last) DB lock acquisition for this
+    // item; the lock is released again before the next item's
+    // chunk-fetch loop starts.
     if let Err(e) =
         db.update_media_storage_sink(&item.asset_id, &new_ref.storage_sink, &new_ref.blob_id)
     {
@@ -718,5 +821,95 @@ mod tests {
         let p: Arc<dyn MigrationProgress> = Arc::new(NoopMigrationProgress);
         p.on_item_started("foo", 0, 1);
         p.on_run_completed(&MigrationReport::default());
+    }
+
+    /// Regression for the "DB lock held during sink I/O" finding —
+    /// the production migration path uses [`LockingDbHandle`] over
+    /// `Mutex<LocalStoreDb>` and must release the DB lock during
+    /// every chunk-fetch / chunk-upload / roundtrip-verify phase.
+    /// We assert this with a sink that grabs `try_lock()` on the
+    /// shared mutex while it's servicing a chunk fetch — if the
+    /// executor were holding the lock, `try_lock` would fail.
+    #[test]
+    fn locking_db_handle_releases_lock_during_sink_io() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let db_mutex = Mutex::new(open_db());
+        let icloud_for_seed = InMemorySink::new("icloud");
+        // Seed two assets through the held-direct path (we own
+        // the only handle here, no contention possible).
+        {
+            let db = db_mutex.lock().unwrap();
+            seed_asset(&db, "icloud", &[vec![1; 16]], &icloud_for_seed);
+            seed_asset(&db, "icloud", &[vec![2; 16]], &icloud_for_seed);
+        }
+        let plan = {
+            let db = db_mutex.lock().unwrap();
+            plan_media_migration(&db, "icloud", "google_drive").unwrap()
+        };
+
+        // Probe sink: every `fetch_media_chunk` call also tries
+        // to grab the DB mutex. If the executor were holding it
+        // across the I/O loop, `try_lock` would return `Err`
+        // and `lock_failures` would advance.
+        #[derive(Debug)]
+        struct ProbingSink<'a> {
+            inner: InMemorySink,
+            db_mutex: &'a Mutex<LocalStoreDb>,
+            lock_attempts: AtomicU32,
+            lock_failures: AtomicU32,
+        }
+        impl MediaBlobSink for ProbingSink<'_> {
+            fn upload_media_chunks(
+                &self,
+                asset_id: &str,
+                blob_class: BlobClass,
+                chunks: &[&[u8]],
+                expected_merkle_root: [u8; 32],
+            ) -> crate::Result<MediaBlobReference> {
+                self.inner
+                    .upload_media_chunks(asset_id, blob_class, chunks, expected_merkle_root)
+            }
+            fn fetch_media_chunk(
+                &self,
+                r: &MediaBlobReference,
+                idx: u32,
+            ) -> crate::Result<Vec<u8>> {
+                self.lock_attempts.fetch_add(1, Ordering::SeqCst);
+                if self.db_mutex.try_lock().is_err() {
+                    self.lock_failures.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.fetch_media_chunk(r, idx)
+            }
+            fn delete_media_blob(&self, r: &MediaBlobReference) -> crate::Result<()> {
+                self.inner.delete_media_blob(r)
+            }
+        }
+
+        let drive = InMemorySink::new("google_drive");
+        let probe = ProbingSink {
+            inner: icloud_for_seed,
+            db_mutex: &db_mutex,
+            lock_attempts: AtomicU32::new(0),
+            lock_failures: AtomicU32::new(0),
+        };
+        let progress = NoopMigrationProgress;
+        let handle = LockingDbHandle::new(&db_mutex);
+        let report =
+            execute_media_migration(&plan, &probe, &drive, &handle, &progress, false).unwrap();
+        assert_eq!(report.migrated(), 2, "both items should migrate");
+        // Source-side fetch was attempted once per chunk, and
+        // (because the loop runs outside the DB lock) every
+        // attempt to take the DB mutex from the sink succeeded.
+        assert!(
+            probe.lock_attempts.load(Ordering::SeqCst) >= 2,
+            "sink should have observed at least one fetch per item",
+        );
+        assert_eq!(
+            probe.lock_failures.load(Ordering::SeqCst),
+            0,
+            "sink saw the DB mutex locked while it was servicing a chunk fetch — \
+             the executor is regressed and is holding the DB lock across sink I/O",
+        );
     }
 }

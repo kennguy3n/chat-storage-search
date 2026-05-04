@@ -284,23 +284,33 @@ impl<'a> SemanticSearchEngine<'a> {
         if let Some(idx) = cached {
             return Ok(idx.search(query_embedding, limit));
         }
-        // Miss path — load candidates, decide whether to build.
+        // Miss path — load candidates **once** and decide
+        // whether to build the HNSW graph or fall straight back
+        // to brute force. We deliberately do not delegate to
+        // `search_semantic` here because that would re-issue the
+        // SQLite query that already populated `raw`, doubling
+        // the I/O for every near-threshold corpus on every
+        // cache-miss query.
         let raw = self.fetch_candidates(conversation_id, model_version)?;
         if raw.len() < HNSW_FALLBACK_THRESHOLD {
-            return self.search_semantic(query_embedding, conversation_id, limit, model_version);
+            return Ok(score_candidates_brute_force(query_embedding, raw, limit));
         }
         let rows: Vec<(String, Vec<f32>)> = raw
-            .into_iter()
+            .iter()
             .filter_map(|(mid, blob)| {
-                let v = dequantize_int8_for_search(&blob);
+                let v = dequantize_int8_for_search(blob);
                 if v.is_empty() {
                     return None;
                 }
-                Some((mid, v))
+                Some((mid.clone(), v))
             })
             .collect();
         let Some(idx) = HnswIndex::build(rows) else {
-            return self.search_semantic(query_embedding, conversation_id, limit, model_version);
+            // The graph builder returned None (every candidate
+            // was unreadable / mismatched dim). Fall back to the
+            // brute-force scorer over the same `raw` we already
+            // fetched — same no-double-fetch rationale as above.
+            return Ok(score_candidates_brute_force(query_embedding, raw, limit));
         };
         let idx = Arc::new(idx);
         // Insert first, then run the search outside the lock —
@@ -340,32 +350,12 @@ impl<'a> SemanticSearchEngine<'a> {
         if limit == 0 || query_embedding.is_empty() {
             return Ok(Vec::new());
         }
-        let query_norm = l2_normalize(query_embedding);
         let candidates = self.fetch_candidates(conversation_id, model_version)?;
-        let mut scored: Vec<SemanticMatch> = candidates
-            .into_iter()
-            .filter_map(|(message_id, blob)| {
-                let stored = dequantize_int8_for_search(&blob);
-                if stored.is_empty() || stored.len() != query_norm.len() {
-                    return None;
-                }
-                let sim = cosine(&query_norm, &stored);
-                Some(SemanticMatch {
-                    message_id,
-                    similarity: sim,
-                })
-            })
-            .collect();
-        // Descending similarity, then ascending message_id for
-        // deterministic tie-breaking.
-        scored.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        scored.truncate(limit);
-        Ok(scored)
+        Ok(score_candidates_brute_force(
+            query_embedding,
+            candidates,
+            limit,
+        ))
     }
 
     fn fetch_candidates(
@@ -465,6 +455,47 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (na * nb)
+}
+
+/// Score `candidates` (already-fetched
+/// `(message_id, int8_embedding_blob)` rows) against
+/// `query_embedding` and return the top-`limit` rows in
+/// descending similarity order. Ties are broken
+/// lexicographically on `message_id` so ordering is
+/// deterministic across runs.
+///
+/// Factored out of `SemanticSearchEngine::search_semantic` so
+/// `search_semantic_auto`'s miss-below-threshold and
+/// graph-build-failure paths can fall back to brute force
+/// **without** re-fetching the candidate set from SQLite.
+fn score_candidates_brute_force(
+    query_embedding: &[f32],
+    candidates: Vec<(String, Vec<u8>)>,
+    limit: usize,
+) -> Vec<SemanticMatch> {
+    let query_norm = l2_normalize(query_embedding);
+    let mut scored: Vec<SemanticMatch> = candidates
+        .into_iter()
+        .filter_map(|(message_id, blob)| {
+            let stored = dequantize_int8_for_search(&blob);
+            if stored.is_empty() || stored.len() != query_norm.len() {
+                return None;
+            }
+            let sim = cosine(&query_norm, &stored);
+            Some(SemanticMatch {
+                message_id,
+                similarity: sim,
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.message_id.cmp(&b.message_id))
+    });
+    scored.truncate(limit);
+    scored
 }
 
 #[cfg(test)]

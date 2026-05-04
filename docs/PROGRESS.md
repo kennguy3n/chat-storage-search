@@ -2173,6 +2173,42 @@ multi-tenant isolation work continues separately).
   retained for the upload (the target sink wants them as
   `&[&[u8]]`) but never duplicated.
 
+* **Media migration DB lock held during sink I/O.**
+  `CoreImpl::migrate_media_sink` previously locked
+  `self.db` at entry and held the `MutexGuard<LocalStoreDb>`
+  for the entire `execute_media_migration` run, blocking
+  every other DB-using worker (search, ingest, backup,
+  hydration, eviction) for the duration of the migration —
+  potentially minutes or hours of total lock-out for a
+  10 000-asset run against real iCloud / Drive / ZKOF
+  backends. A new `MigrationDbHandle` trait abstracts the
+  two DB calls `migrate_one` performs (`get_media_asset`
+  for idempotency + `update_media_storage_sink` after a
+  successful upload). The production path uses the new
+  `LockingDbHandle<'_>` adapter which locks the shared
+  `Mutex` **per call** and drops the guard between
+  operations; the `&LocalStoreDb` impl keeps the existing
+  test callers working unchanged. Regression test
+  (`locking_db_handle_releases_lock_during_sink_io`)
+  asserts the executor releases the DB lock during chunk
+  fetches: a probing sink calls `try_lock` from inside
+  `fetch_media_chunk` and fails the test if any call sees
+  the mutex still held by the executor.
+
+* **HNSW search\_semantic\_auto miss-path double-fetch.**
+  On a cache miss below `HNSW_FALLBACK_THRESHOLD` (or when
+  the graph builder rejected every candidate),
+  `search_semantic_auto` previously delegated to
+  `search_semantic`, which re-issued the same `SELECT`
+  against `search_vector` that just populated the local
+  `raw` candidate list. For a near-threshold corpus
+  (e.g. 999 rows) every cache-miss query doubled the
+  SQLite I/O. Brute-force scoring is now factored into a
+  module-level `score_candidates_brute_force` helper that
+  takes the already-fetched candidate set; both
+  `search_semantic` and the fallback paths in
+  `search_semantic_auto` reuse it.
+
 ### 2026-05-04 — Phase 6 / 7 / 8 batch 4 (this PR)
 
 Builds on the prior 2026-05-04 batches. Lands ten tasks across

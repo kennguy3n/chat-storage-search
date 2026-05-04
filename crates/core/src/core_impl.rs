@@ -1540,6 +1540,16 @@ impl CoreImpl {
     /// `MediaBlobSink` impls for both the source and the
     /// target. The caller decides whether to delete the source
     /// blobs after a successful migration.
+    ///
+    /// The DB lock is **not** held across the migration — we
+    /// hand the executor a
+    /// [`crate::media::migration::LockingDbHandle`] which
+    /// re-acquires `self.db` per DB call (idempotency probe +
+    /// storage-sink update). The chunk-fetch / chunk-upload /
+    /// roundtrip-verify phases (potentially minutes of network
+    /// I/O against iCloud / Google Drive / ZKOF) run with the
+    /// DB lock released so concurrent ingest / search / backup
+    /// workers continue to make progress.
     pub fn migrate_media_sink(
         &self,
         plan: &crate::media::migration::MediaMigrationPlan,
@@ -1548,12 +1558,12 @@ impl CoreImpl {
         progress: &dyn crate::media::migration::MigrationProgress,
         delete_source_after_success: bool,
     ) -> Result<crate::media::migration::MigrationReport> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let handle = crate::media::migration::LockingDbHandle::new(&self.db);
         crate::media::migration::execute_media_migration(
             plan,
             source,
             target,
-            &db,
+            &handle,
             progress,
             delete_source_after_success,
         )
