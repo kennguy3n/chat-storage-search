@@ -99,11 +99,17 @@ pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
 /// Skeleton-row projection used by
 /// [`QueryEngine::execute_search_with_semantic`] to materialize
 /// semantic-only hits.
+///
+/// Carries `kind` so the recency × content-kind multiplier
+/// can be applied without a second round trip — see the merge
+/// loop in
+/// [`QueryEngine::execute_search_with_semantic`].
 #[derive(Debug, Clone)]
 struct SemanticSkeletonInfo {
     conversation_id: String,
     sender_id: String,
     created_at_ms: i64,
+    kind: String,
 }
 
 /// Source of decrypted search-shard rows for cold
@@ -529,13 +535,20 @@ impl<'a> QueryEngine<'a> {
     /// and merges the hits into the FTS / fuzzy candidate set:
     ///
     /// * Rows that already had an FTS or fuzzy hit have
-    ///   `cosine * SEMANTIC_WEIGHT` added to `rank_score`.
+    ///   `cosine * SEMANTIC_WEIGHT` added to `rank_score`. The
+    ///   FTS / fuzzy pass already folded recency × content-kind
+    ///   into the row, so the semantic contribution stacks on
+    ///   top without re-applying that multiplier.
     /// * Rows that **only** appear via semantic search are added
     ///   to the result set with `rank_score =
     ///   cosine * SEMANTIC_WEIGHT * recency_factor *
-    ///   kind_weight` (the existing recency-and-kind multiplier
-    ///   is applied so semantic-only hits don't outrank a strong
-    ///   FTS hit on a stale message).
+    ///   kind_weight`. The recency anchor is the maximum
+    ///   `created_at_ms` across the combined candidate set —
+    ///   FTS / fuzzy hits in `local` plus the semantic-only
+    ///   skeletons — so the half-life decay is honoured. (An
+    ///   earlier bug computed the anchor from a single-element
+    ///   slice, which collapsed `age_ms` to `0` and made the
+    ///   factor always `1.0`.)
     ///
     /// When `text_embedder.embed` fails (or the query is
     /// empty / `embed` returns
@@ -587,7 +600,10 @@ impl<'a> QueryEngine<'a> {
         }
 
         // Bulk-fetch skeleton metadata for any semantic-only hit
-        // we'll need to materialize as a fresh SearchResult.
+        // we'll need to materialize as a fresh SearchResult. The
+        // projection includes `kind` so the recency × content-kind
+        // multiplier can be applied inline without a second round
+        // trip.
         let new_ids: Vec<String> = hits
             .iter()
             .filter(|h| !by_id.contains_key(&h.message_id))
@@ -599,9 +615,28 @@ impl<'a> QueryEngine<'a> {
             HashMap::new()
         };
 
+        // Anchor `now_ms` against the combined candidate set —
+        // FTS / fuzzy hits already in `local` plus any
+        // semantic-only hit the bulk fetch resolved. This matches
+        // `apply_cold_recency_weight`'s pattern. Anchoring on a
+        // single-element slice (the previous bug) collapsed
+        // `age_ms` to `0` for every semantic-only hit and made
+        // `recency_factor` always `1.0`, defeating the
+        // `RECENCY_HALF_LIFE_DAYS` decay.
+        let now_ms: i64 = local
+            .iter()
+            .map(|r| r.created_at_ms)
+            .chain(new_skeletons.values().map(|s| s.created_at_ms))
+            .max()
+            .unwrap_or(0);
+        let lambda = std::f64::consts::LN_2 / RECENCY_HALF_LIFE_DAYS;
+
         for hit in hits {
             let semantic_contribution = (hit.similarity as f64) * SEMANTIC_WEIGHT;
             if let Some(&idx) = by_id.get(&hit.message_id) {
+                // FTS / fuzzy already applied recency × kind in
+                // `execute_search_with_limit`; just stack the
+                // semantic contribution on top.
                 local[idx].rank_score += semantic_contribution;
                 continue;
             }
@@ -615,21 +650,29 @@ impl<'a> QueryEngine<'a> {
             let Ok(conv_uuid) = Uuid::parse_str(&meta.conversation_id) else {
                 continue;
             };
-            let mut sr = SearchResult {
+            // Inline the same recency × content-kind multiplier
+            // that `apply_recency_and_kind_weight` produces, but
+            // anchored on the combined-set `now_ms` rather than
+            // re-deriving it from a single-element slice.
+            let age_ms = (now_ms - meta.created_at_ms).max(0) as f64;
+            let age_days = age_ms / 86_400_000.0;
+            let recency_score = (-lambda * age_days).exp();
+            let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
+            let kind_w = match meta.kind.as_str() {
+                "text" => TEXT_KIND_WEIGHT,
+                "image" | "video" | "audio" | "file" => MEDIA_KIND_WEIGHT,
+                _ => TEXT_KIND_WEIGHT,
+            };
+            let weighted = semantic_contribution * recency_factor * kind_w;
+            local.push(SearchResult {
                 message_id: message_uuid,
                 conversation_id: conv_uuid,
                 sender_id: meta.sender_id.clone(),
                 created_at_ms: meta.created_at_ms,
-                rank_score: semantic_contribution,
+                rank_score: weighted,
                 is_cold: false,
                 snippet: None,
-            };
-            // Reapply recency × content-kind to the fresh row.
-            // The bulk path already ran for FTS/fuzzy hits, so
-            // applying it here gives semantic-only hits the same
-            // treatment.
-            self.apply_recency_and_kind_weight(std::slice::from_mut(&mut sr))?;
-            local.push(sr);
+            });
         }
         // Re-sort: descending rank_score, then created_at DESC,
         // then message_id for determinism.
@@ -656,7 +699,7 @@ impl<'a> QueryEngine<'a> {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT message_id, conversation_id, sender_id, created_at_ms
+            "SELECT message_id, conversation_id, sender_id, created_at_ms, kind
                FROM message_skeleton
               WHERE message_id IN ({placeholders})"
         );
@@ -673,15 +716,17 @@ impl<'a> QueryEngine<'a> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })? {
-            let (mid, conv, sender, ts) = r?;
+            let (mid, conv, sender, ts, kind) = r?;
             out.insert(
                 mid,
                 SemanticSkeletonInfo {
                     conversation_id: conv,
                     sender_id: sender,
                     created_at_ms: ts,
+                    kind,
                 },
             );
         }
@@ -2370,6 +2415,132 @@ mod tests {
         assert!(
             merged_score > plain_score,
             "semantic contribution should raise the dual-hit row's rank ({merged_score} vs {plain_score})",
+        );
+    }
+
+    #[test]
+    fn semantic_only_hit_recency_decays_against_combined_anchor() {
+        // Regression test for the recency-anchor bug fixed in
+        // this commit: `execute_search_with_semantic` previously
+        // called `apply_recency_and_kind_weight(std::slice::from_mut(&mut sr))`
+        // per semantic-only hit, which made `now_ms` equal the
+        // row's own `created_at_ms`, collapsed `age_ms` to `0`,
+        // and pinned `recency_factor` at `1.0`. A 90-day-old
+        // semantic-only hit therefore had its score boosted to
+        // `cosine * SEMANTIC_WEIGHT * 1.0` instead of being
+        // decayed by the 30-day half-life. This test forces the
+        // anchor to come from a fresher row in the combined
+        // candidate set and asserts the stale row's score is
+        // demonstrably below the un-decayed value.
+
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let mut conv_seen: HashMap<String, ()> = HashMap::new();
+        let conv = uuid_fixture(1).to_string();
+
+        // 90-day gap so `recency_factor` is well below the
+        // floor's halfway point.
+        let recent_ms: i64 = 90 * 86_400_000;
+        let stale_ms: i64 = 0;
+        let recent_msg = uuid_fixture(101).to_string();
+        let stale_msg = uuid_fixture(102).to_string();
+
+        // Anchor row: skeleton-only (no FTS body) so the FTS
+        // pass returns an empty `local`. The semantic merge has
+        // to derive its `now_ms` from the combined candidate
+        // set on its own.
+        insert_fixture(
+            &db,
+            &recent_msg,
+            &conv,
+            "alice",
+            recent_ms,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+        insert_fixture(
+            &db,
+            &stale_msg,
+            &conv,
+            "bob",
+            stale_ms,
+            "text",
+            None,
+            &mut conv_seen,
+        );
+
+        // Plant identical mock embeddings for both messages so
+        // both round-trip with cosine ≈ 1.0 against the query
+        // embedding.
+        let mock = MockTextEmbedder::default();
+        let q_text = "find this stale message";
+        let q_emb = mock.embed(q_text).unwrap();
+        let cache = LocalStoreEmbeddingCache::new(db.connection());
+        cache
+            .put(&recent_msg, XLMR_MODEL_VERSION, &q_emb)
+            .unwrap();
+        cache.put(&stale_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let with_semantic = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 200)
+            .unwrap();
+
+        let recent_uuid = Uuid::parse_str(&recent_msg).unwrap();
+        let stale_uuid = Uuid::parse_str(&stale_msg).unwrap();
+        let recent_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == recent_uuid)
+            .map(|r| r.rank_score)
+            .expect("anchor (recent) semantic-only hit should surface");
+        let stale_score = with_semantic
+            .iter()
+            .find(|r| r.message_id == stale_uuid)
+            .map(|r| r.rank_score)
+            .expect("90-day-old semantic-only hit should surface");
+
+        // Numeric envelope:
+        //   cosine ≈ 1.0 (round-trips via the INT8 codec at
+        //     >0.999 fidelity).
+        //   SEMANTIC_WEIGHT = 1.5
+        //   kind_weight = 1.0 (text)
+        //   For the anchor row, age = 0, so recency_factor = 1.0
+        //     and rank_score ≈ 1.5.
+        //   For the 90-day row, age_days = 90,
+        //     recency_score = exp(-90 * ln(2) / 30) = 1/8 = 0.125,
+        //     recency_factor = 0.5 + 0.5 * 0.125 = 0.5625,
+        //     rank_score ≈ 1.5 * 0.5625 ≈ 0.844.
+        let undecayed = SEMANTIC_WEIGHT;
+        assert!(
+            (recent_score - undecayed).abs() < 0.05,
+            "anchor row should sit at ≈ SEMANTIC_WEIGHT (1.5); got {recent_score:.4}",
+        );
+        // The bug under test made stale_score ≈ recent_score.
+        // Demand a clear gap: at least 30% below the un-decayed
+        // value, well above the floor (recency_factor ≥ 0.5
+        // → rank_score ≥ 0.75).
+        assert!(
+            stale_score < undecayed * 0.7,
+            "90-day-old semantic-only hit must be recency-decayed: \
+             got {stale_score:.4}, expected < {:.4} \
+             (un-decayed = {undecayed:.4})",
+            undecayed * 0.7,
+        );
+        assert!(
+            stale_score > undecayed * 0.45,
+            "score floor invariant violated: \
+             got {stale_score:.4} (floor ≈ {:.4})",
+            undecayed * 0.5,
+        );
+        // And the stale hit must rank below the anchor.
+        assert!(
+            stale_score < recent_score,
+            "stale hit should rank strictly below anchor: \
+             stale {stale_score:.4} vs anchor {recent_score:.4}",
         );
     }
 }
