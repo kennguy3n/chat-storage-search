@@ -1366,20 +1366,22 @@ type SearchResultSet<T> = std::result::Result<T, Error>;
 
 /// Phase 8 — append a `conversation_id IN (…)` filter clause for
 /// the supplied [`SearchTarget`]. No-op for [`SearchTarget::Global`]
-/// and for [`SearchTarget::Conversation`] (the legacy
-/// `conversation_filter` path already covers that case via
-/// [`push_structured_filters`]). For Community / Domain /
-/// Tenant / B2cAll the target is resolved against the local
-/// store; an empty resolution adds `1=0` so the WHERE clause
-/// short-circuits to "no rows" rather than falling through.
+/// (no filter wanted). For every other variant — including
+/// [`SearchTarget::Conversation`] — the target is resolved into a
+/// concrete set of `conversation_id`s and emitted as an IN-clause.
+/// An empty resolution adds `1=0` so the WHERE clause
+/// short-circuits to "no rows" rather than falling through to a
+/// global scan. If the legacy `conversation_filter` is also set,
+/// the AND of the two clauses is the (correct) more-restrictive
+/// behavior; in the normal case where they agree the duplicate
+/// IN-clause collapses cleanly.
 fn push_target_filter(
     target: &SearchTarget,
     db: &LocalStoreDb,
     clauses: &mut Vec<String>,
     binds: &mut Vec<Value>,
 ) {
-    let needs_set = !matches!(target, SearchTarget::Global | SearchTarget::Conversation(_));
-    if !needs_set {
+    if matches!(target, SearchTarget::Global) {
         return;
     }
     let resolved = match resolve_target_to_conversation_set(target, db) {
@@ -3606,6 +3608,45 @@ mod phase8_target_tests {
                 "out-of-community message must not surface"
             );
         }
+    }
+
+    #[test]
+    fn search_with_conversation_target_only_filters_to_that_conversation() {
+        // Phase 8 contract: setting `target = SearchTarget::Conversation(c)`
+        // *without* the legacy `conversation_filter` field must scope the
+        // search to that single conversation. Regression for the case
+        // where `push_target_filter` previously skipped the
+        // `Conversation(_)` arm and silently fanned back out to global.
+        let db = fresh_db();
+        let p = MessagePersister::new(&db);
+        let conv_in = Uuid::now_v7();
+        let conv_out = Uuid::now_v7();
+        seed_conv(&db, conv_in, "", "", "", "b2c");
+        seed_conv(&db, conv_out, "", "", "", "b2c");
+        let mid_in = persist(&p, conv_in, 1, "shared content meeting");
+        let mid_out = persist(&p, conv_out, 2, "shared content meeting");
+
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: "meeting".into(),
+            target: SearchTarget::Conversation(conv_in),
+            // legacy field intentionally left None — this is the
+            // bug-regression case.
+            conversation_filter: None,
+            ..Default::default()
+        };
+        let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
+        let ids: std::collections::HashSet<Uuid> = hits.iter().map(|h| h.message_id).collect();
+        assert!(
+            ids.contains(&mid_in),
+            "in-conversation hit must surface (got {:?})",
+            ids
+        );
+        assert!(
+            !ids.contains(&mid_out),
+            "out-of-conversation hit must NOT surface (got {:?})",
+            ids
+        );
     }
 
     #[test]
