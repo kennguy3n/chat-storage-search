@@ -698,9 +698,20 @@ impl<'a> QueryEngine<'a> {
             let age_days = age_ms / 86_400_000.0;
             let recency_score = (-lambda * age_days).exp();
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
+            // Match the canonical vocabulary that
+            // `MessageKind::as_str()` writes into
+            // `message_skeleton.kind`: "text", "media", or
+            // "system". The earlier "image" | "video" | "audio"
+            // | "file" arm was dead code (those strings come
+            // from `MediaDescriptor.kind`, not `MessageKind`),
+            // so media-typed semantic-only hits silently fell
+            // through the `_` arm and got `TEXT_KIND_WEIGHT`
+            // instead of `MEDIA_KIND_WEIGHT`. Mirrors
+            // `apply_recency_and_kind_weight` exactly so the
+            // two paths can't drift on this mapping.
             let kind_w = match meta.kind.as_str() {
                 "text" => TEXT_KIND_WEIGHT,
-                "image" | "video" | "audio" | "file" => MEDIA_KIND_WEIGHT,
+                "media" => MEDIA_KIND_WEIGHT,
                 _ => TEXT_KIND_WEIGHT,
             };
             let weighted = semantic_contribution * recency_factor * kind_w;
@@ -2912,5 +2923,87 @@ mod tests {
             .unwrap();
         assert!(unfiltered.iter().any(|r| r.message_id == allowed));
         assert!(unfiltered.iter().any(|r| r.message_id == blocked));
+    }
+
+    #[test]
+    fn semantic_only_media_hit_uses_media_kind_weight() {
+        // Regression: the kind-weight match arm in
+        // `execute_search_with_semantic` previously matched on
+        // `"image" | "video" | "audio" | "file"` — vocabulary
+        // borrowed from `MediaDescriptor.kind`, not the canonical
+        // `MessageKind::as_str()` strings actually written into
+        // `message_skeleton.kind` ("text" | "media" | "system").
+        // Media-typed semantic-only hits silently fell through
+        // the `_` arm and got `TEXT_KIND_WEIGHT (= 1.0)` instead
+        // of `MEDIA_KIND_WEIGHT (= 0.8)` — overranked by 25%.
+        //
+        // This test seeds two skeleton-only rows at the same
+        // timestamp (so `recency_factor = 1.0` and only the
+        // kind weight differs), one `kind = "text"` and one
+        // `kind = "media"`, plants identical mock embeddings,
+        // and asserts:
+        //
+        //   * text  rank_score ≈ SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT  = 1.50
+        //   * media rank_score ≈ SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT = 1.20
+        //
+        // The buggy code produced 1.50 for both. Tolerances
+        // absorb INT8-quant cosine fidelity (> 0.999).
+        let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).unwrap();
+        let text_mid = uuid_fixture(401).to_string();
+        let media_mid = uuid_fixture(402).to_string();
+        let q_text = "needle";
+        let (text_uuid, media_uuid) = seed_two_semantic_only_hits(
+            &db,
+            ("alice", 10_000, "text", &text_mid),
+            ("alice", 10_000, "media", &media_mid),
+            q_text,
+        );
+
+        let mock = MockTextEmbedder::default();
+        let engine = QueryEngine::new(&db);
+        let q = SearchQuery {
+            query_string: q_text.into(),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_semantic(&q, &SearchScope::LocalOnly, &mock, None, 50)
+            .unwrap();
+
+        let text_score = results
+            .iter()
+            .find(|r| r.message_id == text_uuid)
+            .map(|r| r.rank_score)
+            .expect("text semantic-only hit should surface");
+        let media_score = results
+            .iter()
+            .find(|r| r.message_id == media_uuid)
+            .map(|r| r.rank_score)
+            .expect("media semantic-only hit should surface");
+
+        let expected_text = SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT;
+        let expected_media = SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT;
+        let tol = 0.05;
+
+        assert!(
+            (text_score - expected_text).abs() < tol,
+            "text rank_score {text_score:.4} should be ≈ {expected_text:.4}",
+        );
+        assert!(
+            (media_score - expected_media).abs() < tol,
+            "media rank_score {media_score:.4} should be ≈ {expected_media:.4}; \
+             buggy code (matching on \"image\"/\"video\"/\"audio\"/\"file\") would \
+             have produced {expected_text:.4}",
+        );
+
+        // Tight invariant: the ratio must reflect the kind
+        // weight ratio (1.0 / 0.8 = 1.25), independent of any
+        // INT8 quant noise.
+        let ratio = text_score / media_score;
+        let expected_ratio = TEXT_KIND_WEIGHT / MEDIA_KIND_WEIGHT;
+        assert!(
+            (ratio - expected_ratio).abs() < 0.01,
+            "rank_score ratio {ratio:.4} should be ≈ {expected_ratio:.4} \
+             (= TEXT_KIND_WEIGHT / MEDIA_KIND_WEIGHT)",
+        );
     }
 }
