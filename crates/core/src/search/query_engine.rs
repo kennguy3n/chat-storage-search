@@ -96,6 +96,32 @@ pub(crate) const TEXT_KIND_WEIGHT: f64 = 1.0;
 /// See [`TEXT_KIND_WEIGHT`].
 pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
 
+/// Map a `message_skeleton.kind` string to the multiplicative
+/// content-kind weight used by the ranker. The canonical
+/// vocabulary is whatever
+/// [`crate::local_store::schema::MessageKind::as_str`] writes
+/// — today `"text"`, `"media"`, or `"system"`. Unknown / missing
+/// kinds default to [`TEXT_KIND_WEIGHT`] so cold-only rows that
+/// appear before the local skeleton lands still rank sensibly.
+///
+/// This is the single source of truth for the kind→weight
+/// mapping. Both [`QueryEngine::apply_recency_and_kind_weight`]
+/// (FTS / fuzzy lane) and
+/// [`QueryEngine::execute_search_with_semantic`] (semantic-only
+/// lane) call it so the two paths cannot drift on this mapping
+/// — the bug fixed in 187c666 was exactly that drift, where the
+/// semantic-only branch matched on `MediaDescriptor.kind`
+/// vocabulary (`"image" | "video" | "audio" | "file"`) instead
+/// of `MessageKind` vocabulary, silently demoting media hits to
+/// `TEXT_KIND_WEIGHT`.
+pub(crate) fn kind_str_to_weight(kind: &str) -> f64 {
+    match kind {
+        "text" => TEXT_KIND_WEIGHT,
+        "media" => MEDIA_KIND_WEIGHT,
+        _ => TEXT_KIND_WEIGHT,
+    }
+}
+
 /// Skeleton-row projection used by
 /// [`QueryEngine::execute_search_with_semantic`] to materialize
 /// semantic-only hits.
@@ -698,22 +724,7 @@ impl<'a> QueryEngine<'a> {
             let age_days = age_ms / 86_400_000.0;
             let recency_score = (-lambda * age_days).exp();
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
-            // Match the canonical vocabulary that
-            // `MessageKind::as_str()` writes into
-            // `message_skeleton.kind`: "text", "media", or
-            // "system". The earlier "image" | "video" | "audio"
-            // | "file" arm was dead code (those strings come
-            // from `MediaDescriptor.kind`, not `MessageKind`),
-            // so media-typed semantic-only hits silently fell
-            // through the `_` arm and got `TEXT_KIND_WEIGHT`
-            // instead of `MEDIA_KIND_WEIGHT`. Mirrors
-            // `apply_recency_and_kind_weight` exactly so the
-            // two paths can't drift on this mapping.
-            let kind_w = match meta.kind.as_str() {
-                "text" => TEXT_KIND_WEIGHT,
-                "media" => MEDIA_KIND_WEIGHT,
-                _ => TEXT_KIND_WEIGHT,
-            };
+            let kind_w = kind_str_to_weight(meta.kind.as_str());
             let weighted = semantic_contribution * recency_factor * kind_w;
             local.push(SearchResult {
                 message_id: message_uuid,
@@ -1038,16 +1049,12 @@ impl<'a> QueryEngine<'a> {
             // zero rank — they should still rank below newer
             // identical-relevance hits but stay visible.
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
+            // Default to text weight when the row is missing
+            // from `message_skeleton` (cold-only rows can be
+            // surfaced before the skeleton lands locally).
             let kind_w = kind_by_id
                 .get(&r.message_id.to_string())
-                .map(|k| match k.as_str() {
-                    "text" => TEXT_KIND_WEIGHT,
-                    "media" => MEDIA_KIND_WEIGHT,
-                    _ => TEXT_KIND_WEIGHT,
-                })
-                // Default to text weight when the row is missing
-                // from `message_skeleton` (cold-only rows can be
-                // surfaced before the skeleton lands locally).
+                .map(|k| kind_str_to_weight(k.as_str()))
                 .unwrap_or(TEXT_KIND_WEIGHT);
             r.rank_score *= recency_factor * kind_w;
         }
@@ -3005,5 +3012,27 @@ mod tests {
             "rank_score ratio {ratio:.4} should be ≈ {expected_ratio:.4} \
              (= TEXT_KIND_WEIGHT / MEDIA_KIND_WEIGHT)",
         );
+    }
+
+    #[test]
+    fn kind_str_to_weight_canonical_mapping() {
+        // The helper is the single source of truth for the
+        // skeleton-kind → ranker-weight mapping. Pin the
+        // canonical `MessageKind::as_str()` vocabulary —
+        // anything else collapses to TEXT_KIND_WEIGHT so cold
+        // / unknown rows stay visible.
+        assert_eq!(kind_str_to_weight("text"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("media"), MEDIA_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("system"), TEXT_KIND_WEIGHT);
+        // Vocabulary that previously slipped through the dead
+        // arm in `execute_search_with_semantic` — pin them as
+        // unknown / text-weight so a future regression on the
+        // semantic-only path cannot silently re-route media
+        // hits through these strings.
+        assert_eq!(kind_str_to_weight("image"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("video"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("audio"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight("file"), TEXT_KIND_WEIGHT);
+        assert_eq!(kind_str_to_weight(""), TEXT_KIND_WEIGHT);
     }
 }
