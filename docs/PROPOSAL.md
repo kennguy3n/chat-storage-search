@@ -3,9 +3,14 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
 > Status: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 —
-> Local Store + Text Search + MLS Integration (`In progress | ~95%`).
-> Phase 2 — Media Encryption and Blob Service (`In progress | ~80%`).
-> Phase 3 — Personal Archive and Offload (`In progress | ~35%`).
+> Local Store + Text Search + MLS Integration (`In progress | ~96%`).
+> Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`).
+> Phase 3 — Personal Archive and Offload (`In progress | ~97%`).
+> Phase 4 — Backup and Restore (`In progress | ~90%`).
+> Phase 5 — Search — Fuzzy + Encrypted Shards (`In progress | ~95%`).
+> Phase 6 — Media and Semantic Search (`In progress | ~75%`).
+> Phase 7 — Desktop + Optimization (`In progress | ~40%`).
+> Phase 8 — Multi-Scope, Multi-Tenant Search (`Not started | 0%`).
 > This document defines the target architecture. See
 > [PROGRESS.md](PROGRESS.md) for the live build tracker.
 
@@ -173,6 +178,23 @@ labelled `info` strings (`"kchat-archive-root-v1"`,
 etc.). Versioned info strings let us rotate a derivation path
 without colliding with deployed manifests.
 
+> **Phase 8 extension.** The key hierarchy gains per-tenant B2B
+> isolation:
+>
+> ```
+> K_user_master
+>   ├── K_b2c_archive_root              (personal B2C archive)
+>   ├── K_b2b_tenant_root(tenant_id)    (per-tenant B2B archive)
+>   │     └── K_b2b_archive_epoch(tenant_id, epoch_id)
+>   └── K_search_root
+>         ├── K_b2c_text_index_shard(shard_id)
+>         ├── K_b2b_text_index_shard(tenant_id, shard_id)
+>         └── K_bloom_index_shard(shard_id)   ← NEW
+> ```
+>
+> Per-tenant keys allow cryptographic separation of B2B
+> organizational data from personal B2C data. See PHASES.md Phase 8.
+
 Archive epoch rotation: `K_archive_epoch(epoch_id)` is derived from
 `K_archive_root` with `info = "kchat-archive-epoch-v1" || epoch_id`.
 The default epoch cadence is monthly, matching the archive
@@ -310,6 +332,13 @@ CREATE TABLE media_search_index (
     PRIMARY KEY (asset_id, kind, text)
 );
 ```
+
+> **Phase 8 extension (§3.2.1).** The `conversation` table gains
+> `conversation_type`, `scope`, `tenant_id`, `community_id`, and
+> `domain_id` columns to support the multi-scope, multi-tenant
+> search architecture. The `archive_segment_map` table likewise
+> gains a `tenant_id` column so cold-bucket fan-out can prune by
+> tenant. See PHASES.md Phase 8 and PROPOSAL.md §7.10.
 
 ### 3.3 FTS5 tokenizer choice
 
@@ -749,6 +778,20 @@ metadata signal from "user searched text in April 2026 for
 conversation X" to "user accessed April 2026 shards for
 conversation X".
 
+KChat MAY additionally implement:
+
+```
+GET /v1/archive/index-shards?conversation_hash=...&bucket=2026-04&type=bloom
+```
+
+Bloom filter shards are a Phase 8 addition. They are tiny (~1-10 KB)
+encrypted bloom filters over the lowercased words in a bucket. The
+client fetches bloom shards first to determine which buckets could
+possibly match the query, then fetches full text + fuzzy shards only
+for bloom-positive buckets. This reduces the number of full shard
+downloads by 80%+ for global search without leaking any additional
+metadata beyond the existing `(conversation_hash, bucket)` signal.
+
 ### 7.2 Search content types
 
 | Content              | Indexed locally                                 | Multilingual considerations                                                                                                              |
@@ -810,21 +853,42 @@ boundary as a server request.
 ### 7.5 Ranking formula
 
 ```
-rank =
-    exact_match_score          * 4.0
-  + bm25_score                  * 2.0
-  + fuzzy_score                 * 1.0
-  + semantic_similarity         * 2.5
-  + recency_boost               * 0.5
-  + sender_filter_boost
-  + conversation_filter_boost
-  - cold_content_penalty        * 0.1
+rank = (BM25_WEIGHT × bm25_score + FUZZY_WEIGHT × fuzzy_score + SEMANTIC_WEIGHT × semantic_similarity)
+     × recency_factor(age_days)
+     × content_kind_weight(kind)
+
+where:
+  BM25_WEIGHT           = 2.0
+  FUZZY_WEIGHT          = 1.0
+  SEMANTIC_WEIGHT       = 1.5
+  RECENCY_WEIGHT        = 0.5
+  RECENCY_HALF_LIFE     = 30 days
+  TEXT_KIND_WEIGHT       = 1.0
+  MEDIA_KIND_WEIGHT      = 0.8
+
+  recency_factor = (1 - RECENCY_WEIGHT) + RECENCY_WEIGHT × exp(-ln(2) × age_days / 30)
 ```
 
-The cold content penalty is deliberately small: offloaded results
-should still appear. Penalizing them more would silently hide
-older or larger conversations from search, which contradicts the
-"index always stays" rule in §5.3.
+The constants live in `crates/core/src/search/query_engine.rs`
+(`BM25_WEIGHT`, `FUZZY_WEIGHT`, `SEMANTIC_WEIGHT`, `RECENCY_WEIGHT`,
+`RECENCY_HALF_LIFE_DAYS`, `TEXT_KIND_WEIGHT`, `MEDIA_KIND_WEIGHT`)
+and are applied by `apply_recency_and_kind_weight` /
+`execute_search_with_semantic`. ARCHITECTURE.md §6.3 contains the
+matching tabular reference and worked-example numbers.
+
+Sender, conversation, and date filters are SQL `WHERE`-clause
+filters against `message_skeleton` — they reduce the candidate set
+but are not score boosts. Likewise there is no `exact_match_score *
+4.0` term: exact matches naturally dominate the merged score
+because BM25 ranks them above prefix / fuzzy hits at the lexer
+level. The previous `cold_content_penalty * 0.1` term was removed
+when cold buckets started running through the same
+`recency_factor × content_kind_weight` post-multiplier as local
+results (`apply_cold_recency_weight` in `query_engine.rs`); cold
+hits and local hits now share one symmetric ranker, so an old cold
+hit and an old local hit are penalized identically and a recent
+cold hit can still beat an old local hit on its underlying BM25 /
+fuzzy / semantic contributions.
 
 ### 7.6 On-device ML models (multilingual)
 
@@ -965,7 +1029,7 @@ when needed:
   "magic": "KCHAT_INDEX_SHARD_V1",
   "version": 1,
   "shard_id": "<uuid v7>",
-  "index_type": "text | fuzzy | vector | media",
+  "index_type": "text | fuzzy | vector | media | bloom",
   "conversation_id_hash": "<base64 BLAKE3-keyed-hash>",
   "time_bucket": "2026-04",
   "doc_count": 12000,
@@ -993,6 +1057,48 @@ correlated by the shard listing endpoint.
 4. **Media original offloaded** — thumbnail + OCR / index local;
    result appears instantly; tap downloads encrypted chunks,
    verifies, decrypts, streams.
+
+### 7.10 Multi-scope search architecture (Phase 8)
+
+KChat's organizational model introduces three search scope levels
+beyond the single-conversation filter:
+
+- **B2C**: 1:1 DMs, group chats, communities (collections of group
+  chats / channels).
+- **B2B**: 1:1 DMs, group chats, domains (collections of group
+  chats / channels) — each B2B chat boundary is a tenant.
+- **Global**: search across all conversations on the device.
+
+`SearchQuery.conversation_filter: Option<Uuid>` is replaced by
+`SearchQuery.target: SearchTarget`, where `SearchTarget` is one of:
+`Conversation(Uuid)`, `Community(Uuid)`, `Domain(Uuid)`,
+`Tenant(String)`, `B2cAll`, `Global` (default).
+
+The scope resolver maps each `SearchTarget` to a
+`HashSet<conversation_id>` via SQL lookups on the conversation
+table's `community_id`, `domain_id`, `tenant_id`, and `scope`
+columns. The resolved set replaces the single-ID filter in the
+cold bucket fan-out loop.
+
+Performance optimizations for multi-scope search:
+1. **Bucket-level date pruning** — skip entire month buckets
+   outside `[date_from, date_to]`.
+2. **Encrypted bloom filter per bucket** — pre-check query terms
+   against a tiny bloom shard before downloading full shards.
+3. **On-device shard cache (LRU)** — cache decrypted shards to
+   eliminate re-fetches.
+4. **Parallel bucket fetch** — bounded-concurrency fetch instead
+   of sequential loop.
+5. **Progressive results** — stream cold results as each bucket
+   completes.
+6. **Background shard warming** — pre-fetch shards during idle.
+
+B2B tenant isolation is cryptographic: each tenant derives its own
+`K_b2b_tenant_root(tenant_id)` from `K_user_master`, with
+per-tenant archive and search shard keys. A `TenantSearchPolicy`
+controls whether a tenant's data participates in global search.
+
+See PHASES.md Phase 8 for the full checklist and priority order.
 
 ---
 
