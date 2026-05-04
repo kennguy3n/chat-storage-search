@@ -185,6 +185,11 @@ impl<'a> QueryEngine<'a> {
     ///   `docs/PROPOSAL.md §12`.
     /// * Empty query strings short-circuit to the structured-only
     ///   path; cold fan-out only runs on free-text queries.
+    /// * Non-text `query.content_kind` values short-circuit to
+    ///   the local result set. Phase 5 only ships text + fuzzy
+    ///   cold shards, so a media-only query has no cold
+    ///   contribution to merge; consulting the cold source would
+    ///   leak text-shard hits through the kind filter.
     /// * Errors from the cold source bubble out of this call —
     ///   callers that want graceful degradation should pass an
     ///   adapter that swallows transient transport failures.
@@ -226,6 +231,21 @@ impl<'a> QueryEngine<'a> {
             // shards: the fuzzy / FTS contributions are zero
             // anyway.
             return Ok(local);
+        }
+
+        // Phase 5 only ships text + fuzzy cold shards. When the
+        // caller has explicitly narrowed the search to a non-text
+        // content kind (Image / Video / Audio / Document), the
+        // cold path has nothing to contribute — and worse,
+        // returning text-shard hits here would silently violate
+        // the `content_kind` filter that the local pass already
+        // enforced via `allowed_skeleton_ids`. Short-circuit
+        // before consulting `cold_source` so the cold fan-out
+        // never runs for media-only queries.
+        if let Some(kind) = query.content_kind {
+            if !matches!(kind, ContentKind::Text | ContentKind::Any) {
+                return Ok(local);
+            }
         }
 
         let buckets = cold_source.cold_buckets()?;

@@ -33,7 +33,7 @@ use kchat_core::search::shard_builder::{
     build_fuzzy_search_shard, build_text_search_shard, restore_fuzzy_search_shard,
     restore_text_search_shard, FtsRow, FuzzyRow,
 };
-use kchat_core::{Error, SearchQuery, SearchScope};
+use kchat_core::{ContentKind, Error, SearchQuery, SearchScope};
 use uuid::Uuid;
 
 const DB_KEY: [u8; 32] = [0x77; 32];
@@ -457,4 +457,109 @@ fn cold_shard_merge_does_not_double_weight_local_rows() {
         local_only_score,
         raw_cold_contribution
     );
+}
+
+/// Phase 5, Task 1 contract: when the caller has narrowed the
+/// search to a non-text content kind, the cold fan-out must
+/// short-circuit before consulting `ColdShardSource`. Phase 5
+/// only ships text + fuzzy cold shards, so any cold fetch on a
+/// media-only query would (a) be wasted I/O and (b) leak text
+/// hits through the kind filter that the local pass enforced via
+/// `allowed_skeleton_ids`.
+///
+/// This test stands up a [`PoisonedCatalog`] that panics on every
+/// trait method, runs the search with `content_kind =
+/// ContentKind::Image`, and asserts the call returns `Ok` without
+/// any cold method being invoked.
+#[test]
+fn cold_shard_skips_fan_out_for_non_text_kind() {
+    /// Mock cold source that fails the test if any of its methods
+    /// are called. Used to prove the cold path was never reached.
+    struct PoisonedCatalog;
+    impl ColdShardSource for PoisonedCatalog {
+        fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
+            panic!(
+                "cold_buckets must not be called when content_kind is non-text \
+                 (Phase 5 ships text + fuzzy cold shards only)"
+            );
+        }
+        fn fetch_text_rows(
+            &self,
+            _conversation_id: &str,
+            _time_bucket: &str,
+        ) -> Result<Vec<FtsRow>, Error> {
+            panic!("fetch_text_rows must not be called for non-text content_kind");
+        }
+        fn fetch_fuzzy_rows(
+            &self,
+            _conversation_id: &str,
+            _time_bucket: &str,
+        ) -> Result<Vec<FuzzyRow>, Error> {
+            panic!("fetch_fuzzy_rows must not be called for non-text content_kind");
+        }
+    }
+
+    let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
+    let engine = QueryEngine::new(&db);
+
+    // Image / Video / Audio / Document all map to the `media`
+    // skeleton kind in Phase 1, and none of them have a cold
+    // shard variant in Phase 5. Each must skip the cold fan-out.
+    for kind in [
+        ContentKind::Image,
+        ContentKind::Video,
+        ContentKind::Audio,
+        ContentKind::Document,
+    ] {
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            content_kind: Some(kind),
+            ..Default::default()
+        };
+        // Must not panic — the early return must fire before any
+        // ColdShardSource method is invoked.
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &PoisonedCatalog)
+            .unwrap_or_else(|e| panic!("cold path must not error for kind {kind:?}: {e:?}"));
+        assert!(
+            results.is_empty(),
+            "no local rows in this DB; cold fan-out short-circuited \
+             for kind {kind:?} → result set must be empty"
+        );
+    }
+
+    // Sanity: when content_kind is Text or Any, the cold path is
+    // *expected* to run. Wire up a non-poisoned catalog and prove
+    // the call still works (no early return for these kinds).
+    struct EmptyCatalog;
+    impl ColdShardSource for EmptyCatalog {
+        fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
+            Ok(Vec::new())
+        }
+        fn fetch_text_rows(
+            &self,
+            _conversation_id: &str,
+            _time_bucket: &str,
+        ) -> Result<Vec<FtsRow>, Error> {
+            Ok(Vec::new())
+        }
+        fn fetch_fuzzy_rows(
+            &self,
+            _conversation_id: &str,
+            _time_bucket: &str,
+        ) -> Result<Vec<FuzzyRow>, Error> {
+            Ok(Vec::new())
+        }
+    }
+    for kind in [ContentKind::Text, ContentKind::Any] {
+        let q = SearchQuery {
+            query_string: "lighthouse".into(),
+            content_kind: Some(kind),
+            ..Default::default()
+        };
+        let results = engine
+            .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &EmptyCatalog)
+            .unwrap();
+        assert!(results.is_empty());
+    }
 }
