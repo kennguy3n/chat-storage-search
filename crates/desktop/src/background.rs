@@ -26,7 +26,9 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use kchat_core::scheduler::{BackgroundScheduler, InProcessScheduler, TaskHandler, TaskType};
+use kchat_core::scheduler::{
+    BackgroundScheduler, InProcessScheduler, OneOffTask, TaskConstraints, TaskHandler, TaskType,
+};
 use kchat_core::Error;
 
 /// Desktop wrapper around [`InProcessScheduler`]. Implements
@@ -107,6 +109,13 @@ impl BackgroundScheduler for DesktopScheduler {
     }
     fn is_task_pending(&self, task_id: &str) -> Result<bool, Error> {
         self.inner.is_task_pending(task_id)
+    }
+    fn schedule_one_off_task(
+        &self,
+        task: OneOffTask,
+        constraints: TaskConstraints,
+    ) -> Result<(), Error> {
+        self.inner.schedule_one_off_task(task, constraints)
     }
 }
 

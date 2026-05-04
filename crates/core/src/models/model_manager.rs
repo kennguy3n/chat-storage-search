@@ -382,6 +382,56 @@ impl ModelManager {
         let filename = format!("{model_id}-{safe_version}.onnx");
         self.config.models_dir.join(filename)
     }
+
+    // -------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 8: EP benchmark capture
+    // and auto-selection.
+    // -------------------------------------------------------------
+
+    /// Run an EP benchmark for `(model_id, ep)` via the supplied
+    /// runner. Returns the resulting [`crate::models::ep_tuning::EpBenchmark`]
+    /// without persisting it — callers feed the benchmark into
+    /// an [`crate::models::ep_tuning::EpBenchmarkCache`] if they
+    /// want it to survive process restarts.
+    pub fn benchmark_ep(
+        &self,
+        model_id: &str,
+        ep: crate::models::ep_tuning::ExecutionProvider,
+        runner: &dyn crate::models::ep_tuning::EpBenchmarkRunner,
+    ) -> Result<crate::models::ep_tuning::EpBenchmark> {
+        // We benchmark against the *first* registered version of
+        // this model_id. Production callers typically register a
+        // single version per model_id, but if multiple are
+        // present any one is acceptable for the benchmark
+        // (latency depends on the EP, not the artifact version).
+        let guard = self
+            .artifacts
+            .read()
+            .map_err(|_| crate::Error::Model("ModelManager registry poisoned".into()))?;
+        let artifact = guard
+            .iter()
+            .find(|((id, _), _)| id == model_id)
+            .map(|(_, a)| a.clone())
+            .ok_or_else(|| {
+                crate::Error::Model(format!("benchmark_ep: model_id {model_id} not registered"))
+            })?;
+        drop(guard);
+        runner.run_benchmark(ep, &artifact)
+    }
+
+    /// Pick the EP with the lowest measured latency for
+    /// `model_id` from the supplied cache, falling back to the
+    /// supplied `fallback_chain` when no benchmark is recorded.
+    /// See [`crate::models::ep_tuning::select_best_ep`].
+    pub fn select_optimal_ep(
+        &self,
+        model_id: &str,
+        cache: &crate::models::ep_tuning::EpBenchmarkCache,
+        fallback_chain: &[crate::models::ep_tuning::ExecutionProvider],
+    ) -> crate::models::ep_tuning::ExecutionProvider {
+        let benchmarks = cache.benchmarks_for_model(model_id);
+        crate::models::ep_tuning::select_best_ep(&benchmarks, fallback_chain)
+    }
 }
 
 impl Default for ModelManager {

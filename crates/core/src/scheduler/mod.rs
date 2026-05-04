@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 
 pub mod in_process;
-pub use in_process::{InProcessScheduler, TaskHandler};
+pub use in_process::{
+    InProcessScheduler, OneOffTaskHandler, ResourceProbe, StaticResourceProbe, TaskHandler,
+};
 
 // ---------------------------------------------------------------------------
 // TaskType — enumerated recurring background tasks
@@ -138,6 +140,114 @@ impl ScheduledTask {
 }
 
 // ---------------------------------------------------------------------------
+// OneOffTask — Phase 7 (2026-05-04 batch 10) one-shot work the
+// scheduler runs at idle-priority. Complements the recurring
+// `ScheduledTask` descriptor above. Tasks 5/8/9 fold their
+// background work through this surface.
+// ---------------------------------------------------------------------------
+
+/// A one-shot piece of work the scheduler will execute when its
+/// [`TaskConstraints`] allow it (typically idle + Wi-Fi +
+/// charging). Distinct from [`ScheduledTask`], which describes a
+/// *recurring* loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneOffTask {
+    /// Phase 7 (Task 9) — drain a
+    /// [`crate::media::migration::MediaMigrationPlan`] one item
+    /// at a time. The plan is captured by reference so the
+    /// scheduler can re-run a subset on transient failure.
+    MediaMigration {
+        /// The plan to execute. Stored as a serializable
+        /// snapshot so scheduler implementations that persist
+        /// pending work to disk can round-trip it without
+        /// holding live references.
+        plan: MediaMigrationPlanSnapshot,
+    },
+    /// Phase 7 (Task 8 of the previous batch) — pre-warm the
+    /// on-device shard cache for a list of conversations /
+    /// buckets so the next search hits the cache.
+    ShardWarming {
+        /// Conversation ids to warm.
+        conversations: Vec<String>,
+        /// Bucket ids (e.g. `"2026-04"`) to warm. Cross with
+        /// `conversations` to enumerate the
+        /// `(conversation_id, time_bucket)` pairs the scheduler
+        /// fetches.
+        buckets: Vec<String>,
+    },
+}
+
+/// Serializable snapshot of a
+/// [`crate::media::migration::MediaMigrationPlan`]. The migration
+/// plan itself carries non-serializable per-item handles; this
+/// snapshot captures only the fields the scheduler needs to
+/// queue / persist the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaMigrationPlanSnapshot {
+    /// Tag of the source sink.
+    pub source_sink: String,
+    /// Tag of the target sink.
+    pub target_sink: String,
+    /// Number of assets to migrate.
+    pub item_count: usize,
+}
+
+impl MediaMigrationPlanSnapshot {
+    /// Build a snapshot from a full
+    /// [`crate::media::migration::MediaMigrationPlan`].
+    pub fn from_plan(plan: &crate::media::migration::MediaMigrationPlan) -> Self {
+        Self {
+            source_sink: plan.source_sink.clone(),
+            target_sink: plan.target_sink.clone(),
+            item_count: plan.items.len(),
+        }
+    }
+}
+
+/// Resource constraints the scheduler must satisfy before
+/// running an [`OneOffTask`]. Phase 7 batch 10 — Task 9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskConstraints {
+    /// `true` → only run when the device is on Wi-Fi (or
+    /// equivalent un-metered network).
+    pub require_wifi: bool,
+    /// `true` → only run when the device is charging.
+    pub require_charging: bool,
+    /// `true` → only run when the device is idle (screen off /
+    /// no foreground app).
+    pub require_idle: bool,
+    /// Maximum number of times the scheduler may retry the task
+    /// after a transient failure before surfacing the error to
+    /// the orchestrator.
+    pub max_retry_count: u32,
+}
+
+impl Default for TaskConstraints {
+    fn default() -> Self {
+        Self {
+            require_wifi: false,
+            require_charging: false,
+            require_idle: false,
+            max_retry_count: 3,
+        }
+    }
+}
+
+impl TaskConstraints {
+    /// "Only on Wi-Fi + charging" — the recommended constraint
+    /// set for media migration so it never eats mobile data /
+    /// drains the battery.
+    pub fn wifi_and_charging() -> Self {
+        Self {
+            require_wifi: true,
+            require_charging: true,
+            require_idle: false,
+            max_retry_count: 3,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BackgroundScheduler — orchestration-side trait
 // ---------------------------------------------------------------------------
 
@@ -184,6 +294,26 @@ pub trait BackgroundScheduler: Send + Sync + std::fmt::Debug {
     /// orchestration layer to skip a re-schedule when the
     /// platform already has the task in its queue.
     fn is_task_pending(&self, task_id: &str) -> Result<bool, Error>;
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 9: enqueue a
+    /// one-off task with explicit resource constraints. The
+    /// scheduler is free to defer execution until the
+    /// [`TaskConstraints`] are met (Wi-Fi, charging, idle) and
+    /// to retry up to
+    /// [`TaskConstraints::max_retry_count`] times on transient
+    /// failures.
+    ///
+    /// The default impl returns
+    /// [`Error::NotImplemented("scheduler::schedule_one_off")`]
+    /// so existing platform bridges that haven't migrated yet
+    /// keep compiling.
+    fn schedule_one_off_task(
+        &self,
+        _task: OneOffTask,
+        _constraints: TaskConstraints,
+    ) -> Result<(), Error> {
+        Err(Error::NotImplemented("scheduler::schedule_one_off"))
+    }
 }
 
 // ---------------------------------------------------------------------------

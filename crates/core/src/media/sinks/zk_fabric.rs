@@ -155,6 +155,17 @@ pub trait S3Client: Send + Sync + std::fmt::Debug {
     /// Idempotently delete `(bucket, key)`.
     fn delete_object(&self, bucket: &str, key: &str) -> Result<(), Error>;
 
+    /// Return the byte length of `(bucket, key)`, or `None` if the
+    /// implementation does not support a HEAD-style probe. Used
+    /// by `delete_media_blob` to record the actual size in the
+    /// `DedupEvent::ObjectDeleted` analytics event so the
+    /// in-process byte counter is decremented accurately. The
+    /// default returns `Ok(None)`, in which case callers fall
+    /// back to a chunk-count-based estimate.
+    fn head_object(&self, _bucket: &str, _key: &str) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
     /// List every key under `prefix` in `bucket`. Used by the
     /// backup sink to enumerate manifest IDs at restore time.
     /// Defaults to [`Error::NotImplemented`] so existing
@@ -258,6 +269,13 @@ fn chunk_range(chunk_idx: u32) -> Range<u64> {
 pub struct ZkObjectFabricSink {
     s3: Arc<dyn S3Client>,
     config: ZkFabricSinkConfig,
+    /// Phase 7 (2026-05-04 batch 10 — Task 10) — optional
+    /// dedup-analytics probe. When set, every successful
+    /// `upload_media_chunks` records a
+    /// [`crate::transport::dedup_analytics::DedupEvent::ObjectUploaded`]
+    /// and every successful `delete_media_blob` records an
+    /// [`crate::transport::dedup_analytics::DedupEvent::ObjectDeleted`].
+    dedup_analytics: Option<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
 }
 
 impl ZkObjectFabricSink {
@@ -267,7 +285,22 @@ impl ZkObjectFabricSink {
     /// failure on misconfigured tenants.
     pub fn new(s3: Arc<dyn S3Client>, config: ZkFabricSinkConfig) -> Result<Self, Error> {
         config.validate()?;
-        Ok(Self { s3, config })
+        Ok(Self {
+            s3,
+            config,
+            dedup_analytics: None,
+        })
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): builder helper
+    /// that attaches a dedup-analytics probe. Returns `self` for
+    /// fluent construction.
+    pub fn with_dedup_analytics(
+        mut self,
+        probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+    ) -> Self {
+        self.dedup_analytics = Some(probe);
+        self
     }
 
     /// Bucket name this sink targets.
@@ -309,7 +342,16 @@ impl MediaBlobSink for ZkObjectFabricSink {
         }
 
         let key = asset_key(asset_id);
+        let blob_size = blob.len() as u64;
         self.s3.put_object(&self.config.bucket, &key, &blob)?;
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                    size_bytes: blob_size,
+                    was_deduped: false,
+                },
+            );
+        }
 
         Ok(MediaBlobReference {
             blob_id: asset_id.to_string(),
@@ -348,12 +390,42 @@ impl MediaBlobSink for ZkObjectFabricSink {
                 blob_ref.storage_sink
             )));
         }
-        let asset_id = match &blob_ref.sink_metadata {
-            Some(meta) => decode_metadata(meta)?.0,
-            None => blob_ref.blob_id.clone(),
+        // Decode the metadata once: it carries both the asset id
+        // (for the S3 key) and the chunk_count we use as a
+        // fallback size estimate when the S3 client doesn't
+        // support `head_object`.
+        let (asset_id, chunk_count_estimate) = match &blob_ref.sink_metadata {
+            Some(meta) => {
+                let (asset_id, chunk_count, _) = decode_metadata(meta)?;
+                (asset_id, Some(chunk_count))
+            }
+            None => (blob_ref.blob_id.clone(), None),
         };
-        self.s3
-            .delete_object(&self.config.bucket, &asset_key(&asset_id))
+        let key = asset_key(&asset_id);
+        // Probe the actual byte size *before* the delete so
+        // `DedupEvent::ObjectDeleted` carries an accurate
+        // `size_bytes` for the in-process byte counter. If the
+        // S3 client doesn't support HEAD or the object is
+        // already gone, fall back to a chunk-count-based
+        // estimate; if we have neither, record `0` and let the
+        // caller treat it as best-effort.
+        let size_bytes = if self.dedup_analytics.is_some() {
+            match self.s3.head_object(&self.config.bucket, &key) {
+                Ok(Some(size)) => size,
+                Ok(None) | Err(_) => chunk_count_estimate
+                    .map(|c| (c as u64).saturating_mul(DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64))
+                    .unwrap_or(0),
+            }
+        } else {
+            0
+        };
+        self.s3.delete_object(&self.config.bucket, &key)?;
+        if let Some(probe) = self.dedup_analytics.as_ref() {
+            let _ = probe.record_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectDeleted { size_bytes },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -424,6 +496,15 @@ mod tests {
                 .unwrap()
                 .remove(&(bucket.to_string(), key.to_string()));
             Ok(())
+        }
+
+        fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, Error> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(&(bucket.to_string(), key.to_string()))
+                .map(|b| b.len() as u64))
         }
     }
 
@@ -716,5 +797,139 @@ mod tests {
             .upload_media_chunks("asset-trait", BlobClass::Media, &[&[7, 8, 9]], [0; 32])
             .unwrap();
         assert_eq!(blob_ref.storage_sink, ZK_OBJECT_FABRIC_SINK_TAG);
+    }
+
+    #[test]
+    fn upload_media_chunks_records_dedup_event() {
+        use crate::transport::dedup_analytics::DedupAnalytics;
+        let s3 = Arc::new(InMemoryS3::default());
+        let probe = Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        let sink = ZkObjectFabricSink::new(s3, fresh_config())
+            .unwrap()
+            .with_dedup_analytics(probe.clone());
+        sink.upload_media_chunks(
+            "asset-dedup",
+            BlobClass::Media,
+            &[&[1, 2, 3, 4, 5]],
+            [0u8; 32],
+        )
+        .unwrap();
+        let stats = probe.query_dedup_ratio("tenant-x").unwrap();
+        assert_eq!(stats.total_objects, 1);
+        assert_eq!(stats.total_bytes, 5);
+        let recent = probe.recent_events();
+        assert_eq!(recent.len(), 1);
+        assert!(matches!(
+            recent[0],
+            crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                size_bytes: 5,
+                was_deduped: false
+            }
+        ));
+    }
+
+    /// Regression for the dedup byte-counter inflation Devin
+    /// Review surfaced as BUG-0001: `delete_media_blob` must
+    /// record the actual blob size (via `head_object`) so the
+    /// `total_bytes` counter is decremented correctly. With the
+    /// old hardcoded `size_bytes: 0` the counter never came
+    /// down, leaving `query_dedup_ratio().total_bytes` stuck at
+    /// the upload size after a delete.
+    #[test]
+    fn delete_media_blob_records_actual_size_via_head_object() {
+        use crate::transport::dedup_analytics::DedupAnalytics;
+        let s3 = Arc::new(InMemoryS3::default());
+        let probe = Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        let sink = ZkObjectFabricSink::new(s3.clone(), fresh_config())
+            .unwrap()
+            .with_dedup_analytics(probe.clone());
+
+        let payload: Vec<u8> = (0u8..=63).collect();
+        let blob_ref = sink
+            .upload_media_chunks(
+                "asset-delete",
+                BlobClass::Media,
+                &[payload.as_slice()],
+                [0u8; 32],
+            )
+            .unwrap();
+        let after_upload = probe.query_dedup_ratio("tenant-x").unwrap();
+        assert_eq!(after_upload.total_objects, 1);
+        assert_eq!(after_upload.total_bytes, payload.len() as u64);
+
+        sink.delete_media_blob(&blob_ref).unwrap();
+
+        let after_delete = probe.query_dedup_ratio("tenant-x").unwrap();
+        assert_eq!(after_delete.total_objects, 0);
+        assert_eq!(
+            after_delete.total_bytes, 0,
+            "delete must subtract the actual blob size, not 0"
+        );
+        let recent = probe.recent_events();
+        assert!(matches!(
+            recent.last(),
+            Some(crate::transport::dedup_analytics::DedupEvent::ObjectDeleted { size_bytes })
+                if *size_bytes == payload.len() as u64
+        ));
+    }
+
+    /// When the S3 client doesn't support `head_object` (default
+    /// trait impl), `delete_media_blob` must still record a
+    /// non-zero `size_bytes` derived from the chunk-count in
+    /// `sink_metadata` so dedup byte accounting drifts toward
+    /// zero rather than staying inflated forever.
+    #[test]
+    fn delete_media_blob_falls_back_to_chunk_count_estimate_when_head_unsupported() {
+        use crate::transport::dedup_analytics::DedupAnalytics;
+
+        #[derive(Debug, Default)]
+        struct NoHeadS3 {
+            inner: InMemoryS3,
+        }
+        impl S3Client for NoHeadS3 {
+            fn put_object(&self, b: &str, k: &str, v: &[u8]) -> Result<(), Error> {
+                self.inner.put_object(b, k, v)
+            }
+            fn get_object_range(&self, b: &str, k: &str, r: Range<u64>) -> Result<Vec<u8>, Error> {
+                self.inner.get_object_range(b, k, r)
+            }
+            fn delete_object(&self, b: &str, k: &str) -> Result<(), Error> {
+                self.inner.delete_object(b, k)
+            }
+            // Inherit the default `head_object` (returns
+            // `Ok(None)`), forcing the chunk-count fallback.
+        }
+
+        let s3 = Arc::new(NoHeadS3::default());
+        let probe = Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        let sink = ZkObjectFabricSink::new(s3, fresh_config())
+            .unwrap()
+            .with_dedup_analytics(probe.clone());
+
+        // 3 chunks → estimate is 3 * DEFAULT_CHUNK_CIPHERTEXT_SIZE,
+        // regardless of the actual byte count.
+        let blob_ref = sink
+            .upload_media_chunks(
+                "asset-fallback",
+                BlobClass::Media,
+                &[&[1u8; 4], &[2u8; 4], &[3u8; 4]],
+                [0u8; 32],
+            )
+            .unwrap();
+
+        sink.delete_media_blob(&blob_ref).unwrap();
+
+        let recent = probe.recent_events();
+        let last = recent.last().expect("recorded delete event");
+        match last {
+            crate::transport::dedup_analytics::DedupEvent::ObjectDeleted { size_bytes } => {
+                assert_eq!(
+                    *size_bytes,
+                    3 * DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64,
+                    "fallback must use chunk_count * chunk-ciphertext size"
+                );
+            }
+            _ => panic!("last event was not ObjectDeleted: {last:?}"),
+        }
     }
 }

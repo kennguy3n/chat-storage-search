@@ -21,7 +21,7 @@
 //!   [`DesktopExecutionProviderSelector::select_for_platform`].
 
 use kchat_core::models::ep_tuning::{
-    DeviceCapabilities, ExecutionProvider, ExecutionProviderSelector, Platform,
+    DeviceCapabilities, EpFallbackChain, ExecutionProvider, ExecutionProviderSelector, Platform,
 };
 
 /// Detect the platform the desktop binary is currently running
@@ -86,6 +86,63 @@ impl DesktopExecutionProviderSelector {
     pub fn inner(&self) -> &ExecutionProviderSelector {
         &self.inner
     }
+}
+
+/// Phase 6 (2026-05-04 batch 10) — Task 3: GPU detection stub.
+///
+/// On Windows, the production build will probe DirectX / DXGI to
+/// confirm a DirectML-compatible adapter is present. This stub
+/// returns `false` so the desktop binary degrades cleanly to CPU
+/// until the platform-bridge follow-up lands. Tests can call
+/// [`detect_gpu_available_with_override`] to force the answer.
+pub fn detect_gpu_available() -> bool {
+    detect_gpu_available_with_override(None)
+}
+
+/// Test hook that lets the unit tests force the GPU-availability
+/// answer without touching real platform APIs.
+pub fn detect_gpu_available_with_override(force: Option<bool>) -> bool {
+    force.unwrap_or(false)
+}
+
+/// Phase 6 (2026-05-04 batch 10) — Task 3: build the host-platform
+/// [`EpFallbackChain`] for desktop.
+///
+/// Combines [`host_platform`] with [`detect_gpu_available`] to
+/// produce a fallback chain the desktop ONNX session loaders can
+/// walk through. Returns CPU-only on Windows when no GPU is
+/// detected, [`CoreMl`, `Cpu`] on macOS, [`Cpu`] on Linux.
+pub fn host_fallback_chain() -> EpFallbackChain {
+    let platform = host_platform();
+    let has_gpu = detect_gpu_available();
+    let caps = DeviceCapabilities {
+        has_gpu,
+        // The desktop binary doesn't expose an NPU — the iOS /
+        // Android bridges do that.
+        has_npu: false,
+        gpu_vendor: None,
+        os: platform,
+        // Desktop is x86_64 on Windows / Linux and aarch64 on
+        // Apple Silicon, but the EP state machine doesn't
+        // pivot on arch — pin to a placeholder.
+        arch: kchat_core::models::ep_tuning::Arch::X86_64,
+    };
+    EpFallbackChain::for_platform(platform, &caps)
+}
+
+/// Phase 6 (2026-05-04 batch 10) — Task 3: convenience entry
+/// point that the desktop ONNX-session creation path calls into.
+///
+/// Returns the `(host_platform, primary_ep, fallback_chain)`
+/// triple the session creator needs. The actual `ort::Session`
+/// build lives in [`kchat_core::models::embeddings_onnx`] behind
+/// the `onnx-runtime` cargo feature; this function is the
+/// always-compiled, always-testable wiring that hands the
+/// session-builder its configuration.
+pub fn create_desktop_session_config() -> (Platform, ExecutionProvider, EpFallbackChain) {
+    let chain = host_fallback_chain();
+    let primary = chain.primary();
+    (host_platform(), primary, chain)
 }
 
 #[cfg(test)]
@@ -153,5 +210,85 @@ mod tests {
                 | ExecutionProvider::Cpu
                 | ExecutionProvider::MetalPerformanceShaders
         ));
+    }
+
+    #[test]
+    fn detect_gpu_available_default_false() {
+        // Stub returns `false` until the platform-bridge probe
+        // lands.
+        assert!(!detect_gpu_available());
+    }
+
+    #[test]
+    fn detect_gpu_available_override_returns_forced_value() {
+        assert!(detect_gpu_available_with_override(Some(true)));
+        assert!(!detect_gpu_available_with_override(Some(false)));
+    }
+
+    #[test]
+    fn desktop_ml_ep_selector_matches_core_selector() {
+        // Drive the same input through both selectors — the
+        // desktop wrapper must produce the same answer as the
+        // raw core selector for any explicit platform/caps
+        // pair.
+        let desktop = DesktopExecutionProviderSelector::new();
+        let core = ExecutionProviderSelector::new();
+        for caps in [
+            DeviceCapabilities::apple_silicon_mac(),
+            DeviceCapabilities::apple_silicon_ios(),
+            DeviceCapabilities::android_with_npu(),
+            DeviceCapabilities::windows_with_gpu("nvidia"),
+            DeviceCapabilities::cpu_only(Platform::Linux, Arch::X86_64),
+        ] {
+            for platform in [
+                Platform::MacOs,
+                Platform::Ios,
+                Platform::Android,
+                Platform::Windows,
+                Platform::Linux,
+            ] {
+                assert_eq!(
+                    desktop.select_for_platform(platform, &caps),
+                    core.select_ep(platform, &caps),
+                    "mismatch for platform={platform:?} caps={caps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_fallback_chain_is_non_empty_and_ends_in_cpu() {
+        let chain = host_fallback_chain();
+        let slice = chain.as_slice();
+        assert!(!slice.is_empty());
+        assert_eq!(slice.last().copied().unwrap(), ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn create_desktop_session_config_reports_host_platform() {
+        let (platform, primary, chain) = create_desktop_session_config();
+        assert_eq!(platform, host_platform());
+        // The primary EP and the chain's primary must agree.
+        assert_eq!(primary, chain.primary());
+    }
+
+    #[test]
+    fn desktop_ml_ep_selector_windows_with_gpu_returns_directml() {
+        let s = DesktopExecutionProviderSelector::new();
+        let caps = DeviceCapabilities::windows_with_gpu("nvidia");
+        assert_eq!(
+            s.select_for_platform(Platform::Windows, &caps),
+            ExecutionProvider::DirectMl
+        );
+    }
+
+    #[test]
+    fn desktop_ml_ep_selector_windows_without_gpu_returns_cpu() {
+        let s = DesktopExecutionProviderSelector::new();
+        let caps = DeviceCapabilities::cpu_only(Platform::Windows, Arch::X86_64);
+        assert_eq!(
+            s.select_for_platform(Platform::Windows, &caps),
+            ExecutionProvider::Cpu
+        );
     }
 }

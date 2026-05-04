@@ -43,6 +43,7 @@ pub mod backup;
 pub mod config;
 pub mod core_impl;
 pub mod crypto;
+pub mod desktop_index;
 pub mod formats;
 pub mod local_store;
 pub mod media;
@@ -318,6 +319,76 @@ pub struct SearchResult {
     /// reads this field for ordering decisions.
     #[serde(default)]
     pub semantic_score: Option<f64>,
+}
+
+/// Phase 8 (2026-05-04 batch 10) — Task 2: streaming search
+/// event surface.
+///
+/// `docs/PROPOSAL.md §7.5` calls for the search UX to render
+/// the local FTS / fuzzy hits immediately while the cold-bucket
+/// fan-out completes in the background. The
+/// [`crate::search::query_engine::QueryEngine::execute_search_streaming`]
+/// /
+/// [`crate::CoreImpl::search_streaming`]
+/// callback API emits one of these per state change so the
+/// platform bridges (iOS UniFFI callback interface, Android JNI
+/// listener) can drive a progressive results list:
+///
+/// 1. [`SearchEvent::LocalResults`] — emitted exactly once per
+///    search, immediately after the local FTS / fuzzy / semantic
+///    pass. The payload is the local-only result set with
+///    `is_cold = false` rows pre-merged.
+/// 2. [`SearchEvent::ColdBucketComplete`] — emitted once per
+///    cold bucket as the bucket's text + fuzzy shards arrive,
+///    decrypt, and merge into the running result set.
+///    `new_hits` carries only the *additional* rows surfaced by
+///    this bucket (already deduped against any earlier event's
+///    payload).
+/// 3. [`SearchEvent::SearchComplete`] — emitted exactly once
+///    per search, after every cold bucket has been processed
+///    or skipped. The payload contains the final fully-merged
+///    + reranked list plus the bucket-fan-out counters.
+///
+/// `SearchScope::LocalOnly` searches emit only
+/// [`SearchEvent::LocalResults`] followed by
+/// [`SearchEvent::SearchComplete`] so the UI can keep using the
+/// same listener regardless of scope.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchEvent {
+    /// Local FTS / fuzzy / semantic results. Always emitted
+    /// first, even when the local result set is empty.
+    LocalResults(Vec<SearchResult>),
+    /// One cold bucket completed and contributed `new_hits`
+    /// rows to the running result set. `new_hits` is deduped
+    /// against the local set and any earlier cold bucket — it
+    /// is the *delta* introduced by this bucket.
+    ColdBucketComplete {
+        /// Owning conversation.
+        conversation_id: String,
+        /// Coarse-grained `time_bucket` ID (e.g. `"2026-04"`).
+        time_bucket: String,
+        /// Rows newly surfaced by this bucket. Empty when the
+        /// bucket fetched but produced no hits.
+        new_hits: Vec<SearchResult>,
+    },
+    /// Final event for every search. `total_results` is the
+    /// fully-merged + reranked list (truncated to the search
+    /// limit). The two counters reflect how the bucket fan-out
+    /// resolved against the bloom pre-check / per-bucket
+    /// fail-open path.
+    SearchComplete {
+        /// Final merged + reranked result list, truncated to
+        /// the [`SearchQuery`] limit.
+        total_results: Vec<SearchResult>,
+        /// Number of cold buckets whose `(text, fuzzy)` shards
+        /// were actually fetched and merged.
+        cold_buckets_fetched: usize,
+        /// Number of cold buckets that were resolved but
+        /// skipped — typically because the bloom pre-check
+        /// rejected the bucket or a transport hard-error
+        /// triggered the per-bucket fail-open branch.
+        cold_buckets_skipped: usize,
+    },
 }
 
 /// Why the rehydration / restore path is loading a body or media

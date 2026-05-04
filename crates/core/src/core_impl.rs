@@ -259,6 +259,30 @@ pub struct CoreImpl {
     /// resolve to the empty set).
     conversation_group_resolver:
         Mutex<Option<std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>>>,
+    /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
+    /// `None` until
+    /// [`CoreImpl::install_spotlight_anchor`] is called. The
+    /// `ingest_messages` path forwards a redacted summary of
+    /// every newly-ingested message to the installed anchor.
+    spotlight_anchor: Mutex<Option<std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>>>,
+    /// Phase-7 (2026-05-04 batch 10) Windows Search bridge.
+    /// `None` until
+    /// [`CoreImpl::install_windows_search_anchor`] is called.
+    windows_search_anchor:
+        Mutex<Option<std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>>>,
+    /// Phase-7 (2026-05-04 batch 10 — Task 8) on-device EP
+    /// benchmark runner. `None` until
+    /// [`CoreImpl::install_ep_benchmark_runner`] is called. When
+    /// set, [`CoreImpl::run_ep_benchmark`] forwards calls into
+    /// the installed runner so the platform bridge can supply a
+    /// real `ort::Session`-backed implementation.
+    ep_benchmark_runner:
+        Mutex<Option<std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>>,
+    /// Phase-7 (2026-05-04 batch 10 — Task 8) persistent EP
+    /// benchmark cache. Defaults to an empty cache; the
+    /// orchestration layer can swap a loaded cache via
+    /// [`CoreImpl::install_ep_benchmark_cache`].
+    ep_benchmark_cache: Mutex<crate::models::ep_tuning::EpBenchmarkCache>,
 }
 
 /// One row of [`CoreImpl::tracked_backup_segments`].
@@ -431,6 +455,10 @@ impl CoreImpl {
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
             conversation_group_resolver: Mutex::new(None),
+            spotlight_anchor: Mutex::new(None),
+            windows_search_anchor: Mutex::new(None),
+            ep_benchmark_runner: Mutex::new(None),
+            ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         })
     }
 
@@ -468,6 +496,10 @@ impl CoreImpl {
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
             conversation_group_resolver: Mutex::new(None),
+            spotlight_anchor: Mutex::new(None),
+            windows_search_anchor: Mutex::new(None),
+            ep_benchmark_runner: Mutex::new(None),
+            ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         })
     }
 
@@ -718,6 +750,59 @@ impl CoreImpl {
         let db = self.db.lock().map_err(poisoned)?;
         let engine = QueryEngine::new(&db);
         let results = engine.execute_search_with_cold_source(&query, &scope, cold_source)?;
+        drop(db);
+        if matches!(scope, SearchScope::IncludeCold) {
+            self.enqueue_cold_results_for_hydration(&results);
+        }
+        Ok(results)
+    }
+
+    /// Phase 8 (2026-05-04 batch 10) — Task 2: streaming-search
+    /// orchestration entry point.
+    ///
+    /// Wraps
+    /// [`crate::search::query_engine::QueryEngine::execute_search_streaming`]
+    /// so platform bridges can drive a progressive results UI.
+    /// `emit` is invoked synchronously on the calling thread for
+    /// every [`crate::SearchEvent`] (one
+    /// [`crate::SearchEvent::LocalResults`], one
+    /// [`crate::SearchEvent::ColdBucketComplete`] per bucket, one
+    /// [`crate::SearchEvent::SearchComplete`]). The final return
+    /// value is the same as
+    /// [`Self::search_with_cold_source`] — the merged + reranked
+    /// result list — so callers that don't care about the
+    /// intermediate events can ignore them and treat this as a
+    /// drop-in.
+    ///
+    /// Cold-flagged rows are still enqueued for hydration via
+    /// [`crate::offload::HydrationQueue`] at priority
+    /// `SearchResultTap`, mirroring the non-streaming entry
+    /// point.
+    pub fn search_streaming<F: FnMut(crate::SearchEvent)>(
+        &self,
+        query: SearchQuery,
+        scope: SearchScope,
+        cold_source: &dyn ColdShardSource,
+        emit: F,
+    ) -> Result<Vec<SearchResult>> {
+        let db = self.db.lock().map_err(poisoned)?;
+        let engine = QueryEngine::new(&db);
+        // Use the default tenant policy here for the streaming
+        // entry point — callers that need a custom policy
+        // already bypass `search_streaming` for
+        // `execute_search_with_cold_source_full`.
+        let policy = crate::config::TenantSearchPolicy::default();
+        let results = engine.execute_search_streaming(
+            &query,
+            &scope,
+            cold_source,
+            &policy,
+            None,
+            // Match `execute_search` (no `_with_limit`), which
+            // hardcodes 200 as the engine-default cap.
+            200,
+            emit,
+        )?;
         drop(db);
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
@@ -1212,6 +1297,176 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search anchors.
+    // ----------------------------------------------------------------
+
+    /// Install (or replace) the macOS Spotlight bridge. The
+    /// [`crate::desktop_index::SpotlightAnchor`] surface lets the
+    /// orchestration layer feed redacted message metadata into
+    /// `CSSearchableIndex`. Re-installing replaces the previous
+    /// bridge.
+    pub fn install_spotlight_anchor(
+        &self,
+        anchor: std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>,
+    ) -> Result<()> {
+        *self.spotlight_anchor.lock().map_err(poisoned)? = Some(anchor);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_spotlight_anchor`] has been called.
+    pub fn has_spotlight_anchor(&self) -> bool {
+        self.spotlight_anchor
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Push a batch of [`crate::desktop_index::SpotlightItem`]
+    /// records into the installed Spotlight bridge. No-ops when
+    /// no bridge is installed; surfaces the bridge's error
+    /// otherwise.
+    pub fn update_spotlight_index(
+        &self,
+        items: &[crate::desktop_index::SpotlightItem],
+    ) -> Result<()> {
+        let anchor = match self.spotlight_anchor.lock().map_err(poisoned)?.as_ref() {
+            Some(a) => std::sync::Arc::clone(a),
+            None => return Ok(()),
+        };
+        anchor.index_items(items)
+    }
+
+    /// Install (or replace) the Windows Search bridge.
+    pub fn install_windows_search_anchor(
+        &self,
+        anchor: std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
+    ) -> Result<()> {
+        *self.windows_search_anchor.lock().map_err(poisoned)? = Some(anchor);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_windows_search_anchor`] has been
+    /// called.
+    pub fn has_windows_search_anchor(&self) -> bool {
+        self.windows_search_anchor
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Push a batch of
+    /// [`crate::desktop_index::WindowsSearchItem`] records into
+    /// the installed Windows Search bridge. No-ops when no
+    /// bridge is installed.
+    pub fn update_windows_search_index(
+        &self,
+        items: &[crate::desktop_index::WindowsSearchItem],
+    ) -> Result<()> {
+        let anchor = match self
+            .windows_search_anchor
+            .lock()
+            .map_err(poisoned)?
+            .as_ref()
+        {
+            Some(a) => std::sync::Arc::clone(a),
+            None => return Ok(()),
+        };
+        anchor.index_items(items)
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 8: EP benchmark
+    // capture + persistent cache + auto-selection.
+    // ----------------------------------------------------------------
+
+    /// Install (or replace) the on-device EP benchmark runner
+    /// (Phase 7 Task 8). Production callers wrap their
+    /// `ort::Session` factory in a runner; tests use
+    /// [`crate::models::ep_tuning::NoopEpBenchmarkRunner`] or
+    /// [`crate::models::ep_tuning::MockEpBenchmarkRunner`].
+    pub fn install_ep_benchmark_runner(
+        &self,
+        runner: std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
+    ) -> Result<()> {
+        *self.ep_benchmark_runner.lock().map_err(poisoned)? = Some(runner);
+        Ok(())
+    }
+
+    /// Whether [`Self::install_ep_benchmark_runner`] has been
+    /// called.
+    pub fn has_ep_benchmark_runner(&self) -> bool {
+        self.ep_benchmark_runner
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Run a benchmark for `(model, ep)` via the installed
+    /// runner. Returns `Err(Error::NotImplemented)` when no
+    /// runner is installed.
+    pub fn run_ep_benchmark(
+        &self,
+        ep: crate::models::ep_tuning::ExecutionProvider,
+        model: &crate::models::model_manager::ModelArtifact,
+    ) -> Result<crate::models::ep_tuning::EpBenchmark> {
+        let runner = match self.ep_benchmark_runner.lock().map_err(poisoned)?.as_ref() {
+            Some(r) => std::sync::Arc::clone(r),
+            None => return Err(Error::NotImplemented("ep_benchmark_runner")),
+        };
+        runner.run_benchmark(ep, model)
+    }
+
+    /// Replace the active EP benchmark cache. Production callers
+    /// load a cache from disk on startup with
+    /// [`crate::models::ep_tuning::EpBenchmarkCache::load_from_path`].
+    pub fn install_ep_benchmark_cache(
+        &self,
+        cache: crate::models::ep_tuning::EpBenchmarkCache,
+    ) -> Result<()> {
+        *self.ep_benchmark_cache.lock().map_err(poisoned)? = cache;
+        Ok(())
+    }
+
+    /// Snapshot of the active EP benchmark cache.
+    pub fn ep_benchmark_cache(&self) -> crate::models::ep_tuning::EpBenchmarkCache {
+        self.ep_benchmark_cache
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    /// Run a benchmark via [`Self::run_ep_benchmark`] and
+    /// persist the result into the active cache for `(ep,
+    /// model_id)`. Returns the recorded benchmark.
+    pub fn record_ep_benchmark(
+        &self,
+        ep: crate::models::ep_tuning::ExecutionProvider,
+        model: &crate::models::model_manager::ModelArtifact,
+    ) -> Result<crate::models::ep_tuning::EpBenchmark> {
+        let bench = self.run_ep_benchmark(ep, model)?;
+        let mut cache = self.ep_benchmark_cache.lock().map_err(poisoned)?;
+        cache.insert(ep, &model.model_id, bench.clone());
+        Ok(bench)
+    }
+
+    /// Pick the best EP for `model_id` by consulting the active
+    /// cache, falling back to `fallback_chain` when no benchmark
+    /// is recorded.
+    pub fn select_optimal_ep(
+        &self,
+        model_id: &str,
+        fallback_chain: &[crate::models::ep_tuning::ExecutionProvider],
+    ) -> crate::models::ep_tuning::ExecutionProvider {
+        let cache = self
+            .ep_benchmark_cache
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        let benchmarks = cache.benchmarks_for_model(model_id);
+        crate::models::ep_tuning::select_best_ep(&benchmarks, fallback_chain)
+    }
+
+    // ----------------------------------------------------------------
     // Phase-6 model bridges (Task 2 / 4 / 6 / 9)
     // ----------------------------------------------------------------
 
@@ -1429,6 +1684,45 @@ impl CoreImpl {
         }
     }
 
+    /// Phase 7 (2026-05-04 batch 10) — Task 7: per-operation
+    /// p50 / p95 / p99 dashboard, derived from the installed
+    /// collector's buffered traces. Returns the empty vector
+    /// when no collector is installed or the collector does not
+    /// buffer traces.
+    pub fn get_perf_summary(&self) -> Vec<crate::perf::PerfSummary> {
+        let traces = self.collect_perf_stats();
+        if traces.is_empty() {
+            return Vec::new();
+        }
+        // Group traces by operation id, then summarize each
+        // group. We re-implement
+        // [`InMemoryPerfCollector::summarize`] here so the
+        // dashboard works against any [`crate::perf::PerfCollector`]
+        // that returns a non-empty snapshot.
+        let mut by_op: std::collections::HashMap<String, Vec<crate::perf::PerfTrace>> =
+            std::collections::HashMap::new();
+        for t in traces {
+            by_op.entry(t.operation.clone()).or_default().push(t);
+        }
+        by_op
+            .into_iter()
+            .filter_map(|(op, traces)| crate::perf::summarize_traces(&op, &traces))
+            .collect()
+    }
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 7: budget check
+    /// dashboard. Compares [`Self::get_perf_summary`] output
+    /// against the supplied budgets and returns every violation.
+    /// Empty `budgets` slice is allowed — the result is
+    /// always empty.
+    pub fn check_perf_budgets(
+        &self,
+        budgets: &[crate::perf::PerfBudget],
+    ) -> Vec<crate::perf::BudgetViolation> {
+        let summaries = self.get_perf_summary();
+        crate::perf::check_budgets(&summaries, budgets)
+    }
+
     /// Best-effort emit of one [`crate::perf::PerfTrace`] record
     /// into the installed collector. No-op when no collector is
     /// installed.
@@ -1494,6 +1788,41 @@ impl CoreImpl {
             Some(p) => p.query_storage_savings(tenant_id),
             None => Err(crate::Error::NotImplemented("dedup_analytics")),
         }
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): record one
+    /// dedup event into the installed probe (if any). No-ops
+    /// when no probe is installed so the upload hot paths never
+    /// pay for a hashmap lookup.
+    pub fn record_dedup_event(
+        &self,
+        event: crate::transport::dedup_analytics::DedupEvent,
+    ) -> Result<()> {
+        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
+        match slot.as_ref() {
+            Some(p) => p.record_event(event),
+            None => Ok(()),
+        }
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 10): build a
+    /// [`crate::transport::dedup_analytics::DedupDashboard`] for
+    /// `tenant_id`. The dashboard combines the upstream
+    /// `query_dedup_ratio` / `query_storage_savings` snapshots
+    /// with the local `recent_events` ring buffer.
+    pub fn get_dedup_dashboard(
+        &self,
+        tenant_id: &str,
+    ) -> Result<crate::transport::dedup_analytics::DedupDashboard> {
+        let probe = match self.dedup_analytics.lock().map_err(poisoned)?.as_ref() {
+            Some(p) => std::sync::Arc::clone(p),
+            None => return Err(crate::Error::NotImplemented("dedup_analytics")),
+        };
+        Ok(crate::transport::dedup_analytics::DedupDashboard {
+            stats: probe.query_dedup_ratio(tenant_id)?,
+            savings: probe.query_storage_savings(tenant_id)?,
+            recent_events: probe.recent_events(),
+        })
     }
 
     /// Install (or replace) the multi-scope search resolver
@@ -1566,6 +1895,57 @@ impl CoreImpl {
             &handle,
             progress,
             delete_source_after_success,
+        )
+    }
+
+    /// Phase 7 (2026-05-04 batch 10 — Task 9): schedule the
+    /// supplied [`crate::media::migration::MediaMigrationPlan`]
+    /// as a one-off background task on the installed
+    /// [`crate::scheduler::BackgroundScheduler`].
+    ///
+    /// Returns `Ok(false)` (without scheduling anything) when the
+    /// plan is empty — the orchestration layer should not queue
+    /// no-op work.
+    ///
+    /// Returns `Err(Error::NotImplemented("scheduler"))` when no
+    /// scheduler is installed.
+    pub fn schedule_media_migration(
+        &self,
+        plan: &crate::media::migration::MediaMigrationPlan,
+        constraints: crate::scheduler::TaskConstraints,
+    ) -> Result<bool> {
+        if plan.items.is_empty() {
+            return Ok(false);
+        }
+        let scheduler_guard = self.scheduler.lock().map_err(poisoned)?;
+        let scheduler = match scheduler_guard.as_ref() {
+            Some(s) => s,
+            None => return Err(Error::NotImplemented("scheduler")),
+        };
+        let snapshot = crate::scheduler::MediaMigrationPlanSnapshot::from_plan(plan);
+        scheduler
+            .schedule_one_off_task(
+                crate::scheduler::OneOffTask::MediaMigration { plan: snapshot },
+                constraints,
+            )
+            .map(|_| true)
+    }
+
+    /// Plan and (when the resulting plan is non-empty) schedule
+    /// a media-migration one-off task between
+    /// `(source_sink, target_sink)`. Convenience wrapper that
+    /// calls [`Self::plan_media_migration`] followed by
+    /// [`Self::schedule_media_migration`] with
+    /// [`crate::scheduler::TaskConstraints::wifi_and_charging`].
+    pub fn plan_and_schedule_media_migration(
+        &self,
+        source_sink: &str,
+        target_sink: &str,
+    ) -> Result<bool> {
+        let plan = self.plan_media_migration(source_sink, target_sink)?;
+        self.schedule_media_migration(
+            &plan,
+            crate::scheduler::TaskConstraints::wifi_and_charging(),
         )
     }
 
@@ -2080,6 +2460,14 @@ impl CoreImpl {
         }
         trace.insert_metadata("new_messages", result.new_messages.to_string());
         trace.insert_metadata("duplicate_count", result.duplicate_count.to_string());
+
+        // Phase 7 (2026-05-04 batch 10) — Task 5/6: forward the
+        // batch to any installed Spotlight / Windows Search
+        // bridge. Best-effort — failures here must not roll
+        // back the ingested rows.
+        drop(db);
+        self.maybe_index_in_desktop_search(messages);
+
         trace.finish();
         self.record_perf_trace(trace);
         Ok(result)
@@ -2126,6 +2514,71 @@ impl CoreImpl {
                 // (it sees the raw embed error before installing
                 // its TextEmbedder).
             }
+        }
+    }
+
+    /// Phase 7 (2026-05-04 batch 10) — Task 5/6: best-effort
+    /// fan-out of newly ingested messages to the installed
+    /// macOS Spotlight / Windows Search bridges. No-op on
+    /// platforms where no bridge has been installed. Errors
+    /// from the bridge are swallowed because the message has
+    /// already been persisted; failure to update the OS search
+    /// index must not roll back ingest.
+    fn maybe_index_in_desktop_search(&self, messages: &[IngestedMessage]) {
+        if messages.is_empty() {
+            return;
+        }
+        let has_spotlight = self
+            .spotlight_anchor
+            .lock()
+            .map(|s| s.is_some())
+            .unwrap_or(false);
+        let has_windows = self
+            .windows_search_anchor
+            .lock()
+            .map(|s| s.is_some())
+            .unwrap_or(false);
+        if !has_spotlight && !has_windows {
+            return;
+        }
+        // Build a redacted preview per message — first 80 chars
+        // of the text body. Media-only messages are skipped to
+        // avoid leaking sender identifiers without consent.
+        let mut spotlight_items = Vec::new();
+        let mut windows_items = Vec::new();
+        for msg in messages {
+            let Some(text) = msg.text_content.as_deref() else {
+                continue;
+            };
+            let preview: String = text.chars().take(80).collect();
+            let unique_id = msg.message_id.to_string();
+            let conversation_id = msg.conversation_id.to_string();
+            if has_spotlight {
+                spotlight_items.push(crate::desktop_index::SpotlightItem {
+                    unique_id: unique_id.clone(),
+                    title: msg.sender_id.clone(),
+                    content_description: preview.clone(),
+                    display_name: msg.sender_id.clone(),
+                    timestamp: msg.created_at_ms,
+                    conversation_id: conversation_id.clone(),
+                });
+            }
+            if has_windows {
+                windows_items.push(crate::desktop_index::WindowsSearchItem {
+                    unique_id,
+                    title: msg.sender_id.clone(),
+                    content_description: preview,
+                    display_name: msg.sender_id.clone(),
+                    timestamp: msg.created_at_ms,
+                    conversation_id,
+                });
+            }
+        }
+        if has_spotlight && !spotlight_items.is_empty() {
+            let _ = self.update_spotlight_index(&spotlight_items);
+        }
+        if has_windows && !windows_items.is_empty() {
+            let _ = self.update_windows_search_index(&windows_items);
         }
     }
 
@@ -3140,6 +3593,48 @@ impl CoreImpl {
         conversation_id: Uuid,
         time_bucket: &str,
         k_compact_segment: &[u8; 32],
+        key_for_segment: F,
+        commit_compact: C,
+    ) -> Result<crate::archive::compaction::ArchiveCompactionResult>
+    where
+        F: FnMut(&str) -> Result<[u8; 32]>,
+        C: FnMut(&crate::archive::segment_builder::BuiltSegment) -> Result<()>,
+    {
+        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // compaction hot path. The result counters land on the
+        // trace metadata so downstream dashboards can correlate
+        // latency with bucket size.
+        let mut trace = crate::perf::PerfTrace::new("compact_archive");
+        trace.insert_metadata("conversation_id", conversation_id.to_string());
+        trace.insert_metadata("time_bucket", time_bucket.to_string());
+        let result = self.compact_archive_inner(
+            router,
+            conversation_id,
+            time_bucket,
+            k_compact_segment,
+            key_for_segment,
+            commit_compact,
+        );
+        match result.as_ref() {
+            Ok(s) => {
+                trace.insert_metadata("buckets_compacted", s.buckets_compacted.to_string());
+                trace.insert_metadata("segments_superseded", s.segments_superseded.to_string());
+            }
+            Err(e) => {
+                trace.insert_metadata("error", e.to_string());
+            }
+        }
+        trace.finish();
+        self.record_perf_trace(trace);
+        result
+    }
+
+    fn compact_archive_inner<F, C>(
+        &self,
+        router: &crate::archive::download::ArchiveSegmentRouter<'_>,
+        conversation_id: Uuid,
+        time_bucket: &str,
+        k_compact_segment: &[u8; 32],
         mut key_for_segment: F,
         mut commit_compact: C,
     ) -> Result<crate::archive::compaction::ArchiveCompactionResult>
@@ -3813,87 +4308,107 @@ impl KChatCore for CoreImpl {
     }
 
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage> {
-        // Phase-3 foundation: serve from local storage when a body is
-        // already present, otherwise return the skeleton with
-        // `is_cold = true`. The remote archive fetch path is still
-        // queued for `Task 10+` once the manifest reader lands.
-        let db = self.db.lock().map_err(poisoned)?;
-        let row = db
-            .get_message_with_body(&message_id.to_string())
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let Some((skeleton, body)) = row else {
-            return Ok(HydratedMessage::default());
-        };
-        if skeleton.body_state == BodyState::DeletedForEveryone {
-            return Err(Error::Message(
-                "hydrate_message: message has been deleted for everyone".to_string(),
-            ));
-        }
-        let conversation_id = Uuid::parse_str(&skeleton.conversation_id).ok();
-        let message_id_uuid = Uuid::parse_str(&skeleton.message_id).ok();
-        let is_local = matches!(
-            skeleton.body_state,
-            BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
-        );
-        let text_content = body.as_ref().and_then(|b| b.text_content.clone());
+        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // hydrate hot path with a [`PerfTrace`] so an installed
+        // collector can measure end-to-end hydration latency.
+        // The closure captures `trace` mutably so the success
+        // path can attach `is_cold` / `offline` metadata before
+        // the surrounding match records the finished trace.
+        let mut trace = crate::perf::PerfTrace::new("hydrate_message");
+        trace.insert_metadata("reason", reason.to_string());
 
-        // Detect whether an evicted media asset is attached. We
-        // surface this so the worker can lazily re-download the
-        // blob when the user taps the row (Task 5 — Phase 3
-        // §5.5). The lookup is cheap (`media_asset` carries an
-        // index on `message_id`) and the enqueue happens
-        // unconditionally below.
-        let has_evicted_media = db
-            .get_media_asset_by_message(&skeleton.message_id)
-            .map(|opt| {
-                opt.map(|a| matches!(a.media_state, MediaState::Evicted))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-
-        // Enqueue a hydration request regardless of whether the
-        // body is local — when the orchestration layer drains the
-        // queue it will skip already-served messages, but the
-        // queue still needs a record of the access for telemetry
-        // and adjacent prefetch. When evicted media is attached we
-        // bump the priority to [`HydrationReason::MediaFullScreen`]
-        // so the worker pulls the bytes ahead of opportunistic
-        // skeleton fetches.
-        if let Some(conv) = conversation_id {
-            let mut priority = parse_hydration_reason(reason);
-            // Variant order maps to P0..P5 — *smaller* `Ord` means
-            // *higher* priority. Escalate to MediaFullScreen
-            // whenever the caller asked for something lower-priority
-            // than P1 (MediaFullScreen).
-            if has_evicted_media && priority > HydrationReason::MediaFullScreen {
-                priority = HydrationReason::MediaFullScreen;
+        let trace_ref = &mut trace;
+        let result: Result<HydratedMessage> = (|| {
+            // Phase-3 foundation: serve from local storage when a body is
+            // already present, otherwise return the skeleton with
+            // `is_cold = true`. The remote archive fetch path is still
+            // queued for `Task 10+` once the manifest reader lands.
+            let db = self.db.lock().map_err(poisoned)?;
+            let row = db
+                .get_message_with_body(&message_id.to_string())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let Some((skeleton, body)) = row else {
+                return Ok(HydratedMessage::default());
+            };
+            if skeleton.body_state == BodyState::DeletedForEveryone {
+                return Err(Error::Message(
+                    "hydrate_message: message has been deleted for everyone".to_string(),
+                ));
             }
-            let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
-            queue.enqueue(HydrationRequest {
-                message_id,
-                conversation_id: conv,
-                reason: priority,
-                requested_at_ms: now_ms_for_send_media(),
-            });
-        }
+            let conversation_id = Uuid::parse_str(&skeleton.conversation_id).ok();
+            let message_id_uuid = Uuid::parse_str(&skeleton.message_id).ok();
+            let is_local = matches!(
+                skeleton.body_state,
+                BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
+            );
+            let text_content = body.as_ref().and_then(|b| b.text_content.clone());
 
-        // Phase 7, Task 6 (2026-05-04 batch): expose an explicit
-        // `offline` flag on the hydration result so renderers
-        // can distinguish "cold but reachable, fetch in flight"
-        // from "cold and offline, retry on reconnect". The flag
-        // is `true` only when the body is non-local AND the
-        // installed `OfflineDetector` reports offline; without a
-        // detector installed `is_online()` is always `true`, so
-        // the flag stays `false` for callers that never wired
-        // one in.
-        let offline = !is_local && !self.is_online();
-        Ok(HydratedMessage {
-            message_id: message_id_uuid,
-            conversation_id,
-            text_content: if is_local { text_content } else { None },
-            is_cold: !is_local,
-            offline,
-        })
+            // Detect whether an evicted media asset is attached. We
+            // surface this so the worker can lazily re-download the
+            // blob when the user taps the row (Task 5 — Phase 3
+            // §5.5). The lookup is cheap (`media_asset` carries an
+            // index on `message_id`) and the enqueue happens
+            // unconditionally below.
+            let has_evicted_media = db
+                .get_media_asset_by_message(&skeleton.message_id)
+                .map(|opt| {
+                    opt.map(|a| matches!(a.media_state, MediaState::Evicted))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+            // Enqueue a hydration request regardless of whether the
+            // body is local — when the orchestration layer drains the
+            // queue it will skip already-served messages, but the
+            // queue still needs a record of the access for telemetry
+            // and adjacent prefetch. When evicted media is attached we
+            // bump the priority to [`HydrationReason::MediaFullScreen`]
+            // so the worker pulls the bytes ahead of opportunistic
+            // skeleton fetches.
+            if let Some(conv) = conversation_id {
+                let mut priority = parse_hydration_reason(reason);
+                // Variant order maps to P0..P5 — *smaller* `Ord` means
+                // *higher* priority. Escalate to MediaFullScreen
+                // whenever the caller asked for something lower-priority
+                // than P1 (MediaFullScreen).
+                if has_evicted_media && priority > HydrationReason::MediaFullScreen {
+                    priority = HydrationReason::MediaFullScreen;
+                }
+                let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
+                queue.enqueue(HydrationRequest {
+                    message_id,
+                    conversation_id: conv,
+                    reason: priority,
+                    requested_at_ms: now_ms_for_send_media(),
+                });
+            }
+
+            // Phase 7, Task 6 (2026-05-04 batch): expose an explicit
+            // `offline` flag on the hydration result so renderers
+            // can distinguish "cold but reachable, fetch in flight"
+            // from "cold and offline, retry on reconnect". The flag
+            // is `true` only when the body is non-local AND the
+            // installed `OfflineDetector` reports offline; without a
+            // detector installed `is_online()` is always `true`, so
+            // the flag stays `false` for callers that never wired
+            // one in.
+            let offline = !is_local && !self.is_online();
+            trace_ref.insert_metadata("is_cold", (!is_local).to_string());
+            trace_ref.insert_metadata("offline", offline.to_string());
+            Ok(HydratedMessage {
+                message_id: message_id_uuid,
+                conversation_id,
+                text_content: if is_local { text_content } else { None },
+                is_cold: !is_local,
+                offline,
+            })
+        })();
+        if let Err(e) = result.as_ref() {
+            trace.insert_metadata("error", e.to_string());
+        }
+        trace.finish();
+        self.record_perf_trace(trace);
+        result
     }
 
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
@@ -4001,6 +4516,31 @@ impl KChatCore for CoreImpl {
                 trace.insert_metadata("pressure_level", pressure_str);
                 trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
                 trace.insert_metadata("evicted_count", out.evicted_count.to_string());
+
+                // Phase 7 (2026-05-04 batch 10 — Task 9): when
+                // configured, attempt to schedule a media
+                // migration after a non-empty eviction pass. We
+                // swallow scheduling errors here because the
+                // eviction itself succeeded — the orchestration
+                // layer surfaces scheduler outages through
+                // `has_scheduler` / explicit
+                // `schedule_media_migration` retries.
+                if out.evicted_count > 0 {
+                    if let Some((src, tgt)) = self.config.auto_migrate_after_eviction.clone() {
+                        match self.plan_and_schedule_media_migration(&src, &tgt) {
+                            Ok(true) => {
+                                trace.insert_metadata("migration_scheduled", "true".to_string());
+                            }
+                            Ok(false) => {
+                                trace.insert_metadata("migration_scheduled", "empty".to_string());
+                            }
+                            Err(e) => {
+                                trace.insert_metadata("migration_scheduled", format!("error:{e}"));
+                            }
+                        }
+                    }
+                }
+
                 trace.finish();
                 self.record_perf_trace(trace);
                 Ok(out)
@@ -4015,6 +4555,12 @@ impl KChatCore for CoreImpl {
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
+        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // restore hot path. Each transition is also recorded as a
+        // `transition` metadata field for finer-grained
+        // attribution.
+        let mut trace = crate::perf::PerfTrace::new("restore_from_backup");
+
         // Phase-4 wiring: drive the restore state machine end-to-end
         // through the skeleton-first pipeline. The transport-side
         // contract on `BackupSource` (manifest chain handle, segment
@@ -4025,22 +4571,36 @@ impl KChatCore for CoreImpl {
         // [`CoreImpl::restore_search_shards`] today; once
         // `BackupSource` is fleshed out, the segments, manifests,
         // and shard list flow through here unchanged.
-        let db = self.db.lock().map_err(poisoned)?;
-        let conn = db.connection();
-        crate::restore::state_machine::reset(conn)?;
-        for st in [
-            crate::local_store::state_machines::RestoreState::IdentityRestored,
-            crate::local_store::state_machines::RestoreState::RootKeysUnwrapped,
-            crate::local_store::state_machines::RestoreState::ManifestVerified,
-            crate::local_store::state_machines::RestoreState::SkeletonRestored,
-            crate::local_store::state_machines::RestoreState::SearchRestored,
-            crate::local_store::state_machines::RestoreState::RecentMessagesRestored,
-            crate::local_store::state_machines::RestoreState::MediaLazyRestoreEnabled,
-            crate::local_store::state_machines::RestoreState::FullRestoreComplete,
-        ] {
-            crate::restore::state_machine::transition(conn, st, None)?;
+        let result = (|| -> Result<RestoreResult> {
+            let db = self.db.lock().map_err(poisoned)?;
+            let conn = db.connection();
+            crate::restore::state_machine::reset(conn)?;
+            let mut transitions = 0usize;
+            for st in [
+                crate::local_store::state_machines::RestoreState::IdentityRestored,
+                crate::local_store::state_machines::RestoreState::RootKeysUnwrapped,
+                crate::local_store::state_machines::RestoreState::ManifestVerified,
+                crate::local_store::state_machines::RestoreState::SkeletonRestored,
+                crate::local_store::state_machines::RestoreState::SearchRestored,
+                crate::local_store::state_machines::RestoreState::RecentMessagesRestored,
+                crate::local_store::state_machines::RestoreState::MediaLazyRestoreEnabled,
+                crate::local_store::state_machines::RestoreState::FullRestoreComplete,
+            ] {
+                crate::restore::state_machine::transition(conn, st, None)?;
+                transitions += 1;
+            }
+            let _ = transitions;
+            Ok(RestoreResult::default())
+        })();
+
+        if let Err(e) = result.as_ref() {
+            trace.insert_metadata("error", e.to_string());
+        } else {
+            trace.insert_metadata("transitions", "8".to_string());
         }
-        Ok(RestoreResult::default())
+        trace.finish();
+        self.record_perf_trace(trace);
+        result
     }
 }
 
@@ -8898,6 +9458,168 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search wiring.
+    // -----------------------------------------------------------------
+
+    #[derive(Debug, Default)]
+    struct CountingSpotlight {
+        index_calls: std::sync::Mutex<Vec<crate::desktop_index::SpotlightItem>>,
+    }
+    impl crate::desktop_index::SpotlightAnchor for CountingSpotlight {
+        fn index_items(
+            &self,
+            items: &[crate::desktop_index::SpotlightItem],
+        ) -> std::result::Result<(), Error> {
+            self.index_calls
+                .lock()
+                .unwrap()
+                .extend(items.iter().cloned());
+            Ok(())
+        }
+        fn remove_items(&self, _ids: &[String]) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+        fn remove_all(&self) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingWindowsSearch {
+        index_calls: std::sync::Mutex<Vec<crate::desktop_index::WindowsSearchItem>>,
+    }
+    impl crate::desktop_index::WindowsSearchAnchor for CountingWindowsSearch {
+        fn index_items(
+            &self,
+            items: &[crate::desktop_index::WindowsSearchItem],
+        ) -> std::result::Result<(), Error> {
+            self.index_calls
+                .lock()
+                .unwrap()
+                .extend(items.iter().cloned());
+            Ok(())
+        }
+        fn remove_items(&self, _ids: &[String]) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+        fn remove_all(&self) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn core_impl_ingest_updates_spotlight_when_installed() {
+        use crate::message::processor::IngestedMessage;
+
+        let core = fresh_core();
+        let anchor = std::sync::Arc::new(CountingSpotlight::default());
+        core.install_spotlight_anchor(anchor.clone()).unwrap();
+        assert!(core.has_spotlight_anchor());
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "alice".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: Some("the quick brown fox".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).unwrap();
+
+        let calls = anchor.index_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].unique_id, mid.to_string());
+        assert_eq!(calls[0].conversation_id, conv.to_string());
+        assert!(!calls[0].content_description.is_empty());
+    }
+
+    #[test]
+    fn core_impl_ingest_updates_windows_search_when_installed() {
+        use crate::message::processor::IngestedMessage;
+
+        let core = fresh_core();
+        let anchor = std::sync::Arc::new(CountingWindowsSearch::default());
+        core.install_windows_search_anchor(anchor.clone()).unwrap();
+        assert!(core.has_windows_search_anchor());
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "bob".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: Some("hello windows".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).unwrap();
+        let calls = anchor.index_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].unique_id, mid.to_string());
+    }
+
+    #[test]
+    fn core_impl_ingest_skips_spotlight_when_not_installed() {
+        // No anchor installed -> ingest still succeeds and the
+        // ingest path stays free of panics.
+        use crate::message::processor::IngestedMessage;
+        let core = fresh_core();
+        assert!(!core.has_spotlight_anchor());
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "carol".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: Some("no anchor".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        let res = core.ingest_messages(&[msg]).unwrap();
+        assert_eq!(res.new_messages, 1);
+    }
+
+    #[test]
+    fn core_impl_ingest_skips_media_only_messages_in_spotlight() {
+        use crate::formats::media_descriptor::MediaDescriptor;
+        use crate::message::processor::IngestedMessage;
+        let core = fresh_core();
+        let anchor = std::sync::Arc::new(CountingSpotlight::default());
+        core.install_spotlight_anchor(anchor.clone()).unwrap();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let desc = MediaDescriptor {
+            asset_id: Uuid::now_v7(),
+            mime_type: "image/jpeg".into(),
+            bytes_total: 1_024,
+            chunk_count: 1,
+            merkle_root: [0u8; 32],
+            blob_id: Uuid::now_v7(),
+            wrapped_k_asset: vec![0u8; 40],
+            storage_sink: None,
+        };
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "dave".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: None,
+            media_descriptors: vec![desc],
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).unwrap();
+        // Media-only -> redacted preview policy says skip.
+        assert_eq!(anchor.index_calls.lock().unwrap().len(), 0);
+    }
+
     #[test]
     fn ingest_messages_skips_embedding_without_installed_embedder() {
         use crate::message::processor::IngestedMessage;
@@ -9464,5 +10186,340 @@ mod tests {
             search.metadata.contains_key("result_count"),
             "search trace must record result_count metadata",
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 7 perf-dashboard tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn core_impl_hydrate_message_emits_perf_trace() {
+        use crate::message::processor::IngestedMessage;
+        use crate::perf::InMemoryPerfCollector;
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let msg = IngestedMessage {
+            message_id: mid,
+            conversation_id: conv,
+            sender_id: "perf-carol".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: Some("perf trace hydrate".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).expect("ingest");
+        let _ = core
+            .hydrate_message(mid, "row_visible")
+            .expect("hydrate ok");
+
+        let traces = core.collect_perf_stats();
+        let hydrate = traces
+            .iter()
+            .find(|t| t.operation == "hydrate_message")
+            .expect("hydrate_message trace recorded");
+        assert!(hydrate.end_ns >= hydrate.start_ns);
+        assert_eq!(
+            hydrate.metadata.get("reason").map(String::as_str),
+            Some("row_visible")
+        );
+    }
+
+    #[test]
+    fn core_impl_backup_emits_perf_trace() {
+        use crate::perf::InMemoryPerfCollector;
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        let _ = core.run_incremental_backup("test-backup");
+
+        let traces = core.collect_perf_stats();
+        let backup = traces
+            .iter()
+            .find(|t| t.operation == "run_incremental_backup")
+            .expect("run_incremental_backup trace recorded");
+        assert!(backup.end_ns >= backup.start_ns);
+        assert_eq!(
+            backup.metadata.get("reason").map(String::as_str),
+            Some("test-backup")
+        );
+    }
+
+    #[test]
+    fn core_impl_get_perf_summary_returns_data() {
+        use crate::message::processor::IngestedMessage;
+        use crate::perf::InMemoryPerfCollector;
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        for i in 0..3 {
+            let msg = IngestedMessage {
+                message_id: Uuid::now_v7(),
+                conversation_id: conv,
+                sender_id: format!("perf-bench-{i}"),
+                created_at_ms: now_ms_for_send_media(),
+                text_content: Some(format!("hello {i}")),
+                media_descriptors: Vec::new(),
+                reply_to: None,
+            };
+            core.ingest_messages(&[msg]).expect("ingest");
+        }
+
+        let summaries = core.get_perf_summary();
+        assert!(!summaries.is_empty());
+        let ingest = summaries
+            .iter()
+            .find(|s| s.operation == "ingest_messages")
+            .expect("ingest summary present");
+        assert!(ingest.count >= 3);
+        assert!(ingest.p95_ns >= ingest.p50_ns);
+        assert!(ingest.p99_ns >= ingest.p95_ns);
+    }
+
+    #[test]
+    fn core_impl_check_perf_budgets_detects_violations() {
+        use crate::message::processor::IngestedMessage;
+        use crate::perf::{InMemoryPerfCollector, PerfBudget};
+
+        let core = fresh_core();
+        let collector = std::sync::Arc::new(InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let msg = IngestedMessage {
+            message_id: Uuid::now_v7(),
+            conversation_id: conv,
+            sender_id: "perf-budget".into(),
+            created_at_ms: now_ms_for_send_media(),
+            text_content: Some("hello".into()),
+            media_descriptors: Vec::new(),
+            reply_to: None,
+        };
+        core.ingest_messages(&[msg]).expect("ingest");
+
+        // 1ns budget — guaranteed violation. Whatever the
+        // ingest path measured will exceed it.
+        let budgets = vec![PerfBudget {
+            operation: "ingest_messages".into(),
+            p95_budget_ns: 1,
+        }];
+        let violations = core.check_perf_budgets(&budgets);
+        assert!(!violations.is_empty());
+
+        // Generous budget — no violation expected.
+        let budgets = vec![PerfBudget {
+            operation: "ingest_messages".into(),
+            p95_budget_ns: u64::MAX,
+        }];
+        let violations = core.check_perf_budgets(&budgets);
+        assert!(violations.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 7 (2026-05-04 batch 10) — Task 9 media-migration
+    // scheduling tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn schedule_media_migration_returns_false_for_empty_plan() {
+        let core = fresh_core();
+        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        core.install_scheduler(scheduler)
+            .expect("install scheduler");
+
+        let plan = crate::media::migration::MediaMigrationPlan {
+            source_sink: "local".into(),
+            target_sink: "user-cloud".into(),
+            items: Vec::new(),
+        };
+        let scheduled = core
+            .schedule_media_migration(
+                &plan,
+                crate::scheduler::TaskConstraints::wifi_and_charging(),
+            )
+            .expect("schedule");
+        assert!(!scheduled);
+    }
+
+    #[test]
+    fn schedule_media_migration_without_scheduler_errors() {
+        let core = fresh_core();
+        let plan = crate::media::migration::MediaMigrationPlan {
+            source_sink: "local".into(),
+            target_sink: "user-cloud".into(),
+            items: vec![crate::media::migration::MediaMigrationItem {
+                asset_id: "asset-1".into(),
+                blob_id: "blob-1".into(),
+                chunk_count: 1,
+                merkle_root: [0u8; 32],
+                sink_metadata: None,
+            }],
+        };
+        let err = core
+            .schedule_media_migration(
+                &plan,
+                crate::scheduler::TaskConstraints::wifi_and_charging(),
+            )
+            .expect_err("must error without scheduler");
+        match err {
+            Error::NotImplemented(tag) => assert_eq!(tag, "scheduler"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schedule_media_migration_enqueues_into_in_process_scheduler() {
+        use std::sync::Arc;
+
+        let core = fresh_core();
+        let scheduler = Arc::new(crate::scheduler::InProcessScheduler::new());
+
+        // Wrap the Arc in a thin Box that delegates to the
+        // shared instance so we can keep a side channel for
+        // observing the queue.
+        #[derive(Debug)]
+        struct SharedScheduler(Arc<crate::scheduler::InProcessScheduler>);
+        impl crate::scheduler::BackgroundScheduler for SharedScheduler {
+            fn schedule_backup(&self, ms: u64) -> std::result::Result<(), Error> {
+                self.0.schedule_backup(ms)
+            }
+            fn schedule_archive_compaction(&self, ms: u64) -> std::result::Result<(), Error> {
+                self.0.schedule_archive_compaction(ms)
+            }
+            fn schedule_index_maintenance(&self, ms: u64) -> std::result::Result<(), Error> {
+                self.0.schedule_index_maintenance(ms)
+            }
+            fn cancel_all(&self) -> std::result::Result<(), Error> {
+                self.0.cancel_all()
+            }
+            fn is_task_pending(&self, id: &str) -> std::result::Result<bool, Error> {
+                self.0.is_task_pending(id)
+            }
+            fn schedule_one_off_task(
+                &self,
+                task: crate::scheduler::OneOffTask,
+                c: crate::scheduler::TaskConstraints,
+            ) -> std::result::Result<(), Error> {
+                self.0.schedule_one_off_task(task, c)
+            }
+        }
+
+        let shared = SharedScheduler(scheduler.clone());
+        core.install_scheduler(Box::new(shared))
+            .expect("install scheduler");
+
+        let plan = crate::media::migration::MediaMigrationPlan {
+            source_sink: "local".into(),
+            target_sink: "user-cloud".into(),
+            items: vec![crate::media::migration::MediaMigrationItem {
+                asset_id: "asset-1".into(),
+                blob_id: "blob-1".into(),
+                chunk_count: 1,
+                merkle_root: [0u8; 32],
+                sink_metadata: None,
+            }],
+        };
+        let scheduled = core
+            .schedule_media_migration(
+                &plan,
+                crate::scheduler::TaskConstraints::wifi_and_charging(),
+            )
+            .expect("schedule");
+        assert!(scheduled);
+        assert_eq!(scheduler.pending_one_off_count(), 1);
+    }
+
+    #[test]
+    fn record_dedup_event_with_no_probe_is_noop() {
+        let core = fresh_core();
+        // No probe installed → record_dedup_event must not error.
+        core.record_dedup_event(
+            crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                size_bytes: 10,
+                was_deduped: false,
+            },
+        )
+        .expect("noop without probe");
+    }
+
+    #[test]
+    fn get_dedup_dashboard_aggregates_stats_and_events() {
+        let core = fresh_core();
+        let probe =
+            std::sync::Arc::new(crate::transport::dedup_analytics::InProcessDedupAnalytics::new());
+        core.install_dedup_analytics(probe).expect("install probe");
+
+        for size in [100, 100, 100] {
+            core.record_dedup_event(
+                crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                    size_bytes: size,
+                    was_deduped: false,
+                },
+            )
+            .unwrap();
+        }
+        core.record_dedup_event(
+            crate::transport::dedup_analytics::DedupEvent::ObjectUploaded {
+                size_bytes: 100,
+                was_deduped: true,
+            },
+        )
+        .unwrap();
+
+        let dashboard = core.get_dedup_dashboard("tenant-test").unwrap();
+        assert_eq!(dashboard.stats.total_objects, 4);
+        assert_eq!(dashboard.stats.unique_objects, 3);
+        assert_eq!(dashboard.savings.bytes_saved, 100);
+        assert_eq!(dashboard.recent_events.len(), 4);
+    }
+
+    #[test]
+    fn get_dedup_dashboard_without_probe_errors() {
+        let core = fresh_core();
+        let err = core.get_dedup_dashboard("tenant-test").unwrap_err();
+        match err {
+            Error::NotImplemented(tag) => assert_eq!(tag, "dedup_analytics"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_storage_budget_skips_migration_when_not_configured() {
+        let core = fresh_core();
+        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        core.install_scheduler(scheduler)
+            .expect("install scheduler");
+
+        let collector = std::sync::Arc::new(crate::perf::InMemoryPerfCollector::new());
+        core.install_perf_collector(collector.clone())
+            .expect("install perf collector");
+
+        // No `auto_migrate_after_eviction` configured → eviction
+        // path must not error and must not emit a
+        // `migration_scheduled` perf-trace metadata key.
+        let result = core.enforce_storage_budget("test");
+        assert!(result.is_ok());
+        let traces = core.collect_perf_stats();
+        let evict = traces
+            .iter()
+            .find(|t| t.operation == "enforce_storage_budget")
+            .expect("eviction trace");
+        assert!(!evict.metadata.contains_key("migration_scheduled"));
     }
 }
