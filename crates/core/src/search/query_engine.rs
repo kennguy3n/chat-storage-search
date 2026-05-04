@@ -1152,7 +1152,26 @@ impl<'a> QueryEngine<'a> {
             return Ok(local);
         }
 
-        let buckets = cold_source.cold_buckets()?;
+        // Cold-bucket enumeration is the only fallible step
+        // between the `LocalResults` emission above and the
+        // `SearchComplete` emissions below. To honor the
+        // documented "SearchComplete is emitted exactly once"
+        // contract on `crate::SearchEvent`, treat a
+        // `cold_buckets()` failure as a fail-open: emit
+        // `SearchComplete` carrying the local results so the
+        // listener has a terminal signal, then propagate the
+        // underlying error to the synchronous return value.
+        let buckets = match cold_source.cold_buckets() {
+            Ok(b) => b,
+            Err(e) => {
+                emit(crate::SearchEvent::SearchComplete {
+                    total_results: local.clone(),
+                    cold_buckets_fetched: 0,
+                    cold_buckets_skipped: 0,
+                });
+                return Err(e);
+            }
+        };
         let conv_filter = query.conversation_filter.map(|c| c.to_string());
         #[allow(clippy::manual_unwrap_or_default)]
         let target_set: Option<HashSet<String>> =
@@ -5635,6 +5654,72 @@ mod phase8_target_tests {
             events[1],
             crate::SearchEvent::SearchComplete { .. }
         ));
+    }
+
+    /// Regression for the Devin Review finding that
+    /// `execute_search_streaming` could violate the
+    /// "SearchComplete is emitted exactly once" contract: when
+    /// `cold_source.cold_buckets()` returned an `Err`, the
+    /// previous code propagated the error via `?` *after*
+    /// `LocalResults` had already been emitted, leaving
+    /// callback listeners with no terminal event. The fix emits
+    /// a fail-open `SearchComplete` carrying the local results
+    /// before propagating the error, so the listener always
+    /// sees both edges (local → complete) regardless of
+    /// transport state.
+    #[test]
+    fn streaming_search_emits_search_complete_when_cold_buckets_fails() {
+        #[derive(Debug)]
+        struct FailingBucketsSource;
+        impl ColdShardSource for FailingBucketsSource {
+            fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
+                Err(Error::Transport("simulated cold-buckets failure".into()))
+            }
+            fn fetch_text_rows(&self, _conv: &str, _bucket: &str) -> Result<Vec<FtsRow>, Error> {
+                Ok(Vec::new())
+            }
+            fn fetch_fuzzy_rows(&self, _conv: &str, _bucket: &str) -> Result<Vec<FuzzyRow>, Error> {
+                Ok(Vec::new())
+            }
+        }
+
+        let db = parallel_db();
+        let engine = QueryEngine::new(&db);
+        let source = FailingBucketsSource;
+        let q = SearchQuery {
+            query_string: "alpha".into(),
+            ..SearchQuery::default()
+        };
+        let policy = TenantSearchPolicy::default();
+        let mut events: Vec<crate::SearchEvent> = Vec::new();
+        let res = engine.execute_search_streaming(
+            &q,
+            &SearchScope::IncludeCold,
+            &source,
+            &policy,
+            None,
+            200,
+            |e| events.push(e),
+        );
+        assert!(
+            matches!(res, Err(Error::Transport(_))),
+            "expected the underlying cold_buckets() error to propagate, got {res:?}"
+        );
+        // Listener must see both LocalResults and SearchComplete
+        // exactly once, in that order.
+        assert_eq!(events.len(), 2, "got: {events:?}");
+        assert!(matches!(events[0], crate::SearchEvent::LocalResults(_)));
+        match &events[1] {
+            crate::SearchEvent::SearchComplete {
+                cold_buckets_fetched,
+                cold_buckets_skipped,
+                ..
+            } => {
+                assert_eq!(*cold_buckets_fetched, 0);
+                assert_eq!(*cold_buckets_skipped, 0);
+            }
+            other => panic!("expected SearchComplete, got: {other:?}"),
+        }
     }
 
     #[test]
