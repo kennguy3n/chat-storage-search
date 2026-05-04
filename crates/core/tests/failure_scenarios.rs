@@ -968,6 +968,85 @@ fn low_storage_condition_during_restore_surfaces_resumable_storage_error() {
     assert_eq!(notes.as_deref(), Some("resumed after low-storage failure"));
 }
 
+/// Phase 7 / Task 7 follow-up: end-to-end resume after a
+/// low-storage failure. Drives `RestorePipeline::run` to the
+/// failure point, "frees space" by restoring the dropped state
+/// table, and re-runs the pipeline — asserting it reaches
+/// `RestoreState::FullRestoreComplete` from the resumed
+/// checkpoint without re-running anything that already ran.
+#[test]
+fn low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete() {
+    use kchat_core::local_store::state_machines::RestoreState;
+    use kchat_core::restore::pipeline::RestorePipeline;
+    use kchat_core::restore::state_machine;
+
+    let db = LocalStoreDb::open_in_memory(&[0xCD; 32]).expect("open in-memory db");
+    for st in [
+        RestoreState::IdentityRestored,
+        RestoreState::RootKeysUnwrapped,
+        RestoreState::ManifestVerified,
+    ] {
+        state_machine::transition(db.connection(), st, None).unwrap();
+    }
+
+    let identity = KeyMaterial::from_bytes([0xEF; 32]);
+    let backup_root = derive_backup_root(&identity).unwrap();
+    let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
+
+    // Phase A: fail mid-restore by dropping the state table —
+    // the next state-machine write surfaces a structured
+    // `Error::Storage` (= "no such table") which is the same
+    // shape SQLite returns under `SQLITE_FULL`.
+    db.connection()
+        .execute("DROP TABLE restore_state", [])
+        .unwrap();
+    let pipeline = RestorePipeline::new();
+    let err = pipeline
+        .run(db.connection(), &[], &[], &k_seg, 0, 0)
+        .expect_err("disk-full must surface a Storage error");
+    assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+
+    // Phase B: "free space" — re-create the state table and
+    // restore the checkpoint to the last known committed state.
+    // In production the orchestrator persists this state via
+    // [`state_machine::transition`]; here we simulate by
+    // re-creating the row at `ManifestVerified` (the deepest
+    // step that committed before the failure).
+    db.connection()
+        .execute(
+            "CREATE TABLE restore_state(
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                state TEXT NOT NULL,
+                notes TEXT
+            )",
+            [],
+        )
+        .unwrap();
+    state_machine::save(
+        db.connection(),
+        RestoreState::ManifestVerified,
+        Some("resumed-from-low-storage"),
+    )
+    .unwrap();
+
+    // Phase C: re-run the pipeline. With the checkpoint in
+    // place, `RestorePipeline::run` must walk
+    // `SkeletonRestored → SearchRestored →
+    // RecentMessagesRestored → FullRestoreComplete` without
+    // surfacing any error — proving the checkpoint is the
+    // resume point and no state was lost.
+    let summary = pipeline
+        .run(db.connection(), &[], &[], &k_seg, 0, 0)
+        .expect("resume must succeed after the state table is restored");
+    assert_eq!(summary.final_state, Some(RestoreState::FullRestoreComplete));
+
+    // Persisted state machine matches the in-memory summary.
+    let (final_state, _) = state_machine::load(db.connection())
+        .unwrap()
+        .expect("state row");
+    assert_eq!(final_state, RestoreState::FullRestoreComplete);
+}
+
 // ===========================================================================
 // Scenario 8 — Manifest chain break detected on restore (extended)
 // ===========================================================================

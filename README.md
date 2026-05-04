@@ -53,7 +53,7 @@
 > (Argon2id + AES-256-KW + serde envelope) including the
 > `DeviceTransferEnvelope` zeroize fix).**
 > **Phase 5 — Search (Fuzzy + Encrypted Shards) —
-> `In progress | ~92%`** (cold-bucket fan-out: a
+> `In progress | ~95%`** (cold-bucket fan-out: a
 > `ColdShardSource` trait (`search::query_engine`) resolves cold
 > `(conversation_id, time_bucket)` pairs and decrypts shards via
 > `search::shard_builder::{restore_text_search_shard,
@@ -67,20 +67,42 @@
 > *upload* pipeline lives at `CoreImpl::upload_search_shards`
 > (build → seal → CBOR → `TransportClient::upload_index_shard`
 > → `UploadedSearchShards` receipt with per-shard
-> `(shard_id, doc_count, ciphertext_sha256)`). Script-aware
-> fuzzy matching with per-script overlap floors
-> (`search::tokenizer::fuzzy_min_overlap`), mixed-language
-> fan-out via `segment_by_script`, full ranking formula
-> (`BM25_WEIGHT × FUZZY_WEIGHT × RECENCY_WEIGHT ×
+> `(shard_id, doc_count, ciphertext_sha256)`); the
+> incremental-backup wrapper
+> `CoreImpl::run_incremental_backup_with_search_shards` chains
+> the upload onto every backup so shards stay in lock-step with
+> the segments that produced them. The on-device fetch /
+> decrypt / restore counterpart is
+> `CoreImpl::fetch_and_restore_cold_shards` (calls
+> `search::shard_prefetch::batch_prefetch_shards`, AEAD-opens
+> each prefetched shard under the appropriate
+> `K_search_root` per-shard key, and replays through
+> `restore_text_search_shard` / `restore_fuzzy_search_shard`).
+> The cold-result hydration write-back path is closed by
+> `CoreImpl::hydrate_cold_search_results`: cold hits are
+> resolved to their archive segments, AEAD-opened under the
+> bucket's epoch key, and the body is written back via
+> `LocalStoreDb::rehydrate_message_body` so `body_state`
+> flips from `remote_archive_only` to `local_plain_available`
+> and the message is re-indexed into both `search_fts` and
+> `search_fuzzy`. Script-aware fuzzy matching with per-script
+> overlap floors (`search::tokenizer::fuzzy_min_overlap`),
+> mixed-language fan-out via `segment_by_script`, full ranking
+> formula (`BM25_WEIGHT × FUZZY_WEIGHT × RECENCY_WEIGHT ×
 > CONTENT_KIND_WEIGHTS` with a 30-day half-life recency decay),
 > batch-by-bucket `search::shard_prefetch::batch_prefetch_shards`
 > over all four `IndexType` variants in deterministic
 > `[Text, Fuzzy, Vector, Media]` order, padding variant for
 > `privacy_level = High`, criterion benchmarks at
-> `crates/core/benches/phase5_benchmarks.rs` plus a CI smoke
-> test at `tests/phase5_latency_smoke.rs`. The on-device
-> p95 ≤ 1.5 s gate moves to the Phase-5 device-matrix run.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~25%`**
+> `crates/core/benches/phase5_benchmarks.rs` plus the CI p95
+> latency gate at
+> `tests/phase5_latency_smoke.rs::phase5_cold_shard_p95_latency_under_1_5s_budget`
+> (asserts the end-to-end shard fetch + AEAD decrypt + FTS5 /
+> fuzzy search across a 1 000-message multilingual one-month
+> bucket stays under the **1.5 s** Phase-5 budget at p95). The
+> on-device device-matrix p95 ≤ 1.5 s gate is queued for the
+> Phase-5 device-matrix run.)
+> **Phase 7 — Desktop + Optimization — `In progress | ~28%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -310,6 +332,7 @@ chat-storage-search/
           routing.rs                        # route_archive_upload / route_archive_download / route_manifest_upload (KChat backend ↔ ZK Object Fabric)
           privacy.rs                        # should_pad / compute_padding_count / generate_dummy_segment_id (UUIDv4) / pad_with_dummy_requests (privacy_level = High)
           compaction.rs                     # apply_archive_tombstones + ArchiveCompactionResult (per-bucket merge of archive_verified segments → archive_compacted)
+          body_payload.rs                   # KCHAT_ARCHIVE_BODY_PAYLOAD_V1 envelope: encode_body_payload / decode_body_payload (cold-result hydration write-back path)
         backup/                             # Phase 4 foundation: event journal + segment builder + manifest builder + compaction + sinks
           mod.rs
           event_journal.rs                  # BackupEventType / BackupEvent / BackupEventJournal (write_event / read_events_since / read_unsegmented / cursor)
@@ -358,13 +381,13 @@ chat-storage-search/
         manifest_signing.rs                 # generation chain end-to-end
         key_wrap_hierarchy.rs               # archive vs backup root wrap split
         epoch_key_derivation.rs             # Phase 3: K_archive_epoch determinism / rotation / wrap-unwrap / cross-epoch decrypt / info-string vectors
-        archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance
+        archive_pipeline.rs                 # Phase 3 end-to-end: ingest → archive journal → group → segment build/decrypt → cursor advance, plus archive_pipeline_epoch_rotation_and_cross_epoch_compaction (2-epoch rotation + manifest carry-through) and archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore (3-epoch chain decode after a simulated fresh-device restore via EpochKeyManager::ingest_wrapped_prior_epoch_key)
         backup_pipeline.rs                  # Phase 4 end-to-end: build segment + 2-gen manifest chain → verify_manifest_chain → RestorePipeline::run → terminal FullRestoreComplete; chain-break catch test; search-shard restore round-trip
         backup_restore_multilingual.rs      # Phase 4 multilingual corpus: 8+ scripts (English / Russian / Chinese / Japanese / Arabic / Thai / Hindi / mixed Latin+CJK) round-trip through run_incremental_backup → manifest chain → verify_manifest_chain → RestorePipeline::run → FullRestoreComplete; soft-skips CJK / Thai FTS on non-ICU builds
-        failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage; manifest upload interrupted mid-write retries without chain break
+        failure_scenarios.rs                # Phase 7 failure-test suite (8 of 8): chunk upload interrupted then resumed; SHA-256 fast-fail on tampered ciphertext; tampered descriptor merkle_root; wrong K_backup_segment / wrong manifest signing key; manifest chain break with expected/actual hashes (plus deepest-link variant); MLS-removed device surfaces SignatureInvalid; missing search shard graceful degrade with cold_unavailable flag; low-storage during restore surfaces resumable Error::Storage plus the end-to-end resume gate low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete; manifest upload interrupted mid-write retries without chain break
         cold_shard_search.rs                # Phase 5: encrypted shard fetch via ColdShardSource → on-device decrypt → FTS5 + fuzzy → merge with local hits → SearchScope::IncludeCold marks is_cold = true
         mixed_language_query.rs             # Phase 5: segment_by_script fan-out across Latin × CJK / Cyrillic × Latin / pure-CJK fuzzy fallback / mixed-script promotion / unrelated-row exclusion
-        phase5_latency_smoke.rs             # Phase 5: cold-shard decrypt + search smoke test (asserts < 5 s on debug-build CI; on-device p95 ≤ 1.5 s gate runs in the device-matrix bench)
+        phase5_latency_smoke.rs             # Phase 5: cold-shard decrypt + search smoke test (debug-build smoke gate; plus the p95 latency gate phase5_cold_shard_p95_latency_under_1_5s_budget that drives 20 iterations on a 1 000-message multilingual one-month bucket and asserts the end-to-end shard fetch + AEAD decrypt + FTS5 / fuzzy search p95 stays under the 1.5 s Phase-5 budget; on-device device-matrix p95 ≤ 1.5 s gate runs in the device-matrix bench)
         media_pipeline.rs                   # process_media + chunker + cache + caption + routing + thumbnail end-to-end
         storage_budget_enforcement.rs       # Phase 3 end-to-end: pressure assessment → candidate collection → tiered eviction → executor (every PressureLevel × every EvictionTier)
         multilingual_search.rs              # Latin/Cyrillic/CJK/Arabic/Thai/Devanagari FTS5 round-trip

@@ -87,8 +87,11 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
-> **Phase 0 closed; Phase 1 in flight (~95%).** Updates vs. the
-> original target structure below:
+> **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
+> (~95%); Phase 3 in flight (~97%); Phase 4 in flight (~90%);
+> Phase 5 in flight (~95%, cold-shard fetch + restore + p95
+> latency gate landed); Phase 7 in flight (~28%, failure suite at
+> 8 of 8).** Updates vs. the original target structure below:
 >
 > * `crates/core/src/formats/` is a **Phase-0 addition** for the
 >   CBOR wire-format types (segment frames, manifest spec, media
@@ -1689,6 +1692,38 @@ sign manifest → advance cursor.
   `doc_count`, `ciphertext_len`, `ciphertext_sha256`) so
   callers can record the entry in their own search-shard
   ledger.
+* `CoreImpl::run_incremental_backup_with_search_shards` —
+  Phase-5, Task-1 wrapper that piggy-backs on
+  `run_incremental_backup_inner`. Once the backup commits the
+  affected `(conversation_id, time_bucket)` rows, the wrapper
+  builds + seals fresh text + fuzzy shards under per-shard
+  keys derived from `K_search_root`, encodes the
+  `SearchIndexShard` frame, and uploads via
+  `TransportClient::upload_index_shard`. Existing call sites
+  keep using `run_incremental_backup`; new orchestration code
+  opts into the shard-aware variant.
+* `CoreImpl::fetch_and_restore_cold_shards` — Phase-5, Task-2
+  on-device entry point for the cold-search restore path.
+  Calls `search::shard_prefetch::batch_prefetch_shards` for a
+  bucket, AEAD-opens each `PrefetchedShard` under the
+  appropriate per-shard key derived from `K_search_root`, and
+  replays the decrypted entries through
+  `restore_text_search_shard` /
+  `restore_fuzzy_search_shard` so the local FTS5 / fuzzy
+  indexes match the cold ones. Returns a structured
+  `RestoredShardSummary` with per-type row counts.
+* `CoreImpl::hydrate_cold_search_results` — Phase-5, Task-3
+  cold-result hydration write-back. After
+  `search_and_prefetch_cold` identifies cold hits, the
+  routine fetches the archive segment via
+  `archive::prefetch::batch_prefetch_bucket`, decrypts under
+  the bucket's epoch key, extracts the message body from the
+  `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope
+  (`crates/core/src/archive/body_payload.rs`), and calls
+  `LocalStoreDb::rehydrate_message_body` so `body_state`
+  flips from `remote_archive_only` to `local_plain_available`
+  and the body is re-indexed into both `search_fts` and
+  `search_fuzzy`. Idempotent re-runs are a no-op.
 
 ### 9.8 Archive compaction at production scale
 

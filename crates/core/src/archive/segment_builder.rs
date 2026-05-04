@@ -287,7 +287,17 @@ impl ArchiveSegmentBuilder {
 /// Default monthly time bucket. Format: `YYYY-MM`. Falls back to
 /// `"unknown"` when `created_at_ms` is negative or out of range.
 pub fn default_time_bucket(event: &ArchiveEvent) -> String {
-    let secs = event.created_at_ms / 1_000;
+    default_time_bucket_for_ms(event.created_at_ms)
+}
+
+/// Same monthly-bucket computation as
+/// [`default_time_bucket`] but for a raw millisecond
+/// timestamp. Used by the backup pipeline (which carries
+/// `BackupEvent`, not `ArchiveEvent`) to derive the
+/// `(conversation_id, time_bucket)` keys it ferries search
+/// shards under.
+pub fn default_time_bucket_for_ms(created_at_ms: i64) -> String {
+    let secs = created_at_ms / 1_000;
     if secs < 0 {
         return "unknown".into();
     }

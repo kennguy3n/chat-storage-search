@@ -218,6 +218,46 @@ impl EpochKeyManager {
             )
             .collect()
     }
+
+    /// Inverse of [`Self::wrapped_prior_epoch_keys_for_manifest`].
+    ///
+    /// Insert a [`crate::formats::manifest::WrappedEpochKeyRef`]
+    /// (typically read out of an `ArchiveManifest` during the
+    /// restore path) into `prior_epoch_keys` so a subsequent
+    /// [`Self::unwrap_prior_epoch_key`] can service the row.
+    ///
+    /// The byte length is validated against the AES-256-KW
+    /// wrapped-key length up front; an unexpected length surfaces
+    /// `Error::Storage(...)` rather than waiting for the
+    /// downstream unwrap to fail. Re-ingesting an `epoch_id` that
+    /// already exists is rejected — the manifest chain must be
+    /// the canonical source of truth.
+    pub fn ingest_wrapped_prior_epoch_key(
+        &mut self,
+        w: crate::formats::manifest::WrappedEpochKeyRef,
+    ) -> Result<(), Error> {
+        if w.epoch_id == self.current_epoch_id {
+            return Err(Error::Storage(format!(
+                "ingest_wrapped_prior_epoch_key: epoch_id {:?} matches current epoch",
+                w.epoch_id
+            )));
+        }
+        if w.wrapped_key.len() != crate::crypto::key_wrap::WRAPPED_KEY_LEN {
+            return Err(Error::Storage(format!(
+                "ingest_wrapped_prior_epoch_key: wrapped_key length {} != expected {}",
+                w.wrapped_key.len(),
+                crate::crypto::key_wrap::WRAPPED_KEY_LEN
+            )));
+        }
+        if self.prior_epoch_keys.contains_key(&w.epoch_id) {
+            return Err(Error::Storage(format!(
+                "ingest_wrapped_prior_epoch_key: epoch_id {:?} already known",
+                w.epoch_id
+            )));
+        }
+        self.prior_epoch_keys.insert(w.epoch_id, w.wrapped_key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +287,59 @@ mod tests {
         let mgr_a = EpochKeyManager::new(&root, "2026-05").unwrap();
         let mgr_b = EpochKeyManager::new(&root, "2026-06").unwrap();
         assert_ne!(mgr_a.current_epoch_key(), mgr_b.current_epoch_key());
+    }
+
+    #[test]
+    fn ingest_wrapped_prior_epoch_key_round_trips_through_manifest_payload() {
+        // Manager A: rotates twice → has two retired epochs.
+        let root = fresh_root();
+        let mut mgr_a = EpochKeyManager::new(&root, "2026-01").unwrap();
+        let jan_key = *mgr_a.current_epoch_key();
+        mgr_a.rotate_epoch(&root, "2026-02").unwrap();
+        mgr_a.rotate_epoch(&root, "2026-03").unwrap();
+        let payload = mgr_a.wrapped_prior_epoch_keys_for_manifest();
+        assert_eq!(payload.len(), 2);
+
+        // Manager B: simulates a fresh restore device. Rebuild
+        // from `K_archive_root` at the *current* epoch only, then
+        // ingest the wrapped prior keys from the manifest payload.
+        let mut mgr_b = EpochKeyManager::new(&root, "2026-03").unwrap();
+        assert_eq!(mgr_b.prior_count(), 0);
+        for w in payload {
+            mgr_b.ingest_wrapped_prior_epoch_key(w).unwrap();
+        }
+        assert_eq!(mgr_b.prior_count(), 2);
+        assert_eq!(
+            mgr_b.retired_epoch_ids(),
+            vec!["2026-01".to_string(), "2026-02".to_string()],
+        );
+        let recovered_jan = mgr_b.unwrap_prior_epoch_key("2026-01", &root).unwrap();
+        assert_eq!(recovered_jan, jan_key);
+    }
+
+    #[test]
+    fn ingest_wrapped_prior_epoch_key_rejects_invalid_inputs() {
+        use crate::formats::manifest::WrappedEpochKeyRef;
+        let root = fresh_root();
+        let mut mgr = EpochKeyManager::new(&root, "2026-01").unwrap();
+        // Same as current — must reject.
+        let err = mgr
+            .ingest_wrapped_prior_epoch_key(WrappedEpochKeyRef {
+                epoch_id: "2026-01".into(),
+                wrapped_key: vec![0u8; crate::crypto::key_wrap::WRAPPED_KEY_LEN],
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)));
+
+        // Wrong wrapped-key length — must reject.
+        let err = mgr
+            .ingest_wrapped_prior_epoch_key(WrappedEpochKeyRef {
+                epoch_id: "2026-00".into(),
+                wrapped_key: vec![0u8; 16],
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)));
+        assert_eq!(mgr.prior_count(), 0);
     }
 
     #[test]
