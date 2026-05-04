@@ -499,6 +499,33 @@ pub trait TransportClient: Send + Sync {
         bucket: &str,
         shard_type: &str,
     ) -> TransportResult<Vec<u8>>;
+
+    /// Upload one encrypted search-index shard for the supplied
+    /// `(conversation_hash, bucket, shard_type)` triple. The bytes
+    /// are the CBOR-encoded
+    /// [`crate::formats::search_shard::SearchIndexShard`] frame —
+    /// the AEAD seal is already wrapped around the FTS / fuzzy
+    /// payload by [`crate::search::shard_builder::build_text_search_shard`]
+    /// and friends, so the transport layer only needs to ferry
+    /// opaque bytes.
+    ///
+    /// `shard_type` matches the `shard_type` parameter of
+    /// [`Self::fetch_index_shards`] (`"text"`, `"fuzzy"`, …) so
+    /// the upload + fetch sides agree on a single addressing
+    /// scheme.
+    ///
+    /// Default impl returns
+    /// [`crate::Error::NotImplemented("transport_upload_index_shard")`]
+    /// so existing implementations don't need to bump.
+    fn upload_index_shard(
+        &self,
+        _conversation_hash: &str,
+        _bucket: &str,
+        _shard_type: &str,
+        _ciphertext: &[u8],
+    ) -> TransportResult<()> {
+        Err(crate::Error::NotImplemented("transport_upload_index_shard"))
+    }
 }
 
 /// Phase-1 placeholder [`TransportClient`] implementation.
@@ -573,6 +600,248 @@ impl TransportClient for NoopTransportClient {
         _shard_type: &str,
     ) -> TransportResult<Vec<u8>> {
         Err(crate::Error::NotImplemented("transport"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockTransportClient — programmable test double
+// ---------------------------------------------------------------------------
+
+/// In-memory programmable [`TransportClient`] mock, sized to the
+/// Phase 5 + Phase 7 test surfaces.
+///
+/// `MockTransportClient` covers the two transport
+/// surfaces the encrypted-shard pipeline cares about:
+///
+/// 1. [`TransportClient::fetch_index_shards`] — backed by a
+///    `(conversation_hash, bucket, shard_type) → ciphertext` map
+///    seeded with [`MockTransportClient::stage_index_shard`]. An
+///    unset entry returns `Ok(Vec::new())`, matching the
+///    "no shard uploaded yet" contract documented on
+///    [`TransportClient::fetch_index_shards`] and exercised by
+///    the cold-result hydration path in
+///    [`crate::search::query_engine::QueryEngine::execute_search_with_cold_source`].
+///
+/// 2. [`TransportClient::upload_index_shard`] — captures the
+///    uploaded `(triple, ciphertext)` so tests can assert the
+///    upload pipeline produced exactly the bytes the build step
+///    sealed.
+///
+/// Programmable failure injection is supplied via
+/// [`MockTransportClient::fail_index_shard_fetch_with`] and
+/// [`MockTransportClient::fail_index_shard_upload_with`] so the
+/// Phase-7 failure-suite tests (`docs/PHASES.md §Phase 7`) can
+/// drive transport errors without spinning up a custom mock per
+/// scenario.
+///
+/// Every other [`TransportClient`] method (`fetch_messages`,
+/// `init_blob_upload`, …) returns
+/// `Err(crate::Error::NotImplemented("transport"))` so this mock
+/// does not silently mask call-sites that need a different
+/// transport surface.
+#[derive(Debug, Default)]
+pub struct MockTransportClient {
+    inner: std::sync::Mutex<MockTransportState>,
+}
+
+#[derive(Debug, Default)]
+struct MockTransportState {
+    /// Pre-staged shard responses, keyed by
+    /// `(conversation_hash, bucket, shard_type)`.
+    fetch_responses: std::collections::HashMap<(String, String, String), Vec<u8>>,
+    /// Recorded `fetch_index_shards` calls, in order.
+    fetch_calls: Vec<(String, String, String)>,
+    /// Recorded `upload_index_shard` calls, in order.
+    upload_calls: Vec<(String, String, String, Vec<u8>)>,
+    /// Programmable, key-scoped failure for shard fetches. When set
+    /// for a `(hash, bucket, type)` triple the next call to
+    /// `fetch_index_shards` for that triple returns
+    /// `Err(Error::Transport(message))` and the entry is consumed.
+    fail_fetch_once: std::collections::HashMap<(String, String, String), String>,
+    /// Programmable, key-scoped failure for shard uploads. When set
+    /// for a triple the next call to `upload_index_shard` returns
+    /// `Err(Error::Transport(message))` and the entry is consumed.
+    fail_upload_once: std::collections::HashMap<(String, String, String), String>,
+}
+
+impl MockTransportClient {
+    /// Construct a new, empty mock.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-stage one ciphertext shard response for the supplied
+    /// `(conversation_hash, bucket, shard_type)`.
+    pub fn stage_index_shard(
+        &self,
+        conversation_hash: &str,
+        bucket: &str,
+        shard_type: &str,
+        ciphertext: Vec<u8>,
+    ) {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.fetch_responses.insert(
+            (conversation_hash.into(), bucket.into(), shard_type.into()),
+            ciphertext,
+        );
+    }
+
+    /// Programme the next `fetch_index_shards` call for
+    /// `(conversation_hash, bucket, shard_type)` to fail with
+    /// `Error::Transport(message)`. The failure is consumed on
+    /// the first matching call, so subsequent calls fall back to
+    /// any staged ciphertext.
+    pub fn fail_index_shard_fetch_with(
+        &self,
+        conversation_hash: &str,
+        bucket: &str,
+        shard_type: &str,
+        message: impl Into<String>,
+    ) {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.fail_fetch_once.insert(
+            (conversation_hash.into(), bucket.into(), shard_type.into()),
+            message.into(),
+        );
+    }
+
+    /// Programme the next `upload_index_shard` call for the
+    /// supplied triple to fail with `Error::Transport(message)`.
+    pub fn fail_index_shard_upload_with(
+        &self,
+        conversation_hash: &str,
+        bucket: &str,
+        shard_type: &str,
+        message: impl Into<String>,
+    ) {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.fail_upload_once.insert(
+            (conversation_hash.into(), bucket.into(), shard_type.into()),
+            message.into(),
+        );
+    }
+
+    /// Snapshot the recorded `fetch_index_shards` calls.
+    pub fn fetch_calls(&self) -> Vec<(String, String, String)> {
+        self.inner
+            .lock()
+            .expect("mock state poisoned")
+            .fetch_calls
+            .clone()
+    }
+
+    /// Snapshot the recorded `upload_index_shard` calls. Each entry
+    /// is `(conversation_hash, bucket, shard_type, ciphertext)`.
+    pub fn upload_calls(&self) -> Vec<(String, String, String, Vec<u8>)> {
+        self.inner
+            .lock()
+            .expect("mock state poisoned")
+            .upload_calls
+            .clone()
+    }
+}
+
+impl TransportClient for MockTransportClient {
+    fn fetch_messages(
+        &self,
+        _conversation_id: &str,
+        _after_cursor: Option<&str>,
+    ) -> TransportResult<FetchMessagesResponse> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn init_blob_upload(
+        &self,
+        _size: u64,
+        _blob_class: BlobClass,
+        _expected_merkle_root: [u8; 32],
+    ) -> TransportResult<BlobUploadHandle> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn upload_chunk(
+        &self,
+        _blob_id: &str,
+        _chunk_idx: u32,
+        _ciphertext: &[u8],
+        _sha256: [u8; 32],
+    ) -> TransportResult<ChunkReceipt> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn commit_blob(&self, _blob_id: &str) -> TransportResult<CommitBlobResponse> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn fetch_blob_range(&self, _blob_id: &str, _range: Range<u64>) -> TransportResult<Vec<u8>> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn fetch_archive_manifests(
+        &self,
+        _after_generation: Option<u64>,
+    ) -> TransportResult<Vec<EncryptedManifest>> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn fetch_archive_segment(&self, _segment_id: &str) -> TransportResult<Vec<u8>> {
+        Err(crate::Error::NotImplemented("transport"))
+    }
+
+    fn fetch_index_shards(
+        &self,
+        conversation_hash: &str,
+        bucket: &str,
+        shard_type: &str,
+    ) -> TransportResult<Vec<u8>> {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        let key = (
+            conversation_hash.to_string(),
+            bucket.to_string(),
+            shard_type.to_string(),
+        );
+        state.fetch_calls.push(key.clone());
+        if let Some(msg) = state.fail_fetch_once.remove(&key) {
+            return Err(crate::Error::Transport(msg));
+        }
+        Ok(state.fetch_responses.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn upload_index_shard(
+        &self,
+        conversation_hash: &str,
+        bucket: &str,
+        shard_type: &str,
+        ciphertext: &[u8],
+    ) -> TransportResult<()> {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        let key = (
+            conversation_hash.to_string(),
+            bucket.to_string(),
+            shard_type.to_string(),
+        );
+        if let Some(msg) = state.fail_upload_once.remove(&key) {
+            // Record the failed attempt anyway so callers can
+            // detect the retry pattern.
+            state.upload_calls.push((
+                conversation_hash.into(),
+                bucket.into(),
+                shard_type.into(),
+                ciphertext.to_vec(),
+            ));
+            return Err(crate::Error::Transport(msg));
+        }
+        state.upload_calls.push((
+            conversation_hash.into(),
+            bucket.into(),
+            shard_type.into(),
+            ciphertext.to_vec(),
+        ));
+        // Cross-wire: a successful upload also seeds the fetch
+        // response so the round-trip read path returns the same
+        // bytes that were just uploaded.
+        state.fetch_responses.insert(key, ciphertext.to_vec());
+        Ok(())
     }
 }
 

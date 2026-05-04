@@ -1668,6 +1668,27 @@ sign manifest → advance cursor.
   `restore_text_search_shard` / `restore_fuzzy_search_shard`
   invert the path. Tests cover round-trip, wrong-key, and
   multilingual content (Latin / CJK / Arabic).
+* `crates/core/src/search/cold_shard_source.rs` — concrete
+  `ColdShardSource` adapter. `TransportColdShardSource` bridges
+  a `dyn TransportClient` and a `ShardKeyRegistry`
+  (`(conversation_id, time_bucket, IndexType) → KeyMaterial`)
+  into the trait by hashing the conversation id under
+  `K_conversation_hash`, calling
+  `TransportClient::fetch_index_shards`, and decrypting via
+  `restore_text_search_shard` / `restore_fuzzy_search_shard`.
+  `GracefulCold` wraps any `ColdShardSource` and swallows
+  `Error::Transport` / `Error::Storage` so the orchestration
+  layer can degrade to local-only results without aborting the
+  query (Phase 7 graceful-degradation).
+* `CoreImpl::upload_search_shards` — encrypted-shard upload
+  pipeline. Takes the FTS / fuzzy rows for a bucket, builds +
+  seals through the same `build_*_search_shard` helpers,
+  CBOR-encodes the `SearchIndexShard` frame, and ferries it to
+  `TransportClient::upload_index_shard`. Returns an
+  `UploadedSearchShards` receipt (per-shard `shard_id`,
+  `doc_count`, `ciphertext_len`, `ciphertext_sha256`) so
+  callers can record the entry in their own search-shard
+  ledger.
 
 ### 9.8 Archive compaction at production scale
 

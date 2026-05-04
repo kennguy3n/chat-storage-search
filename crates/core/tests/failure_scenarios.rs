@@ -27,6 +27,7 @@ use kchat_core::backup::manifest_builder::{build_backup_manifest, BackupManifest
 use kchat_core::backup::segment_builder::{
     decrypt_backup_segment, BackupSegmentBuildRequest, BackupSegmentBuilder,
 };
+use kchat_core::backup::sinks::BackupSink;
 use kchat_core::crypto::aead::BlobClass;
 use kchat_core::crypto::key_hierarchy::{
     derive_backup_manifest, derive_backup_root, derive_backup_segment, KeyMaterial,
@@ -1095,4 +1096,184 @@ fn manifest_chain_break_at_deepest_generation_reports_correct_link() {
         }
         other => panic!("expected ChainBreak {{ generation: 3 }}, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// Scenario 9 — Manifest upload interrupted mid-write
+// ===========================================================================
+//
+// Phase 7 / `docs/PHASES.md §Failure test suite`. Models the
+// orchestration-layer failure mode where a backup manifest has
+// already been built and signed locally, but the call to
+// `BackupSink::upload_backup_manifest` fails with a transient
+// network error (Wi-Fi drop, Cellular handoff, …) part-way
+// through the write. The test asserts that:
+//
+// 1. `upload_backup_manifest` surfaces a structured
+//    `Error::Transport` (not a panic, not a corrupted local
+//    state).
+// 2. The failure does not destroy the manifest — the orchestration
+//    layer can re-issue the upload against a healthy sink and
+//    succeed without rebuilding or re-signing the manifest.
+// 3. `verify_manifest_chain` still accepts the chain after the
+//    retry — the manifest bytes the retry uploads are
+//    byte-for-byte the bytes the failed attempt tried to upload,
+//    so generation 1 still chains correctly under generation 0.
+
+/// Programmable [`BackupSink`] that fails the first
+/// `upload_backup_manifest` call with `Error::Transport(message)`
+/// and succeeds on every subsequent call. Records every uploaded
+/// manifest so the test can assert "the retry uploaded the same
+/// bytes the original attempt was carrying".
+#[derive(Debug)]
+struct FlakyManifestSink {
+    fail_next: Mutex<Option<String>>,
+    uploaded_manifests: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl FlakyManifestSink {
+    fn new(initial_failure: &str) -> Self {
+        Self {
+            fail_next: Mutex::new(Some(initial_failure.to_string())),
+            uploaded_manifests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn uploaded(&self) -> Vec<(String, Vec<u8>)> {
+        self.uploaded_manifests.lock().unwrap().clone()
+    }
+}
+
+impl BackupSink for FlakyManifestSink {
+    fn upload_backup_segment(
+        &self,
+        _segment_id: &str,
+        _ciphertext: &[u8],
+    ) -> kchat_core::Result<()> {
+        Ok(())
+    }
+
+    fn upload_backup_manifest(&self, manifest_id: &str, sealed: &[u8]) -> kchat_core::Result<()> {
+        if let Some(msg) = self.fail_next.lock().unwrap().take() {
+            return Err(Error::Transport(msg));
+        }
+        self.uploaded_manifests
+            .lock()
+            .unwrap()
+            .push((manifest_id.into(), sealed.to_vec()));
+        Ok(())
+    }
+
+    fn fetch_backup_manifest(&self, _manifest_id: &str) -> kchat_core::Result<Vec<u8>> {
+        Err(Error::NotImplemented("backup_sink"))
+    }
+
+    fn fetch_backup_segment(&self, _segment_id: &str) -> kchat_core::Result<Vec<u8>> {
+        Err(Error::NotImplemented("backup_sink"))
+    }
+
+    fn list_backup_manifests(&self) -> kchat_core::Result<Vec<String>> {
+        Err(Error::NotImplemented("backup_sink"))
+    }
+}
+
+#[test]
+fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
+    let identity = KeyMaterial::from_bytes([0x73; 32]);
+    let backup_root = derive_backup_root(&identity).expect("backup_root");
+    let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
+    let k_man = derive_backup_manifest(&backup_root, b"upload-interrupt").unwrap();
+    let signer = SigningKey::from_bytes(&[0x77; 32]);
+
+    let evt = BackupEvent {
+        event_type: BackupEventType::MessageReceived,
+        conversation_id: Some(Uuid::now_v7()),
+        message_id: Some(Uuid::now_v7()),
+        payload: b"event".to_vec(),
+        created_at_ms: 1,
+    };
+    let segment = BackupSegmentBuilder::new()
+        .build_segment(
+            BackupSegmentBuildRequest {
+                events: vec![evt],
+                segment_type: SegmentType::Events,
+            },
+            &k_seg,
+        )
+        .expect("seal segment");
+
+    let gen0 = build_backup_manifest(
+        BackupManifestBuildRequest {
+            segments: std::slice::from_ref(&segment),
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            previous: None,
+            device_id: "device-A".into(),
+        },
+        &signer,
+        &k_man,
+    )
+    .expect("gen0");
+
+    let gen1 = build_backup_manifest(
+        BackupManifestBuildRequest {
+            segments: std::slice::from_ref(&segment),
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            previous: Some(&gen0.manifest),
+            device_id: "device-A".into(),
+        },
+        &signer,
+        &k_man,
+    )
+    .expect("gen1");
+
+    // Encode gen1 as the orchestration layer would have, verbatim,
+    // so we can replay the same bytes through the retry. The
+    // sealed manifest's `ciphertext` field is the on-the-wire
+    // payload the sink ferries; the orchestrator stores
+    // `(nonce, ciphertext, signature)` separately for the
+    // metadata lookup. We use `ciphertext` here as the byte-for-
+    // byte equivalent that must round-trip across retries.
+    let gen1_id = gen1.manifest.manifest_id.to_string();
+    let gen1_bytes = gen1.ciphertext.clone();
+
+    let sink = FlakyManifestSink::new("connection reset");
+
+    // First attempt — must fail with Error::Transport.
+    let err = sink
+        .upload_backup_manifest(&gen1_id, &gen1_bytes)
+        .expect_err("first attempt must fail");
+    match err {
+        Error::Transport(msg) => assert_eq!(msg, "connection reset"),
+        other => panic!("expected Error::Transport, got {other:?}"),
+    }
+    assert!(
+        sink.uploaded().is_empty(),
+        "failed attempt must NOT record an uploaded manifest"
+    );
+
+    // Retry — must succeed against the now-healthy sink.
+    sink.upload_backup_manifest(&gen1_id, &gen1_bytes)
+        .expect("retry upload must succeed");
+    let uploaded = sink.uploaded();
+    assert_eq!(
+        uploaded.len(),
+        1,
+        "retry must record exactly one uploaded manifest"
+    );
+    assert_eq!(uploaded[0].0, gen1_id);
+    assert_eq!(
+        uploaded[0].1, gen1_bytes,
+        "retry must upload byte-for-byte the same manifest bytes"
+    );
+
+    // Verify the chain still validates — the retry did not
+    // produce a duplicate generation, and the manifest's
+    // previous_manifest_hash still chains under gen0.
+    let chain = vec![gen0.manifest.clone(), gen1.manifest.clone()];
+    verify_manifest_chain(&chain, &signer.verifying_key())
+        .expect("chain must verify after manifest-upload retry");
 }

@@ -199,6 +199,105 @@ impl std::fmt::Debug for CoreImpl {
     }
 }
 
+/// Receipt returned by [`CoreImpl::upload_search_shards`].
+///
+/// The receipt carries per-shard success metadata *and* per-shard
+/// failure messages so callers can detect "text uploaded, fuzzy
+/// failed" and retry only the failing half. This is critical for
+/// incremental backups where re-uploading a successful shard is
+/// wasteful (and on bandwidth-constrained connections, harmful).
+///
+/// The two halves are independent:
+///
+/// * `text_shard.is_some()` ⟺ the text shard upload succeeded.
+/// * `text_error.is_some()` ⟺ the text shard upload failed; the
+///   string carries the upstream transport message verbatim.
+///
+/// At most one of `text_shard` / `text_error` is `Some` for a given
+/// call (analogously for fuzzy). When the corresponding rows
+/// vector was empty, both are `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedSearchShards {
+    /// URL-safe base64 of the keyed `conversation_id_hash` the
+    /// transport ferried the shards to. The cold-result hydration
+    /// path uses the same string when calling
+    /// [`crate::transport::TransportClient::fetch_index_shards`].
+    pub conversation_hash: String,
+    /// Echo of the time bucket the request targeted.
+    pub time_bucket: String,
+    /// Receipt for the text shard, `None` when `fts_rows` was
+    /// empty *or* when the text upload failed (in which case
+    /// [`Self::text_error`] is set).
+    pub text_shard: Option<UploadedShardMetadata>,
+    /// Receipt for the fuzzy shard, `None` when `fuzzy_rows` was
+    /// empty *or* when the fuzzy upload failed (in which case
+    /// [`Self::fuzzy_error`] is set).
+    pub fuzzy_shard: Option<UploadedShardMetadata>,
+    /// Upstream transport error from the text shard upload, if it
+    /// failed. `None` on success or when the text upload was
+    /// skipped.
+    pub text_error: Option<String>,
+    /// Upstream transport error from the fuzzy shard upload, if it
+    /// failed. `None` on success or when the fuzzy upload was
+    /// skipped.
+    pub fuzzy_error: Option<String>,
+}
+
+impl UploadedSearchShards {
+    /// `true` when at least one shard upload failed.
+    pub fn has_failures(&self) -> bool {
+        self.text_error.is_some() || self.fuzzy_error.is_some()
+    }
+
+    /// First failure message (text first, fuzzy second), if any.
+    /// Useful for surfacing a short banner in the UI; the full
+    /// per-shard breakdown is on the receipt.
+    pub fn first_error(&self) -> Option<&str> {
+        self.text_error.as_deref().or(self.fuzzy_error.as_deref())
+    }
+}
+
+/// One row of [`UploadedSearchShards`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedShardMetadata {
+    /// Stable shard id allocated by the builder.
+    pub shard_id: Uuid,
+    /// Number of FTS / fuzzy rows the shard sealed.
+    pub doc_count: u64,
+    /// Length of the CBOR-encoded shard frame uploaded over the
+    /// wire.
+    pub ciphertext_len: usize,
+    /// Hash of the AEAD ciphertext produced by the seal step.
+    /// Surfaces `BuiltSearchShard::ciphertext_sha256` so callers
+    /// can record it in their `search_shard_map` ledger and
+    /// detect drift on later fetches.
+    pub ciphertext_sha256: [u8; 32],
+}
+
+/// URL-safe base64 (no padding) of a byte slice. Internal helper
+/// used by [`CoreImpl::upload_search_shards`] to ferry the
+/// `conversation_id_hash` into the transport surface.
+fn base64_urlsafe_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        let n = chunk.len();
+        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if n >= 2 {
+            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if n >= 3 {
+            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
 impl CoreImpl {
     /// Construct a new core, opening the SQLCipher database at
     /// `{config.data_dir}/kchat.db` with `key`. No transport
@@ -503,6 +602,143 @@ impl CoreImpl {
             self.enqueue_cold_results_for_hydration(&results);
         }
         Ok(results)
+    }
+
+    /// Build encrypted text + fuzzy search shards for a given
+    /// `(conversation_id, time_bucket)` and ferry them to the
+    /// archive backend (Phase 5, Task 2).
+    ///
+    /// `docs/PHASES.md §Phase 5` calls for the orchestration
+    /// layer to:
+    ///
+    /// 1. Pull the FTS / fuzzy rows for the bucket out of local
+    ///    storage,
+    /// 2. seal them with `build_text_search_shard` /
+    ///    `build_fuzzy_search_shard` under the active epoch's
+    ///    per-shard keys,
+    /// 3. upload each sealed shard via
+    ///    [`crate::transport::TransportClient::upload_index_shard`],
+    ///    and
+    /// 4. record the upload in the local "what shards do we have
+    ///    on the backend" ledger so the cold-result hydration
+    ///    path
+    ///    ([`Self::search_with_cold_source`]) knows to ask the
+    ///    backend for them.
+    ///
+    /// Step 1 (loading rows out of LocalStoreDb) is the caller's
+    /// responsibility — different callers source rows differently
+    /// (full bucket flush vs. incremental delta vs. retry of an
+    /// already-built shard) so the method takes the rows as
+    /// arguments rather than re-querying the DB. Step 4 is also
+    /// the caller's job until the
+    /// `search_shard_map` table lands in a follow-up; the method
+    /// returns an [`UploadedSearchShards`] receipt with enough
+    /// metadata for the caller to record the entry.
+    ///
+    /// The method skips the upload entirely for empty `fts_rows`
+    /// and `fuzzy_rows` so callers can call it unconditionally
+    /// per bucket without worrying about empty buckets producing
+    /// noise on the wire.
+    ///
+    /// Transport failures on either half are recorded on the
+    /// returned [`UploadedSearchShards`] receipt as
+    /// `text_error` / `fuzzy_error` (with the upstream message
+    /// verbatim) — *not* propagated as `Result::Err`. This is the
+    /// "partial upload" contract: if the text shard succeeds but
+    /// the fuzzy shard fails, callers see
+    /// `text_shard = Some(_), fuzzy_error = Some(_)` and can
+    /// retry only the failing half. Use
+    /// [`UploadedSearchShards::has_failures`] to test whether
+    /// retry is needed.
+    ///
+    /// `Result::Err` is reserved for build-time errors that
+    /// happen before any upload was attempted — CBOR encode
+    /// failures, key-derivation failures inside
+    /// `build_text_search_shard` /
+    /// `build_fuzzy_search_shard`. These are programmer / data
+    /// errors, not retryable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_search_shards(
+        &self,
+        transport: &dyn TransportClient,
+        conversation_id: &str,
+        time_bucket: &str,
+        fts_rows: Vec<crate::search::shard_builder::FtsRow>,
+        fuzzy_rows: Vec<crate::search::shard_builder::FuzzyRow>,
+        k_text_index_shard: &crate::crypto::key_hierarchy::KeyMaterial,
+        k_fuzzy_index_shard: &crate::crypto::key_hierarchy::KeyMaterial,
+        conversation_hash_key: &crate::crypto::key_hierarchy::KeyMaterial,
+    ) -> Result<UploadedSearchShards> {
+        let conv_hash = crate::search::shard_builder::keyed_conversation_id_hash(
+            conversation_id,
+            conversation_hash_key,
+        );
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+
+        let mut receipt = UploadedSearchShards {
+            conversation_hash: conv_hash_b64.clone(),
+            time_bucket: time_bucket.into(),
+            text_shard: None,
+            fuzzy_shard: None,
+            text_error: None,
+            fuzzy_error: None,
+        };
+
+        if !fts_rows.is_empty() {
+            let built = crate::search::shard_builder::build_text_search_shard(
+                fts_rows,
+                conversation_id,
+                time_bucket.to_string(),
+                k_text_index_shard,
+                conversation_hash_key,
+            )?;
+            let bytes = serde_cbor::to_vec(&built.shard).map_err(|e| {
+                Error::Storage(format!("upload_search_shards: text shard cbor: {e}"))
+            })?;
+            match transport.upload_index_shard(&conv_hash_b64, time_bucket, "text", &bytes) {
+                Ok(()) => {
+                    receipt.text_shard = Some(UploadedShardMetadata {
+                        shard_id: built.shard.shard_id,
+                        doc_count: built.shard.doc_count,
+                        ciphertext_len: bytes.len(),
+                        ciphertext_sha256: built.shard.ciphertext_sha256,
+                    });
+                }
+                Err(Error::Transport(msg)) => {
+                    receipt.text_error = Some(format!("upload_search_shards text: {msg}"));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        if !fuzzy_rows.is_empty() {
+            let built = crate::search::shard_builder::build_fuzzy_search_shard(
+                fuzzy_rows,
+                conversation_id,
+                time_bucket.to_string(),
+                k_fuzzy_index_shard,
+                conversation_hash_key,
+            )?;
+            let bytes = serde_cbor::to_vec(&built.shard).map_err(|e| {
+                Error::Storage(format!("upload_search_shards: fuzzy shard cbor: {e}"))
+            })?;
+            match transport.upload_index_shard(&conv_hash_b64, time_bucket, "fuzzy", &bytes) {
+                Ok(()) => {
+                    receipt.fuzzy_shard = Some(UploadedShardMetadata {
+                        shard_id: built.shard.shard_id,
+                        doc_count: built.shard.doc_count,
+                        ciphertext_len: bytes.len(),
+                        ciphertext_sha256: built.shard.ciphertext_sha256,
+                    });
+                }
+                Err(Error::Transport(msg)) => {
+                    receipt.fuzzy_error = Some(format!("upload_search_shards fuzzy: {msg}"));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        Ok(receipt)
     }
 
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
@@ -5486,5 +5722,267 @@ mod tests {
                 .unwrap();
             assert_eq!(state, "archive_verified");
         });
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 5, Task 2: upload_search_shards round-trip
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn upload_search_shards_round_trip_through_mock_transport() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::formats::search_shard::IndexType;
+        use crate::search::cold_shard_source::{ShardKeyRegistry, TransportColdShardSource};
+        use crate::search::query_engine::ColdShardSource;
+        use crate::search::shard_builder::{FtsRow, FuzzyRow};
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+
+        let fts_row = FtsRow {
+            message_id: Uuid::now_v7().to_string(),
+            conversation_id: conv_id.clone(),
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: "wendy lighthouse".into(),
+        };
+        let fuzzy_row = FuzzyRow {
+            token: "wendy".into(),
+            script: "Latn".into(),
+            message_id: fts_row.message_id.clone(),
+        };
+
+        let transport = MockTransportClient::new();
+        let receipt = core
+            .upload_search_shards(
+                &transport,
+                &conv_id,
+                bucket,
+                vec![fts_row.clone()],
+                vec![fuzzy_row.clone()],
+                &k_text,
+                &k_fuzzy,
+                &conv_hash_key,
+            )
+            .expect("upload");
+        assert!(receipt.text_shard.is_some());
+        assert!(receipt.fuzzy_shard.is_some());
+        assert_eq!(receipt.text_shard.as_ref().unwrap().doc_count, 1);
+        assert_eq!(receipt.fuzzy_shard.as_ref().unwrap().doc_count, 1);
+
+        let upload_calls = transport.upload_calls();
+        assert_eq!(upload_calls.len(), 2);
+        // Order: text first, then fuzzy.
+        assert_eq!(upload_calls[0].2, "text");
+        assert_eq!(upload_calls[1].2, "fuzzy");
+        assert_eq!(upload_calls[0].0, receipt.conversation_hash);
+
+        // Round-trip: TransportColdShardSource should retrieve and
+        // decrypt the rows we just uploaded.
+        let mut registry = ShardKeyRegistry::new();
+        registry.insert(&conv_id, bucket, IndexType::Text, k_text.clone());
+        registry.insert(&conv_id, bucket, IndexType::Fuzzy, k_fuzzy.clone());
+        let adapter = TransportColdShardSource::new(
+            &transport,
+            vec![(conv_id.clone(), bucket.into())],
+            &registry,
+            &conv_hash_key,
+        );
+        let rows = adapter.fetch_text_rows(&conv_id, bucket).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text_content, "wendy lighthouse");
+
+        let fz = adapter.fetch_fuzzy_rows(&conv_id, bucket).expect("rows");
+        assert_eq!(fz.len(), 1);
+        assert_eq!(fz[0].token, "wendy");
+    }
+
+    #[test]
+    fn upload_search_shards_skips_empty_buckets() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+
+        let transport = MockTransportClient::new();
+        let receipt = core
+            .upload_search_shards(
+                &transport,
+                &conv_id,
+                "2026-04",
+                vec![],
+                vec![],
+                &k_text,
+                &k_fuzzy,
+                &conv_hash_key,
+            )
+            .expect("upload");
+        assert!(receipt.text_shard.is_none());
+        assert!(receipt.fuzzy_shard.is_none());
+        assert!(transport.upload_calls().is_empty());
+    }
+
+    #[test]
+    fn upload_search_shards_records_transport_failure_on_receipt() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::shard_builder::{keyed_conversation_id_hash, FtsRow};
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+
+        let conv_hash = keyed_conversation_id_hash(&conv_id, &conv_hash_key);
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+
+        let transport = MockTransportClient::new();
+        transport.fail_index_shard_upload_with(&conv_hash_b64, bucket, "text", "connection reset");
+
+        let fts_row = FtsRow {
+            message_id: Uuid::now_v7().to_string(),
+            conversation_id: conv_id.clone(),
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: "wendy lighthouse".into(),
+        };
+
+        let receipt = core
+            .upload_search_shards(
+                &transport,
+                &conv_id,
+                bucket,
+                vec![fts_row],
+                vec![],
+                &k_text,
+                &k_fuzzy,
+                &conv_hash_key,
+            )
+            .expect("upload should not error on transport failure — failure is on the receipt");
+        assert!(
+            receipt.text_shard.is_none(),
+            "failed text shard should not be reported as success"
+        );
+        assert!(receipt.fuzzy_shard.is_none(), "fuzzy was empty");
+        assert!(
+            receipt.has_failures(),
+            "receipt must report the transport failure"
+        );
+        let text_err = receipt.text_error.as_ref().expect("text_error populated");
+        assert!(
+            text_err.contains("connection reset") && text_err.contains("upload_search_shards"),
+            "text_error preserves upstream message: {text_err}",
+        );
+        assert_eq!(receipt.first_error(), receipt.text_error.as_deref());
+
+        // Retry with a fresh transport that doesn't fail.
+        let healthy = MockTransportClient::new();
+        let fts_row_2 = FtsRow {
+            message_id: Uuid::now_v7().to_string(),
+            conversation_id: conv_id.clone(),
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_001,
+            text_content: "wendy lighthouse".into(),
+        };
+        let receipt = core
+            .upload_search_shards(
+                &healthy,
+                &conv_id,
+                bucket,
+                vec![fts_row_2],
+                vec![],
+                &k_text,
+                &k_fuzzy,
+                &conv_hash_key,
+            )
+            .expect("retry upload");
+        assert!(receipt.text_shard.is_some());
+        assert!(!receipt.has_failures());
+    }
+
+    #[test]
+    fn upload_search_shards_partial_success_text_uploaded_fuzzy_failed() {
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::search::shard_builder::{keyed_conversation_id_hash, FtsRow, FuzzyRow};
+        use crate::transport::MockTransportClient;
+
+        let core = fresh_core();
+        let conv_hash_key = KeyMaterial::from_bytes([0x66; 32]);
+        let k_text = KeyMaterial::from_bytes([0xA1; 32]);
+        let k_fuzzy = KeyMaterial::from_bytes([0xA2; 32]);
+        let conv_id = Uuid::now_v7().to_string();
+        let bucket = "2026-04";
+
+        let conv_hash = keyed_conversation_id_hash(&conv_id, &conv_hash_key);
+        let conv_hash_b64 = base64_urlsafe_encode(&conv_hash);
+
+        let transport = MockTransportClient::new();
+        transport.fail_index_shard_upload_with(
+            &conv_hash_b64,
+            bucket,
+            "fuzzy",
+            "fuzzy backend 503",
+        );
+
+        let fts_row = FtsRow {
+            message_id: Uuid::now_v7().to_string(),
+            conversation_id: conv_id.clone(),
+            sender_id: "user-1".into(),
+            created_at_ms: 1_700_000_000_000,
+            text_content: "wendy lighthouse".into(),
+        };
+        let fuzzy_row = FuzzyRow {
+            token: "wendy".into(),
+            script: "Latn".into(),
+            message_id: fts_row.message_id.clone(),
+        };
+
+        // Partial-upload contract: text succeeds, fuzzy fails. The
+        // caller can detect this and retry only the fuzzy half
+        // without re-uploading the text shard.
+        let receipt = core
+            .upload_search_shards(
+                &transport,
+                &conv_id,
+                bucket,
+                vec![fts_row],
+                vec![fuzzy_row],
+                &k_text,
+                &k_fuzzy,
+                &conv_hash_key,
+            )
+            .expect("upload");
+        assert!(
+            receipt.text_shard.is_some(),
+            "text shard should be recorded as successfully uploaded",
+        );
+        assert!(
+            receipt.fuzzy_shard.is_none(),
+            "fuzzy shard upload failed, must not be reported as success",
+        );
+        assert!(receipt.text_error.is_none());
+        let fuzzy_err = receipt.fuzzy_error.as_ref().expect("fuzzy_error populated");
+        assert!(
+            fuzzy_err.contains("fuzzy backend 503") && fuzzy_err.contains("upload_search_shards"),
+            "fuzzy_error preserves upstream message: {fuzzy_err}",
+        );
+        assert!(receipt.has_failures());
+
+        // The text shard was sent over the wire even though fuzzy
+        // failed — exactly one upload call recorded.
+        let calls = transport.upload_calls();
+        assert_eq!(calls.iter().filter(|c| c.2 == "text").count(), 1);
+        assert_eq!(calls.iter().filter(|c| c.2 == "fuzzy").count(), 1);
     }
 }
