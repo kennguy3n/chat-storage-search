@@ -827,19 +827,36 @@ impl<'a> QueryEngine<'a> {
             SearchScope::LocalOnly | SearchScope::IncludeCold => {}
         }
 
-        let want: HashSet<String> = results.iter().map(|r| r.message_id.to_string()).collect();
-        let conn = self.db.connection();
-        let mut stmt = conn.prepare(
+        // Phase 6, Task 4 (2026-05-04 batch — Devin Review
+        // follow-up): use a parameterized `IN (...)` clause keyed
+        // by `message_id` so the lookup is O(k · log N) against
+        // the `(message_id, model_version)` primary-key index
+        // instead of an O(N) sweep across every embedding for
+        // this `model_version`. This matches the pattern in
+        // [`Self::fetch_skeleton_columns_for_semantic`] and
+        // [`apply_recency_and_kind_weight`].
+        let ids: Vec<String> = results.iter().map(|r| r.message_id.to_string()).collect();
+        // Bind layout: ?1 = model_version, ?2..?{N+1} = message_ids.
+        let placeholders = (0..ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
             "SELECT message_id, embedding FROM search_vector
-              WHERE model_version = ?1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![mv])?;
+              WHERE model_version = ?1
+                AND message_id IN ({placeholders})"
+        );
+        let conn = self.db.connection();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+        binds.push(Value::Text(mv.to_string()));
+        for id in &ids {
+            binds.push(Value::Text(id.clone()));
+        }
         let mut by_id: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut rows = stmt.query(params_from_iter(binds.iter()))?;
         while let Some(row) = rows.next()? {
             let mid: String = row.get(0)?;
-            if !want.contains(&mid) {
-                continue;
-            }
             let blob: Vec<u8> = row.get(1)?;
             by_id.insert(mid, blob);
         }
