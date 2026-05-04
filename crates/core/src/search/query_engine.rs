@@ -2476,9 +2476,7 @@ mod tests {
         let q_text = "find this stale message";
         let q_emb = mock.embed(q_text).unwrap();
         let cache = LocalStoreEmbeddingCache::new(db.connection());
-        cache
-            .put(&recent_msg, XLMR_MODEL_VERSION, &q_emb)
-            .unwrap();
+        cache.put(&recent_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
         cache.put(&stale_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
 
         let engine = QueryEngine::new(&db);
