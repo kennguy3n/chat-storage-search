@@ -354,14 +354,46 @@ impl<'a> QueryEngine<'a> {
         // skip every cold bucket whose conversation_id is outside
         // the resolved target set. This keeps the cold fan-out
         // honest to the same scoping the local pass enforces.
-        // Fall back to "no extra restriction" on a transient
-        // resolver error — the local pass has already
-        // returned a fail-closed result, so the cold pass
-        // matches by being maximally permissive without
-        // dropping local hits.
+        //
+        // Resolution semantics (matches `resolve_target_to_conversation_set`'s
+        // documented contract — see the `Ok(None)` rustdoc on that
+        // helper):
+        //
+        //   * `Ok(None)`               → `SearchTarget::Global`. No
+        //                                additional restriction; every
+        //                                cold bucket is in scope.
+        //   * `Ok(Some(non_empty))`    → restrict to those buckets.
+        //   * `Ok(Some(empty))`        → **fail-closed**: the target
+        //                                resolved to zero conversations
+        //                                (e.g. `Starred` / `Unread`
+        //                                with the default
+        //                                `NoopConversationGroupResolver`,
+        //                                or a `Conversation(uuid)` that
+        //                                does not exist). Drop every
+        //                                cold bucket so the cold pass
+        //                                stays consistent with the
+        //                                local pass — `push_target_filter`
+        //                                emits `1=0` for an empty
+        //                                resolution, so the local
+        //                                pass returns zero rows; the
+        //                                cold pass mirrors that.
+        //   * `Err(_)`                 → transient resolver error. Fall
+        //                                back to "no extra restriction"
+        //                                (`None`) so a flaky resolver
+        //                                cannot mask cold hits the
+        //                                conversation_filter or the
+        //                                local pass would otherwise
+        //                                surface.
+        // The explicit `Ok(opt) => opt` / `Err(_) => None` arms here
+        // exactly mirror the semantics in the comment above. We keep
+        // the match form rather than `Result::unwrap_or_default` so
+        // the per-arm rustdoc above lines up 1:1 with each pattern.
+        #[allow(clippy::manual_unwrap_or_default)]
         let target_set: Option<HashSet<String>> =
-            resolve_target_to_conversation_set(&query.effective_target(), self.db)
-                .unwrap_or_default();
+            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+                Ok(opt) => opt,
+                Err(_) => None,
+            };
         let buckets: Vec<(String, String)> = buckets
             .into_iter()
             .filter(|(c, _)| conv_filter.as_deref().is_none_or(|cf| cf == c.as_str()))

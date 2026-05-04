@@ -158,24 +158,37 @@ impl InProcessScheduler {
         if interval_ms == 0 {
             return Err(Error::Storage("scheduler interval_ms must be > 0".into()));
         }
-        // Deduplication: if a worker for this task type is
-        // already alive, succeed without spawning a duplicate.
-        {
-            let workers = self
-                .workers
-                .lock()
-                .map_err(|_| Error::Storage("scheduler worker mutex poisoned".into()))?;
-            if workers.contains_key(&task) {
-                return Ok(());
-            }
-        }
-
+        // Hold the workers lock for the entire spawn — dedup
+        // check, thread spawn, and handle insert happen
+        // atomically so two concurrent
+        // `schedule_*` callers cannot both pass the dedup
+        // check, both spawn worker threads, and have one
+        // overwrite the other in `workers.insert` (which would
+        // orphan the first worker because its shutdown
+        // state Arc would no longer be reachable from
+        // `cancel_all`).
+        //
+        // We acquire the handlers lock first to avoid any
+        // possibility of a `cancel_all` ↔ `spawn_worker`
+        // deadlock — `cancel_all` only ever takes the
+        // workers lock, never handlers.
         let handler = self
             .handlers
             .lock()
             .map_err(|_| Error::Storage("scheduler handler mutex poisoned".into()))?
             .get(&task)
             .cloned();
+
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| Error::Storage("scheduler worker mutex poisoned".into()))?;
+
+        // Deduplication: if a worker for this task type is
+        // already alive, succeed without spawning a duplicate.
+        if workers.contains_key(&task) {
+            return Ok(());
+        }
 
         let state: Arc<(Mutex<TaskState>, Condvar)> =
             Arc::new((Mutex::new(TaskState::default()), Condvar::new()));
@@ -229,10 +242,6 @@ impl InProcessScheduler {
             })
             .map_err(|e| Error::Storage(format!("scheduler thread spawn failed: {e}")))?;
 
-        let mut workers = self
-            .workers
-            .lock()
-            .map_err(|_| Error::Storage("scheduler worker mutex poisoned".into()))?;
         workers.insert(task, WorkerHandle { state, join });
         Ok(())
     }
@@ -427,6 +436,60 @@ mod tests {
     fn is_task_pending_returns_false_for_unknown_id() {
         let s = InProcessScheduler::new();
         assert!(!s.is_task_pending("kchat.scheduler.unknown").unwrap());
+    }
+
+    /// Regression for the dedup TOCTOU race: two threads racing
+    /// on the same `TaskType` must not both spawn a worker and
+    /// have one overwrite the other in `workers.insert`. After
+    /// the contention settles, exactly one worker must be
+    /// alive and `cancel_all` must reach it (no orphans).
+    #[test]
+    fn schedule_dedup_is_atomic_under_concurrent_callers() {
+        use std::sync::Barrier;
+
+        for _ in 0..20 {
+            let s = Arc::new(InProcessScheduler::new());
+            let (counter, handler) = counting_handler();
+            s.set_handler(TaskType::IncrementalBackup, handler);
+
+            // Force every spawned thread to call `schedule_backup`
+            // at the same instant — this is what tickled the
+            // original TOCTOU between the dedup check and the
+            // insert.
+            let n_callers = 8usize;
+            let barrier = Arc::new(Barrier::new(n_callers));
+            let mut handles = Vec::with_capacity(n_callers);
+            for _ in 0..n_callers {
+                let s = Arc::clone(&s);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    s.schedule_backup(20).expect("schedule");
+                }));
+            }
+            for h in handles {
+                h.join().expect("join caller");
+            }
+
+            assert!(s.is_task_pending_kind(TaskType::IncrementalBackup));
+
+            // Wait for at least one tick so we know the surviving
+            // worker is actually wired to the counter.
+            wait_for_at_least(&counter, 1, Duration::from_secs(1));
+
+            // Cancel and confirm the counter stops advancing.
+            // If a duplicate worker had been orphaned by a
+            // race, this assertion would flake — the orphan
+            // would keep ticking after cancel.
+            s.cancel_all().expect("cancel_all");
+            let snapshot = counter.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            let later = counter.load(Ordering::SeqCst);
+            assert_eq!(
+                snapshot, later,
+                "cancel_all must reach every spawned worker — no orphans",
+            );
+        }
     }
 
     #[test]
