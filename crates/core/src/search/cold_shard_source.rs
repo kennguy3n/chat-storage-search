@@ -307,11 +307,13 @@ impl<F: FnMut(&str, &str, &Error)> ColdShardSource for GracefulCold<'_, F> {
     ) -> Result<Vec<FtsRow>, Error> {
         match self.inner.fetch_text_rows(conversation_id, time_bucket) {
             Ok(rows) => Ok(rows),
-            Err(Error::Transport(_)) | Err(Error::Storage(_)) => {
-                let err = Error::Transport(format!(
-                    "graceful: text shard fetch failed for ({conversation_id}, {time_bucket})"
-                ));
-                (self.on_failure.borrow_mut())(conversation_id, time_bucket, &err);
+            Err(ref e @ Error::Transport(_)) | Err(ref e @ Error::Storage(_)) => {
+                // Forward the original error verbatim so the
+                // orchestration layer's `on_failure` callback can
+                // log the actual underlying message (e.g. the
+                // upstream `"connection reset"`, `"404"`,
+                // `"timeout"`) rather than a synthesized stub.
+                (self.on_failure.borrow_mut())(conversation_id, time_bucket, e);
                 Ok(Vec::new())
             }
             Err(other) => Err(other),
@@ -325,11 +327,8 @@ impl<F: FnMut(&str, &str, &Error)> ColdShardSource for GracefulCold<'_, F> {
     ) -> Result<Vec<FuzzyRow>, Error> {
         match self.inner.fetch_fuzzy_rows(conversation_id, time_bucket) {
             Ok(rows) => Ok(rows),
-            Err(Error::Transport(_)) | Err(Error::Storage(_)) => {
-                let err = Error::Transport(format!(
-                    "graceful: fuzzy shard fetch failed for ({conversation_id}, {time_bucket})"
-                ));
-                (self.on_failure.borrow_mut())(conversation_id, time_bucket, &err);
+            Err(ref e @ Error::Transport(_)) | Err(ref e @ Error::Storage(_)) => {
+                (self.on_failure.borrow_mut())(conversation_id, time_bucket, e);
                 Ok(Vec::new())
             }
             Err(other) => Err(other),
