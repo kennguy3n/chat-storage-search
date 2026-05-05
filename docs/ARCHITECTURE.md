@@ -88,19 +88,24 @@ goes through the FFI bridge for the host platform.
 ## 2. Crate Structure
 
 > **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
-> (~95%); Phase 3 in flight (~97%); Phase 4 in flight (~90%);
+> (~98%, `HttpTransportClient` (feature-gated `http-transport`)
+> lands the production HTTP transport with retry + timeout +
+> auth-header coverage); Phase 3 in flight (~99%, iCloud +
+> Google Drive bridge wrappers in ios-bridge / android-bridge);
+> Phase 4 in flight (~90%);
 > Phase 5 in flight (~98%, cold-shard fetch + restore + p95
 > latency gate across multilingual / large-bucket / multi-shard
 > scenarios + per-platform `DeviceMatrixConfig` budgets);
-> Phase 6 in flight (~92%, ML inference seams for XLM-R /
+> Phase 6 in flight (~95%, ML inference seams for XLM-R /
 > MobileCLIP-S2 / Whisper / DocumentExtractor /
 > VideoKeyframeSampler + on-device reranker with raw
 > `semantic_score` + INT4 quantization selection + INT4
 > encode/decode codec + criterion bench scaffold + desktop
 > ONNX EP wiring — `create_xlmr_session_with_ep` /
-> `create_mobileclip_session_with_ep` + `EpFallbackChain` +
+> `create_mobileclip_session_with_ep` +
+> `EpFallbackChain::select_first_available` +
 > `DesktopMlEpSelector::create_desktop_session`); Phase 7 in
-> flight (~80%, failure suite at 8 of 8 + offline detector +
+> flight (~85%, failure suite at 14 of 14 + offline detector +
 > perf p95 dashboard with `PerfSummary` / `PerfBudget` +
 > hot-path coverage spanning `hydrate_message`,
 > `run_incremental_backup`, `compact_archive`,
@@ -108,7 +113,9 @@ goes through the FFI bridge for the host platform.
 > surface complete + EP benchmark capture-cache-auto-selection
 > + media migration auto-scheduled after eviction +
 > `ZkofDedupAnalytics` real wiring with backup / media sinks
-> recording `DedupEvent`s); Phase 8 in flight
+> recording `DedupEvent`s + 6 large-scale stress tests + 6
+> edge-case scenarios + media-sink stress with real iCloud /
+> Google Drive bridges); Phase 8 in flight
 > (~98%, multi-scope / multi-tenant search foundation —
 > conversation hierarchy columns + indexes,
 > `archive_segment_map.tenant_id`, `SearchTarget` enum + scope

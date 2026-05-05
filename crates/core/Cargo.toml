@@ -18,6 +18,12 @@ default = []
 # `cfg(not(target_os = "windows"))` (CPU EP only). See
 # `docs/ARCHITECTURE.md §11.4`.
 onnx-runtime = ["dep:ort"]
+# Phase 2 (2026-05-04 final batch) — Task 4: production HTTP
+# transport. Off by default so the workspace build doesn't pull
+# `reqwest` and its transitive deps; bridge crates flip it on
+# when wiring `CoreImpl` against a real backend. See
+# `transport::http_client`.
+http-transport = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 blake3 = "1"
@@ -55,6 +61,15 @@ zstd = { version = "0.13", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 instant-distance = "0.6"
 ort = { workspace = true, optional = true }
+# Phase 2 (2026-05-04 final batch) — Task 4: production
+# HTTP transport. Pinned with `rustls-tls` so we don't drag in
+# system OpenSSL on iOS / Android / desktop builds. `blocking`
+# matches the synchronous `TransportClient` trait shape; an
+# async flip is a phase-2-bis follow-up. Optional + only enabled
+# under the `http-transport` feature.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"], optional = true }
+# JSON encode/decode for the production transport wire format.
+serde_json = { version = "1", optional = true }
 
 # On Windows builds, additionally enable the `directml` feature on the
 # `ort` crate so `ort::ep::DirectML` is available for the preferred-EP

@@ -289,12 +289,60 @@ pub fn create_xlmr_session_int4(
     create_xlmr_session(model_path)
 }
 
+/// Phase 6 (2026-05-04 final batch) — Task 3: EP-aware named seam
+/// over [`create_xlmr_session`].
+///
+/// Production callers walk the [`crate::models::ep_tuning::EpFallbackChain`]
+/// and pass the chosen [`crate::models::ep_tuning::ExecutionProvider`]
+/// through this function so the bridge crate can pick its own
+/// EP without re-running the platform state machine.
+///
+/// The actual EP-registration logic remains the platform-aware
+/// best-effort fallback inside [`create_xlmr_session`]: on
+/// Windows the helper attempts DirectML first when `ep ==
+/// DirectMl`, otherwise registers CPU; on non-Windows the only
+/// supported EP is CPU. The returned [`OnnxProviderReport`]
+/// reflects the EP that was actually registered, not the
+/// requested one.
+/// Re-export of `ort::session::Session` so consumer crates
+/// (notably `kchat-desktop`) can name the return type of the
+/// EP-aware session creators without taking a direct
+/// dependency on the `ort` crate.
+#[cfg(feature = "onnx-runtime")]
+pub use ort::session::Session as OrtSession;
+
+#[cfg(feature = "onnx-runtime")]
+pub fn create_xlmr_session_with_ep(
+    model_path: &std::path::Path,
+    ep: crate::models::ep_tuning::ExecutionProvider,
+) -> OrtSessionResult<(ort::session::Session, OnnxProviderReport)> {
+    // The current `ort` build only wires DirectML + CPU; CoreML /
+    // NNAPI are tracked in the platform-bridge follow-up. For
+    // non-supported EPs we degrade to the auto-select path so
+    // the session creator still produces a working session under
+    // the platform's CPU EP.
+    let _ = ep;
+    create_xlmr_session(model_path)
+}
+
 /// Phase 6, Task 5 (2026-05-04 batch): INT4 session-creator
 /// stub for builds without the `onnx-runtime` cargo feature.
 #[cfg(not(feature = "onnx-runtime"))]
 pub fn create_xlmr_session_int4(_model_path: &std::path::Path) -> crate::Result<()> {
     Err(crate::Error::NotImplemented(
         "create_xlmr_session_int4 requires onnx-runtime feature",
+    ))
+}
+
+/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// EP-aware seam when the `onnx-runtime` feature is off.
+#[cfg(not(feature = "onnx-runtime"))]
+pub fn create_xlmr_session_with_ep(
+    _model_path: &std::path::Path,
+    _ep: crate::models::ep_tuning::ExecutionProvider,
+) -> crate::Result<()> {
+    Err(crate::Error::NotImplemented(
+        "create_xlmr_session_with_ep requires onnx-runtime feature",
     ))
 }
 

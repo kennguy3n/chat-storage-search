@@ -22,8 +22,9 @@
 //!    and confirming the local store reflects the new sink.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kchat_core::config::{KChatCoreConfig, Platform};
 use kchat_core::core_impl::CoreImpl;
@@ -32,7 +33,10 @@ use kchat_core::crypto::content_hash::content_hash;
 use kchat_core::local_store::schema::{Conversation, MediaAsset, MessageKind, MessageSkeleton};
 use kchat_core::local_store::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 use kchat_core::media::migration::NoopMigrationProgress;
+use kchat_core::media::sinks::google_drive::{GoogleDriveBridge, GoogleDriveMediaBlobSink};
+use kchat_core::media::sinks::icloud::{ICloudBlobBridge, ICloudMediaBlobSink};
 use kchat_core::media::sinks::{MediaBlobReference, MediaBlobSink};
+use kchat_core::Error;
 
 const KEY: [u8; 32] = [0x66; 32];
 const TOTAL: usize = 10_000;
@@ -280,4 +284,191 @@ fn asset_offset(sinks: &[(&str, &InMemorySink, usize); 4], tag: &str) -> usize {
         off += *c;
     }
     off
+}
+
+// ---------------------------------------------------------------
+// Phase 7 (2026-05-04 final batch) — Task 16: real-bridge media
+// sink stress.
+//
+// `InMemoryICloudBridge` and `InMemoryGoogleDriveBridge` give the
+// production `ICloudMediaBlobSink` / `GoogleDriveMediaBlobSink`
+// real byte storage so the round-trip exercises the Phase 3
+// metadata encoder/decoder, not just the in-memory chunked sink
+// shape. The migration round-trip test verifies every byte after
+// moving 1k assets between the two bridge-backed sinks.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct InMemoryICloudBridge {
+    /// `record_name` → blob bytes. Each upload writes the entire
+    /// flattened ciphertext blob (the iCloud sink concatenates
+    /// chunks before calling `upload_file`).
+    store: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl ICloudBlobBridge for InMemoryICloudBridge {
+    fn upload_file(&self, record_name: &str, bytes: &[u8]) -> Result<String, Error> {
+        self.store
+            .lock()
+            .unwrap()
+            .insert(record_name.to_string(), bytes.to_vec());
+        Ok(record_name.to_string())
+    }
+
+    fn download_file_range(&self, record_name: &str, range: Range<u64>) -> Result<Vec<u8>, Error> {
+        let store = self.store.lock().unwrap();
+        let blob = store
+            .get(record_name)
+            .ok_or_else(|| Error::Storage(format!("missing record {record_name}")))?;
+        let start = range.start as usize;
+        let end = (range.end as usize).min(blob.len());
+        if start >= blob.len() {
+            return Ok(Vec::new());
+        }
+        Ok(blob[start..end].to_vec())
+    }
+
+    fn delete_file(&self, record_name: &str) -> Result<(), Error> {
+        self.store.lock().unwrap().remove(record_name);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct InMemoryGoogleDriveBridge {
+    store: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl GoogleDriveBridge for InMemoryGoogleDriveBridge {
+    fn upload_file(&self, asset_id: &str, bytes: &[u8]) -> Result<String, Error> {
+        let file_id = format!("drive-{asset_id}");
+        self.store
+            .lock()
+            .unwrap()
+            .insert(file_id.clone(), bytes.to_vec());
+        Ok(file_id)
+    }
+
+    fn download_file_range(&self, file_id: &str, range: Range<u64>) -> Result<Vec<u8>, Error> {
+        let store = self.store.lock().unwrap();
+        let blob = store
+            .get(file_id)
+            .ok_or_else(|| Error::Storage(format!("missing file {file_id}")))?;
+        let start = range.start as usize;
+        let end = (range.end as usize).min(blob.len());
+        if start >= blob.len() {
+            return Ok(Vec::new());
+        }
+        Ok(blob[start..end].to_vec())
+    }
+
+    fn delete_file(&self, file_id: &str) -> Result<(), Error> {
+        self.store.lock().unwrap().remove(file_id);
+        Ok(())
+    }
+}
+
+#[test]
+fn in_memory_icloud_bridge_round_trip() {
+    let bridge = InMemoryICloudBridge::default();
+    let payload = (0u8..32).cycle().take(2048).collect::<Vec<u8>>();
+    let id = bridge.upload_file("rec-1", &payload).unwrap();
+    assert_eq!(id, "rec-1");
+    let back = bridge.download_file_range("rec-1", 0..2048).unwrap();
+    assert_eq!(back, payload);
+    bridge.delete_file("rec-1").unwrap();
+    assert!(bridge.download_file_range("rec-1", 0..2048).is_err());
+}
+
+#[test]
+fn in_memory_google_drive_bridge_round_trip() {
+    let bridge = InMemoryGoogleDriveBridge::default();
+    let payload = (0u8..32).cycle().take(2048).collect::<Vec<u8>>();
+    let id = bridge.upload_file("asset-7", &payload).unwrap();
+    assert_eq!(id, "drive-asset-7");
+    let back = bridge.download_file_range(&id, 0..2048).unwrap();
+    assert_eq!(back, payload);
+    bridge.delete_file(&id).unwrap();
+    assert!(bridge.download_file_range(&id, 0..2048).is_err());
+}
+
+#[test]
+#[ignore = "stress test — run with --ignored"]
+fn media_sink_stress_with_in_memory_bridges() {
+    // Drive 1 000 asset uploads through the real iCloud sink + a
+    // real Google Drive sink, each backed by the in-memory bridge.
+    // Round-trip every chunk and confirm the bytes are identical.
+    let icloud_bridge: Arc<InMemoryICloudBridge> = Arc::new(InMemoryICloudBridge::default());
+    let drive_bridge: Arc<InMemoryGoogleDriveBridge> =
+        Arc::new(InMemoryGoogleDriveBridge::default());
+    let icloud_sink = ICloudMediaBlobSink::new(icloud_bridge.clone());
+    let drive_sink = GoogleDriveMediaBlobSink::new(drive_bridge.clone());
+
+    const N: usize = 1_000;
+    for i in 0..N {
+        let asset_id = format!("real-asset-{i:06}");
+        let payload = (i as u8..(i as u8).wrapping_add(64)).collect::<Vec<u8>>();
+        let merkle = content_hash(&payload);
+        let chunks: &[&[u8]] = &[&payload];
+
+        let icloud_ref = icloud_sink
+            .upload_media_chunks(&asset_id, BlobClass::Media, chunks, merkle)
+            .unwrap();
+        let drive_ref = drive_sink
+            .upload_media_chunks(&asset_id, BlobClass::Media, chunks, merkle)
+            .unwrap();
+
+        let icloud_back = icloud_sink.fetch_media_chunk(&icloud_ref, 0).unwrap();
+        let drive_back = drive_sink.fetch_media_chunk(&drive_ref, 0).unwrap();
+        assert_eq!(icloud_back, payload, "icloud round-trip {asset_id}");
+        assert_eq!(drive_back, payload, "drive round-trip {asset_id}");
+    }
+}
+
+#[test]
+#[ignore = "stress test — run with --ignored"]
+fn media_sink_stress_migration_round_trip_with_real_data() {
+    // 1 000 assets uploaded into the in-memory iCloud sink, then
+    // migrated to Google Drive via the production migration
+    // executor. Every byte must arrive intact.
+    let core = open_core();
+    let icloud_bridge: Arc<InMemoryICloudBridge> = Arc::new(InMemoryICloudBridge::default());
+    let drive_bridge: Arc<InMemoryGoogleDriveBridge> =
+        Arc::new(InMemoryGoogleDriveBridge::default());
+    let icloud_sink = ICloudMediaBlobSink::new(icloud_bridge.clone());
+    let drive_sink = GoogleDriveMediaBlobSink::new(drive_bridge.clone());
+
+    const N: usize = 1_000;
+    let mut payloads: HashMap<String, Vec<u8>> = HashMap::with_capacity(N);
+    for i in 0..N {
+        let asset_id = format!("migr-asset-{i:06}");
+        let payload = (0u8..=255).cycle().take(48 + (i % 16)).collect::<Vec<u8>>();
+        let merkle = content_hash(&payload);
+        let chunks: &[&[u8]] = &[&payload];
+        let _ = icloud_sink
+            .upload_media_chunks(&asset_id, BlobClass::Media, chunks, merkle)
+            .unwrap();
+        // Mirror the asset row in the local store so the
+        // migration planner can find it.
+        seed(&core, &asset_id, "icloud", std::slice::from_ref(&payload));
+        payloads.insert(asset_id, payload);
+    }
+
+    let plan = core.plan_media_migration("icloud", "google_drive").unwrap();
+    assert_eq!(plan.len(), N);
+    let progress = NoopMigrationProgress;
+    let report = core
+        .migrate_media_sink(&plan, &icloud_sink, &drive_sink, &progress, true)
+        .unwrap();
+    assert_eq!(report.migrated(), N);
+    assert_eq!(report.failed(), 0);
+
+    // Every byte made it across.
+    for (asset_id, payload) in &payloads {
+        let id = format!("drive-{asset_id}");
+        let back = drive_bridge
+            .download_file_range(&id, 0..payload.len() as u64)
+            .unwrap();
+        assert_eq!(&back, payload, "byte-mismatch on {asset_id}");
+    }
 }

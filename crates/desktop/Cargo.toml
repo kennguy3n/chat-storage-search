@@ -8,5 +8,12 @@ description = "Desktop (macOS / Windows) consumer crate for kchat-core. Phase 0 
 [lib]
 crate-type = ["lib"]
 
+[features]
+default = []
+# Mirror of the `kchat-core` feature — flipping this on the
+# `kchat-desktop` crate compiles the desktop ONNX session helpers
+# in `desktop::ml_ep`.
+onnx-runtime = ["kchat-core/onnx-runtime"]
+
 [dependencies]
 kchat-core = { path = "../core" }

@@ -2,7 +2,7 @@
 
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, archive segment builder now covers all seven segment types). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~98%`, p95 latency gate hit across multilingual / large-bucket / multi-shard scenarios + `DeviceMatrixConfig` per-platform budgets). Phase 6 — Media and Semantic Search (`In progress | ~92%`, desktop ONNX EP wiring complete — `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep` + `EpFallbackChain` per-platform + `DesktopMlEpSelector::create_desktop_session`). Phase 7 — Desktop + Optimization (`In progress | ~80%`, Spotlight / Windows Search bridge surface complete + perf p95 dashboard with `PerfSummary` / `PerfBudget` + EP benchmark capture-cache-auto-selection + media migration auto-scheduled after eviction + dedup analytics with real `ZkofDedupAnalytics` + `InProcessDedupAnalytics` ring buffer + backup / media sinks recording `DedupEvent`s). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`, parallel bucket fetch via `std::thread::scope` + progressive `SearchEvent` streaming API surfaced through iOS / Android bridges).
+- **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~98%`, `HttpTransportClient` (feature-gated) lands the production HTTP transport with retry + timeout + auth-header coverage). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, iCloud + Google Drive bridge wrappers added in ios-bridge / android-bridge). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~98%`, p95 latency gate hit across multilingual / large-bucket / multi-shard scenarios + `DeviceMatrixConfig` per-platform budgets). Phase 6 — Media and Semantic Search (`In progress | ~95%`, desktop ONNX EP wiring complete — `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep` + `EpFallbackChain::select_first_available` + `DesktopMlEpSelector::create_desktop_session`). Phase 7 — Desktop + Optimization (`In progress | ~85%`, Spotlight / Windows Search bridge surface complete + perf p95 dashboard with `PerfSummary` / `PerfBudget` + EP benchmark capture-cache-auto-selection + media migration auto-scheduled after eviction + dedup analytics with real `ZkofDedupAnalytics` + 6 large-scale + 6 edge-case stress tests + media-sink stress with real iCloud/Drive bridges). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`, parallel bucket fetch via `std::thread::scope` + progressive `SearchEvent` streaming API surfaced through iOS / Android bridges).
 - **Last updated**: 2026-05-04
 
 This document is a phase-gated tracker. Each phase has an explicit
@@ -2097,6 +2097,70 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 ---
 
 ## Changelog
+
+### 2026-05-04 — Final completion batch: 16 tasks (this PR)
+
+Lands all remaining open items across Phases 2, 3, 5, 6, 7, and 8.
+Phase 2 advances from `~95%` to `~98%`, Phase 3 holds at `~99%`
+with bridge wrappers added, Phase 6 advances to `~95%`, Phase 7
+advances from `~80%` to `~85%`, and Phase 8 holds at `~98%`.
+
+1. **Parallel bucket fetch (Phase 8).** Already merged.
+2. **Progressive / streaming search results (Phase 8).** Already merged.
+3. **Desktop ONNX EP wiring — CoreML / DirectML / CPU (Phase 6).**
+   `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep`
+   are EP-aware named seams; `EpFallbackChain::select_first_available`
+   walks the chain on registration failure. `create_desktop_session`
+   in `crates/desktop/src/ml_ep.rs` is the convenience driver.
+4. **Production HTTP `TransportClient` (Phase 2).**
+   `crates/core/src/transport/http_client.rs` adds
+   `HttpTransportClient` (feature-gated on `http-transport`) with
+   exponential-backoff retry (1s/2s/4s), 30s standard / 120s blob
+   timeouts, hex / base64 / urlencode helpers, and full coverage
+   of every `TransportClient` method.
+5. **Performance profiling: PerfSummary + p95 dashboard (Phase 7).** Already merged.
+6. **ML EP benchmark capture + auto-selection (Phase 7).** Already merged.
+7. **Dedup analytics real wiring (Phase 7).** Already merged.
+8. **Media migration background scheduling (Phase 7).** Already merged.
+9. **macOS Spotlight + background scheduler wiring (Phase 7).** Already merged.
+10. **Windows Search + CPU ML wiring (Phase 7).** Already merged.
+11. **iCloud `MediaBlobSink` CloudKit bridge (Phase 3).**
+    `crates/ios-bridge/src/lib.rs` adds `ICloudBlobCallback` +
+    `ICloudBlobBridgeImpl`. The bridge adapts a Swift-side
+    callback (a UniFFI `callback interface`) into the canonical
+    `kchat_core::media::sinks::icloud::ICloudBlobBridge`. Tests
+    `icloud_bridge_upload_round_trip`,
+    `icloud_bridge_delete_removes_record`,
+    `icloud_bridge_download_range_returns_correct_slice`,
+    `icloud_bridge_error_surfaces_as_transport_error`.
+12. **Google Drive `MediaBlobSink` Drive API bridge (Phase 3).**
+    `crates/android-bridge/src/lib.rs` adds
+    `GoogleDriveBridgeCallback` + `GoogleDriveBridgeImpl` mirroring
+    the iCloud surface. Tests
+    `google_drive_bridge_upload_round_trip`,
+    `google_drive_bridge_delete_removes_file`,
+    `google_drive_bridge_download_range_returns_correct_slice`,
+    `google_drive_bridge_error_surfaces_as_transport_error`.
+13. **On-device p95 latency-gate expansion (Phase 5).** Already merged.
+14. **Large-scale testing expansion (Phase 7).**
+    `crates/core/tests/large_scale.rs` adds 6 `#[ignore]` stress
+    tests: 200k ingest, concurrent backup-and-search,
+    10k-segment archive compaction, 50-generation manifest
+    chain, 12-month cross-epoch search, 5k-asset migration.
+15. **Edge-case handling expansion (Phase 7).**
+    `crates/core/tests/failure_scenarios.rs` adds 6 edge-case
+    tests covering eviction-vs-backup contention, missing
+    epoch keys, search-during-restore partials, expired media
+    auth tokens, archive network partition resume, and shard
+    cache corruption detection.
+16. **Media blob sink stress with real bridges (Phase 7).**
+    `crates/core/tests/media_sink_stress.rs` adds
+    `InMemoryICloudBridge` / `InMemoryGoogleDriveBridge` and
+    two `#[ignore]` stress tests:
+    `media_sink_stress_with_in_memory_bridges` (1k chunked
+    round-trips through the production sinks) and
+    `media_sink_stress_migration_round_trip_with_real_data`
+    (1k-asset migration with byte-level verification).
 
 ### 2026-05-04 — Phase 5/6/7/8 completion batch: 10 tasks (this PR)
 

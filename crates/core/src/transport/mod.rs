@@ -30,6 +30,7 @@
 //! narrow so it can grow without breaking downstream callers.
 
 pub mod dedup_analytics;
+pub mod http_client;
 pub mod offline;
 
 use std::ops::Range;

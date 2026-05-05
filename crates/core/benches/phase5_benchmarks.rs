@@ -354,6 +354,130 @@ fn bench_combined_local_plus_cold_search(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// phase5_p95_multilingual — text shard across CJK / Arabic /
+// Cyrillic / Latin corpora.
+//
+// Phase 5 (2026-05-04 final batch) — Task 13: device-matrix p95
+// gate. The bench is sized so each subgroup (`bench_function`)
+// produces an independent histogram, which lets a per-script p95
+// regression be diffed against the
+// [`kchat_core::config::DeviceMatrixConfig`] budget without
+// rebuilding the corpus across iterations.
+// ---------------------------------------------------------------------------
+fn phase5_p95_multilingual(c: &mut Criterion) {
+    let identity = KeyMaterial::from_bytes([0xAB; 32]);
+    let search_root = derive_search_root(&identity).unwrap();
+    let conv_hash_key = KeyMaterial::from_bytes([0xCD; 32]);
+
+    let scripts: [(&str, &[&str]); 4] = [
+        ("latin", &["coffee shop near the lighthouse harbor"]),
+        ("cjk", &["上海港口的灯塔附近的咖啡店"]),
+        ("arabic", &["مقهى بالقرب من ميناء المنارة"]),
+        ("cyrillic", &["Кофейня рядом с маяком в гавани"]),
+    ];
+
+    let mut group = c.benchmark_group("phase5_p95_multilingual");
+    group.sample_size(20);
+
+    for (label, sentences) in scripts.iter() {
+        let conv_id = Uuid::now_v7().to_string();
+        let k_text = derive_text_index_shard(&search_root, Uuid::now_v7().as_bytes()).unwrap();
+
+        // Build a 1k-row corpus using the script-specific sentence.
+        let corpus: Vec<(String, String, i64, String)> = (0..SHARD_ROWS)
+            .map(|i| {
+                let mid = Uuid::now_v7().to_string();
+                let sender = format!("user-{}", i % 5);
+                let ts = 1_700_000_000_000 + i as i64;
+                let s = sentences[i % sentences.len()];
+                let text = format!("{s} (#{i})");
+                (mid, sender, ts, text)
+            })
+            .collect();
+
+        let text_shard = build_text_shard(&corpus, &conv_id, &k_text, &conv_hash_key);
+        let mut catalog = DelayedCatalog::new(Duration::ZERO);
+        catalog
+            .text_blobs
+            .insert((conv_id.clone(), BUCKET.to_string()), (text_shard, k_text));
+
+        // Pull a query token from the seed sentence so the
+        // FTS5 path actually finds rows.
+        let needle: String = sentences[0]
+            .split_whitespace()
+            .next()
+            .unwrap_or(NEEDLE)
+            .to_string();
+
+        let db = fresh_db();
+        group.bench_function(*label, |b| {
+            b.iter(|| {
+                let engine = QueryEngine::new(&db);
+                let q = SearchQuery {
+                    query_string: needle.clone(),
+                    ..Default::default()
+                };
+                let hits = engine
+                    .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &catalog)
+                    .unwrap();
+                black_box(hits);
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// phase5_p95_large_bucket — 5000-message bucket stress.
+// ---------------------------------------------------------------------------
+fn phase5_p95_large_bucket(c: &mut Criterion) {
+    const LARGE_ROWS: usize = 5_000;
+    let identity = KeyMaterial::from_bytes([0xAB; 32]);
+    let search_root = derive_search_root(&identity).unwrap();
+    let conv_id = Uuid::now_v7().to_string();
+    let conv_hash_key = KeyMaterial::from_bytes([0xCD; 32]);
+    let k_text = derive_text_index_shard(&search_root, Uuid::now_v7().as_bytes()).unwrap();
+
+    // 5k row corpus, ~1% rows carry the needle.
+    let corpus: Vec<(String, String, i64, String)> = (0..LARGE_ROWS)
+        .map(|i| {
+            let mid = Uuid::now_v7().to_string();
+            let sender = format!("user-{}", i % 5);
+            let ts = 1_700_000_000_000 + i as i64;
+            let text = if i % (LARGE_ROWS / 10) == 0 {
+                format!("{NEEDLE} keepers gathered at dusk near the harbor (#{i})")
+            } else {
+                format!("standard chatter about coffee, work, and weekends (#{i})")
+            };
+            (mid, sender, ts, text)
+        })
+        .collect();
+    let text_shard = build_text_shard(&corpus, &conv_id, &k_text, &conv_hash_key);
+    let mut catalog = DelayedCatalog::new(Duration::ZERO);
+    catalog
+        .text_blobs
+        .insert((conv_id.clone(), BUCKET.to_string()), (text_shard, k_text));
+
+    let db = fresh_db();
+    let mut group = c.benchmark_group("phase5_p95_large_bucket");
+    group.sample_size(10);
+    group.bench_function("text_only_5k", |b| {
+        b.iter(|| {
+            let engine = QueryEngine::new(&db);
+            let q = SearchQuery {
+                query_string: NEEDLE.into(),
+                ..Default::default()
+            };
+            let hits = engine
+                .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &catalog)
+                .unwrap();
+            black_box(hits);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     name = phase5_benches;
     config = Criterion::default();
@@ -361,5 +485,7 @@ criterion_group!(
         bench_shard_decrypt_and_search,
         bench_fuzzy_shard_decrypt_and_search,
         bench_combined_local_plus_cold_search,
+        phase5_p95_multilingual,
+        phase5_p95_large_bucket,
 );
 criterion_main!(phase5_benches);
