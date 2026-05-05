@@ -594,6 +594,207 @@ fn _backup_source_is_in_scope() -> BackupSource {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 (2026-05-04 final batch) — Task 11: iCloud bridge wiring.
+//
+// `ICloudBlobBridgeImpl` adapts a Swift-side
+// [`ICloudBlobCallback`] trait object into the canonical
+// [`kchat_core::media::sinks::icloud::ICloudBlobBridge`] the
+// core's `ICloudMediaBlobSink` consumes. The Rust side does not
+// itself talk to CloudKit; the callback's `upload_file`,
+// `download_file_range`, and `delete_file` methods are
+// implemented in Swift against `CKContainer.default()`.
+//
+// The `ICloudBlobCallback` shape is stable:
+// adding it to `kchat.udl` as a `callback interface` is the
+// final step before Swift can call it, but the Rust trait + the
+// `ICloudBlobBridgeImpl` adapter are land-able independently so
+// the core's wiring is testable today.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use kchat_core::media::sinks::icloud::{
+    ICloudBlobBridge as CoreICloudBlobBridge, ICloudMediaBlobSink,
+};
+
+/// Callback contract the Swift side fulfills against
+/// `CKContainer.default().publicCloudDatabase`.
+///
+/// Mirrors a UniFFI `callback interface ICloudBlobCallback`.
+/// Each method maps 1:1 to the bridge methods on
+/// [`CoreICloudBlobBridge`]; ranges are passed as
+/// `(offset, length)` pairs because UniFFI cannot lower
+/// `Range<u64>` directly.
+pub trait ICloudBlobCallback: Send + Sync + std::fmt::Debug {
+    fn upload_file(
+        &self,
+        record_name: String,
+        data: Vec<u8>,
+    ) -> std::result::Result<String, String>;
+    fn download_file_range(
+        &self,
+        record_name: String,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<Vec<u8>, String>;
+    fn delete_file(&self, record_name: String) -> std::result::Result<(), String>;
+}
+
+/// Production [`CoreICloudBlobBridge`] backed by an
+/// [`ICloudBlobCallback`] supplied by the iOS / macOS host
+/// application.
+#[derive(Debug)]
+pub struct ICloudBlobBridgeImpl {
+    callback: Arc<dyn ICloudBlobCallback>,
+}
+
+impl ICloudBlobBridgeImpl {
+    /// Construct the bridge over `callback`.
+    pub fn new(callback: Arc<dyn ICloudBlobCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Convenience: build a ready-to-install
+    /// [`ICloudMediaBlobSink`] from `callback`.
+    pub fn into_sink(self) -> ICloudMediaBlobSink {
+        ICloudMediaBlobSink::new(Arc::new(self) as Arc<dyn CoreICloudBlobBridge>)
+    }
+}
+
+impl CoreICloudBlobBridge for ICloudBlobBridgeImpl {
+    fn upload_file(
+        &self,
+        record_name: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<String, kchat_core::Error> {
+        self.callback
+            .upload_file(record_name.to_string(), bytes.to_vec())
+            .map_err(kchat_core::Error::Transport)
+    }
+
+    fn download_file_range(
+        &self,
+        record_name: &str,
+        range: std::ops::Range<u64>,
+    ) -> std::result::Result<Vec<u8>, kchat_core::Error> {
+        self.callback
+            .download_file_range(
+                record_name.to_string(),
+                range.start,
+                range.end.saturating_sub(range.start),
+            )
+            .map_err(kchat_core::Error::Transport)
+    }
+
+    fn delete_file(&self, record_name: &str) -> std::result::Result<(), kchat_core::Error> {
+        self.callback
+            .delete_file(record_name.to_string())
+            .map_err(kchat_core::Error::Transport)
+    }
+}
+
+#[cfg(test)]
+mod icloud_bridge_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct MockCallback {
+        store: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl ICloudBlobCallback for MockCallback {
+        fn upload_file(
+            &self,
+            record_name: String,
+            data: Vec<u8>,
+        ) -> std::result::Result<String, String> {
+            self.store.lock().unwrap().insert(record_name.clone(), data);
+            Ok(record_name)
+        }
+        fn download_file_range(
+            &self,
+            record_name: String,
+            offset: u64,
+            length: u64,
+        ) -> std::result::Result<Vec<u8>, String> {
+            let s = self.store.lock().unwrap();
+            let blob = s
+                .get(&record_name)
+                .ok_or_else(|| format!("missing record {record_name}"))?;
+            let start = offset as usize;
+            let end = ((offset + length) as usize).min(blob.len());
+            if start >= blob.len() {
+                return Ok(Vec::new());
+            }
+            Ok(blob[start..end].to_vec())
+        }
+        fn delete_file(&self, record_name: String) -> std::result::Result<(), String> {
+            self.store.lock().unwrap().remove(&record_name);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn icloud_bridge_upload_round_trip() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = ICloudBlobBridgeImpl::new(cb.clone() as Arc<dyn ICloudBlobCallback>);
+        let id = bridge.upload_file("rec-1", b"hello").unwrap();
+        assert_eq!(id, "rec-1");
+        let back = bridge.download_file_range("rec-1", 0..5).unwrap();
+        assert_eq!(back, b"hello");
+    }
+
+    #[test]
+    fn icloud_bridge_delete_removes_record() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = ICloudBlobBridgeImpl::new(cb.clone() as Arc<dyn ICloudBlobCallback>);
+        bridge.upload_file("rec-2", b"data").unwrap();
+        bridge.delete_file("rec-2").unwrap();
+        let r = bridge.download_file_range("rec-2", 0..4);
+        assert!(matches!(r, Err(kchat_core::Error::Transport(_))));
+    }
+
+    #[test]
+    fn icloud_bridge_download_range_returns_correct_slice() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = ICloudBlobBridgeImpl::new(cb.clone() as Arc<dyn ICloudBlobCallback>);
+        bridge.upload_file("rec-3", b"abcdefgh").unwrap();
+        let back = bridge.download_file_range("rec-3", 2..6).unwrap();
+        assert_eq!(back, b"cdef");
+    }
+
+    #[test]
+    fn icloud_bridge_error_surfaces_as_transport_error() {
+        #[derive(Debug)]
+        struct ErrCallback;
+        impl ICloudBlobCallback for ErrCallback {
+            fn upload_file(&self, _: String, _: Vec<u8>) -> std::result::Result<String, String> {
+                Err("upload broke".into())
+            }
+            fn download_file_range(
+                &self,
+                _: String,
+                _: u64,
+                _: u64,
+            ) -> std::result::Result<Vec<u8>, String> {
+                Err("download broke".into())
+            }
+            fn delete_file(&self, _: String) -> std::result::Result<(), String> {
+                Err("delete broke".into())
+            }
+        }
+        let bridge =
+            ICloudBlobBridgeImpl::new(Arc::new(ErrCallback) as Arc<dyn ICloudBlobCallback>);
+        assert!(matches!(
+            bridge.upload_file("r", &[]),
+            Err(kchat_core::Error::Transport(_))
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UniFFI scaffolding
 // ---------------------------------------------------------------------------
 

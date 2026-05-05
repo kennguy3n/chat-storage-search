@@ -738,6 +738,198 @@ mod jni_bindings {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 (2026-05-04 final batch) — Task 12: Google Drive bridge
+// wiring.
+//
+// `GoogleDriveBridgeImpl` adapts an Android-side
+// [`GoogleDriveBridgeCallback`] trait object into the canonical
+// [`kchat_core::media::sinks::google_drive::GoogleDriveBridge`]
+// the core's `GoogleDriveMediaBlobSink` consumes.
+//
+// The Rust side does not itself talk to Drive; the callback's
+// `upload_file`, `download_file_range`, and `delete_file`
+// methods are implemented in Kotlin against the Drive SDK and
+// invoked through JNI by the host application.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use kchat_core::media::sinks::google_drive::{
+    GoogleDriveBridge as CoreGoogleDriveBridge, GoogleDriveMediaBlobSink,
+};
+
+/// Callback contract the Kotlin / JNI side fulfills against the
+/// Google Drive REST API.
+///
+/// Mirrors a UniFFI `callback interface` (added to `kchat.udl` in
+/// the platform follow-up). Each method maps 1:1 to the bridge
+/// methods on [`CoreGoogleDriveBridge`].
+pub trait GoogleDriveBridgeCallback: Send + Sync + std::fmt::Debug {
+    fn upload_file(&self, asset_id: String, data: Vec<u8>) -> std::result::Result<String, String>;
+    fn download_file_range(
+        &self,
+        file_id: String,
+        offset: u64,
+        length: u64,
+    ) -> std::result::Result<Vec<u8>, String>;
+    fn delete_file(&self, file_id: String) -> std::result::Result<(), String>;
+}
+
+/// Production [`CoreGoogleDriveBridge`] backed by a
+/// [`GoogleDriveBridgeCallback`] supplied by the Android host
+/// application.
+#[derive(Debug)]
+pub struct GoogleDriveBridgeImpl {
+    callback: Arc<dyn GoogleDriveBridgeCallback>,
+}
+
+impl GoogleDriveBridgeImpl {
+    pub fn new(callback: Arc<dyn GoogleDriveBridgeCallback>) -> Self {
+        Self { callback }
+    }
+
+    /// Convenience: build a ready-to-install
+    /// [`GoogleDriveMediaBlobSink`].
+    pub fn into_sink(self) -> GoogleDriveMediaBlobSink {
+        GoogleDriveMediaBlobSink::new(Arc::new(self) as Arc<dyn CoreGoogleDriveBridge>)
+    }
+}
+
+impl CoreGoogleDriveBridge for GoogleDriveBridgeImpl {
+    fn upload_file(
+        &self,
+        asset_id: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<String, kchat_core::Error> {
+        self.callback
+            .upload_file(asset_id.to_string(), bytes.to_vec())
+            .map_err(kchat_core::Error::Transport)
+    }
+
+    fn download_file_range(
+        &self,
+        file_id: &str,
+        range: std::ops::Range<u64>,
+    ) -> std::result::Result<Vec<u8>, kchat_core::Error> {
+        self.callback
+            .download_file_range(
+                file_id.to_string(),
+                range.start,
+                range.end.saturating_sub(range.start),
+            )
+            .map_err(kchat_core::Error::Transport)
+    }
+
+    fn delete_file(&self, file_id: &str) -> std::result::Result<(), kchat_core::Error> {
+        self.callback
+            .delete_file(file_id.to_string())
+            .map_err(kchat_core::Error::Transport)
+    }
+}
+
+#[cfg(test)]
+mod google_drive_bridge_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct MockCallback {
+        store: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl GoogleDriveBridgeCallback for MockCallback {
+        fn upload_file(
+            &self,
+            asset_id: String,
+            data: Vec<u8>,
+        ) -> std::result::Result<String, String> {
+            let file_id = format!("drive-{asset_id}");
+            self.store.lock().unwrap().insert(file_id.clone(), data);
+            Ok(file_id)
+        }
+        fn download_file_range(
+            &self,
+            file_id: String,
+            offset: u64,
+            length: u64,
+        ) -> std::result::Result<Vec<u8>, String> {
+            let s = self.store.lock().unwrap();
+            let blob = s
+                .get(&file_id)
+                .ok_or_else(|| format!("missing file {file_id}"))?;
+            let start = offset as usize;
+            let end = ((offset + length) as usize).min(blob.len());
+            if start >= blob.len() {
+                return Ok(Vec::new());
+            }
+            Ok(blob[start..end].to_vec())
+        }
+        fn delete_file(&self, file_id: String) -> std::result::Result<(), String> {
+            self.store.lock().unwrap().remove(&file_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn google_drive_bridge_upload_round_trip() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = GoogleDriveBridgeImpl::new(cb.clone() as Arc<dyn GoogleDriveBridgeCallback>);
+        let id = bridge.upload_file("asset-1", b"payload").unwrap();
+        assert_eq!(id, "drive-asset-1");
+        let back = bridge.download_file_range(&id, 0..7).unwrap();
+        assert_eq!(back, b"payload");
+    }
+
+    #[test]
+    fn google_drive_bridge_delete_removes_file() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = GoogleDriveBridgeImpl::new(cb.clone() as Arc<dyn GoogleDriveBridgeCallback>);
+        let id = bridge.upload_file("asset-2", b"payload").unwrap();
+        bridge.delete_file(&id).unwrap();
+        let r = bridge.download_file_range(&id, 0..7);
+        assert!(matches!(r, Err(kchat_core::Error::Transport(_))));
+    }
+
+    #[test]
+    fn google_drive_bridge_download_range_returns_correct_slice() {
+        let cb: Arc<MockCallback> = Arc::new(MockCallback::default());
+        let bridge = GoogleDriveBridgeImpl::new(cb.clone() as Arc<dyn GoogleDriveBridgeCallback>);
+        let id = bridge.upload_file("asset-3", b"abcdefgh").unwrap();
+        let back = bridge.download_file_range(&id, 2..6).unwrap();
+        assert_eq!(back, b"cdef");
+    }
+
+    #[test]
+    fn google_drive_bridge_error_surfaces_as_transport_error() {
+        #[derive(Debug)]
+        struct ErrCallback;
+        impl GoogleDriveBridgeCallback for ErrCallback {
+            fn upload_file(&self, _: String, _: Vec<u8>) -> std::result::Result<String, String> {
+                Err("upload broke".into())
+            }
+            fn download_file_range(
+                &self,
+                _: String,
+                _: u64,
+                _: u64,
+            ) -> std::result::Result<Vec<u8>, String> {
+                Err("download broke".into())
+            }
+            fn delete_file(&self, _: String) -> std::result::Result<(), String> {
+                Err("delete broke".into())
+            }
+        }
+        let bridge =
+            GoogleDriveBridgeImpl::new(Arc::new(ErrCallback) as Arc<dyn GoogleDriveBridgeCallback>);
+        assert!(matches!(
+            bridge.upload_file("a", &[]),
+            Err(kchat_core::Error::Transport(_))
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

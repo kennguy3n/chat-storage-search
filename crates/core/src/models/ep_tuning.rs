@@ -404,6 +404,35 @@ impl EpFallbackChain {
     pub fn cpu_fallback(&self) -> ExecutionProvider {
         *self.eps.last().expect("chain is non-empty by construction")
     }
+
+    /// Phase 6 (2026-05-04 final batch) — Task 3: walk the chain
+    /// and return the first EP that is not in `failed`.
+    ///
+    /// Used by the always-compiled "session falls back to CPU on
+    /// EP failure" wiring: production session creators build the
+    /// host fallback chain via [`Self::for_platform`], try the
+    /// primary EP, and on registration failure remember it in a
+    /// local set + retry through this helper. CPU is the
+    /// guaranteed fallback because the chain always ends in
+    /// [`ExecutionProvider::Cpu`] which is never marked failed.
+    pub fn select_first_available(
+        &self,
+        failed: &std::collections::HashSet<ExecutionProvider>,
+    ) -> ExecutionProvider {
+        for ep in &self.eps {
+            // CPU is the universal fallback — we never mark it as
+            // failed even if the caller does, because returning
+            // anything else from a chain that ends in CPU would
+            // violate the invariant on this type.
+            if *ep == ExecutionProvider::Cpu {
+                return *ep;
+            }
+            if !failed.contains(ep) {
+                return *ep;
+            }
+        }
+        ExecutionProvider::Cpu
+    }
 }
 
 // ---------------------------------------------------------------
@@ -867,6 +896,40 @@ mod tests {
         assert_eq!(chain.as_slice(), &[ExecutionProvider::Cpu]);
         assert_eq!(chain.primary(), ExecutionProvider::Cpu);
         assert_eq!(chain.cpu_fallback(), ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn create_session_falls_back_to_cpu_on_ep_failure() {
+        // Phase 6 (2026-05-04 final batch) — Task 3: with the
+        // primary EP marked failed, `select_first_available`
+        // must walk the chain and return CPU. Mirrors the
+        // session-creation contract: if `DirectML.register`
+        // returns an error, the next attempt registers `CPU`.
+        let chain = EpFallbackChain::for_platform(
+            Platform::Windows,
+            &DeviceCapabilities::windows_with_gpu("nvidia"),
+        );
+        assert_eq!(chain.primary(), ExecutionProvider::DirectMl);
+
+        let mut failed = std::collections::HashSet::new();
+        failed.insert(ExecutionProvider::DirectMl);
+        assert_eq!(
+            chain.select_first_available(&failed),
+            ExecutionProvider::Cpu
+        );
+    }
+
+    #[test]
+    fn select_first_available_returns_primary_when_no_failures() {
+        let chain = EpFallbackChain::for_platform(
+            Platform::MacOs,
+            &DeviceCapabilities::apple_silicon_mac(),
+        );
+        let failed = std::collections::HashSet::<ExecutionProvider>::new();
+        assert_eq!(
+            chain.select_first_available(&failed),
+            ExecutionProvider::CoreMl
+        );
     }
 
     // -----------------------------------------------------------

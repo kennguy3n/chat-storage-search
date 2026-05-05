@@ -145,6 +145,40 @@ pub fn create_desktop_session_config() -> (Platform, ExecutionProvider, EpFallba
     (host_platform(), primary, chain)
 }
 
+/// Phase 6 (2026-05-04 final batch) — Task 3: end-to-end desktop
+/// session helper for the XLM-R text encoder.
+///
+/// Walks [`host_fallback_chain`] to pick the primary EP, then
+/// hands `(model_path, ep)` to
+/// [`kchat_core::models::embeddings_onnx::create_xlmr_session_with_ep`].
+/// On Windows + DirectML this attempts DirectML first and falls
+/// back to CPU; on macOS / Linux it registers the CPU EP.
+///
+/// The function is feature-gated on `onnx-runtime` because the
+/// underlying `ort::Session` only exists with that feature; tests
+/// without `--features onnx-runtime` exercise the always-compiled
+/// state-machine pieces ([`host_fallback_chain`],
+/// [`create_desktop_session_config`]).
+#[cfg(feature = "onnx-runtime")]
+pub fn create_desktop_session(
+    model_path: &std::path::Path,
+) -> kchat_core::models::embeddings_onnx::OrtSessionResult<(
+    kchat_core::models::embeddings_onnx::OrtSession,
+    kchat_core::models::embeddings_onnx::OnnxProviderReport,
+)> {
+    let (_, primary, _chain) = create_desktop_session_config();
+    kchat_core::models::embeddings_onnx::create_xlmr_session_with_ep(model_path, primary)
+}
+
+/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// always-on shape when the `onnx-runtime` feature is off.
+#[cfg(not(feature = "onnx-runtime"))]
+pub fn create_desktop_session(_model_path: &std::path::Path) -> kchat_core::Result<()> {
+    Err(kchat_core::Error::NotImplemented(
+        "create_desktop_session requires onnx-runtime feature",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

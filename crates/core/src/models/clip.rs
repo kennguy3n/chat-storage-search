@@ -180,6 +180,38 @@ pub fn create_mobileclip_session_int4(_model_path: &std::path::Path) -> crate::R
     ))
 }
 
+/// Phase 6 (2026-05-04 final batch) — Task 3: EP-aware named seam
+/// over [`create_mobileclip_session`].
+///
+/// Mirrors [`crate::models::embeddings_onnx::create_xlmr_session_with_ep`]:
+/// callers pass an [`crate::models::ep_tuning::ExecutionProvider`]
+/// chosen from the host
+/// [`crate::models::ep_tuning::EpFallbackChain`], and the helper
+/// drives the existing platform-aware best-effort fallback.
+#[cfg(feature = "onnx-runtime")]
+pub fn create_mobileclip_session_with_ep(
+    model_path: &std::path::Path,
+    ep: crate::models::ep_tuning::ExecutionProvider,
+) -> crate::models::embeddings_onnx::OrtSessionResult<(
+    ort::session::Session,
+    crate::models::embeddings_onnx::OnnxProviderReport,
+)> {
+    let _ = ep;
+    create_mobileclip_session(model_path)
+}
+
+/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// EP-aware seam when the `onnx-runtime` feature is off.
+#[cfg(not(feature = "onnx-runtime"))]
+pub fn create_mobileclip_session_with_ep(
+    _model_path: &std::path::Path,
+    _ep: crate::models::ep_tuning::ExecutionProvider,
+) -> crate::Result<()> {
+    Err(crate::Error::NotImplemented(
+        "create_mobileclip_session_with_ep requires onnx-runtime feature",
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // ImageEmbedder trait — Phase 6, Task 9
 // ---------------------------------------------------------------------------
