@@ -4,10 +4,10 @@
 //! change in `BackupManifest` / `ArchiveManifest` also breaks this
 //! test (rather than just the in-module unit tests).
 
-use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use uuid::Uuid;
 
+use kchat_core::crypto::signing::{HybridSigningKey, HybridVerifyingKey};
 use kchat_core::formats::manifest::{
     compute_archive_manifest_hash, compute_manifest_hash, sign_archive_manifest,
     sign_backup_manifest, sign_manifest, verify_archive_manifest, verify_backup_manifest,
@@ -18,9 +18,9 @@ use kchat_core::formats::manifest::{
 use kchat_core::formats::search_shard::IndexType;
 use kchat_core::formats::SegmentType;
 
-fn keys() -> (SigningKey, ed25519_dalek::VerifyingKey) {
+fn keys() -> (HybridSigningKey, HybridVerifyingKey) {
     let mut rng = OsRng;
-    let sk = SigningKey::generate(&mut rng);
+    let sk = HybridSigningKey::generate(&mut rng);
     let vk = sk.verifying_key();
     (sk, vk)
 }
@@ -82,6 +82,7 @@ fn build_backup_manifest(generation: u64, previous_manifest_hash: [u8; 32]) -> B
         tombstones: vec![tombstone(0x40)],
         merkle_root: [0x55; 32],
         manifest_signature: Vec::new(),
+        pqc_signature: Vec::new(),
     }
 }
 
@@ -99,6 +100,7 @@ fn build_archive_manifest(generation: u64, previous_manifest_hash: [u8; 32]) -> 
         wrapped_prior_epoch_keys: vec![],
         merkle_root: [0x66; 32],
         manifest_signature: Vec::new(),
+        pqc_signature: Vec::new(),
     }
 }
 
@@ -181,17 +183,71 @@ fn cross_chain_attack_is_rejected() {
 fn raw_sign_verify_round_trip() {
     let (sk, vk) = keys();
     let payload = b"externally-canonicalised-manifest-bytes";
-    let sig = sign_manifest(payload, &sk);
-    verify_manifest(payload, sig.to_bytes().as_ref(), &vk).expect("verify");
+    let sig = sign_manifest(payload, &sk).expect("hybrid sign");
+    let ed_bytes = sig.ed25519_bytes();
+    let pqc_bytes = sig.pqc_bytes();
+    verify_manifest(payload, &ed_bytes, &pqc_bytes, &vk).expect("verify");
 }
 
 #[test]
 fn raw_verify_rejects_bit_flip() {
     let (sk, vk) = keys();
     let payload = b"signed-payload";
-    let sig = sign_manifest(payload, &sk);
+    let sig = sign_manifest(payload, &sk).expect("hybrid sign");
     let mut tampered = payload.to_vec();
     tampered[0] ^= 0x01;
-    let res = verify_manifest(&tampered, sig.to_bytes().as_ref(), &vk);
+    let ed_bytes = sig.ed25519_bytes();
+    let pqc_bytes = sig.pqc_bytes();
+    let res = verify_manifest(&tampered, &ed_bytes, &pqc_bytes, &vk);
     assert!(res.is_err(), "bit-flip verified: {res:?}");
+}
+
+/// New hybrid coverage: round-trip works, but flipping just the
+/// PQC leg of the signature also rejects — mirrors the Ed25519
+/// bit-flip case for the post-quantum branch.
+#[test]
+fn raw_verify_rejects_pqc_bit_flip() {
+    let (sk, vk) = keys();
+    let payload = b"signed-payload-2";
+    let sig = sign_manifest(payload, &sk).expect("hybrid sign");
+    let mut bad_pqc = sig.pqc_bytes();
+    bad_pqc[0] ^= 0x01;
+    let ed_bytes = sig.ed25519_bytes();
+    let res = verify_manifest(payload, &ed_bytes, &bad_pqc, &vk);
+    assert!(res.is_err(), "pqc bit-flip verified: {res:?}");
+}
+
+/// New hybrid coverage: a manifest signed under the right
+/// Ed25519 key but the wrong ML-DSA-65 key (and vice versa) must
+/// be rejected.
+#[test]
+fn manifest_with_mismatched_pqc_pubkey_fails() {
+    let (sk, _vk) = keys();
+    let (_other_sk, other_vk) = keys();
+    let mut manifest = build_backup_manifest(0, GENESIS_PREVIOUS_HASH);
+    sign_backup_manifest(&mut manifest, &sk).unwrap();
+
+    let mixed =
+        HybridVerifyingKey::from_parts(*sk.verifying_key().ed25519(), other_vk.ml_dsa().clone());
+    let res = verify_backup_manifest(&manifest, &mixed);
+    assert!(
+        res.is_err(),
+        "hybrid verify accepted mismatched ML-DSA pubkey: {res:?}"
+    );
+}
+
+#[test]
+fn manifest_with_mismatched_ed25519_pubkey_fails() {
+    let (sk, _vk) = keys();
+    let (_other_sk, other_vk) = keys();
+    let mut manifest = build_backup_manifest(0, GENESIS_PREVIOUS_HASH);
+    sign_backup_manifest(&mut manifest, &sk).unwrap();
+
+    let mixed =
+        HybridVerifyingKey::from_parts(*other_vk.ed25519(), sk.verifying_key().ml_dsa().clone());
+    let res = verify_backup_manifest(&manifest, &mixed);
+    assert!(
+        res.is_err(),
+        "hybrid verify accepted mismatched Ed25519 pubkey: {res:?}"
+    );
 }

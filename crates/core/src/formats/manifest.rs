@@ -7,31 +7,47 @@
 //! generations advance independently and their `previous_manifest_hash`
 //! chains must not cross.
 //!
-//! Manifests are signed with an Ed25519 device key. The signature is
-//! computed over the **canonical CBOR** encoding of the manifest with
-//! `manifest_signature` set to an empty `Vec<u8>` — see
-//! [`canonical_signing_payload`]. Verification reproduces that
-//! canonical encoding and checks the signature; tampering with any
-//! field, swapping in a different signing key, or truncating the
-//! signature all cause `verify_manifest` / `verify_archive_manifest`
-//! to return an error.
+//! Manifests are signed with a **hybrid Ed25519 + ML-DSA-65 device
+//! key** (see [`crate::crypto::signing`]). The two signatures are
+//! computed over the **canonical CBOR** encoding of the manifest
+//! with both `manifest_signature` and `pqc_signature` set to empty
+//! `Vec<u8>` — see [`canonical_signing_payload`]. Verification
+//! reproduces that canonical encoding and checks **both**
+//! signatures; tampering with any field, swapping in a different
+//! signing key, or truncating either signature all cause
+//! `verify_manifest` / `verify_archive_manifest` to return an
+//! error.
+//!
+//! The hybrid scheme follows NIST SP 800-227 and gives KChat both
+//! classical security (Ed25519) and post-quantum security
+//! (ML-DSA-65, FIPS 204).
 
 use blake3::Hasher;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::serde_bytes_array;
+use crate::crypto::signing::{
+    encode_ml_dsa_signature, HybridSigningKey, HybridVerifyingKey, MlDsaSignature,
+    ML_DSA_65_SIGNATURE_LEN,
+};
 use crate::crypto::{CryptoError, CryptoResult};
+use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
 
-/// Magic string for [`BackupManifest`].
-pub const BACKUP_MANIFEST_MAGIC: &str = "KCHAT_BAK_MANIFEST_V1";
+/// Magic string for [`BackupManifest`]. Bumped to `_V2` for the
+/// hybrid Ed25519 + ML-DSA-65 manifest signing scheme; the V1
+/// magic from the pure-Ed25519 era is intentionally not
+/// recognised so a stale producer can't mix into a V2 chain.
+pub const BACKUP_MANIFEST_MAGIC: &str = "KCHAT_BAK_MANIFEST_V2";
 
-/// Magic string for [`ArchiveManifest`].
-pub const ARCHIVE_MANIFEST_MAGIC: &str = "KCHAT_ARC_MANIFEST_V1";
+/// Magic string for [`ArchiveManifest`]. See
+/// [`BACKUP_MANIFEST_MAGIC`] for the V1 → V2 rationale.
+pub const ARCHIVE_MANIFEST_MAGIC: &str = "KCHAT_ARC_MANIFEST_V2";
 
-/// On-wire manifest version.
-pub const MANIFEST_VERSION: u32 = 1;
+/// On-wire manifest version. Bumped to `2` alongside the magic
+/// strings when manifest signing moved from pure Ed25519 to
+/// hybrid Ed25519 + ML-DSA-65.
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// All-zero `previous_manifest_hash` used to terminate the genesis
 /// manifest's chain (`generation == 0`).
@@ -186,10 +202,23 @@ pub struct BackupManifest {
     pub merkle_root: [u8; 32],
 
     /// Ed25519 signature over the canonical CBOR encoding of this
-    /// manifest with `manifest_signature` empty. See
-    /// [`sign_backup_manifest`] / [`verify_backup_manifest`].
+    /// manifest with both `manifest_signature` and
+    /// `pqc_signature` empty. See [`sign_backup_manifest`] /
+    /// [`verify_backup_manifest`].
     #[serde(with = "serde_bytes")]
     pub manifest_signature: Vec<u8>,
+
+    /// ML-DSA-65 (FIPS 204) post-quantum signature over the same
+    /// canonical payload as `manifest_signature`. Both signatures
+    /// must verify for a manifest to be accepted.
+    ///
+    /// `#[serde(default)]` is harmless on a pre-launch protocol —
+    /// the verifier still rejects a missing/empty signature
+    /// because the ML-DSA-65 leg checks the byte length — and
+    /// keeps any partial encoder regression failing loudly
+    /// rather than silently producing a half-signed manifest.
+    #[serde(default, with = "serde_bytes")]
+    pub pqc_signature: Vec<u8>,
 }
 
 impl BackupManifest {
@@ -257,9 +286,16 @@ pub struct ArchiveManifest {
     pub merkle_root: [u8; 32],
 
     /// Ed25519 signature over the canonical CBOR encoding of this
-    /// manifest with `manifest_signature` empty.
+    /// manifest with both `manifest_signature` and
+    /// `pqc_signature` empty.
     #[serde(with = "serde_bytes")]
     pub manifest_signature: Vec<u8>,
+
+    /// ML-DSA-65 (FIPS 204) post-quantum signature over the same
+    /// canonical payload as `manifest_signature`. See
+    /// [`BackupManifest::pqc_signature`] for the discipline.
+    #[serde(default, with = "serde_bytes")]
+    pub pqc_signature: Vec<u8>,
 }
 
 impl ArchiveManifest {
@@ -282,16 +318,22 @@ impl ArchiveManifest {
 /// hash helpers can be written once.
 pub trait Manifest: Serialize {
     /// The signature field value to substitute when computing the
-    /// signing payload (always empty in v1).
+    /// signing payload (always empty for both legs).
     fn signing_signature_placeholder() -> Vec<u8> {
         Vec::new()
     }
 
-    /// Replace the manifest's `manifest_signature` with `sig`.
+    /// Replace the manifest's `manifest_signature` (Ed25519) with `sig`.
     fn set_signature(&mut self, sig: Vec<u8>);
 
-    /// Borrow the manifest's `manifest_signature`.
+    /// Borrow the manifest's `manifest_signature` (Ed25519).
     fn signature(&self) -> &[u8];
+
+    /// Replace the manifest's `pqc_signature` (ML-DSA-65) with `sig`.
+    fn set_pqc_signature(&mut self, sig: Vec<u8>);
+
+    /// Borrow the manifest's `pqc_signature` (ML-DSA-65).
+    fn pqc_signature(&self) -> &[u8];
 }
 
 impl Manifest for BackupManifest {
@@ -301,6 +343,14 @@ impl Manifest for BackupManifest {
 
     fn signature(&self) -> &[u8] {
         &self.manifest_signature
+    }
+
+    fn set_pqc_signature(&mut self, sig: Vec<u8>) {
+        self.pqc_signature = sig;
+    }
+
+    fn pqc_signature(&self) -> &[u8] {
+        &self.pqc_signature
     }
 }
 
@@ -312,66 +362,123 @@ impl Manifest for ArchiveManifest {
     fn signature(&self) -> &[u8] {
         &self.manifest_signature
     }
+
+    fn set_pqc_signature(&mut self, sig: Vec<u8>) {
+        self.pqc_signature = sig;
+    }
+
+    fn pqc_signature(&self) -> &[u8] {
+        &self.pqc_signature
+    }
 }
 
 /// Compute the **signing payload** for a manifest: the canonical CBOR
-/// encoding of the manifest with `manifest_signature` cleared. Both
-/// the signer and the verifier feed this exact byte string into
-/// Ed25519, which is what makes the signature value-binding rather
-/// than encoding-binding.
+/// encoding of the manifest with **both** `manifest_signature` and
+/// `pqc_signature` cleared. Both the signer and the verifier feed
+/// this exact byte string into Ed25519 and ML-DSA-65, which is what
+/// makes the hybrid signature value-binding rather than
+/// encoding-binding.
 fn canonical_signing_payload<M>(manifest: &M) -> CryptoResult<Vec<u8>>
 where
     M: Manifest + Clone,
 {
     let mut clone = manifest.clone();
     clone.set_signature(M::signing_signature_placeholder());
+    clone.set_pqc_signature(M::signing_signature_placeholder());
     serde_cbor::to_vec(&clone)
         .map_err(|_| CryptoError::Frame("manifest: canonical CBOR encode failed".to_string()))
 }
 
+/// Hybrid signature pair returned by [`sign`] /
+/// [`sign_backup_manifest`] / [`sign_archive_manifest`].
+#[derive(Debug, Clone)]
+pub struct HybridManifestSignature {
+    /// Classical Ed25519 signature, also stored verbatim in
+    /// `manifest_signature`.
+    pub ed25519: Signature,
+    /// Post-quantum ML-DSA-65 signature, also stored verbatim in
+    /// `pqc_signature`.
+    pub ml_dsa: MlDsaSignature,
+}
+
+impl HybridManifestSignature {
+    /// Raw bytes of the Ed25519 leg (`SIGNATURE_LENGTH = 64`).
+    pub fn ed25519_bytes(&self) -> [u8; SIGNATURE_LENGTH] {
+        self.ed25519.to_bytes()
+    }
+
+    /// Raw bytes of the ML-DSA-65 leg
+    /// (`ML_DSA_65_SIGNATURE_LEN = 3309`).
+    pub fn pqc_bytes(&self) -> Vec<u8> {
+        crate::crypto::signing::encode_ml_dsa_signature(&self.ml_dsa)
+    }
+}
+
 /// Sign `manifest` in place: replace `manifest_signature` with the
-/// Ed25519 signature over the canonical signing payload.
-fn sign<M>(manifest: &mut M, signing_key: &SigningKey) -> CryptoResult<Signature>
+/// Ed25519 signature and `pqc_signature` with the ML-DSA-65
+/// signature, both over the canonical signing payload.
+fn sign<M>(
+    manifest: &mut M,
+    signing_key: &HybridSigningKey,
+) -> CryptoResult<HybridManifestSignature>
 where
     M: Manifest + Clone,
 {
     let payload = canonical_signing_payload(manifest)?;
-    let sig: Signature = signing_key.sign(&payload);
-    manifest.set_signature(sig.to_bytes().to_vec());
-    Ok(sig)
+    let (ed_sig, ml_sig) = signing_key.sign_payload(&payload)?;
+    manifest.set_signature(ed_sig.to_bytes().to_vec());
+    manifest.set_pqc_signature(encode_ml_dsa_signature(&ml_sig));
+    Ok(HybridManifestSignature {
+        ed25519: ed_sig,
+        ml_dsa: ml_sig,
+    })
 }
 
-/// Verify a manifest's `manifest_signature` against `verifying_key`.
-fn verify<M>(manifest: &M, verifying_key: &VerifyingKey) -> CryptoResult<()>
+/// Verify a manifest's hybrid signatures against `verifying_key`.
+/// Both legs must verify or the call returns `Err`.
+fn verify<M>(manifest: &M, verifying_key: &HybridVerifyingKey) -> CryptoResult<()>
 where
     M: Manifest + Clone,
 {
-    let sig_bytes: [u8; SIGNATURE_LENGTH] = manifest.signature().try_into().map_err(|_| {
-        CryptoError::Frame(format!(
-            "manifest: signature must be {SIGNATURE_LENGTH} bytes, got {}",
+    if manifest.signature().len() != SIGNATURE_LENGTH {
+        return Err(CryptoError::Frame(format!(
+            "manifest: ed25519 signature must be {SIGNATURE_LENGTH} bytes, got {}",
             manifest.signature().len()
-        ))
-    })?;
-    let signature = Signature::from_bytes(&sig_bytes);
+        )));
+    }
+    if manifest.pqc_signature().len() != ML_DSA_65_SIGNATURE_LEN {
+        return Err(CryptoError::Frame(format!(
+            "manifest: ml-dsa-65 signature must be {ML_DSA_65_SIGNATURE_LEN} bytes, got {}",
+            manifest.pqc_signature().len()
+        )));
+    }
     let payload = canonical_signing_payload(manifest)?;
     verifying_key
-        .verify(&payload, &signature)
-        .map_err(|_| CryptoError::Aead("manifest: ed25519 verify failed"))
+        .verify_payload(&payload, manifest.signature(), manifest.pqc_signature())
+        .map_err(|leg| match leg {
+            crate::crypto::signing::HybridSignatureFailure::Ed25519 => {
+                CryptoError::Aead("manifest: ed25519 verify failed")
+            }
+            crate::crypto::signing::HybridSignatureFailure::MlDsa => {
+                CryptoError::Aead("manifest: ml-dsa-65 verify failed")
+            }
+        })
 }
 
-/// Sign a [`BackupManifest`] in place. Returns the produced signature.
+/// Sign a [`BackupManifest`] in place. Returns the produced hybrid
+/// signature pair.
 pub fn sign_backup_manifest(
     manifest: &mut BackupManifest,
-    signing_key: &SigningKey,
-) -> CryptoResult<Signature> {
+    signing_key: &HybridSigningKey,
+) -> CryptoResult<HybridManifestSignature> {
     sign(manifest, signing_key)
 }
 
-/// Verify a [`BackupManifest`]'s `manifest_signature` against
-/// `verifying_key`.
+/// Verify a [`BackupManifest`]'s hybrid signatures against
+/// `verifying_key`. Both Ed25519 and ML-DSA-65 legs must verify.
 pub fn verify_backup_manifest(
     manifest: &BackupManifest,
-    verifying_key: &VerifyingKey,
+    verifying_key: &HybridVerifyingKey,
 ) -> CryptoResult<()> {
     verify(manifest, verifying_key)
 }
@@ -379,46 +486,57 @@ pub fn verify_backup_manifest(
 /// Sign an [`ArchiveManifest`] in place.
 pub fn sign_archive_manifest(
     manifest: &mut ArchiveManifest,
-    signing_key: &SigningKey,
-) -> CryptoResult<Signature> {
+    signing_key: &HybridSigningKey,
+) -> CryptoResult<HybridManifestSignature> {
     sign(manifest, signing_key)
 }
 
-/// Verify an [`ArchiveManifest`]'s `manifest_signature`.
+/// Verify an [`ArchiveManifest`]'s hybrid signatures.
 pub fn verify_archive_manifest(
     manifest: &ArchiveManifest,
-    verifying_key: &VerifyingKey,
+    verifying_key: &HybridVerifyingKey,
 ) -> CryptoResult<()> {
     verify(manifest, verifying_key)
 }
 
-/// Lower-level sign helper that operates on a pre-encoded payload.
+/// Lower-level sign helper that operates on a pre-encoded payload
+/// and returns the hybrid signature pair.
 ///
 /// Most callers want [`sign_backup_manifest`] /
-/// [`sign_archive_manifest`], which compute the canonical payload for
-/// you. This raw helper exists for the case where the caller already
-/// has the payload bytes (e.g. a future `manifest.cbor` written to
-/// disk before the signature is committed).
-pub fn sign_manifest(manifest_bytes: &[u8], signing_key: &SigningKey) -> Signature {
-    signing_key.sign(manifest_bytes)
+/// [`sign_archive_manifest`], which compute the canonical payload
+/// for you. This raw helper exists for the case where the caller
+/// already has the payload bytes (e.g. a future `manifest.cbor`
+/// written to disk before the signatures are committed).
+pub fn sign_manifest(
+    manifest_bytes: &[u8],
+    signing_key: &HybridSigningKey,
+) -> CryptoResult<HybridManifestSignature> {
+    let (ed_sig, ml_sig) = signing_key.sign_payload(manifest_bytes)?;
+    Ok(HybridManifestSignature {
+        ed25519: ed_sig,
+        ml_dsa: ml_sig,
+    })
 }
 
-/// Lower-level verify helper that operates on a pre-encoded payload.
+/// Lower-level verify helper that operates on a pre-encoded payload
+/// and a pair of (Ed25519, ML-DSA-65) signatures. Both must
+/// verify.
 pub fn verify_manifest(
     manifest_bytes: &[u8],
-    signature: &[u8],
-    verifying_key: &VerifyingKey,
+    ed25519_signature: &[u8],
+    pqc_signature: &[u8],
+    verifying_key: &HybridVerifyingKey,
 ) -> CryptoResult<()> {
-    let sig_bytes: [u8; SIGNATURE_LENGTH] = signature.try_into().map_err(|_| {
-        CryptoError::Frame(format!(
-            "verify_manifest: signature must be {SIGNATURE_LENGTH} bytes, got {}",
-            signature.len()
-        ))
-    })?;
-    let signature = Signature::from_bytes(&sig_bytes);
     verifying_key
-        .verify(manifest_bytes, &signature)
-        .map_err(|_| CryptoError::Aead("verify_manifest: ed25519 verify failed"))
+        .verify_payload(manifest_bytes, ed25519_signature, pqc_signature)
+        .map_err(|leg| match leg {
+            crate::crypto::signing::HybridSignatureFailure::Ed25519 => {
+                CryptoError::Aead("verify_manifest: ed25519 verify failed")
+            }
+            crate::crypto::signing::HybridSignatureFailure::MlDsa => {
+                CryptoError::Aead("verify_manifest: ml-dsa-65 verify failed")
+            }
+        })
 }
 
 /// 32-byte BLAKE3 over the canonical CBOR encoding of `manifest`. The
@@ -445,14 +563,14 @@ pub fn compute_archive_manifest_hash(manifest: &ArchiveManifest) -> CryptoResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::signing::HybridSigningKey;
     use crate::formats::search_shard::IndexType;
     use crate::formats::SegmentType;
-    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
-    fn keys() -> (SigningKey, VerifyingKey) {
+    fn keys() -> (HybridSigningKey, HybridVerifyingKey) {
         let mut rng = OsRng;
-        let sk = SigningKey::generate(&mut rng);
+        let sk = HybridSigningKey::generate(&mut rng);
         let vk = sk.verifying_key();
         (sk, vk)
     }
@@ -505,6 +623,7 @@ mod tests {
             tombstones: vec![sample_tombstone()],
             merkle_root: [0x11; 32],
             manifest_signature: Vec::new(),
+            pqc_signature: Vec::new(),
         }
     }
 
@@ -527,6 +646,7 @@ mod tests {
             wrapped_prior_epoch_keys: vec![],
             merkle_root: [0x22; 32],
             manifest_signature: Vec::new(),
+            pqc_signature: Vec::new(),
         }
     }
 
@@ -699,16 +819,43 @@ mod tests {
     fn raw_sign_manifest_round_trip() {
         let (sk, vk) = keys();
         let payload = b"arbitrary bytes that the engine has already serialised";
-        let sig = sign_manifest(payload, &sk);
-        verify_manifest(payload, sig.to_bytes().as_ref(), &vk).expect("ed25519 verify");
+        let sig = sign_manifest(payload, &sk).expect("hybrid sign");
+        let ed_bytes = sig.ed25519.to_bytes().to_vec();
+        let pq_bytes = encode_ml_dsa_signature(&sig.ml_dsa);
+        verify_manifest(payload, &ed_bytes, &pq_bytes, &vk).expect("hybrid verify");
     }
 
     #[test]
-    fn raw_verify_manifest_rejects_short_signature() {
+    fn raw_verify_manifest_rejects_short_ed25519_signature() {
         let (sk, vk) = keys();
         let payload = b"x";
-        let sig = sign_manifest(payload, &sk);
-        let truncated = &sig.to_bytes()[..16];
-        assert!(verify_manifest(payload, truncated, &vk).is_err());
+        let sig = sign_manifest(payload, &sk).unwrap();
+        let truncated = &sig.ed25519.to_bytes()[..16];
+        let pq_bytes = encode_ml_dsa_signature(&sig.ml_dsa);
+        assert!(verify_manifest(payload, truncated, &pq_bytes, &vk).is_err());
+    }
+
+    #[test]
+    fn raw_verify_manifest_rejects_short_pqc_signature() {
+        let (sk, vk) = keys();
+        let payload = b"x";
+        let sig = sign_manifest(payload, &sk).unwrap();
+        let ed_bytes = sig.ed25519.to_bytes().to_vec();
+        let pq_truncated = encode_ml_dsa_signature(&sig.ml_dsa)
+            .into_iter()
+            .take(32)
+            .collect::<Vec<_>>();
+        assert!(verify_manifest(payload, &ed_bytes, &pq_truncated, &vk).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_zero_pqc_signature() {
+        let mut m = fresh_genesis_backup();
+        let (sk, vk) = keys();
+        sign_backup_manifest(&mut m, &sk).unwrap();
+        // Wipe the PQC leg with all-zero bytes of the right length.
+        m.pqc_signature = vec![0u8; ML_DSA_65_SIGNATURE_LEN];
+        let res = verify_backup_manifest(&m, &vk);
+        assert!(res.is_err(), "all-zero pqc verified: {res:?}");
     }
 }

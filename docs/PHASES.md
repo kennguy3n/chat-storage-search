@@ -31,7 +31,8 @@ Checklist:
       layout) covering both KChat-internal AAD (PROPOSAL §8.3) and
       ZK Object Fabric Pattern C (empty AAD; PROPOSAL §8.4).
 - [x] Manifest spec (backup manifest, archive manifest;
-      `previous_manifest_hash` chain; Ed25519 signature).
+      `previous_manifest_hash` chain; hybrid Ed25519 + ML-DSA-65
+      signature — see PQC hybrid signing note below).
 - [x] Media descriptor spec (`asset_id`, `K_asset`, mime type,
       sizes, Merkle root, blob ID, chunk count).
 - [x] Search index shard spec (text, fuzzy, vector, media index
@@ -59,6 +60,25 @@ Checklist:
 > (`"kchat-archive-epoch-v1" || epoch_id`) and does not modify any
 > existing derivation path or test vector. The spec, implementation,
 > and test vectors for epoch keys land with Phase 3.
+
+> **Note (2026-05-05) — PQC hybrid manifest signing.** Manifest
+> signing is upgraded from pure Ed25519 to **hybrid Ed25519 +
+> ML-DSA-65** (FIPS 204) per NIST SP 800-227. The system is
+> pre-launch, so this is a hard breaking change rather than a
+> staged migration: `MANIFEST_VERSION` bumps from `1` to `2`, the
+> magic strings become `KCHAT_BAK_MANIFEST_V2` /
+> `KCHAT_ARC_MANIFEST_V2`, and both `BackupManifest` and
+> `ArchiveManifest` gain a `pqc_signature: Vec<u8>` field
+> alongside the existing `manifest_signature` (Ed25519). The
+> canonical signing payload clears **both** signature fields to
+> empty before CBOR-encoding, and verification requires **both**
+> the Ed25519 and ML-DSA-65 legs to validate — either failing
+> rejects the manifest. Device signing keys are now hybrid
+> (`HybridSigningKey` / `HybridVerifyingKey` in
+> `crates/core/src/crypto/signing.rs`); Ed25519 supplies classical
+> security, ML-DSA-65 supplies post-quantum resilience against
+> Shor's algorithm on a future cryptographically-relevant quantum
+> computer.
 
 **Decision gate**: Crypto test vectors pass across Rust, Swift (via
 UniFFI), Kotlin (via JNI), and Go (zk-object-fabric SDK). A
@@ -349,9 +369,10 @@ Checklist:
       tests live alongside the builder and in
       `crates/core/tests/archive_pipeline.rs`.)_
 - [x] Archive manifest chain (generation N+1 referencing N via
-      `previous_manifest_hash`; Ed25519 signature).
+      `previous_manifest_hash`; hybrid Ed25519 + ML-DSA-65 signature).
       _(`archive::manifest_builder::ArchiveManifestBuilder` builds
-      genesis + chained manifests, signs with Ed25519, and
+      genesis + chained manifests, signs with hybrid Ed25519 +
+      ML-DSA-65, and
       AEAD-seals under `K_archive_manifest` derived from the
       active epoch key. The chain carries
       `wrapped_prior_epoch_keys: Vec<WrappedEpochKeyRef>` so
@@ -578,7 +599,7 @@ working state.
 > `BackupSegmentBuilder` (CBOR + zstd + XChaCha20-Poly1305 seal
 > under `K_backup_segment` derived via
 > `derive_backup_segment(K_backup_root, segment_id)`) →
-> `build_backup_manifest` (Ed25519-signed,
+> `build_backup_manifest` (hybrid Ed25519 + ML-DSA-65-signed,
 > generation-chained, AEAD-sealed under `K_backup_manifest` with
 > `device_id` mixed into the AAD) → `backup::compaction`
 > (daily → weekly → monthly bucketing with `apply_tombstones`)
@@ -651,13 +672,15 @@ Checklist:
       `derive_backup_segment(K_backup_root, segment_id)`. AAD =
       `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`.
       `decrypt_backup_segment` round-trips for the restore path.)_
-- [x] Backup manifest chain with Ed25519 signature.
+- [x] Backup manifest chain with hybrid Ed25519 + ML-DSA-65
+      signature.
       _(`crates/core/src/backup/manifest_builder.rs::build_backup_manifest`:
       genesis (`generation = 0`,
       `previous_manifest_hash = [0; 32]`) → chained
       (`generation = prev.generation + 1`,
       `previous_manifest_hash = compute_manifest_hash(prev)`).
-      Ed25519 over canonical CBOR; AEAD-sealed under
+      Hybrid Ed25519 + ML-DSA-65 over canonical CBOR (both signature
+      fields cleared before encoding); AEAD-sealed under
       `K_backup_manifest` with `device_id` mixed into the AAD for
       device attribution. Negative tests cover wrong-key /
       wrong-device-id failures.)_
@@ -720,7 +743,7 @@ Checklist:
       `previous_manifest_hash` walk).
       _(`crates/core/src/restore/manifest_verifier.rs::verify_manifest_chain`:
       walks `manifests[0..]` from genesis to latest, verifies
-      every Ed25519 signature via
+      both the Ed25519 and ML-DSA-65 legs of every signature via
       `formats::manifest::verify_backup_manifest`, enforces
       `manifests[0].previous_manifest_hash == GENESIS_PREVIOUS_HASH`
       and `manifests[n].previous_manifest_hash == compute_manifest_hash(manifests[n-1])`,
@@ -1345,7 +1368,8 @@ Checklist:
         _(`crates/core/tests/failure_scenarios.rs::wrong_backup_segment_key_fails_aead_open`
         bit-flips `K_backup_segment` and asserts `Error::Crypto`;
         `wrong_signing_key_on_manifest_chain_fails_signature_invalid`
-        verifies a chain under an imposter Ed25519 key and asserts
+        verifies a chain under an imposter hybrid Ed25519 + ML-DSA-65
+        key and asserts
         `VerificationError::SignatureInvalid { generation: 0 }`.)_
   - [x] corrupted chunk (Merkle / SHA-256 mismatch)
         _(`crates/core/tests/failure_scenarios.rs::corrupted_chunk_ciphertext_fails_sha256_fast_fail`
@@ -1357,9 +1381,10 @@ Checklist:
         AEAD AAD binding rejects it.)_
   - [x] device removed from MLS group between backup and restore
         _(`crates/core/tests/failure_scenarios.rs::device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_invalid`:
-        builds a manifest signed by the original device,
-        rotates the device-id signing key as if MLS removed the
-        old device, and asserts `verify_manifest_chain` returns
+        builds a manifest signed by the original device's hybrid
+        signing key, rotates the device-id signing key as if MLS
+        removed the old device, and asserts `verify_manifest_chain`
+        returns
         a structured `VerificationError::SignatureInvalid` —
         no panic, no partial-write side effects.)_
   - [x] search shard missing from the backend

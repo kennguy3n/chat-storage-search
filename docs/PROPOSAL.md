@@ -159,7 +159,7 @@ Account recovery material
 
 Device-local
   ├── K_local_db                      (SQLCipher key, never leaves device)
-  ├── device signing key              (Ed25519, identifies device on backend)
+  ├── device signing key              (hybrid Ed25519 + ML-DSA-65, identifies device on backend)
   ├── wrapped K_user_master           (sealed by Keychain / Keystore)
   └── recovery envelope metadata      (recovery key fingerprint, etc.)
 
@@ -700,9 +700,17 @@ bit-identical with the Go SDK; see §8.4.
   "media_references": [ { "asset_id": "...", "blob_id": "...", "merkle_root": "...", "wrapped_k_asset": "..." } ],
   "tombstones": [ { "kind": "...", "id": "...", "deleted_at_ms": ... } ],
   "merkle_root": "<32-byte BLAKE3 over segments + shards + media_references>",
-  "manifest_signature": "<Ed25519 over the above, signed with the device's manifest signing key>"
+  "manifest_signature": "<Ed25519 over the above, signed with the device's classical leg of the hybrid manifest signing key>",
+  "pqc_signature":      "<ML-DSA-65 (FIPS 204) over the same canonical payload, signed with the post-quantum leg>"
 }
 ```
+
+Both signatures cover the same canonical CBOR payload (manifest with
+`manifest_signature` and `pqc_signature` cleared to empty before encoding).
+Verification requires **both** legs to validate; either failing rejects
+the manifest. This is a hybrid PQC scheme per NIST SP 800-227 — Ed25519
+for classical security plus ML-DSA-65 for resilience against
+Shor's algorithm on a future cryptographically-relevant quantum computer.
 
 The manifest is then itself sealed with `K_backup_manifest` and
 uploaded last so a half-failed backup never leaves a manifest
@@ -1160,7 +1168,7 @@ Integrity layers:
 - Whole-object BLAKE3 Merkle root.
 - AEAD authentication tag per chunk.
 - Manifest reference back to the Merkle root.
-- Optional Ed25519 device signature over the manifest.
+- Optional hybrid Ed25519 + ML-DSA-65 device signature over the manifest.
 
 ### 8.4 Interoperability with `kennguy3n/zk-object-fabric`
 
@@ -1258,7 +1266,7 @@ and this library.
 
 The transport client is responsible for:
 
-- Authenticating via the device signing key.
+- Authenticating via the device's hybrid (Ed25519 + ML-DSA-65) signing key.
 - Resuming partial uploads using returned chunk receipts.
 - Verifying the backend-returned Merkle root against the locally
   computed one before commit.

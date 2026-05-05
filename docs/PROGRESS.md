@@ -3,7 +3,7 @@
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~98%`, `HttpTransportClient` (feature-gated) lands the production HTTP transport with retry + timeout + auth-header coverage). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, iCloud + Google Drive bridge wrappers added in ios-bridge / android-bridge). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~98%`, p95 latency gate hit across multilingual / large-bucket / multi-shard scenarios + `DeviceMatrixConfig` per-platform budgets). Phase 6 — Media and Semantic Search (`In progress | ~95%`, desktop ONNX EP wiring complete — `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep` + `EpFallbackChain::select_first_available` + `DesktopMlEpSelector::create_desktop_session`). Phase 7 — Desktop + Optimization (`In progress | ~85%`, Spotlight / Windows Search bridge surface complete + perf p95 dashboard with `PerfSummary` / `PerfBudget` + EP benchmark capture-cache-auto-selection + media migration auto-scheduled after eviction + dedup analytics with real `ZkofDedupAnalytics` + 6 large-scale + 6 edge-case stress tests + media-sink stress with real iCloud/Drive bridges). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`, parallel bucket fetch via `std::thread::scope` + progressive `SearchEvent` streaming API surfaced through iOS / Android bridges).
-- **Last updated**: 2026-05-04
+- **Last updated**: 2026-05-05
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -38,12 +38,20 @@ Checklist:
       layout) covering both KChat-internal AAD and ZK Object Fabric
       Pattern C.
 - [x] Manifest spec (backup manifest, archive manifest;
-      `previous_manifest_hash` chain; Ed25519 signature). _(See
-      `crates/core/src/formats/manifest.rs`. `BackupManifest` and
-      `ArchiveManifest` share the canonical-CBOR signing payload,
-      `compute_manifest_hash` powers the generation chain, and the
-      integration test at `crates/core/tests/manifest_signing.rs`
-      walks gen 0 → gen 1 → gen 2 end-to-end.)_
+      `previous_manifest_hash` chain; **hybrid Ed25519 + ML-DSA-65
+      signature** per NIST SP 800-227 — `MANIFEST_VERSION = 2`,
+      magic strings `KCHAT_BAK_MANIFEST_V2` /
+      `KCHAT_ARC_MANIFEST_V2`). _(See
+      `crates/core/src/formats/manifest.rs` and the new
+      `crates/core/src/crypto/signing.rs` (`HybridSigningKey` /
+      `HybridVerifyingKey`). `BackupManifest` and
+      `ArchiveManifest` share the canonical-CBOR signing payload
+      with **both** `manifest_signature` and `pqc_signature`
+      cleared before CBOR-encoding, `compute_manifest_hash` powers
+      the generation chain, and the integration test at
+      `crates/core/tests/manifest_signing.rs` walks gen 0 → gen 1
+      → gen 2 end-to-end and exercises hybrid mismatch / bit-flip
+      cases for both legs.)_
 - [x] Media descriptor spec. _(See
       `crates/core/src/formats/media_descriptor.rs`:
       `MediaDescriptor` carries `asset_id`, `mime_type`,
@@ -2097,6 +2105,60 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 ---
 
 ## Changelog
+
+### 2026-05-05 — PQC hybrid manifest signing (Phase 0)
+
+Manifest signing migrates from pure Ed25519 to **hybrid Ed25519 +
+ML-DSA-65** (FIPS 204), per NIST SP 800-227. Ed25519 supplies
+classical security; ML-DSA-65 supplies post-quantum resilience
+against Shor's algorithm on a future cryptographically-relevant
+quantum computer. The system is pre-launch, so this is a hard
+break rather than a staged migration.
+
+- **`MANIFEST_VERSION`** bumps from `1` to `2`. Magic strings
+  rebrand to `KCHAT_BAK_MANIFEST_V2` /
+  `KCHAT_ARC_MANIFEST_V2` so a stale V1 manifest can never
+  silently route through the V2 verifier.
+- **New module `crates/core/src/crypto/signing.rs`** introduces
+  `HybridSigningKey` and `HybridVerifyingKey`. Each wraps an
+  `ed25519_dalek` keypair *and* an ML-DSA-65 keypair derived
+  from the same `RngCore + CryptoRng` source.
+  `HybridSigningKey::sign_payload` returns `(Ed25519Signature,
+  MlDsaSignature)`; `HybridVerifyingKey::verify_payload` requires
+  **both** legs to validate, returning a structured
+  `HybridSignatureFailure::Ed25519` /
+  `HybridSignatureFailure::MlDsa` for diagnostics.
+- **`BackupManifest` / `ArchiveManifest`** gain a
+  `pqc_signature: Vec<u8>` field alongside `manifest_signature`.
+  The canonical signing payload (`canonical_signing_payload`)
+  clears **both** fields to empty before CBOR-encoding so the
+  Ed25519 and ML-DSA-65 legs cover the same bytes.
+- **`sign_backup_manifest` / `sign_archive_manifest` /
+  `verify_backup_manifest` / `verify_archive_manifest`** now take
+  `&HybridSigningKey` / `&HybridVerifyingKey`. The lower-level
+  `sign_manifest` / `verify_manifest` helpers were retyped the
+  same way and now return / accept `(ed25519_bytes, pqc_bytes)`.
+- **Pipeline-wide threading.** The hybrid types replace
+  `ed25519_dalek::SigningKey` / `VerifyingKey` in
+  `backup::manifest_builder`, `archive::manifest_builder`,
+  `archive::routing`, `restore::manifest_verifier`,
+  `restore::pipeline`, and `core_impl::install_backup_keys` /
+  `CoreImpl::backup_signing_key`.
+- **Tests.** All seven integration test files
+  (`backup_pipeline.rs`, `archive_pipeline.rs`,
+  `failure_scenarios.rs`, `manifest_signing.rs`,
+  `backup_restore_multilingual.rs`, `large_scale.rs`,
+  `large_scale_test.rs`) construct `HybridSigningKey::generate`
+  with `OsRng` instead of seeded `SigningKey::from_bytes`. New
+  hybrid-coverage tests in
+  `crates/core/src/restore/manifest_verifier.rs` and
+  `crates/core/tests/manifest_signing.rs` assert that a manifest
+  signed under the **right** Ed25519 key but the **wrong**
+  ML-DSA-65 key (and vice versa) fails verification, plus a PQC
+  bit-flip case mirroring the Ed25519 bit-flip case.
+- **No backward compatibility.** Pre-launch system, so V1
+  manifests are abandoned. Any V1 magic / version on the wire
+  surfaces as a structured frame error.
 
 ### 2026-05-04 — Final completion batch: 16 tasks (this PR)
 

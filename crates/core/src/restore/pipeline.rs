@@ -401,9 +401,10 @@ mod tests {
     use crate::crypto::key_hierarchy::{
         derive_backup_manifest, derive_backup_root, derive_backup_segment, KeyMaterial,
     };
+    use crate::crypto::signing::HybridSigningKey;
     use crate::formats::SegmentType;
     use crate::local_store::db::LocalStoreDb;
-    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     fn fresh_db_at_manifest_verified() -> LocalStoreDb {
         let db = LocalStoreDb::open_in_memory(&[0x77; 32]).expect("open in-memory");
@@ -440,7 +441,8 @@ mod tests {
     fn run_full_pipeline_walks_to_full_restore_complete() {
         let db = fresh_db_at_manifest_verified();
         let (k_seg, k_man) = fresh_keys();
-        let signing = SigningKey::from_bytes(&[0x44; 32]);
+        let mut rng = OsRng;
+        let signing = HybridSigningKey::generate(&mut rng);
 
         let conv_a = Uuid::now_v7();
         let now_ms = 1_777_000_000_000_i64;

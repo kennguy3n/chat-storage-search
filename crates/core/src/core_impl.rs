@@ -142,9 +142,11 @@ pub struct CoreImpl {
     /// noop result rather than failing — the device may not have
     /// finished unlocking the backup root yet.
     backup_root_key: Mutex<Option<Zeroizing<[u8; KEY_LEN]>>>,
-    /// Ed25519 device signing key used to sign backup manifests.
-    /// `None` until [`CoreImpl::install_backup_keys`] is called.
-    backup_signing_key: Mutex<Option<ed25519_dalek::SigningKey>>,
+    /// Hybrid Ed25519 + ML-DSA-65 device signing key used to
+    /// sign backup manifests (see
+    /// [`crate::crypto::signing::HybridSigningKey`]). `None` until
+    /// [`CoreImpl::install_backup_keys`] is called.
+    backup_signing_key: Mutex<Option<crate::crypto::signing::HybridSigningKey>>,
     /// Stable device id stamped into the backup manifest AAD so
     /// the orchestrator can attribute manifests to the device that
     /// produced them.
@@ -3140,7 +3142,7 @@ impl CoreImpl {
     pub fn install_backup_keys(
         &self,
         backup_root: [u8; KEY_LEN],
-        signing_key: ed25519_dalek::SigningKey,
+        signing_key: crate::crypto::signing::HybridSigningKey,
         device_id: String,
     ) -> Result<()> {
         *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
@@ -7378,14 +7380,16 @@ mod tests {
     #[test]
     fn manifest_builder_carries_wrapped_prior_epoch_keys_after_rotation() {
         use crate::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
-        use ed25519_dalek::SigningKey;
+        use crate::crypto::signing::HybridSigningKey;
+        use rand::rngs::OsRng;
 
         let core = fresh_core();
         let root = fresh_archive_root();
         core.install_epoch_key_manager(&root, "2026-05").unwrap();
         let _ = core.rotate_archive_epoch(&root, "2026-06").unwrap();
 
-        let signing_key = SigningKey::from_bytes(&[0x55; 32]);
+        let mut rng = OsRng;
+        let signing_key = HybridSigningKey::generate(&mut rng);
         let k_manifest = [0x77u8; 32];
         let prior = core.wrapped_prior_epoch_keys_for_manifest().unwrap();
         let req = ManifestBuildRequest {
@@ -7407,9 +7411,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn install_test_backup_keys(core: &CoreImpl) {
-        use ed25519_dalek::SigningKey;
+        use crate::crypto::signing::HybridSigningKey;
+        use rand::rngs::OsRng;
         let backup_root = [0x33u8; 32];
-        let signing = SigningKey::from_bytes(&[0x44u8; 32]);
+        let mut rng = OsRng;
+        let signing = HybridSigningKey::generate(&mut rng);
         core.install_backup_keys(backup_root, signing, "test-device".to_string())
             .expect("install backup keys");
     }

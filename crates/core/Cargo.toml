@@ -37,6 +37,17 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_cbor = "0.11"
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+# ML-DSA-65 (FIPS 204) post-quantum signatures, paired with
+# Ed25519 in the hybrid manifest signing scheme — see
+# `crates/core/src/crypto/signing.rs` and
+# `docs/PROPOSAL.md §2.1`. Pinned to 0.0.4 because it tracks the
+# `signature` 2.x API surface used by `ed25519-dalek 2`; later
+# `0.1.0-rc.*` lines move to `signature` 3.x and `rand_core` 0.10
+# which conflict with the ed25519/rand stack the rest of the
+# crate already pulls. The `rand_core` feature is enabled so the
+# randomized variant is available; the manifest signer itself
+# uses `sign_deterministic` so signatures are reproducible.
+ml-dsa = { version = "0.0.4", features = ["rand_core"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"

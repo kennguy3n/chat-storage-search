@@ -3,8 +3,9 @@
 //! Pulls a list of [`crate::archive::segment_builder::BuiltSegment`]s
 //! and the previous manifest (if any), produces an
 //! [`crate::formats::manifest::ArchiveManifest`], signs it with the
-//! caller-supplied Ed25519 device key, and AEAD-seals it under
-//! `K_archive_manifest` derived from the active epoch key.
+//! caller-supplied **hybrid Ed25519 + ML-DSA-65 device key**, and
+//! AEAD-seals it under `K_archive_manifest` derived from the
+//! active epoch key.
 //!
 //! The chain discipline matches the backup manifest:
 //!
@@ -24,16 +25,16 @@
 //! blobs.
 
 use blake3::Hasher;
-use ed25519_dalek::{Signature, SigningKey};
 use rand::RngCore;
 use uuid::Uuid;
 
 use crate::crypto::aead::xchacha20_poly1305::{seal, NONCE_LEN};
+use crate::crypto::signing::HybridSigningKey;
 use crate::crypto::CryptoError;
 use crate::formats::manifest::{
-    compute_archive_manifest_hash, sign_archive_manifest, ArchiveManifest, ManifestMediaRef,
-    ManifestSegmentRef, ManifestShardRef, Tombstone, WrappedEpochKeyRef, ARCHIVE_MANIFEST_MAGIC,
-    GENESIS_PREVIOUS_HASH, MANIFEST_VERSION,
+    compute_archive_manifest_hash, sign_archive_manifest, ArchiveManifest, HybridManifestSignature,
+    ManifestMediaRef, ManifestSegmentRef, ManifestShardRef, Tombstone, WrappedEpochKeyRef,
+    ARCHIVE_MANIFEST_MAGIC, GENESIS_PREVIOUS_HASH, MANIFEST_VERSION,
 };
 use crate::Error;
 
@@ -41,14 +42,22 @@ use super::segment_builder::BuiltSegment;
 
 /// Bundle returned by [`build_archive_manifest`]: the signed
 /// manifest plus its AEAD seal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `HybridManifestSignature` does not implement `PartialEq`/`Eq`
+/// (the underlying ML-DSA-65 signature type doesn't), so we only
+/// derive `Debug`/`Clone` here — callers compare the manifest
+/// body and reverify the signatures separately.
+#[derive(Debug, Clone)]
 pub struct SealedArchiveManifest {
     /// The signed [`ArchiveManifest`] (clear text — segment / shard
     /// / media references are not secrets, only the body of the
-    /// manifest is sealed).
+    /// manifest is sealed). Both Ed25519 and ML-DSA-65 signatures
+    /// live inside this struct.
     pub manifest: ArchiveManifest,
-    /// Ed25519 signature produced during [`sign_archive_manifest`].
-    pub signature: Signature,
+    /// Hybrid Ed25519 + ML-DSA-65 signatures produced during
+    /// [`sign_archive_manifest`]. The same bytes are stored in
+    /// `manifest.manifest_signature` and `manifest.pqc_signature`.
+    pub signature: HybridManifestSignature,
     /// 24-byte XChaCha20-Poly1305 nonce sealing
     /// [`Self::ciphertext`].
     pub nonce: [u8; NONCE_LEN],
@@ -93,12 +102,14 @@ pub struct ManifestBuildRequest<'a> {
 
 /// Build a single archive-manifest record.
 ///
-/// `signing_key` is the Ed25519 device key. `k_archive_manifest`
-/// is the AEAD key derived from the active epoch key
+/// `signing_key` is the device's hybrid Ed25519 + ML-DSA-65
+/// signing key (see [`HybridSigningKey`]).
+/// `k_archive_manifest` is the AEAD key derived from the active
+/// epoch key
 /// (`K_archive_manifest = HKDF(K_archive_epoch, "kchat-archive-manifest-v1")`).
 pub fn build_archive_manifest(
     request: ManifestBuildRequest<'_>,
-    signing_key: &SigningKey,
+    signing_key: &HybridSigningKey,
     k_archive_manifest: &[u8; 32],
 ) -> Result<SealedArchiveManifest, Error> {
     let (generation, previous_manifest_hash) = match request.previous {
@@ -142,6 +153,7 @@ pub fn build_archive_manifest(
         wrapped_prior_epoch_keys: request.wrapped_prior_epoch_keys,
         merkle_root,
         manifest_signature: Vec::new(),
+        pqc_signature: Vec::new(),
     };
 
     let signature = sign_archive_manifest(&mut manifest, signing_key).map_err(Error::Crypto)?;
@@ -227,11 +239,16 @@ mod tests {
     use super::*;
     use crate::archive::event_journal::{ArchiveEvent, ArchiveEventType};
     use crate::archive::segment_builder::{ArchiveSegmentBuilder, SegmentBuildRequest};
+    use crate::crypto::signing::{HybridSigningKey, HybridVerifyingKey};
     use crate::formats::manifest::{compute_archive_manifest_hash, verify_archive_manifest};
-    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use rand::rngs::OsRng;
 
-    fn fake_signing_key() -> SigningKey {
-        SigningKey::from_bytes(&[0x11; 32])
+    /// Test helper: a fresh hybrid signing key per call. The
+    /// existing tests only assert verification accepts/rejects
+    /// the right keys, so a per-call random keypair is fine.
+    fn fake_signing_key() -> HybridSigningKey {
+        let mut rng = OsRng;
+        HybridSigningKey::generate(&mut rng)
     }
 
     fn fake_segment(conv: Uuid, bucket: &str) -> BuiltSegment {
@@ -348,11 +365,12 @@ mod tests {
             &k_manifest(),
         )
         .unwrap();
-        let vk: VerifyingKey = key.verifying_key();
+        let vk: HybridVerifyingKey = key.verifying_key();
         verify_archive_manifest(&sealed.manifest, &vk).expect("good signature");
 
         // Wrong key → reject.
-        let other_vk: VerifyingKey = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let mut rng = OsRng;
+        let other_vk = HybridSigningKey::generate(&mut rng).verifying_key();
         verify_archive_manifest(&sealed.manifest, &other_vk).expect_err("wrong vk should fail");
     }
 
