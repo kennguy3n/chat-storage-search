@@ -7,8 +7,10 @@
 //! that breaks segment ↔ manifest ↔ verifier ↔ pipeline
 //! interoperability surfaces here.
 
-use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use uuid::Uuid;
+
+use kchat_core::crypto::signing::HybridSigningKey;
 
 use kchat_core::backup::event_journal::{BackupEvent, BackupEventType};
 use kchat_core::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
@@ -32,7 +34,8 @@ fn backup_to_restore_round_trip_walks_to_full_complete() {
     let backup_root = derive_backup_root(&identity).unwrap();
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"integration").unwrap();
-    let signing = SigningKey::from_bytes(&[0xAB; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
 
     let conv = Uuid::now_v7();
     let now_ms = 1_777_000_000_000_i64;
@@ -141,7 +144,8 @@ fn manifest_verifier_catches_chain_break_on_restore() {
     let backup_root = derive_backup_root(&identity).unwrap();
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"chain-break").unwrap();
-    let signing = SigningKey::from_bytes(&[0xCD; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
 
     let event = BackupEvent {
         event_type: BackupEventType::MessageReceived,
@@ -337,7 +341,8 @@ fn passphrase_recovery_end_to_end_round_trip_across_three_scripts() {
         .expect("wrap master with passphrase");
 
     // ---- 3. Source device: build segments + manifest chain --------------
-    let signing = SigningKey::from_bytes(&[0xAB; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
     let conv = Uuid::now_v7();
     let now_ms = 1_777_000_000_000_i64;
     let latin_id = Uuid::now_v7();

@@ -20,6 +20,7 @@ pub mod content_hash;
 pub mod convergent;
 pub mod key_hierarchy;
 pub mod key_wrap;
+pub mod signing;
 
 /// Crypto module error type.
 #[derive(Debug, thiserror::Error)]

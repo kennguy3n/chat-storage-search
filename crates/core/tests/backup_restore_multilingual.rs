@@ -21,8 +21,10 @@
 //! the ICU tokenizer follows the same pattern as
 //! `crates/core/tests/multilingual_search.rs`.
 
-use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use uuid::Uuid;
+
+use kchat_core::crypto::signing::HybridSigningKey;
 
 use kchat_core::backup::event_journal::{BackupEvent, BackupEventType};
 use kchat_core::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
@@ -197,7 +199,8 @@ fn backup_restore_multilingual_corpus_round_trip() {
     let k_seg =
         derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).expect("k_segment");
     let k_man = derive_backup_manifest(&backup_root, b"multilingual").expect("k_manifest");
-    let signing = SigningKey::from_bytes(&[0xAB; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
 
     let segment = BackupSegmentBuilder::new()
         .build_segment(

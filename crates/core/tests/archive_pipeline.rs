@@ -479,12 +479,13 @@ fn archive_pipeline_remaining_segment_types_round_trip_and_reject_non_archive() 
 ///    (forward secrecy).
 #[test]
 fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
-    use ed25519_dalek::SigningKey;
     use kchat_core::archive::epoch_keys::EpochKeyManager;
     use kchat_core::archive::event_journal::{ArchiveEvent, ArchiveEventType};
     use kchat_core::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
     use kchat_core::crypto::key_hierarchy::KeyMaterial;
+    use kchat_core::crypto::signing::HybridSigningKey;
     use kchat_core::formats::SegmentType;
+    use rand::rngs::OsRng;
 
     // ---- 1. Bootstrap epoch manager at 2026-01 -------------------------
     let identity = KeyMaterial::from_bytes([0xE9; 32]);
@@ -553,7 +554,8 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
     );
 
     // ---- 4. Manifest carries the wrapped prior epoch key ---------------
-    let signing = SigningKey::from_bytes(&[0xA9; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
     let k_archive_manifest = kchat_core::crypto::key_hierarchy::derive_archive_manifest_key(
         &KeyMaterial::from_bytes(*mgr.current_epoch_key()),
         "2026-02",
@@ -684,15 +686,17 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
 /// retired epoch key must be reachable from the chain alone.
 #[test]
 fn archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore() {
-    use ed25519_dalek::SigningKey;
     use kchat_core::archive::epoch_keys::EpochKeyManager;
     use kchat_core::archive::event_journal::{ArchiveEvent, ArchiveEventType};
     use kchat_core::archive::manifest_builder::{build_archive_manifest, ManifestBuildRequest};
     use kchat_core::crypto::key_hierarchy::{derive_archive_manifest_key, KeyMaterial};
+    use kchat_core::crypto::signing::HybridSigningKey;
+    use rand::rngs::OsRng;
 
     let identity = KeyMaterial::from_bytes([0xCC; 32]);
     let archive_root = derive_archive_root(&identity).expect("archive_root");
-    let signing = SigningKey::from_bytes(&[0xB7; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
     let conv = Uuid::now_v7();
 
     // ---- 1) Epoch 2026-01 ---------------------------------------

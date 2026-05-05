@@ -575,8 +575,9 @@ the standard library and chosen primitives.
 > `archive::segment_builder` (CBOR → zstd → XChaCha20-Poly1305
 > sealed segments under `K_archive_segment(segment_id)`),
 > `archive::manifest_builder` (genesis → gen N chain, BLAKE3 over
-> canonical-CBOR signing payload, Ed25519 signature, AEAD-seal
-> under `K_archive_manifest`), `archive::upload`
+> canonical-CBOR signing payload, hybrid Ed25519 + ML-DSA-65
+> signature, AEAD-seal under `K_archive_manifest`),
+> `archive::upload`
 > (`upload_archive_segment` drives the `TransportClient` upload
 > sequence and verifies the commit-time ciphertext Merkle root;
 > `persist_segment_map_row` records the resulting blob in
@@ -657,8 +658,9 @@ the standard library and chosen primitives.
 > `decrypt_backup_segment` for the restore path),
 > `backup::manifest_builder::build_backup_manifest` (genesis +
 > chained generations → BLAKE3 over canonical-CBOR signing
-> payload → Ed25519 signature → AEAD-seal under
-> `K_backup_manifest` with `device_id` mixed into the AAD for
+> payload → hybrid Ed25519 + ML-DSA-65 signature → AEAD-seal
+> under `K_backup_manifest` with `device_id` mixed into the AAD
+> for
 > device attribution), `backup::compaction` (`CompactionTier`
 > daily → weekly → monthly state machine; deterministic
 > `CompactionPolicy::plan` buckets segments by
@@ -671,8 +673,9 @@ the standard library and chosen primitives.
 > over the already-defined
 > `local_store::state_machines::RestoreState` enum),
 > `restore::manifest_verifier::verify_manifest_chain` (walks
-> generation 0 → latest, verifies every Ed25519 signature and
-> every `previous_manifest_hash` link, surfaces structured
+> generation 0 → latest, verifies both legs of every hybrid
+> Ed25519 + ML-DSA-65 signature and every `previous_manifest_hash`
+> link, surfaces structured
 > `EmptyChain` / `SignatureInvalid` / `ChainBreak` /
 > `GapDetected` / `GenesisHashNotZero` /
 > `HashComputationFailed` failures), and
@@ -914,7 +917,7 @@ stateDiagram-v2
     direction LR
     [*] --> identity_restored : "device key recovered"
     identity_restored --> root_keys_unwrapped : "K_user_master + sub-roots in memory"
-    root_keys_unwrapped --> manifest_verified : "manifest chain Ed25519 + hash walk"
+    root_keys_unwrapped --> manifest_verified : "manifest chain hybrid Ed25519 + ML-DSA-65 + hash walk"
     manifest_verified --> skeleton_restored : "conversation list + skeletons reconstructed"
     skeleton_restored --> search_restored : "FTS / fuzzy / vector / media shards reattached"
     search_restored --> recent_messages_restored : "recent bodies hydrated"
@@ -930,9 +933,9 @@ flowchart LR
     Persister["MessagePersister<br/>(SAVEPOINT)"]
     Journal["BackupEventJournal<br/>(typed taxonomy)"]
     Builder["BackupSegmentBuilder<br/>(CBOR → zstd → AEAD seal)"]
-    Manifest["build_backup_manifest<br/>(Ed25519 signature, AEAD-seal,<br/>previous_manifest_hash chain)"]
+    Manifest["build_backup_manifest<br/>(hybrid Ed25519 + ML-DSA-65 signature, AEAD-seal,<br/>previous_manifest_hash chain)"]
     Compactor["CompactionPolicy<br/>(daily → weekly → monthly,<br/>apply_tombstones)"]
-    Verifier["restore::manifest_verifier<br/>(walk chain, verify Ed25519,<br/>previous_manifest_hash check)"]
+    Verifier["restore::manifest_verifier<br/>(walk chain, verify hybrid Ed25519 + ML-DSA-65,<br/>previous_manifest_hash check)"]
     Pipeline["RestorePipeline<br/>(skeleton-first restore)"]
 
     Persister -->|persist / edit / delete| Journal
@@ -1367,7 +1370,7 @@ flowchart TD
     SR --> MS
 
     LDB["K_local_db<br/>(SQLCipher key)"]
-    DSK["Device signing key<br/>(Ed25519)"]
+    DSK["Device signing key<br/>(hybrid Ed25519 + ML-DSA-65)"]
     UM_W["wrapped K_user_master<br/>(Keychain / Keystore)"]
 
     LDB -.- DSK -.- UM_W
@@ -1654,7 +1657,7 @@ sequenceDiagram
         Bk->>Sink: "upload (resume from prior chunk receipt if any)"
     end
     Bk->>Cr: "build, sign, seal manifest gen N+1"
-    Cr-->>Bk: "manifest ciphertext + Ed25519 signature"
+    Cr-->>Bk: "manifest ciphertext + hybrid Ed25519 + ML-DSA-65 signatures"
     Bk->>Sink: "upload manifest (last)"
     Bk-->>Sched: "BackupResult"
 ```
@@ -1732,8 +1735,9 @@ The Rust modules implementing the diagrams above:
   compress → XChaCha20-Poly1305 seal under `K_backup_segment`)
   and `decrypt_backup_segment` for the inverse path.
 * `crates/core/src/backup/manifest_builder.rs` —
-  `build_backup_manifest` (genesis → gen-N chain, Ed25519 over
-  canonical CBOR, AEAD-seal under `K_backup_manifest` with
+  `build_backup_manifest` (genesis → gen-N chain, hybrid Ed25519
+  + ML-DSA-65 over canonical CBOR with both signature fields
+  cleared, AEAD-seal under `K_backup_manifest` with
   `device_id` mixed into the AAD).
 * `crates/core/src/backup/compaction.rs` — `CompactionPolicy::plan`
   drives the daily → weekly → monthly merge; `apply_tombstones`
@@ -1813,8 +1817,9 @@ sign manifest → advance cursor.
   single-row `restore_state` table layered on
   `local_store::state_machines::RestoreState`.
 * `crates/core/src/restore/manifest_verifier.rs` —
-  `verify_manifest_chain` walks gen 0 → latest, verifies every
-  Ed25519 signature, and enforces the
+  `verify_manifest_chain` walks gen 0 → latest, verifies both
+  legs of every hybrid Ed25519 + ML-DSA-65 signature, and
+  enforces the
   `previous_manifest_hash == compute_manifest_hash(prev)`
   invariant. Returns structured `EmptyChain` /
   `SignatureInvalid { generation }` /

@@ -19,7 +19,8 @@
 use std::ops::Range;
 use std::sync::Mutex;
 
-use ed25519_dalek::SigningKey;
+use kchat_core::crypto::signing::HybridSigningKey;
+use rand::rngs::OsRng;
 use uuid::Uuid;
 
 use kchat_core::backup::event_journal::{BackupEvent, BackupEventType};
@@ -433,8 +434,9 @@ fn wrong_signing_key_on_manifest_chain_fails_signature_invalid() {
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"wrong-signing-key").unwrap();
 
-    let signer = SigningKey::from_bytes(&[0x77; 32]);
-    let imposter = SigningKey::from_bytes(&[0x88; 32]);
+    let mut rng = OsRng;
+    let signer = HybridSigningKey::generate(&mut rng);
+    let imposter = HybridSigningKey::generate(&mut rng);
 
     let evt = BackupEvent {
         event_type: BackupEventType::MessageReceived,
@@ -487,7 +489,8 @@ fn manifest_chain_break_returns_chain_break_with_expected_and_actual() {
     let backup_root = derive_backup_root(&identity).expect("backup_root");
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"chain-break").unwrap();
-    let signer = SigningKey::from_bytes(&[0xAA; 32]);
+    let mut rng = OsRng;
+    let signer = HybridSigningKey::generate(&mut rng);
 
     let evt = BackupEvent {
         event_type: BackupEventType::MessageReceived,
@@ -617,13 +620,14 @@ fn device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_i
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"device-removed").unwrap();
 
+    let mut rng = OsRng;
     // Key A: the device's MLS-group signing key at backup time.
-    let pre_removal_signer = SigningKey::from_bytes(&[0xA1; 32]);
+    let pre_removal_signer = HybridSigningKey::generate(&mut rng);
     // Key B: the *replacement* device key the surviving group
     // members rotated to after kicking the leaver. The verifier
     // (= the new device receiving the backup at restore time)
     // only trusts B.
-    let post_removal_trusted = SigningKey::from_bytes(&[0xB1; 32]);
+    let post_removal_trusted = HybridSigningKey::generate(&mut rng);
 
     let evt = BackupEvent {
         event_type: BackupEventType::MessageReceived,
@@ -1064,7 +1068,8 @@ fn manifest_chain_break_at_deepest_generation_reports_correct_link() {
     let backup_root = derive_backup_root(&identity).expect("backup_root");
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"deep-break").unwrap();
-    let signer = SigningKey::from_bytes(&[0x42; 32]);
+    let mut rng = OsRng;
+    let signer = HybridSigningKey::generate(&mut rng);
 
     let evt = BackupEvent {
         event_type: BackupEventType::MessageReceived,
@@ -1262,7 +1267,8 @@ fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
     let backup_root = derive_backup_root(&identity).expect("backup_root");
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
     let k_man = derive_backup_manifest(&backup_root, b"upload-interrupt").unwrap();
-    let signer = SigningKey::from_bytes(&[0x77; 32]);
+    let mut rng = OsRng;
+    let signer = HybridSigningKey::generate(&mut rng);
 
     let evt = BackupEvent {
         event_type: BackupEventType::MessageReceived,

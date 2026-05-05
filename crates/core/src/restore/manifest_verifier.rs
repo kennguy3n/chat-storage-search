@@ -3,8 +3,10 @@
 //! Walks an ordered slice of [`BackupManifest`] from generation 0
 //! to the latest and verifies:
 //!
-//! * Every manifest's Ed25519 [`manifest_signature`] under the
+//! * Every manifest's hybrid Ed25519 + ML-DSA-65 signature pair
+//!   ([`manifest_signature`] / [`pqc_signature`]) under the
 //!   supplied verifying key.
+//!
 //! * The chain link
 //!   `manifest[n].previous_manifest_hash == compute_manifest_hash(manifest[n-1])`.
 //! * Genesis (`generation == 0`) has
@@ -19,10 +21,11 @@
 //! the input slice.
 //!
 //! [`manifest_signature`]: crate::formats::manifest::BackupManifest::manifest_signature
+//! [`pqc_signature`]: crate::formats::manifest::BackupManifest::pqc_signature
 
-use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
+use crate::crypto::signing::HybridVerifyingKey;
 use crate::formats::manifest::{
     compute_manifest_hash, verify_backup_manifest, BackupManifest, GENESIS_PREVIOUS_HASH,
 };
@@ -36,7 +39,9 @@ pub enum VerificationError {
     #[error("manifest chain is empty")]
     EmptyChain,
 
-    /// `manifest[generation]` failed Ed25519 verification.
+    /// `manifest[generation]` failed hybrid signature verification —
+    /// either the Ed25519 leg or the ML-DSA-65 leg (or both) did
+    /// not validate against the supplied verifying key.
     #[error("manifest {generation}: signature failed verification")]
     SignatureInvalid {
         /// Generation of the failing manifest.
@@ -84,10 +89,11 @@ pub enum VerificationError {
 
 /// Walk the manifest chain from `manifests[0]` (genesis) to
 /// `manifests.last()`. Returns `Ok(())` only if every check
-/// passes.
+/// passes — including both the Ed25519 and ML-DSA-65 signature
+/// legs on every generation.
 pub fn verify_manifest_chain(
     manifests: &[BackupManifest],
-    signing_public_key: &VerifyingKey,
+    signing_public_key: &HybridVerifyingKey,
 ) -> Result<(), VerificationError> {
     if manifests.is_empty() {
         return Err(VerificationError::EmptyChain);
@@ -157,9 +163,15 @@ mod tests {
     use crate::crypto::key_hierarchy::{
         derive_backup_manifest, derive_backup_root, derive_backup_segment, KeyMaterial,
     };
+    use crate::crypto::signing::HybridSigningKey;
     use crate::formats::SegmentType;
-    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use uuid::Uuid;
+
+    fn fresh_signing_key() -> HybridSigningKey {
+        let mut rng = OsRng;
+        HybridSigningKey::generate(&mut rng)
+    }
 
     fn fake_segment(k_seg: &KeyMaterial) -> BuiltBackupSegment {
         let event = BackupEvent {
@@ -181,7 +193,7 @@ mod tests {
     }
 
     fn build_chain(
-        signing_key: &SigningKey,
+        signing_key: &HybridSigningKey,
         n: u64,
     ) -> (Vec<BackupManifest>, KeyMaterial, KeyMaterial) {
         let identity = KeyMaterial::from_bytes([0xDD; 32]);
@@ -217,30 +229,30 @@ mod tests {
 
     #[test]
     fn empty_chain_errors() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let err = verify_manifest_chain(&[], &signing.verifying_key()).unwrap_err();
         assert_eq!(err, VerificationError::EmptyChain);
     }
 
     #[test]
     fn single_genesis_passes() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (chain, _, _) = build_chain(&signing, 1);
         verify_manifest_chain(&chain, &signing.verifying_key()).unwrap();
     }
 
     #[test]
     fn three_generation_chain_passes() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (chain, _, _) = build_chain(&signing, 3);
         verify_manifest_chain(&chain, &signing.verifying_key()).unwrap();
     }
 
     #[test]
-    fn tampered_signature_is_detected() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+    fn tampered_ed25519_signature_is_detected() {
+        let signing = fresh_signing_key();
         let (mut chain, _, _) = build_chain(&signing, 2);
-        // Flip a byte in the signature on generation 1.
+        // Flip a byte in the Ed25519 signature on generation 1.
         if !chain[1].manifest_signature.is_empty() {
             chain[1].manifest_signature[0] ^= 0xFF;
         }
@@ -249,8 +261,20 @@ mod tests {
     }
 
     #[test]
+    fn tampered_pqc_signature_is_detected() {
+        let signing = fresh_signing_key();
+        let (mut chain, _, _) = build_chain(&signing, 2);
+        // Flip a byte in the ML-DSA-65 signature on generation 1.
+        if !chain[1].pqc_signature.is_empty() {
+            chain[1].pqc_signature[0] ^= 0xFF;
+        }
+        let err = verify_manifest_chain(&chain, &signing.verifying_key()).unwrap_err();
+        assert_eq!(err, VerificationError::SignatureInvalid { generation: 1 });
+    }
+
+    #[test]
     fn chain_break_is_detected() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (mut chain, k_seg, k_man) = build_chain(&signing, 2);
         // Forge a generation-1 manifest whose previous_manifest_hash is wrong.
         let bad = build_backup_manifest(
@@ -284,7 +308,7 @@ mod tests {
 
     #[test]
     fn gap_in_generations_is_detected() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (chain, _, _) = build_chain(&signing, 3);
         // Drop the middle manifest.
         let chain_with_gap: Vec<_> = vec![chain[0].clone(), chain[2].clone()];
@@ -299,7 +323,7 @@ mod tests {
 
     #[test]
     fn missing_generation_zero_errors() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (chain, _, _) = build_chain(&signing, 2);
         // Drop the genesis.
         let chain_without_genesis: Vec<_> = chain.into_iter().skip(1).collect();
@@ -315,7 +339,7 @@ mod tests {
 
     #[test]
     fn nonzero_previous_hash_on_genesis_errors() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
+        let signing = fresh_signing_key();
         let (mut chain, _, _) = build_chain(&signing, 1);
         chain[0].previous_manifest_hash = [0xAA; 32];
         // Re-sign so the signature verifies but the genesis hash check fails.
@@ -329,10 +353,50 @@ mod tests {
 
     #[test]
     fn wrong_public_key_fails() {
-        let signing = SigningKey::from_bytes(&[0x99; 32]);
-        let other_pub = SigningKey::from_bytes(&[0xAA; 32]).verifying_key();
+        let signing = fresh_signing_key();
+        let other_pub = fresh_signing_key().verifying_key();
         let (chain, _, _) = build_chain(&signing, 2);
         let err = verify_manifest_chain(&chain, &other_pub).unwrap_err();
+        match err {
+            VerificationError::SignatureInvalid { generation } => assert_eq!(generation, 0),
+            other => panic!("expected SignatureInvalid, got {other:?}"),
+        }
+    }
+
+    /// New hybrid coverage: Ed25519 leg correct, ML-DSA-65 leg
+    /// belongs to a different signer → must reject.
+    #[test]
+    fn matching_ed25519_but_wrong_ml_dsa_pubkey_fails() {
+        let signing = fresh_signing_key();
+        let other = fresh_signing_key();
+        let (chain, _, _) = build_chain(&signing, 2);
+        // Hand-craft a verifying key that uses the *correct*
+        // Ed25519 verifying key but the *wrong* ML-DSA verifying
+        // key. This is exactly the failure mode hybrid signing
+        // is supposed to catch.
+        let mixed = HybridVerifyingKey::from_parts(
+            *signing.verifying_key().ed25519(),
+            other.verifying_key().ml_dsa().clone(),
+        );
+        let err = verify_manifest_chain(&chain, &mixed).unwrap_err();
+        match err {
+            VerificationError::SignatureInvalid { generation } => assert_eq!(generation, 0),
+            other => panic!("expected SignatureInvalid, got {other:?}"),
+        }
+    }
+
+    /// And the symmetric case: ML-DSA-65 leg correct, Ed25519 leg
+    /// belongs to a different signer → must reject.
+    #[test]
+    fn matching_ml_dsa_but_wrong_ed25519_pubkey_fails() {
+        let signing = fresh_signing_key();
+        let other = fresh_signing_key();
+        let (chain, _, _) = build_chain(&signing, 2);
+        let mixed = HybridVerifyingKey::from_parts(
+            *other.verifying_key().ed25519(),
+            signing.verifying_key().ml_dsa().clone(),
+        );
+        let err = verify_manifest_chain(&chain, &mixed).unwrap_err();
         match err {
             VerificationError::SignatureInvalid { generation } => assert_eq!(generation, 0),
             other => panic!("expected SignatureInvalid, got {other:?}"),

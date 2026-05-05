@@ -38,8 +38,10 @@
 
 use std::collections::BTreeSet;
 
-use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use uuid::Uuid;
+
+use kchat_core::crypto::signing::HybridSigningKey;
 
 use kchat_core::backup::event_journal::{BackupEvent, BackupEventType};
 use kchat_core::backup::manifest_builder::{build_backup_manifest, BackupManifestBuildRequest};
@@ -388,7 +390,8 @@ fn large_scale_backup_restore_round_trip() {
     let k_seg =
         derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).expect("k_segment");
     let k_man = derive_backup_manifest(&backup_root, b"large_scale").expect("k_manifest");
-    let signing = SigningKey::from_bytes(&[0xAB; 32]);
+    let mut rng = OsRng;
+    let signing = HybridSigningKey::generate(&mut rng);
 
     // ---- Build a single segment carrying the full event set,
     // then chain a 2-generation manifest (gen0 + gen1).

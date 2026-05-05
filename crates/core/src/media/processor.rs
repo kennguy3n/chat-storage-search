@@ -256,7 +256,10 @@ mod tests {
         // 1) Unwrap K_asset and confirm we recover the same key the
         //    chunker used.
         let unwrapped = unwrap_key(&wrapping, &res.descriptor.wrapped_k_asset).unwrap();
-        assert_eq!(&unwrapped, res.k_asset_raw.as_ref());
+        // `as_ref::<[u8]>()` to disambiguate now that `hybrid_array`
+        // (pulled in by `ml-dsa`) also implements
+        // `AsRef<Array<T, U>> for [T; N]`.
+        assert_eq!(&unwrapped[..], &res.k_asset_raw[..]);
 
         // 2) Decrypt every chunk under the same blob_id / class /
         //    merkle_root and confirm the plaintext matches.
@@ -320,7 +323,7 @@ mod tests {
         let a = process_media(&pt, "image/png", &wrapping, BlobClass::Media, false).unwrap();
         let b = process_media(&pt, "image/png", &wrapping, BlobClass::Media, false).unwrap();
         // K_asset is fresh-random per call.
-        assert_ne!(a.k_asset_raw.as_ref(), b.k_asset_raw.as_ref());
+        assert_ne!(&a.k_asset_raw[..], &b.k_asset_raw[..]);
         // …and so is the ciphertext, even though the plaintext is
         // identical.
         assert_ne!(

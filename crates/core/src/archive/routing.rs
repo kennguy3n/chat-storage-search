@@ -239,16 +239,13 @@ impl ZkofArchiveAdapter for S3ZkofArchiveAdapter {
 
 /// CBOR-encode a [`SealedArchiveManifest`] for cross-backend
 /// transport. The inner [`ArchiveManifest`] already implements
-/// `Serialize`; the wrapper holds an [`ed25519_dalek::Signature`]
-/// (no `Serialize` impl) plus the AEAD nonce / ciphertext, so we
-/// project the bundle into a plain `(manifest, signature_bytes,
-/// nonce, ciphertext)` shape that round-trips cleanly through
-/// CBOR / Pattern C.
+/// `Serialize` and now carries both the Ed25519 and ML-DSA-65
+/// signatures inline (`manifest_signature` and `pqc_signature`),
+/// so the wire shape just needs the manifest body plus the AEAD
+/// nonce / ciphertext.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WireSealedArchiveManifest {
     manifest: crate::formats::manifest::ArchiveManifest,
-    #[serde(with = "serde_bytes")]
-    signature: Vec<u8>,
     #[serde(with = "serde_bytes")]
     nonce: Vec<u8>,
     #[serde(with = "serde_bytes")]
@@ -264,7 +261,6 @@ pub(crate) fn encode_sealed_archive_manifest(
 ) -> Result<Vec<u8>, Error> {
     let wire = WireSealedArchiveManifest {
         manifest: manifest.manifest.clone(),
-        signature: manifest.signature.to_bytes().to_vec(),
         nonce: manifest.nonce.to_vec(),
         ciphertext: manifest.ciphertext.clone(),
     };
@@ -337,15 +333,18 @@ mod tests {
 
     use crate::config::Platform;
     use crate::crypto::aead::{xchacha20_poly1305, BlobClass};
+    use crate::crypto::signing::{HybridSigningKey, ML_DSA_65_SIGNATURE_LEN};
     use crate::formats::manifest::{
-        ArchiveManifest, ARCHIVE_MANIFEST_MAGIC, GENESIS_PREVIOUS_HASH, MANIFEST_VERSION,
+        sign_archive_manifest, ArchiveManifest, ARCHIVE_MANIFEST_MAGIC, GENESIS_PREVIOUS_HASH,
+        MANIFEST_VERSION,
     };
     use crate::formats::SegmentType;
     use crate::transport::{
         BlobUploadHandle, ChunkReceipt, CommitBlobResponse, EncryptedManifest,
         FetchMessagesResponse, TransportClient as TransportClientTrait, TransportResult,
     };
-    use ed25519_dalek::{Signature, SIGNATURE_LENGTH};
+    use ed25519_dalek::SIGNATURE_LENGTH;
+    use rand::rngs::OsRng;
 
     /// In-memory transport that stores a single archive segment
     /// upload via init/upload/commit and serves
@@ -493,22 +492,37 @@ mod tests {
     }
 
     fn stub_manifest() -> SealedArchiveManifest {
+        // Build a real manifest, sign it with a fresh hybrid key,
+        // and return the sealed bundle. We don't try to fabricate
+        // signature bytes by hand any more — ML-DSA-65 signatures
+        // are 3309 bytes of structured material with no
+        // "all-zero" valid form, so producing them via the actual
+        // `sign_archive_manifest` is both simpler and more
+        // honest.
+        let mut rng = OsRng;
+        let signing_key = HybridSigningKey::generate(&mut rng);
+        let mut manifest = ArchiveManifest {
+            magic: ARCHIVE_MANIFEST_MAGIC.to_string(),
+            version: MANIFEST_VERSION,
+            manifest_id: Uuid::now_v7(),
+            generation: 0,
+            previous_manifest_hash: GENESIS_PREVIOUS_HASH,
+            segments: vec![],
+            search_index_shards: vec![],
+            media_references: vec![],
+            tombstones: vec![],
+            wrapped_prior_epoch_keys: vec![],
+            merkle_root: [0u8; 32],
+            manifest_signature: vec![],
+            pqc_signature: vec![],
+        };
+        let signature = sign_archive_manifest(&mut manifest, &signing_key)
+            .expect("hybrid sign archive manifest in stub");
+        debug_assert_eq!(manifest.manifest_signature.len(), SIGNATURE_LENGTH);
+        debug_assert_eq!(manifest.pqc_signature.len(), ML_DSA_65_SIGNATURE_LEN);
         SealedArchiveManifest {
-            manifest: ArchiveManifest {
-                magic: ARCHIVE_MANIFEST_MAGIC.to_string(),
-                version: MANIFEST_VERSION,
-                manifest_id: Uuid::now_v7(),
-                generation: 0,
-                previous_manifest_hash: GENESIS_PREVIOUS_HASH,
-                segments: vec![],
-                search_index_shards: vec![],
-                media_references: vec![],
-                tombstones: vec![],
-                wrapped_prior_epoch_keys: vec![],
-                merkle_root: [0u8; 32],
-                manifest_signature: vec![],
-            },
-            signature: Signature::from_bytes(&[0u8; SIGNATURE_LENGTH]),
+            manifest,
+            signature,
             nonce: [0u8; xchacha20_poly1305::NONCE_LEN],
             ciphertext: vec![],
         }

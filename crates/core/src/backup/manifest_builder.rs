@@ -6,8 +6,8 @@
 //! [`crate::backup::segment_builder::BuiltBackupSegment`]s and the
 //! previous backup manifest (if any), produces a
 //! [`crate::formats::manifest::BackupManifest`], signs it with the
-//! caller-supplied Ed25519 device key, and AEAD-seals it under
-//! `K_backup_manifest`.
+//! caller-supplied **hybrid Ed25519 + ML-DSA-65 device key**, and
+//! AEAD-seals it under `K_backup_manifest`.
 //!
 //! Chain discipline:
 //!
@@ -27,18 +27,18 @@
 //! segment blobs.
 
 use blake3::Hasher;
-use ed25519_dalek::{Signature, SigningKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::crypto::aead::xchacha20_poly1305::{open, seal, NONCE_LEN};
 use crate::crypto::key_hierarchy::KeyMaterial;
+use crate::crypto::signing::HybridSigningKey;
 use crate::crypto::CryptoError;
 use crate::formats::manifest::{
-    compute_manifest_hash, sign_backup_manifest, BackupManifest, ManifestMediaRef,
-    ManifestSegmentRef, ManifestShardRef, Tombstone, BACKUP_MANIFEST_MAGIC, GENESIS_PREVIOUS_HASH,
-    MANIFEST_VERSION,
+    compute_manifest_hash, sign_backup_manifest, BackupManifest, HybridManifestSignature,
+    ManifestMediaRef, ManifestSegmentRef, ManifestShardRef, Tombstone, BACKUP_MANIFEST_MAGIC,
+    GENESIS_PREVIOUS_HASH, MANIFEST_VERSION,
 };
 use crate::Error;
 
@@ -46,14 +46,24 @@ use super::segment_builder::BuiltBackupSegment;
 
 /// Bundle returned by [`build_backup_manifest`]: the signed
 /// manifest plus its AEAD seal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The hybrid `HybridManifestSignature` does not implement
+/// `PartialEq`/`Eq` (the underlying ML-DSA-65 signature type
+/// doesn't), so we hand-derive only `Debug`/`Clone` and don't try
+/// to compare two `SealedBackupManifest`s by signature — callers
+/// compare the manifest body and reverify the signatures
+/// separately, which is the correct check anyway.
+#[derive(Debug, Clone)]
 pub struct SealedBackupManifest {
     /// The signed [`BackupManifest`] (clear text — segment / shard
     /// / media references are not secrets, only the body of the
-    /// manifest is sealed).
+    /// manifest is sealed). Both the Ed25519 and ML-DSA-65
+    /// signatures live inside this struct.
     pub manifest: BackupManifest,
-    /// Ed25519 signature produced during [`sign_backup_manifest`].
-    pub signature: Signature,
+    /// Hybrid Ed25519 + ML-DSA-65 signatures produced during
+    /// [`sign_backup_manifest`]. The same bytes are stored in
+    /// `manifest.manifest_signature` and `manifest.pqc_signature`.
+    pub signature: HybridManifestSignature,
     /// 24-byte XChaCha20-Poly1305 nonce sealing
     /// [`Self::ciphertext`].
     pub nonce: [u8; NONCE_LEN],
@@ -88,13 +98,14 @@ pub struct BackupManifestBuildRequest<'a> {
 
 /// Build a single backup-manifest record.
 ///
-/// `signing_key` is the Ed25519 device key.
+/// `signing_key` is the device's hybrid Ed25519 + ML-DSA-65
+/// signing key (see [`HybridSigningKey`]).
 /// `k_backup_manifest` is `K_backup_manifest` — derived from
 /// `K_backup_root` via
 /// [`crate::crypto::key_hierarchy::derive_backup_manifest_key`].
 pub fn build_backup_manifest(
     request: BackupManifestBuildRequest<'_>,
-    signing_key: &SigningKey,
+    signing_key: &HybridSigningKey,
     k_backup_manifest: &KeyMaterial,
 ) -> Result<SealedBackupManifest, Error> {
     let (generation, previous_manifest_hash) = match request.previous {
@@ -134,6 +145,7 @@ pub fn build_backup_manifest(
         tombstones: request.tombstones,
         merkle_root,
         manifest_signature: Vec::new(),
+        pqc_signature: Vec::new(),
     };
 
     let signature = sign_backup_manifest(&mut manifest, signing_key).map_err(Error::Crypto)?;
@@ -234,12 +246,18 @@ mod tests {
     use crate::crypto::key_hierarchy::{
         derive_backup_manifest, derive_backup_root, derive_backup_segment, KeyMaterial,
     };
+    use crate::crypto::signing::{HybridSigningKey, HybridVerifyingKey};
     use crate::formats::manifest::verify_backup_manifest;
     use crate::formats::SegmentType;
-    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use rand::rngs::OsRng;
 
-    fn fake_signing_key() -> (SigningKey, VerifyingKey) {
-        let sk = SigningKey::from_bytes(&[0x11; 32]);
+    /// Test helper: a fresh hybrid signing key. We don't need
+    /// determinism here \u2014 the assertions only check that
+    /// `verify_*` accepts/rejects the right keys, not specific
+    /// signature bytes \u2014 so a per-call random key is fine.
+    fn fake_signing_key() -> (HybridSigningKey, HybridVerifyingKey) {
+        let mut rng = OsRng;
+        let sk = HybridSigningKey::generate(&mut rng);
         let vk = sk.verifying_key();
         (sk, vk)
     }
@@ -368,7 +386,7 @@ mod tests {
     #[test]
     fn signature_fails_under_wrong_public_key() {
         let (sk, _vk) = fake_signing_key();
-        let other_vk = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let (_other_sk, other_vk) = fake_signing_key();
         let (k_seg, k_man) = fresh_keys();
         let sealed = build_backup_manifest(
             BackupManifestBuildRequest {
