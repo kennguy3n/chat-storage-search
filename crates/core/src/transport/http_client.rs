@@ -19,7 +19,16 @@
 //!   → bytes.
 //!
 //! Retry policy: 3 attempts at 1 s / 2 s / 4 s backoff for any
-//! transient transport error (connection reset, 5xx, 429).
+//! transient failure. Two failure classes trigger a retry:
+//!
+//! * Transport-level [`reqwest::Error`]s that report
+//!   `is_timeout` / `is_connect` (DNS / TCP / TLS failure).
+//! * Completed HTTP exchanges whose response status is `429`
+//!   or any `5xx`. Status-code classification happens on the
+//!   [`reqwest::blocking::Response`] returned by `send`, not on
+//!   `reqwest::Error::status` (which only carries a code for
+//!   errors produced by `error_for_status`, a path we never take).
+//!
 //! Per-request timeout: 30 s (120 s for chunk uploads, which can
 //! be megabytes large under hostile carrier conditions).
 //!
@@ -97,12 +106,21 @@ struct EncryptedManifestWire {
 /// `Content-Type: application/json` (or `application/octet-stream`
 /// for blob bodies). Internal retry uses exponential backoff —
 /// see [`HTTP_TRANSPORT_RETRY_ATTEMPTS`].
+///
+/// Two `reqwest::blocking::Client` instances are built once at
+/// [`HttpTransportClient::new`] time and re-used for every call:
+/// `client` carries the 30 s control-plane timeout; `upload_client`
+/// carries the 120 s blob-upload timeout. `reqwest::blocking::Client`
+/// internally owns a tokio runtime and connection pool, so building
+/// it per call would spawn a fresh runtime on every chunk upload —
+/// the field-level cache avoids that.
 #[cfg(feature = "http-transport")]
 #[derive(Debug, Clone)]
 pub struct HttpTransportClient {
     base_url: String,
     auth_token: String,
     client: reqwest::blocking::Client,
+    upload_client: reqwest::blocking::Client,
 }
 
 #[cfg(feature = "http-transport")]
@@ -119,10 +137,15 @@ impl HttpTransportClient {
             .timeout(Duration::from_secs(HTTP_TRANSPORT_REQUEST_TIMEOUT_SECS))
             .build()
             .map_err(|e| crate::Error::Transport(format!("reqwest builder: {e}")))?;
+        let upload_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(HTTP_TRANSPORT_BLOB_UPLOAD_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| crate::Error::Transport(format!("reqwest upload builder: {e}")))?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token: auth_token.to_string(),
             client,
+            upload_client,
         })
     }
 
@@ -134,31 +157,43 @@ impl HttpTransportClient {
         format!("Bearer {}", self.auth_token)
     }
 
-    /// Wrap a fallible request in the retry policy: 3 attempts at
-    /// 1 s / 2 s / 4 s backoff, retrying only on `reqwest::Error`s
-    /// that report `is_timeout`/`is_connect` or 5xx / 429.
-    fn with_retry<T>(
+    /// Wrap a fallible HTTP request in the retry policy: 3 attempts
+    /// at 1 s / 2 s / 4 s exponential backoff.
+    ///
+    /// Retries on:
+    ///   - Transport-level [`reqwest::Error`]s that report
+    ///     `is_timeout` / `is_connect`.
+    ///   - HTTP responses with status `429` or any `5xx`.
+    ///
+    /// `reqwest::blocking::Client::send` returns `Ok(Response)` for
+    /// every completed HTTP exchange regardless of status, and
+    /// `reqwest::Error::status` only carries a code for errors
+    /// produced by `error_for_status` (which we never call). The
+    /// retry helper therefore inspects the
+    /// [`reqwest::blocking::Response`] directly rather than relying
+    /// on the error variant. The final response (or error) is
+    /// returned to the caller after the retry budget is exhausted
+    /// so the existing `if !status.is_success() { … }` branch can
+    /// surface the body in the canonical `Error::Transport`.
+    fn with_retry(
         attempts: u32,
-        mut op: impl FnMut() -> Result<T, reqwest::Error>,
-    ) -> Result<T, reqwest::Error> {
-        let mut last_err: Option<reqwest::Error> = None;
+        mut op: impl FnMut() -> Result<reqwest::blocking::Response, reqwest::Error>,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        debug_assert!(attempts >= 1, "with_retry requires at least one attempt");
         for attempt in 0..attempts {
-            match op() {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    let retryable = e.is_timeout()
-                        || e.is_connect()
-                        || matches!(e.status().map(|s| s.as_u16()), Some(429) | Some(500..=599));
-                    last_err = Some(e);
-                    if !retryable || attempt + 1 >= attempts {
-                        break;
-                    }
-                    let backoff_ms = 1_000u64 << attempt; // 1s, 2s, 4s
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                }
+            let is_last = attempt + 1 >= attempts;
+            let result = op();
+            let retryable = match &result {
+                Ok(resp) => response_status_is_retryable(resp.status()),
+                Err(e) => err_is_retryable(e),
+            };
+            if !retryable || is_last {
+                return result;
             }
+            let backoff_ms = 1_000u64 << attempt; // 1s, 2s, 4s
+            std::thread::sleep(Duration::from_millis(backoff_ms));
         }
-        Err(last_err.expect("at least one attempt was made"))
+        unreachable!("with_retry loop must return before exhausting all attempts")
     }
 
     fn map_err(label: &str, err: reqwest::Error) -> crate::Error {
@@ -172,6 +207,25 @@ impl HttpTransportClient {
             body.chars().take(256).collect::<String>()
         ))
     }
+}
+
+/// Whether a response status code should trigger a retry under the
+/// [`HttpTransportClient`] retry policy: `429` (Too Many Requests)
+/// and any `5xx`. Pulled out as a free function so the unit tests
+/// can exercise the classifier without fabricating a
+/// [`reqwest::blocking::Response`].
+#[cfg(feature = "http-transport")]
+fn response_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
+}
+
+/// Whether a transport-level [`reqwest::Error`] should trigger a
+/// retry: timeouts and connect errors only. Status-code-bearing
+/// errors (from `error_for_status`) are not produced by our call
+/// sites, so we deliberately do not classify on `e.status()`.
+#[cfg(feature = "http-transport")]
+fn err_is_retryable(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
 }
 
 #[cfg(feature = "http-transport")]
@@ -251,15 +305,13 @@ impl TransportClient for HttpTransportClient {
             urlencoding_encode(blob_id),
             chunk_idx
         ));
-        // Use the longer upload timeout for blob bodies.
-        let upload_client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(HTTP_TRANSPORT_BLOB_UPLOAD_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| crate::Error::Transport(format!("reqwest builder: {e}")))?;
-
+        // Use the longer-timeout upload client built once at
+        // construction time. Building a fresh
+        // `reqwest::blocking::Client` per call would spin up a new
+        // tokio runtime + connection pool every chunk.
         let body_bytes = ciphertext.to_vec();
         let response = Self::with_retry(HTTP_TRANSPORT_RETRY_ATTEMPTS, || {
-            upload_client
+            self.upload_client
                 .put(&url)
                 .header("Authorization", self.auth_header())
                 .header("Content-Type", "application/octet-stream")
@@ -610,17 +662,43 @@ mod tests {
     }
 
     #[test]
-    fn with_retry_returns_first_success() {
-        let calls = std::sync::Mutex::new(0u32);
-        // Manually-constructed dummy that always succeeds — we
-        // can't easily fabricate a `reqwest::Error`, so we test
-        // the success path here.
-        let r: Result<u32, reqwest::Error> = HttpTransportClient::with_retry(3, || {
-            *calls.lock().unwrap() += 1;
-            Ok(42)
-        });
-        assert_eq!(r.unwrap(), 42);
-        assert_eq!(*calls.lock().unwrap(), 1);
+    fn response_status_is_retryable_classifies_correctly() {
+        // 5xx and 429 retry; everything else does not.
+        assert!(response_status_is_retryable(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(response_status_is_retryable(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(response_status_is_retryable(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(response_status_is_retryable(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        ));
+        assert!(response_status_is_retryable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!response_status_is_retryable(reqwest::StatusCode::OK));
+        assert!(!response_status_is_retryable(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!response_status_is_retryable(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!response_status_is_retryable(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+    }
+
+    #[test]
+    fn http_client_new_builds_two_distinct_clients() {
+        // Both clients must be constructed eagerly so per-call
+        // `upload_chunk` does not allocate a new tokio runtime.
+        let c = HttpTransportClient::new("https://example.com", "tok").unwrap();
+        let client_addr = std::ptr::addr_of!(c.client) as usize;
+        let upload_addr = std::ptr::addr_of!(c.upload_client) as usize;
+        assert_ne!(client_addr, upload_addr);
     }
 }
 
