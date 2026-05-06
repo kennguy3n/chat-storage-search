@@ -1,14 +1,14 @@
-# How KChat Keeps Your Messages Private: A Deep Dive into Privacy-First Chat Architecture
+# How KChat Storage, Backup and Search Approach Keeps Your Messages Private: A Deep Dive into Privacy-First Chat Architecture
 
 *A look inside the engineering of a messaging system where the server never sees your data — and what makes it different from the apps you use today.*
 
 ---
 
-## The Problem With Most Chat Apps
+## The Problem With Most Chat Apps When It Comes to Search
 
-When you search for a message in most chat apps, your search query travels to a server, the server looks through your messages, and sends results back. That server — and anyone who compromises it — can see what you searched for, what you said, and to whom.
+When you search for a message in most chat apps, it is either all your text in local storage (which is a problem when device runs out of space) and files, media are unable to retrieve easily or your search query travels to a server, the server looks through your messages, and sends results back. That server — and anyone who compromises it — can see what you searched for, what you said, and to whom.
 
-KChat takes a fundamentally different approach. The server is treated as an **untrusted storage locker**. It holds encrypted blobs it cannot read. Every meaningful operation — searching, archiving, backing up, restoring — happens entirely on your device.
+KChat takes a fundamentally different approach. Your data is yours forever and noone else can see it and for that we allow users to enable offloaded storage & backup (if user turns on) in a high privacy design and high usability manner. The server is treated as an **untrusted storage locker**. It holds encrypted blobs it cannot read. Every meaningful operation — searching, archiving, backing up, restoring — happens entirely on your device.
 
 This blog walks through the most interesting design decisions that make this possible.
 
