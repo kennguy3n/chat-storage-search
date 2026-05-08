@@ -4,13 +4,13 @@
 
 > Status: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 —
 > Local Store + Text Search + MLS Integration (`In progress | ~96%`).
-> Phase 2 — Media Encryption and Blob Service (`In progress | ~95%`).
-> Phase 3 — Personal Archive and Offload (`In progress | ~97%`).
+> Phase 2 — Media Encryption and Blob Service (`In progress | ~98%`).
+> Phase 3 — Personal Archive and Offload (`In progress | ~99%`).
 > Phase 4 — Backup and Restore (`In progress | ~90%`).
-> Phase 5 — Search — Fuzzy + Encrypted Shards (`In progress | ~95%`).
-> Phase 6 — Media and Semantic Search (`In progress | ~75%`).
-> Phase 7 — Desktop + Optimization (`In progress | ~40%`).
-> Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~90%`).
+> Phase 5 — Search — Fuzzy + Encrypted Shards (`In progress | ~98%`).
+> Phase 6 — Media and Semantic Search (`In progress | ~95%`).
+> Phase 7 — Desktop + Optimization (`In progress | ~85%`).
+> Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`).
 > This document defines the target architecture. See
 > [PROGRESS.md](PROGRESS.md) for the live build tracker.
 

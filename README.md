@@ -8,8 +8,8 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 > Status: **Phase 0 — `COMPLETE`.** **Phase 1 — Local Store + Text
-> Search + MLS Integration — `In progress | ~95%`.** **Phase 2 —
-> Media Encryption and Blob Service — `In progress | ~95%` (chunked
+> Search + MLS Integration — `In progress | ~96%`.** **Phase 2 —
+> Media Encryption and Blob Service — `In progress | ~98%` (chunked
 > media pipeline + thumbnailing landed; tiered media-storage routing
 > wired through `MediaBlobSink`).**
 > **Phase 3 — Personal Archive and Offload — `In progress | ~99%`
@@ -27,7 +27,7 @@
 > sink, iCloud `CloudKit` bridge, Google Drive bridge), tiered
 > eviction policy (cloud-offload first → full eviction),
 > `CoreImpl::enforce_storage_budget`).**
-> **Phase 4 — Backup and Restore — `In progress | ~85%`
+> **Phase 4 — Backup and Restore — `In progress | ~90%`
 > (full Rust backup + restore foundation: typed
 > `BackupEventJournal`, CBOR + zstd + XChaCha20-Poly1305 segment
 > builder under `K_backup_segment`, Ed25519-signed
@@ -102,7 +102,7 @@
 > bucket stays under the **1.5 s** Phase-5 budget at p95). The
 > on-device device-matrix p95 ≤ 1.5 s gate is queued for the
 > Phase-5 device-matrix run.)
-> **Phase 6 — Media and Semantic Search — `In progress | ~92%`**
+> **Phase 6 — Media and Semantic Search — `In progress | ~95%`**
 > (ONNX Runtime session lifecycle in
 > `crates/core/src/models/embeddings_onnx.rs`; XLM-R inference
 > seam — `TextEmbedder` trait + `NoopTextEmbedder` /
@@ -166,7 +166,7 @@
 > Items still open: real platform-bridge attach for Whisper /
 > MobileCLIP / XLM-R sessions, desktop EP tuning, and the
 > INT4-vs-INT8 multilingual relevance benchmark.)
-> **Phase 7 — Desktop + Optimization — `In progress | ~80%`**
+> **Phase 7 — Desktop + Optimization — `In progress | ~85%`**
 > (production-scale archive compaction via
 > `CoreImpl::compact_archive` with cross-epoch decrypt
 > coverage; **all 8 of 8** failure scenarios passing in
@@ -574,6 +574,7 @@ chat-storage-search/
           mod.rs
           offline.rs                        # Phase 7: OfflineDetector trait (Send+Sync+Debug, object-safe) + NoopOfflineDetector (always-online fail-open) + AlwaysOfflineDetector (test) + ToggleOfflineDetector (mid-test flip)
         perf.rs                             # Phase 7: PerfTrace + PerfCollector trait (Send+Sync+Debug, object-safe) + NoopPerfCollector + InMemoryPerfCollector — wired into CoreImpl via install_perf_collector / has_perf_collector / collect_perf_stats; ingest_messages / search / enforce_storage_budget hot paths emit start/end ns + free-form metadata
+        desktop_index.rs                    # Phase 7: SpotlightAnchor / WindowsSearchAnchor object-safe traits — host-OS search-index bridges (macOS Spotlight via CSSearchableIndex, Windows Search via ISearchManager) so kchat metadata surfaces in the system search bar without breaking E2EE; CoreImpl carries a slot for each so platform bridges plug in without depending on the desktop crate
       benches/
         phase1_benchmarks.rs                # criterion: insert / search / batch / prefix / structured
         phase5_benchmarks.rs                # criterion: text_only_one_month / fuzzy_only_one_month / local_plus_one_cold_bucket — Phase 5 cold-shard latency budget
@@ -1221,9 +1222,10 @@ chat-storage-search/
   crate dependency graph, four-store data flow, schema, search
   pipeline, crypto flows, backup/restore sequences.
 - [docs/PHASES.md](docs/PHASES.md) — phased delivery plan
-  (Phase 0 → Phase 7) with explicit decision gates.
+  (Phase 0 → Phase 8) with explicit decision gates.
 - [docs/PROGRESS.md](docs/PROGRESS.md) — phase-gated tracker
   matching `kennguy3n/zk-object-fabric/docs/PROGRESS.md`.
+- [docs/BLOG_PRIVACY_ARCHITECTURE.md](docs/BLOG_PRIVACY_ARCHITECTURE.md) — privacy architecture blog post.
 
 ## License
 

@@ -146,7 +146,7 @@ Notes:
 
 ## Phase 1: Local Store + Text Search + MLS Integration
 
-**Status**: `In progress | ~95%`
+**Status**: `In progress | ~96%`
 
 **Goal**: Basic encrypted local storage with multilingual text
 search and MLS-plaintext ingest.
@@ -615,7 +615,7 @@ Notes:
 
 ## Phase 2: Media Encryption and Blob Service
 
-**Status**: `In progress | ~95%`
+**Status**: `In progress | ~98%`
 
 **Goal**: Chunked encrypted media upload / download, thumbnailing,
 local media cache.
@@ -692,7 +692,7 @@ Notes:
 
 ## Phase 3: Personal Archive and Offload
 
-**Status**: `In progress | ~97%`
+**Status**: `In progress | ~99%`
 
 **Goal**: Interactive cold storage with scroll-back rehydration and
 storage-pressure management.
@@ -706,17 +706,17 @@ Checklist:
       edit / delete and `CoreImpl::send_media` writes a matching
       `ArchiveEvent` inside the same SAVEPOINT as the
       `backup_event_journal` row.)
-- [~] Archive segment builder (per-conversation / per-time-bucket).
+- [x] Archive segment builder (per-conversation / per-time-bucket).
       (`crates/core/src/archive/segment_builder.rs`: CBOR encode →
       zstd compress → XChaCha20-Poly1305 seal under
       `K_archive_segment`, BLAKE3 plaintext root, default monthly
       `time_bucket` helper.)
-- [~] Archive manifest chain (generation N+1, `previous_manifest_hash`,
+- [x] Archive manifest chain (generation N+1, `previous_manifest_hash`,
       Ed25519 signature). (`crates/core/src/archive/manifest_builder.rs`:
       genesis → gen N chain, BLAKE3 over canonical-CBOR signing
       payload, Ed25519 signature, AEAD-seal under
       `K_archive_manifest` derived from the active epoch key.)
-- [~] Encrypted segment upload to backend blob service.
+- [x] Encrypted segment upload to backend blob service.
       (`crates/core/src/archive/upload.rs::upload_archive_segment`:
       computes ciphertext-side BLAKE3 Merkle root, drives
       `TransportClient::init_blob_upload → upload_chunk →
@@ -724,23 +724,23 @@ Checklist:
       matches, and `persist_segment_map_row` records the
       result in `archive_segment_map` with `state =
       'archive_uploaded'`.)
-- [~] Whole-object Merkle-root verification after upload.
+- [x] Whole-object Merkle-root verification after upload.
       (`upload_archive_segment` rejects a mismatched
       `commit_blob` Merkle root before any state-machine
       transition.)
-- [~] Archive state machine (`not_archived` → `archive_pending` →
+- [x] Archive state machine (`not_archived` → `archive_pending` →
       `archive_uploaded` → `archive_verified` → `archive_compacted`).
       (`local_store::db::update_archive_state`: validates every
       row's predecessor via `ArchiveState::try_transition` before
       issuing the batch UPDATE; rejects illegal jumps such as
       `not_archived → archive_verified`.)
-- [~] Storage budget enforcement (`enforceStorageBudget`).
+- [x] Storage budget enforcement (`enforceStorageBudget`).
       (`crates/core/src/offload/budget.rs` with `StorageBudget`,
       `StorageUsage`, `BudgetAssessment`, `PressureLevel` and a
       stateless `StorageBudgetEnforcer::assess` driving the offload
       orchestration loop. `CoreImpl::enforce_storage_budget` wires
       this in.)
-- [~] Eviction scoring formula.
+- [x] Eviction scoring formula.
       (`crates/core/src/offload/scoring.rs`:
       `compute_eviction_score` combines `ContentKind` weight,
       30-day half-life recency decay, and 16 MiB-normalised size
@@ -800,7 +800,7 @@ Checklist:
       `visible_viewport` → P2, `prefetch` / `adjacent_prefetch` →
       P3, `background_restore` → P4, `idle_fill` /
       `opportunistic_fill` → P5; unknown reasons collapse to P5).)
-- [~] Epoch-rotated archive key derivation: `K_archive_root` →
+- [x] Epoch-rotated archive key derivation: `K_archive_root` →
       `K_archive_epoch(epoch_id)` → `K_archive_segment` /
       `K_archive_manifest`. HKDF info =
       `"kchat-archive-epoch-v1" || epoch_id`. Default epoch
@@ -865,7 +865,7 @@ Checklist:
       uses an `S3Client`-shaped trait (`NoopS3Client` stub for
       now) and maps manifest objects to a well-known
       `manifests/index` key.)
-- [~] Batch-by-bucket prefetch: on any archive segment miss, fetch
+- [x] Batch-by-bucket prefetch: on any archive segment miss, fetch
       all segments for the `(conversation_id, time_bucket)` pair.
       Reduces per-segment access-pattern metadata to per-bucket
       granularity. (`crates/core/src/archive/prefetch.rs::batch_prefetch_bucket`
@@ -1032,7 +1032,7 @@ Notes:
 
 ## Phase 4: Backup and Restore
 
-**Status**: `In progress | ~85%`
+**Status**: `In progress | ~90%`
 
 **Goal**: Incremental backup to platform sinks and skeleton-first
 restore.
@@ -1059,13 +1059,13 @@ Checklist:
       `derive_backup_segment(K_backup_root, segment_id)`. AAD =
       `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`.
       `decrypt_backup_segment` powers the restore path.)
-- [x] Backup manifest chain with Ed25519 signature.
+- [x] Backup manifest chain with hybrid Ed25519 + ML-DSA-65 signature.
       (`crates/core/src/backup/manifest_builder.rs::build_backup_manifest`:
       genesis (`generation = 0`,
       `previous_manifest_hash = [0; 32]`) → chained
       (`generation = prev.generation + 1`,
       `previous_manifest_hash = compute_manifest_hash(prev)`).
-      Ed25519 over canonical CBOR, AEAD-sealed under
+      Hybrid Ed25519 + ML-DSA-65 over canonical CBOR, AEAD-sealed under
       `K_backup_manifest` with `device_id` mixed into the AAD for
       device attribution.)
 - [x] iOS iCloud backup sink.
@@ -1122,7 +1122,7 @@ Checklist:
 - [x] Manifest chain verification on restore.
       (`crates/core/src/restore/manifest_verifier.rs::verify_manifest_chain`:
       walks `manifests[0..]` from genesis to latest, verifies
-      every Ed25519 signature via
+      both the Ed25519 and ML-DSA-65 legs of every hybrid signature via
       `formats::manifest::verify_backup_manifest`, enforces
       `manifests[0].previous_manifest_hash == GENESIS_PREVIOUS_HASH`
       and `manifests[n].previous_manifest_hash ==
@@ -1534,7 +1534,7 @@ Notes:
 
 ## Phase 6: Media and Semantic Search
 
-**Status**: `In progress | ~92%`
+**Status**: `In progress | ~95%`
 
 **Goal**: On-device ML for OCR, image / video / audio search, and
 semantic text search — all multilingual.
@@ -1806,7 +1806,7 @@ Notes:
 
 ## Phase 7: Desktop + Optimization
 
-**Status**: `In progress | ~80%`
+**Status**: `In progress | ~85%`
 
 **Goal**: Production-ready performance, desktop integration, and an
 explicit failure-test matrix.
@@ -2019,7 +2019,7 @@ Checklist:
       migration executor at scale by draining iCloud into
       Google Drive. Run with
       `cargo test --test media_sink_stress -- --ignored`.)_
-- [x] **Failure test suite**, 8 of 8 passing
+- [x] **Failure test suite**, 14 of 14 passing
       (`crates/core/tests/failure_scenarios.rs`):
       - [x] chunk upload interrupted
             (`chunk_upload_interrupted_then_resumed_succeeds`)
@@ -2044,6 +2044,18 @@ Checklist:
             (`manifest_chain_break_returns_chain_break_with_expected_and_actual`,
             plus the deepest-link variant
             `manifest_chain_break_at_deepest_generation_reports_correct_link`)
+      - [x] eviction-vs-backup contention
+            (`concurrent_backup_and_eviction_does_not_corrupt`)
+      - [x] missing epoch keys
+            (`restore_with_missing_epoch_key_degrades_gracefully`)
+      - [x] search-during-restore partials
+            (`search_during_active_restore_returns_partial_results`)
+      - [x] expired media auth tokens
+            (`media_rehydration_with_expired_auth_token_retries`)
+      - [x] archive network partition resume
+            (`archive_upload_with_network_partition_resumes`)
+      - [x] shard cache corruption detection
+            (`shard_cache_corruption_detected_and_evicted`)
 
 **Decision gate**: Production-ready performance on the target
 device matrix. Full failure test suite passes on every platform.
