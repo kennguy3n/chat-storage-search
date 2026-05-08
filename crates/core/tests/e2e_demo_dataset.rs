@@ -113,7 +113,10 @@ pub const DEFAULT_MEDIA_COUNT: usize = 20;
 /// Three-month span lands message timestamps in `2026-04`,
 /// `2026-05`, and `2026-06` so the archive partitioner produces
 /// at least three buckets.
-pub const DATASET_START_MS: i64 = 20_545 * 86_400 * 1_000;
+///
+/// `20_544` is the Unix day count of `2026-04-01 00:00:00 UTC`
+/// (verified against `chrono::DateTime::from_timestamp`).
+pub const DATASET_START_MS: i64 = 20_544 * 86_400 * 1_000;
 /// Three months in milliseconds — 90 days × 86_400 s × 1_000 ms.
 pub const DATASET_SPAN_MS: i64 = 90 * 86_400 * 1_000;
 
