@@ -29,6 +29,22 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+  # Comprehensive end-to-end demo — exercises the full pipeline
+  # (ingest → FTS / fuzzy / structured search → archive →
+  # backup → manifest verification → skeleton-first restore →
+  # search-after-restore → storage-budget enforcement) against a
+  # 200-message multilingual corpus. See `docs/PROGRESS.md`'s
+  # 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  e2e-demo:
+    name: E2E Demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: E2E Demo
+        run: cargo test --test e2e_demo --verbose
+
   # Phase 0+ : cross-language interop check via the Go vector
   # generator. Uses a local replace to the zk-object-fabric SDK on
   # CI nodes that have the sibling repo available; on a fresh
