@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-05-08",
+  "platform": "development-vm",
+  "results": {
+    "insert_text_message_us": { "p50_us": 130, "p95_us": 204, "p99_us": 251, "samples": 1000 },
+    "fts_search_1k_us": { "p50_us": 423, "p95_us": 465, "p99_us": 498, "samples": 1000 },
+    "fuzzy_search_1k_us": { "p50_us": 234, "p95_us": 264, "p99_us": 326, "samples": 1000 },
+    "backup_segment_build_us": { "p50_us": 1017, "p95_us": 1929, "p99_us": 1929, "samples": 10 },
+    "archive_round_trip_us": { "p50_us": 946, "p95_us": 1050, "p99_us": 1050, "samples": 10 },
+    "restore_pipeline_us": { "p50_us": 1089, "p95_us": 1118, "p99_us": 1118, "samples": 10 }
+  }
+}

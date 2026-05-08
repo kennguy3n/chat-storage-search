@@ -3,7 +3,7 @@
 - **Project**: KChat Storage & Search — Rust Core
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 — Local Store + Text Search + MLS Integration (`In progress | ~96%`). Phase 2 — Media Encryption and Blob Service (`In progress | ~98%`, `HttpTransportClient` (feature-gated) lands the production HTTP transport with retry + timeout + auth-header coverage). Phase 3 — Personal Archive and Offload (`In progress | ~99%`, iCloud + Google Drive bridge wrappers added in ios-bridge / android-bridge). Phase 4 — Backup and Restore (`In progress | ~90%`). Phase 5 — Search (Fuzzy + Encrypted Shards) (`In progress | ~98%`, p95 latency gate hit across multilingual / large-bucket / multi-shard scenarios + `DeviceMatrixConfig` per-platform budgets). Phase 6 — Media and Semantic Search (`In progress | ~95%`, desktop ONNX EP wiring complete — `create_xlmr_session_with_ep` / `create_mobileclip_session_with_ep` + `EpFallbackChain::select_first_available` + `DesktopMlEpSelector::create_desktop_session`). Phase 7 — Desktop + Optimization (`In progress | ~85%`, Spotlight / Windows Search bridge surface complete + perf p95 dashboard with `PerfSummary` / `PerfBudget` + EP benchmark capture-cache-auto-selection + media migration auto-scheduled after eviction + dedup analytics with real `ZkofDedupAnalytics` + 6 large-scale + 6 edge-case stress tests + media-sink stress with real iCloud/Drive bridges). Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`, parallel bucket fetch via `std::thread::scope` + progressive `SearchEvent` streaming API surfaced through iOS / Android bridges).
-- **Last updated**: 2026-05-05
+- **Last updated**: 2026-05-08
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -2118,6 +2118,78 @@ Phase 8 prefetch order has been updated: `[Bloom, Text, Fuzzy, Vector, Media]`. 
 
 ## Changelog
 
+### 2026-05-08 — E2E demo, benchmark baseline, doc audit
+
+Lands a comprehensive end-to-end demo test
+(`crates/core/tests/e2e_demo.rs`) that exercises the full
+pipeline against a 200-message multilingual corpus drawn from
+twelve scripts (English, Russian, Chinese, Japanese, Arabic,
+Thai, Hindi, Korean, Vietnamese, German, French, mixed-script)
+and a five-conversation, twenty-media-asset, three-month
+dataset:
+
+1. `CoreImpl` initialization with in-memory SQLCipher,
+2. seed five conversations,
+3. ingest the 200-message corpus + media descriptors,
+4. FTS search with `SearchScope::LocalOnly` covering ≥ 2/3 of
+   scripts (Thai / Khmer have no whitespace word boundaries so
+   the fuzzy engine backstops the long tail),
+5. fuzzy search with deliberate typos,
+6. structured search by sender / date range / conversation /
+   content kind,
+7. archive segment build + decrypt round-trip via
+   `ArchiveEventJournal::read_unsegmented` →
+   `ArchiveSegmentBuilder::group_events_by_bucket`,
+8. backup segment + 2-generation manifest chain via
+   `BackupSegmentBuilder` + `build_backup_manifest` with
+   `HybridSigningKey`,
+9. `verify_manifest_chain` over the 2-generation chain,
+10. skeleton-first restore against a fresh in-memory DB
+    (`IdentityRestored` → `RootKeysUnwrapped` →
+    `ManifestVerified` → `FullRestoreComplete`),
+11. search-after-restore re-running every query and asserting
+    matching hit counts,
+12. `StorageBudgetEnforcer` at `Critical` pressure with
+    eviction-count assertions.
+
+Each step is wrapped in `std::time::Instant`; the test prints
+a structured summary to stdout (step name, duration, key
+metrics — message count, hit count, segment count, eviction
+count). A `#[ignore]` `e2e_demo_large_scale` variant scales
+the same flow to 10 000 messages and 1 000 media assets for
+stress runs.
+
+The dataset generators are extracted into the shared module
+`crates/core/tests/e2e_demo_dataset.rs`
+(`generate_demo_conversations`, `generate_demo_messages`,
+`generate_demo_media_assets`) so the demo test and the new
+benchmark test share one corpus shape. The module is
+`#[path]`-included into both consumers.
+
+Adds `crates/core/tests/benchmark_baseline.rs` — a
+`#[ignore]` benchmark sweep that captures `p50`, `p95`, `p99`
+microsecond latencies for single-message insert (1 000
+iterations), FTS / fuzzy search over a 1 000-message corpus
+(1 000 iterations each), backup segment build + seal, archive
+segment build + decrypt round-trip, and end-to-end restore
+pipeline (10 iterations each). Output is hand-rolled JSON
+(no `serde_json` dev-dep) emitted both to stdout and to
+`tests/benchmark_results.json` (configurable via the
+`E2E_BENCHMARK_OUTPUT` env var); the file is committed to
+the repo so the next benchmark pass has a baseline to diff
+against.
+
+Documentation audit follow-up (continuation of the 2026-05-05
+cleanup pass): `Last updated` bumped from 2026-05-05 to
+2026-05-08; the new changelog entry above lands at the top of
+the changelog section. No further percentage / `[~]` /
+hybrid-signing / Phase-range residuals were found in the
+final grep pass.
+
+CI pipeline (`.github/workflows/ci.yml`) gains a dedicated
+`e2e-demo` job (`cargo test --test e2e_demo --verbose`) so
+the comprehensive flow gates every PR.
+
 ### 2026-05-05 — PQC hybrid manifest signing (Phase 0)
 
 Manifest signing migrates from pure Ed25519 to **hybrid Ed25519 +
@@ -3763,8 +3835,8 @@ and skeleton-first restore pipeline.
    `IdentityRestored`; backwards / skip transitions error.
 9. **Manifest chain verifier**
    (`crates/core/src/restore/manifest_verifier.rs`): walks the
-   manifest chain from genesis to the latest, verifying every
-   Ed25519 signature and the
+   manifest chain from genesis to the latest, verifying both
+   legs of every hybrid Ed25519 + ML-DSA-65 signature and the
    `previous_manifest_hash == compute_manifest_hash(prev)`
    invariant. Returns structured `EmptyChain` /
    `SignatureInvalid { generation }` /
