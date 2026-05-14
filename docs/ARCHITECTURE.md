@@ -87,311 +87,39 @@ goes through the FFI bridge for the host platform.
 
 ## 2. Crate Structure
 
-> **Phase 0 closed; Phase 1 in flight (~96%); Phase 2 in flight
-> (~98%, `HttpTransportClient` (feature-gated `http-transport`)
-> lands the production HTTP transport with retry + timeout +
-> auth-header coverage); Phase 3 in flight (~99%, iCloud +
-> Google Drive bridge wrappers in ios-bridge / android-bridge);
-> Phase 4 in flight (~90%);
-> Phase 5 in flight (~98%, cold-shard fetch + restore + p95
-> latency gate across multilingual / large-bucket / multi-shard
-> scenarios + per-platform `DeviceMatrixConfig` budgets);
-> Phase 6 in flight (~95%, ML inference seams for XLM-R /
-> MobileCLIP-S2 / Whisper / DocumentExtractor /
-> VideoKeyframeSampler + on-device reranker with raw
-> `semantic_score` + INT4 quantization selection + INT4
-> encode/decode codec + criterion bench scaffold + desktop
-> ONNX EP wiring — `create_xlmr_session_with_ep` /
-> `create_mobileclip_session_with_ep` +
-> `EpFallbackChain::select_first_available` +
-> `DesktopMlEpSelector::create_desktop_session`); Phase 7 in
-> flight (~85%, failure suite at 14 of 14 + offline detector +
-> perf p95 dashboard with `PerfSummary` / `PerfBudget` +
-> hot-path coverage spanning `hydrate_message`,
-> `run_incremental_backup`, `compact_archive`,
-> `restore_from_backup` + Spotlight / Windows Search Rust API
-> surface complete + EP benchmark capture-cache-auto-selection
-> + media migration auto-scheduled after eviction +
-> `ZkofDedupAnalytics` real wiring with backup / media sinks
-> recording `DedupEvent`s + 6 large-scale stress tests + 6
-> edge-case scenarios + media-sink stress with real iCloud /
-> Google Drive bridges); Phase 8 in flight
-> (~98%, multi-scope / multi-tenant search foundation —
-> conversation hierarchy columns + indexes,
-> `archive_segment_map.tenant_id`, `SearchTarget` enum + scope
-> resolver wired through `QueryEngine`, `IndexType::Bloom`
-> shard type with `K_bloom_index_shard` derivation, prefetch
-> order updated to `[Bloom, Text, Fuzzy, Vector, Media]`,
-> bucket-level date pruning (`bucket_overlaps_date_range`),
-> bloom-filter precheck in the cold fan-out
-> (`ColdShardSource::fetch_bloom_shard`), on-device decrypted
-> LRU shard cache (`crates/core/src/search/shard_cache.rs`,
-> default 50 MB) with idle-time `warm_shard_cache` warmer +
-> `ResourceGate::should_warm_shards` + scheduler
-> `TaskType::ShardCacheWarming`, B2B per-tenant key derivation
-> (`derive_b2b_tenant_root` / `derive_b2b_archive_epoch` /
-> `derive_b2b_text_index_shard`), `TenantSearchPolicy` config +
-> enforcement, scope-proportional cover-traffic padding
-> (`compute_scope_padding_multiplier`), Android / iOS bridge
-> surface for `SearchTarget` (Android JNI
-> `search_with_target` + iOS UDL `SearchTarget` enum + optional
-> `target` on `SearchQuery`), Phase 8 latency benchmarks at
-> `crates/core/benches/phase8_benchmarks.rs`, and Phase 8
-> integration tests at
-> `crates/core/tests/phase8_multi_scope_search.rs`; this batch
-> closes the last two items — parallel bucket fetch via
-> `std::thread::scope` over `KChatCoreConfig::max_cold_fetch_concurrency`
-> chunks, and the progressive `SearchEvent::{LocalResults,
-> ColdBucketComplete, SearchComplete}` streaming API surfaced
-> through iOS / Android `SearchEventListener` callbacks; see
-> PHASES.md Phase 8).** Updates vs.
-> the original target structure below:
->
-> * `crates/core/src/formats/` is a **Phase-0 addition** for the
->   CBOR wire-format types (segment frames, manifest spec, media
->   descriptor, search index shard). It was not shown in the
->   original target structure but is required by the Phase 0
->   checklist; the formats need to exist in code before the
->   higher-level engines (`archive`, `backup`, `search`, `restore`)
->   that consume them.
-> * `crates/core/src/crypto/key_wrap.rs` is **implemented**
->   (AES-256-KW per RFC 3394) and is no longer a stub. The
->   platform-specific wraps for `K_local_db` (Keychain / Keystore /
->   DPAPI) still arrive in Phase 1; they layer on top of the same
->   `wrap_key` / `unwrap_key` primitives.
-> * `crates/core/src/search/tokenizer.rs` is the **Phase-0 closing**
->   multilingual tokenization spec: `TokenizerConfig`,
->   `FallbackMode::{Icu, Unicode61}`, ISO-15924 `ScriptClass`, the
->   `FuzzyGranularity` mapping, and `detect_script` /
->   `segment_by_script` for mixed-script runs.
-> * `crates/core/src/local_store/schema.rs` is the **Phase-1
->   foundation** for the SQLCipher schema: typed Rust row structs
->   for every table in §4 plus the `SCHEMA_SQL` constant carrying
->   the `CREATE TABLE` / `CREATE VIRTUAL TABLE` statements.
-> * `crates/core/src/local_store/db.rs` is the **Phase-1 SQLCipher
->   binding**: `LocalStoreDb` opens / creates `{data_dir}/kchat.db`
->   (or an `:memory:` database for tests), sets `PRAGMA key` from
->   the 32-byte `K_local_db`, enables foreign-key enforcement, and
->   runs `SCHEMA_SQL` with automatic detection of the FTS5 ICU
->   tokenizer plus `unicode61` fallback via
->   `create_schema_with_unicode61_fallback()`. CRUD helpers cover
->   conversation / skeleton / body / `update_body_state` /
->   `insert_backup_event`. SQLCipher itself is bundled by
->   `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature so
->   the workspace builds and tests without a system SQLCipher /
->   OpenSSL install. Platform-specific wrapping of `K_local_db`
->   (Keychain / Keystore / DPAPI) is still stubbed and lands later
->   in Phase 1 alongside the production UniFFI / JNI packaging.
->   The Phase-1 **bridge scaffolds** themselves are already in
->   tree: `crates/ios-bridge/` carries the UDL at
->   `src/kchat.udl`, a `build.rs` that calls
->   `uniffi::generate_scaffolding`, and FFI-shaped wrappers
->   around `CoreImpl` (UUIDs cross the FFI as canonical
->   strings; argument validation throws
->   `KChatError::InvalidArgument`).
->   `crates/android-bridge/` carries the
->   `Java_com_kchat_core_KChatBridge_*` JNI entry points
->   (`initialize`, `destroy`, `sendText`, `search`,
->   `editMessage`, `deleteForMe`, `deleteForEveryone`,
->   `getMessage`, `getConversationMessages`) plus a pure-Rust
->   `KChatBridgeHandle` so unit tests exercise the same code
->   paths without a JNIEnv. Errors throw
->   `com.kchat.core.KChatException`; `MessageView` /
->   `SearchResult` batches marshal as JSON for brevity.
-> * `crates/core/src/local_store/state_machines.rs` defines the
->   `body_state`, `media_state`, `archive_state`, `backup_state`,
->   and `restore_state` enums with `try_transition`, `Display` /
->   `FromStr`, and serde support — every transition not in the
->   diagrams in §5 is rejected.
-> * `crates/core/src/message/processor.rs` carries the **Phase-1
->   message processor**: `IngestedMessage`, `OutboxEntry`,
->   `OutboxStatus`, `IngestResult`, the pure validators
->   (`validate_ingest`, `is_duplicate`, `create_outbox_entry`),
->   and the DB-backed `MessagePersister` that wraps skeleton +
->   body + FTS row + `"message_received"` /
->   `"outbox_pending"` / `"outbox_sent"` /
->   `"message_edited"` / `"message_deleted"` journal writes
->   inside one `SAVEPOINT` so a crash mid-ingest cannot leave
->   the FTS index out of sync with the skeleton table.
->   `edit_message`, `delete_for_me`, and `delete_for_everyone`
->   call `try_transition` on `body_state` from §5 before
->   touching the FTS / body rows, and the for-everyone path
->   drops `message_body` in addition to clearing the FTS row.
-> * `crates/core/src/search/text_search.rs` is the **Phase-1 FTS5
->   text search engine**: `TextSearchEngine::search_fts` runs
->   `bm25(search_fts)`-ordered queries returning
->   `FtsMatch { message_id, conversation_id, sender_id,
->   created_at_ms, snippet, bm25_score }`. `build_fts_query`
->   quotes free-text tokens token-by-token while preserving
->   `"phrase"` and trailing-`*` prefix queries plus the explicit
->   `AND` / `OR` / `NOT` / `NEAR` operators.
-> * `crates/core/src/search/query_engine.rs` is the **Phase-1
->   unified search engine**: `QueryEngine::execute_search` fans
->   out to both `TextSearchEngine::search_fts` and
->   `FuzzySearchEngine::search_fuzzy`, deduplicates the union by
->   `message_id`, and weights the merged scores with
->   `BM25_WEIGHT = 2.0` / `FUZZY_WEIGHT = 1.0` per
->   `docs/PROPOSAL.md §7.5` so exact hits always outrank
->   fuzzy-only hits on the same query. Fuzzy-only rows are
->   skeleton-hydrated through one
->   `fetch_skeleton_basic_info()` batch query so the engine
->   does not pay one round-trip per fuzzy hit. The same
->   structured `WHERE` clause on `message_skeleton`
->   (`sender_filter`, `conversation_filter`, `date_from` /
->   `date_to`, `content_kind`) filters both engine outputs via
->   the unified `allowed_skeleton_ids()` helper. The result is
->   mapped to `SearchResult { snippet, rank_score, is_cold }`
->   and short-circuits to a recency-ordered skeleton scan when
->   the query string is empty. `SearchScope::LocalOnly` is
->   honored — no archive fan-out attempts in Phase 1.
-> * `crates/core/src/search/fuzzy_search.rs` is the **early
->   Phase-5 foundation** for the fuzzy index, now wired into the
->   Phase-1 hot path. `FuzzyTokenizer` splits text into
->   per-script runs via `segment_by_script` and emits trigrams
->   or bigrams per `fuzzy_granularity(script)` from §3 of
->   `docs/PROPOSAL.md`. Tokens are lowercased for
->   case-insensitive matching and never straddle ASCII
->   whitespace / punctuation / digit boundaries.
->   `FuzzySearchEngine` writes into the `search_fuzzy` table
->   (`message_id`, `token`, `script`) with `INSERT OR IGNORE`
->   semantics, supports `remove_message`, and ranks
->   `search_fuzzy` results by token-overlap ratio.
->   `MessagePersister` (above) calls `index_message` from
->   `persist_ingested_message` / `persist_outbox_entry`,
->   `remove_message` + `index_message` from `edit_message`, and
->   `remove_message` from `delete_for_me` /
->   `delete_for_everyone` so the FTS5 and fuzzy indexes stay in
->   lock-step on every body mutation. The encrypted-shard /
->   archive fan-out path arrives later in Phase 5.
-> * `crates/core/src/core_impl.rs` is the **Phase-1 concrete
->   `KChatCore` implementation**. `CoreImpl::new(config, key)`
->   opens the SQLCipher store, retains the 32-byte
->   `K_local_db` in a `Zeroizing<[u8; 32]>` so
->   `initialize(new_config)` can re-open at a different
->   `data_dir`, and stores the `LocalStoreDb` behind a `Mutex`
->   so the trait's `&self` API stays sync. `send_text` mints
->   an `OutboxEntry` through `MessageProcessor::create_outbox_entry`
->   and persists it via
->   `MessagePersister::persist_outbox_entry`;
->   `edit_message`, `delete_for_me`, and `delete_for_everyone`
->   lock the db mutex and delegate to `MessagePersister` so
->   the trait surfaces the full local message lifecycle.
->   `get_message` and `get_conversation_messages` delegate to
->   `LocalStoreDb::get_message_with_body` and
->   `LocalStoreDb::get_conversation_messages` and re-shape the
->   rows into the public `MessageView` (skeleton fields plus
->   the optional decrypted body text) so the bindings never
->   leak the internal schema. `search` delegates to
->   `QueryEngine::execute_search`. The transport-driven
->   `ingest_remote_messages` is now wired against an injected
->   `Box<dyn DeliveryClient>` held in
->   `Mutex<Option<…>>`: `CoreImpl::with_transport(config, key,
->   client)` and the alternate `set_delivery_client(client)`
->   install the implementation; the trait method calls
->   `fetch_messages(conversation_id, after_cursor)`, converts
->   each `RawDeliveryMessage` into `IngestedMessage` (parsing
->   ids back to `Uuid`), and forwards into the existing
->   `ingest_messages` pipeline so deduplication / FTS / fuzzy
->   / journal writes are unchanged. The transport's
->   `next_cursor` is propagated end-to-end through the
->   `IngestResult.next_cursor: Option<String>` field so
->   bridge layers can drive paginated drains directly off
->   the result without poking at the transport mock; the
->   inherent `CoreImpl::ingest_messages(&[IngestedMessage])`
->   path leaves the field as `None` because it has no
->   transport context. When no transport is configured the
->   trait method returns
->   `Err(Error::Transport("no delivery client configured"))`
->   so callers fail fast instead of silently no-oping.
->   Inherent **conversation-management methods**
->   (`create_conversation`, `list_conversations`,
->   `get_conversation`, `update_conversation_pin`,
->   `update_conversation_mute`) wrap the matching helpers on
->   `LocalStoreDb` and surface `Error::Storage` when the
->   conversation does not exist so the bridge layer can show
->   the failure to the user. The trait now also exposes
->   **`delete_conversation(uuid)`** so bridge clients can drive
->   the cascade through the public API; it cascades through
->   every dependent row (`media_search_index` → `search_fuzzy`
->   → `search_fts` → `search_vector` → `media_asset` →
->   `message_body` → `message_skeleton` → `conversation`)
->   inside a single `SAVEPOINT`, leaving sibling conversations
->   untouched. The ordering is dictated by the schema's
->   foreign-key direction: `media_search_index.asset_id`
->   references `media_asset(asset_id)` and
->   `media_asset.message_id` references
->   `message_skeleton(message_id)`, so both must drain
->   top-down before the skeleton delete runs;
->   `search_vector` carries no FK but the rows are
->   message-scoped and never want to outlive the skeleton.
->   The trait also carries a Phase-1 stub
->   **`register_device(&str) -> Result<DeviceRegistration>`**
->   that returns
->   `Err(Error::NotImplemented("register_device"))` until the
->   MLS credential / KeyPackage publication pipeline lands;
->   the empty `DeviceRegistration` placeholder lives next to
->   the other Phase-1 placeholder result types in
->   `crates/core/src/lib.rs` so the FFI shape is stable.
->   Inherent **timeline + single-message helpers**
->   (`get_timeline(uuid, before_ms, limit)` for newest-first
->   `TimelineRow` pages, plus `get_message_with_body(uuid)`
->   and `get_message_body(uuid)` for the binding hydration
->   path) wrap the matching DB helpers without re-shaping
->   through `MessageView`. The Phase-2/3/4 trait methods
->   `send_media`, `hydrate_message`, `run_incremental_backup`,
->   `enforce_storage_budget`, and `restore_from_backup`
->   currently return `Err(Error::NotImplemented(<method>))` —
->   the surface is locked but the implementation lands with
->   the relevant later phase.
-> * `crates/core/src/transport/mod.rs` is the **Phase-1
->   transport trait abstraction**. The module exposes two
->   layered traits. The narrower `DeliveryClient` (object-safe,
->   `Send + Sync`) drives `ingest_remote_messages` today via
->   `FetchResult { messages, next_cursor }`, the
->   string-typed `RawDeliveryMessage` wire shape, and
->   `TransportError { Network, Auth, Server }` with
->   `thiserror`-derived `Display` so upper layers can route
->   on intent without parsing free-form text. A test-only
->   `MockDeliveryClient` stages FIFO
->   `(after_cursor → response)` mappings and asserts —
->   inside `fetch_messages` — that the actual `after_cursor`
->   matches the staged one, which is how the
->   `core_impl::core_impl_ingest_remote_passes_cursor` test
->   pins the cursor pass-through. The broader
->   `TransportClient` is the §10 surface that the
->   later-phase engines (`media`, `archive`, `backup`,
->   search-shard fetch) will share: cursor-paginated
->   `fetch_messages` returning `FetchMessagesResponse`,
->   chunked blob upload (`init_blob_upload` →
->   `upload_chunk` → `commit_blob`) with whole-object Merkle
->   verification through `BlobUploadHandle` / `ChunkReceipt`
->   / `CommitBlobResponse`, ranged blob download
->   (`fetch_blob_range`), Personal-Archive manifest +
->   segment fetch (`fetch_archive_manifests` returning
->   `EncryptedManifest`, `fetch_archive_segment` returning
->   ciphertext bytes), and encrypted-search-shard fetch
->   (`fetch_index_shards`). The `BlobClass` enum
->   (`Media`, `ArchiveSegment`, `SearchIndexShard`,
->   `BackupSegment`, `Manifest`) is shared with the AEAD
->   AAD tag in `crypto::aead`, so the wire-level binding
->   and the transport-level upload argument can never
->   disagree. A `NoopTransportClient` returns
->   `Error::NotImplemented("transport")` from every method
->   so `CoreImpl` can be constructed without a real backend
->   until Phase 2 lands. The Phase-2+ HTTP / gRPC / MLS-blob
->   transports layer on top of these traits in sibling
->   sub-modules added when those engines arrive.
-> * `crates/core/benches/phase1_benchmarks.rs` is the **Phase-1
->   performance benchmark suite** (criterion). Five benches
->   exercise `MessagePersister::persist_ingested_message`
->   (single insert + 100-row batch),
->   `QueryEngine::execute_search` against a 1k-row corpus
->   (single needle, structured filters, prefix queries) so the
->   < 20 ms / < 150 ms p95 budgets in §13 of
->   `docs/PROPOSAL.md` are continuously verifiable.
+The Rust workspace is organized into four crates: one
+platform-agnostic library (`crates/core`) and three thin bridges
+that expose that library to platform code.
 
-The workspace ships four crates: a core that knows nothing about
-platforms, and three thin bridges.
+- `crates/core` is the entire library. It opens the encrypted
+  local SQLCipher database, encrypts and decrypts messages and
+  media, builds backup and archive manifests, runs multilingual
+  search across local and cold-shard data, and speaks to the
+  backend transport. All four-store logic lives here. The crate
+  is platform-free: it does no filesystem path translation, no
+  thread spawning beyond the Tokio runtime injected by callers,
+  and no platform secret storage.
+- `crates/ios-bridge` wraps `crates/core` with a UniFFI surface
+  and emits a Swift package consumed by the iOS app and its
+  extensions. It contains the Keychain wrappers for `K_local_db`
+  and `K_user_master`, the iCloud media-sink bridge, and the
+  background-task scheduler glue.
+- `crates/android-bridge` wraps `crates/core` with JNI bindings
+  and provides an idiomatic Kotlin façade. It contains the
+  Android Keystore wrappers, the Google Drive media-sink bridge,
+  the WorkManager scheduler glue, and the Auto Backup integration.
+- `crates/desktop` consumes `crates/core` directly (no FFI layer)
+  and adds DPAPI-bound key storage on Windows, Keychain bindings
+  on macOS, OS-native search-index surfaces (Spotlight on macOS,
+  Windows Search), and the ONNX execution-provider auto-selector
+  used by on-device ML.
+
+Each crate boundary is enforced at compile time: `crates/core`
+has no platform-specific code paths, and the bridge crates depend
+on `crates/core` but not on each other. The desktop crate uses
+`crates/core` directly because it shares the same Rust runtime;
+the mobile bridges go through FFI because they target Swift and
+Kotlin runtimes.
 
 ```mermaid
 flowchart LR
@@ -466,235 +194,6 @@ flowchart TD
 ciphertext routes through it, and `crypto` itself depends only on
 the standard library and chosen primitives.
 
-> **Phase 0 closed; Phase 1 in flight.** The crypto module
-> implements `content_hash`, `key_hierarchy`, `aead`, `convergent`,
-> and `key_wrap` (AES-256-KW). The platform-specific wrappers
-> (Keychain, Android Keystore, DPAPI) and `K_asset` wrapping for
-> archive / backup land in Phase 1 / Phase 2 and layer on top of
-> the same `wrap_key` / `unwrap_key` primitives.
->
-> Phase 1 has additionally landed the `local_store::schema`,
-> `local_store::db` (SQLCipher binding + CRUD helpers + the
-> conversation-management helpers `list_conversations` /
-> `update_conversation_pin` / `update_conversation_mute`),
-> `local_store::state_machines`, `message::processor` (validators
-> *and* DB-backed `MessagePersister` that now indexes both
-> `search_fts` and `search_fuzzy` on every body mutation
-> through edit / delete),
-> `search::tokenizer`, `search::text_search` (FTS5 BM25 engine),
-> `search::query_engine` (unified FTS + fuzzy + structured
-> search merged by `message_id` with PROPOSAL.md §7.5 weights),
-> and the early-Phase-5 `search::fuzzy_search` (script-aware
-> n-gram indexer) modules, plus the expanded `KChatCore`
-> public-API trait in `lib.rs` (`SearchQuery`, `SearchScope`,
-> `SearchResult`, `HydrationReason`, `BackupReason`,
-> `StoragePressureReason`, `ClientMessageId`, `DeliveryCursor`,
-> the new placeholder result types `HydratedMessage` /
-> `BackupResult` / `OffloadResult` / `RestoreResult` /
-> `BackupSource`, and `Error::NotImplemented(&'static str)`)
-> and its concrete implementation `core_impl::CoreImpl` wiring
-> `send_text` / `ingest_messages` / `search` to the SQLCipher
-> store, exposing inherent conversation-management methods
-> (`create_conversation` / `list_conversations` /
-> `get_conversation` / `update_conversation_pin` /
-> `update_conversation_mute`), and stubbing the Phase-2/3/4
-> trait methods (`send_media` / `hydrate_message` /
-> `run_incremental_backup` / `enforce_storage_budget` /
-> `restore_from_backup`) with `Error::NotImplemented`. A
-> criterion benchmark suite at
-> `crates/core/benches/phase1_benchmarks.rs` enforces the
-> < 20 ms / < 150 ms p95 budgets from §13 of
-> `docs/PROPOSAL.md`.
->
-> Phase 2 has now started filling `crates/core/src/media/`. It
-> is no longer a pure placeholder: in addition to the
-> tiered-media routing seam under `media/sinks/`
-> (`MediaBlobSink` trait + `NoopMediaBlobSink`, see PROPOSAL.md
-> §5.7) the module now carries the chunked-media pipeline at
-> `media/chunker.rs` (`chunk_and_encrypt`, `verify_and_decrypt`,
-> `pad_to_size_class` / `unpad_from_size_class`, the
-> `SealedChunk` / `ChunkedMedia` pair, `DEFAULT_CHUNK_SIZE`),
-> `media/processor.rs` (`process_media` →
-> `MediaProcessResult { descriptor, sealed_chunks, k_asset_raw,
-> initial_media_state }` with random `K_asset` generation,
-> AES-256-KW wrap, `MediaDescriptor` assembly, and the
-> `transition_media_state` / `mark_downloaded` /
-> `mark_evicted` / `mark_deleted` helpers that drive the
-> `MediaState` machine through `LocalStoreDb::update_media_state`),
-> `media/upload.rs` (`upload_chunked_media` / `resume_upload`
-> over `TransportClient` with server-side BLAKE3 verification),
-> `media/download.rs` (`download_chunked_media` /
-> `download_single_chunk` fetching encrypted chunks via
-> `TransportClient::fetch_blob_range`, per-chunk SHA-256
-> fast-fail, AEAD-open with per-chunk AAD, BLAKE3 root
-> verification), `media/cache.rs` (`MediaCache` with O(1)
-> insert / `touch` / `remove` and LRU eviction to a
-> configurable byte budget), `media/caption.rs`
-> (`normalize_caption`, `sanitize_filename`, `validate_mime_type`
-> with Unicode NFC normalization, filesystem-illegal-char
-> stripping, byte-budget truncation that preserves character
-> boundaries, and full multilingual coverage), and
-> `media/routing.rs` (`route_media_upload` /
-> `route_media_download` dispatching between the KChat backend
-> via `TransportClient` and the configured `MediaBlobSink`
-> based on `is_thumbnail` and `MediaBlobReference::storage_sink`).
->
-> The remaining higher-level modules (`backup`, `restore`,
-> `transport`, `scheduler`) are Phase-0 placeholders
-> and are filled in across Phases 3 – 7. `transport` is
-> partially populated by Phase 1 (`DeliveryClient` /
-> `TransportClient` traits, `NoopTransportClient`,
-> `MockDeliveryClient`).
->
-> The Phase-6 `models` module is no longer a placeholder: it
-> hosts the on-device ML seam surface that the platform bridges
-> wire actual inference into. See §11 for the full surface, but
-> in brief:
-> `models::embeddings` (the `TextEmbedder` trait + the
-> shared `EmbeddingCache` / `LocalStoreEmbeddingCache` keyed
-> `(message_id, model_version)` and the INT8 codec used for
-> on-disk storage), `models::embeddings_onnx` (ONNX Runtime
-> session lifecycle + EP-selection state machine, gated behind
-> `#[cfg(feature = "onnx-runtime")]`), `models::clip` (the
-> `ImageEmbedder` trait + MobileCLIP-S2 constants),
-> `models::ocr` (the `OcrBridge` trait — platform OCR is the
-> Vision / ML Kit / Windows.Media.Ocr backend implementing this
-> seam), `models::resource_gate` (battery / thermal / charging /
-> network policy with a `ResourceProbe` trait so the host
-> platform supplies the live readings), and
-> `models::model_manager` (the on-disk artifact lifecycle:
-> register / ensure / verify / list / delete plus the
-> `ModelDownloader` trait that isolates HTTP from the core).
->
-> The Phase 3 modules `archive` and `offload` are no longer
-> placeholders: `archive::event_journal` (append-only mutation
-> log feeding the segment builder; **wired into
-> `MessagePersister`** so every persist / edit / delete path and
-> `CoreImpl::send_media` writes a matching `ArchiveEvent` inside
-> the existing SAVEPOINT alongside the `BackupEvent`),
-> `archive::segment_builder` (CBOR → zstd → XChaCha20-Poly1305
-> sealed segments under `K_archive_segment(segment_id)`),
-> `archive::manifest_builder` (genesis → gen N chain, BLAKE3 over
-> canonical-CBOR signing payload, hybrid Ed25519 + ML-DSA-65
-> signature, AEAD-seal under `K_archive_manifest`),
-> `archive::upload`
-> (`upload_archive_segment` drives the `TransportClient` upload
-> sequence and verifies the commit-time ciphertext Merkle root;
-> `persist_segment_map_row` records the resulting blob in
-> `archive_segment_map`), `archive::prefetch::batch_prefetch_bucket`
-> (one transport hop per `(conversation_id, time_bucket)` per
-> PROPOSAL §5.6), `archive::prefetch::batch_prefetch_bucket_with_padding`
-> (the privacy-aware variant — interleaves UUIDv4 dummy
-> segment-ids with the real UUIDv7 ones when
-> `KChatCoreConfig::privacy_level == High`),
-> `archive::epoch_keys::EpochKeyManager` (current epoch key in
-> `Zeroizing<[u8; 32]>` plus a registry of prior epoch keys
-> wrapped via AES-256-KW under `K_archive_root` for cross-epoch
-> segment decrypt; `rotate(new_epoch_id)` /
-> `unwrap_prior_epoch_key` / `delete_epoch_key(epoch_id)` cover
-> the lifecycle including forward-secrecy deletion),
-> `archive::routing::{route_archive_upload, route_archive_download,
-> route_manifest_upload}` (dispatches archive operations to
-> either the `TransportClient` or a `ZkofArchiveAdapter` based
-> on `KChatCoreConfig::archive_backend`; the ZKOF adapter is
-> backed by an `S3Client` trait with a `NoopS3Client` stub),
-> `archive::download::{download_archive_segment,
-> decrypt_archive_segment, decode_archive_segment_payload,
-> fetch_and_decrypt_segment}` (mirrors the inverse of
-> `segment_builder` — XChaCha20-Poly1305 open + zstd decompress
-> + CBOR decode — and is consumed by
-> `CoreImpl::rehydrate_timeline_skeletons` to land archive-only
-> stub skeletons on scroll-back),
-> `archive::privacy::{should_pad, compute_padding_count,
-> generate_dummy_segment_id, pad_with_dummy_requests}`
-> (privacy-padding helpers consumed by the prefetch path),
-> `local_store::db::update_archive_state` (atomic batch UPDATE
-> gated by `ArchiveState::try_transition`),
-> `local_store::db::rehydrate_message_body` (in-place body update
-> + `body_state` transition + FTS / fuzzy re-indexing inside one
-> SAVEPOINT, no `created_at_ms` / `received_at_ms` mutation, so
-> the timeline never scroll-jumps when a cold body lands),
-> `media::download::rehydrate_media_asset` (reads
-> `media_asset.{blob_id, storage_sink, chunk_count, merkle_root,
-> wrapped_k_asset}`, unwraps `K_asset` via `K_local_db`, drives
-> the chunked download through `TransportClient` or the
-> configured `MediaBlobSink` based on `storage_sink`, and flips
-> `media_state` to `original_local`), `media::sinks::zk_fabric`
-> (`ZkObjectFabricSink` mapping
-> `upload_media_chunks` / `fetch_media_chunk` /
-> `delete_media_blob` to per-chunk S3 keys
-> `media/{asset_id}/chunk-{idx:08}` against a configured bucket;
-> `MediaBlobReference::metadata` carries
-> `[chunk_count:u32_be][merkle_root:32b][asset_id:utf8]` so the
-> rehydration path can re-derive every chunk key without a
-> second DB round-trip), and `offload::{budget, scoring, eviction,
-> hydration}` (storage budget enforcer, eviction scoring per
-> PROPOSAL §5.4 with a `pinned`-row guard returning `f64::MIN`,
-> pressure-tier-aware eviction planner / executor including the
-> tiered policy `plan_tiered_eviction` (cloud-offload pool first
-> → KChat-backend pool only on shortfall), P0..P5 hydration
-> priority queue). All of this is wired into `CoreImpl`:
-> `enforce_storage_budget` now harvests candidate rows via
-> `collect_eviction_candidates` and runs the tiered eviction
-> planner / executor in two passes (cloud, then full) with the
-> combined `freed_bytes` / `evicted_count` reported back to the
-> caller, and `hydrate_message` enqueues every request into a
-> `Mutex<HydrationQueue>` with the priority mapped from the
-> reason string by `parse_hydration_reason`, calling
-> `LocalStoreDb::rehydrate_message_body` for cold text bodies
-> and `media::download::rehydrate_media_asset` for evicted /
-> remote-only media on the same path. The remote archive fetch
-> path (manifest reader / segment download / replay) is queued
-> for the next Phase 3 milestone.
->
-> The Phase 4 modules `backup` and `restore` are now in tree as
-> well: `backup::event_journal::BackupEventJournal` (typed
-> `BackupEventType` taxonomy + cursor-based drainage; **wired
-> into `MessagePersister`** alongside `ArchiveEventJournal`),
-> `backup::segment_builder::BackupSegmentBuilder` (CBOR → zstd →
-> XChaCha20-Poly1305 seal under
-> `K_backup_segment(K_backup_root, segment_id)` with AAD
-> `KCHAT_BACKUP_SEGMENT_V1 || segment_id || merkle_root`, plus
-> `decrypt_backup_segment` for the restore path),
-> `backup::manifest_builder::build_backup_manifest` (genesis +
-> chained generations → BLAKE3 over canonical-CBOR signing
-> payload → hybrid Ed25519 + ML-DSA-65 signature → AEAD-seal
-> under `K_backup_manifest` with `device_id` mixed into the AAD
-> for
-> device attribution), `backup::compaction` (`CompactionTier`
-> daily → weekly → monthly state machine; deterministic
-> `CompactionPolicy::plan` buckets segments by
-> `(source_tier, week_or_month_bucket)` and applies tombstones
-> via `apply_tombstones` so superseded
-> `MessageDeleted` / `ConversationDeleted` / `MediaDeleted`
-> events do not re-enter the compacted segment),
-> `restore::state_machine::{load, save, transition, reset}` (SQL
-> helpers for the single-row `restore_state` table, layered
-> over the already-defined
-> `local_store::state_machines::RestoreState` enum),
-> `restore::manifest_verifier::verify_manifest_chain` (walks
-> generation 0 → latest, verifies both legs of every hybrid
-> Ed25519 + ML-DSA-65 signature and every `previous_manifest_hash`
-> link, surfaces structured
-> `EmptyChain` / `SignatureInvalid` / `ChainBreak` /
-> `GapDetected` / `GenesisHashNotZero` /
-> `HashComputationFailed` failures), and
-> `restore::pipeline::RestorePipeline` (skeleton-first
-> conversation list → timeline skeletons → search shards
-> placeholder → recent bodies → enable lazy media, persisting a
-> `RestoreState` transition between every step). All of it is
-> bound through `CoreImpl::restore_from_backup`, which now
-> drives the persisted state machine end-to-end to terminal
-> `FullRestoreComplete` instead of returning
-> `Error::NotImplemented`. Phase 3 sink slots also caught up:
-> `media::sinks::icloud::ICloudMediaBlobSink` and
-> `media::sinks::google_drive::GoogleDriveMediaBlobSink` both
-> follow the same `MediaBlobSink` + bridge-trait pattern as
-> `media::sinks::zk_fabric::ZkObjectFabricSink`. Outstanding
-> Phase-4 scope: Android Auto-Backup / SAF strategy, key
-> recovery flows, encrypted search-index shard backup, and the
-> multilingual restore corpus.
-
 ---
 
 ## 3. Four-Store Data Flow
@@ -722,13 +221,13 @@ Backup never feeds the archive directly, and the archive never
 feeds the backup directly. They are independent pipelines reading
 from their own event journals on the local store.
 
-> **Tiered media storage (PROPOSAL.md §5.7).** Media originals may
-> route to user cloud storage (iCloud / Google Drive / ZK Object
-> Fabric) via the `MediaBlobSink` trait instead of the Personal
-> Archive backend. The archive stores only `media_key_delta`
-> segments (the `K_asset` wraps) and thumbnails; the originals are
-> fetched from the user's configured media sink on tap. Thumbnails
-> and archive segments stay on Tier 0; only originals are routed.
+**Tiered media storage.** Media originals may route to user cloud
+storage (iCloud / Google Drive / ZK Object Fabric) via the
+`MediaBlobSink` trait instead of the Personal Archive backend. The
+archive stores only `media_key_delta` segments (the `K_asset`
+wraps) and thumbnails; originals are fetched from the user's
+configured media sink on tap. Thumbnails and archive segments
+stay on Tier 0; only originals are routed. See PROPOSAL.md §5.7.
 
 ---
 
@@ -849,12 +348,6 @@ CREATE TABLE restore_state (
 
 The whole database is a SQLCipher database keyed by `K_local_db`,
 itself wrapped by the platform Keychain / Keystore.
-
-> **Phase 8 extension.** The `conversation` table gains hierarchy
-> columns (`conversation_type`, `scope`, `tenant_id`,
-> `community_id`, `domain_id`) and the `archive_segment_map` table
-> gains a `tenant_id` column for B2B isolation. See PHASES.md
-> Phase 8 and PROPOSAL.md §7.10.
 
 ---
 
@@ -1063,12 +556,6 @@ seam (put/get round-trip with INT8-codec cosine fidelity > 0.999,
 version-mismatch → `None`, two-instance same-connection
 cross-pipeline visibility).
 
-> **Phase 8 extension.** The search pipeline gains multi-scope
-> support (`SearchTarget` replacing `conversation_filter`),
-> bucket-level date pruning, encrypted bloom filter pre-check,
-> on-device shard cache, parallel bucket fetch, and progressive
-> result streaming. See PHASES.md Phase 8 and PROPOSAL.md §7.10.
-
 ### 6.1 Encrypted shard prefetch
 
 When a query needs a shard that is not in the on-device cache, the
@@ -1123,15 +610,13 @@ caller's job to decrypt under the appropriate
 `K_search_root`. This keeps the transport layer ignorant of the
 shard payload format.
 
-### 6.2 Cold-shard search pipeline (Phase 5)
+### 6.2 Cold-shard search pipeline
 
-Cold-bucket search lives behind the
-[`search::query_engine::ColdShardSource`](../crates/core/src/search/query_engine.rs)
-trait. The trait is what lets the
-[`QueryEngine`](../crates/core/src/search/query_engine.rs) fan out
-to offloaded buckets without taking a hard dependency on the
-`TransportClient` — the same code path covers production (real
-network) and tests (in-process mocks).
+Cold-bucket search lives behind the `ColdShardSource` trait. The
+trait lets the query engine fan out to offloaded buckets without
+taking a hard dependency on the transport client — the same code
+path covers production (real network) and tests (in-process
+mocks).
 
 ```mermaid
 flowchart LR
@@ -1181,83 +666,30 @@ pub trait ColdShardSource {
 }
 ```
 
-`cold_buckets` is allowed to consult local state (e.g. join
+`cold_buckets` may consult local state (e.g. join
 `message_skeleton.body_state` against `archive_segment_map.state`)
 to enumerate offloaded `(conversation_id, time_bucket)` pairs.
-The two `fetch_*` methods perform the
-`TransportClient::fetch_index_shards` call and run the
-[`search::shard_builder::restore_text_search_shard`](../crates/core/src/search/shard_builder.rs)
-/ `restore_fuzzy_search_shard` decrypt path under the appropriate
-`K_text_index_shard` / `K_fuzzy_index_shard` (derived from
-`K_search_root`). Implementations return `Ok(Vec::new())` when no
-shard exists for the pair — that is a legitimate "no results"
-signal, not an error — so the query engine can search without
-touching the SQLCipher store.
+The two `fetch_*` methods call the transport layer and run the
+shard-restore decrypt path under the appropriate per-shard key
+derived from `K_search_root`. Implementations return
+`Ok(Vec::new())` when no shard exists for the pair — that is a
+legitimate "no results" signal, not an error — so the query
+engine can search without touching the SQLCipher store.
 
-`QueryEngine::execute_search_with_cold_source` is the entry point
-the platform layer calls when `SearchScope::IncludeCold` is set.
-It runs the local fan-out first, then asks the source for cold
-buckets, decrypts each one, runs FTS5 + fuzzy against the
-in-memory shard, marks every cold hit with `is_cold = true`, and
-merges with local hits before reranking under the §6.3 formula.
-`CoreImpl::search_and_prefetch_cold` in turn enqueues every cold
-hit into the `HydrationQueue` at `HydrationReason::SearchResultTap`
-(P0) priority so the actual body / media chase the search hit on
-tap. End-to-end coverage lives at
-[`crates/core/tests/cold_shard_search.rs`](../crates/core/tests/cold_shard_search.rs).
+The query engine entry point runs the local fan-out first, then
+asks the source for cold buckets, decrypts each one, runs FTS5 +
+fuzzy against the in-memory shard, marks every cold hit with
+`is_cold = true`, and merges with local hits before reranking
+under the §6.3 formula. Cold hits are enqueued into the
+`HydrationQueue` at `SearchResultTap` (P0) priority so the actual
+body / media chase the search hit on tap.
 
-> **Phase 8 optimizations (batch 6 — landed).** The sequential
-> `for (conv, bucket) in buckets` loop now layers four
-> optimizations:
->
-> 1. **Bucket-level date pruning** — `bucket_overlaps_date_range`
->    in `crates/core/src/search/query_engine.rs` parses the
->    `YYYY-MM` bucket grammar into a half-open `[start_ms,
->    end_ms)` window and drops any bucket that doesn't intersect
->    `[SearchQuery::date_from, date_to]`. Malformed bucket
->    strings fall through to "include" so the engine never
->    silently swallows a bucket whose timestamps it cannot
->    reason about; the per-row date filter still has the final
->    say.
-> 2. **Bloom filter pre-check** — for each remaining bucket the
->    cold loop probes the new
->    `ColdShardSource::fetch_bloom_shard` (default `Ok(None)`
->    for back-compat). When the bloom shard advertises that
->    *every* lowercased query token is absent the bucket is
->    skipped before paying for the text/fuzzy fetch + decrypt.
->    Missing bloom shards or transport errors fall through to
->    the full fetch (graceful degradation).
-> 3. **LRU shard cache** — `ShardCache` from
->    `crates/core/src/search/shard_cache.rs` (default 50 MB,
->    `Mutex<Option<ShardCache>>` on `CoreImpl`, mounted via
->    `install_shard_cache`) caches decrypted Bloom / Text /
->    Fuzzy rows keyed by `(conversation_id, time_bucket,
->    IndexType)`. The cache is consulted before each transport
->    fetch and populated after each successful decrypt; a
->    background `warm_shard_cache` warmer pre-fetches recently
->    searched buckets when `ResourceGate::should_warm_shards`
->    reports the device is idle + charging + Wi-Fi
->    (P5 idle / `TaskType::ShardCacheWarming`).
-> 4. **Parallel bucket fetch + progressive streaming** — still
->    deferred to a later batch. The current loop is sequential
->    so `cold_buckets()` ordering is preserved; the only fan-out
->    today is the per-shard `[Bloom, Text, Fuzzy]` ordering
->    inside one bucket.
->
-> See PHASES.md Phase 8 for the per-task checklist.
-
-When the backend returns 404 / `Error::Transport` for a shard
-(offloaded then garbage-collected), the orchestration layer wraps
-the underlying `ColdShardSource` in a graceful-degradation
-adapter that swallows the transport error, returns an empty row
-vector to the query engine, and records the failed
-`(conversation_id, time_bucket, kind)` in a side-channel log so
-the platform layer can render a "search results may be
-incomplete" banner without losing local hits. The
-`search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag`
-failure-suite test pins that contract end-to-end (see
-`GracefulCold` in
-[`crates/core/tests/failure_scenarios.rs`](../crates/core/tests/failure_scenarios.rs)).
+When the backend returns 404 for a shard (offloaded then garbage
+collected), a graceful-degradation adapter wraps the underlying
+`ColdShardSource`. It swallows the transport error, returns an
+empty row vector to the query engine, and records the failure in
+a side-channel log so the platform layer can render a "search
+results may be incomplete" banner without losing local hits.
 
 ### 6.3 Ranking formula (PROPOSAL §7.5)
 
@@ -1401,44 +833,11 @@ flowchart LR
     Wrapped_backup --> Backup
 ```
 
-> Phase 3 inserts the `K_archive_epoch(epoch_id)` indirection
-> between `K_archive_root` and the per-segment / per-manifest
-> keys. `crypto::key_hierarchy` exposes
-> `derive_archive_epoch_key`, `derive_archive_segment_key`,
-> `derive_archive_manifest_key`, and the AES-256-KW pair
-> `wrap_epoch_key` / `unwrap_epoch_key` so the orchestration
-> layer can rotate epochs (default cadence: monthly, matching
-> `time_bucket`) and still recover prior-epoch segment / manifest
-> keys from the wrapped form persisted in the manifest chain.
-
-> **Phase 8 extension (batch 6 — landed).** The key hierarchy
-> gains per-tenant B2B isolation. Three new derivation
-> functions in `crates/core/src/crypto/key_hierarchy.rs`
-> (`derive_b2b_tenant_root`, `derive_b2b_archive_epoch`,
-> `derive_b2b_text_index_shard`) seal each tenant's archive
-> and search subtrees under disjoint info strings
-> (`info::B2B_TENANT_ROOT` / `B2B_ARCHIVE_EPOCH` /
-> `B2B_TEXT_INDEX_SHARD`):
->
-> ```
-> K_user_master
->   ├── K_b2c_archive_root              (personal B2C archive)
->   ├── K_b2b_tenant_root(tenant_id)    (per-tenant B2B archive)
->   │     └── K_b2b_archive_epoch(tenant_id, epoch_id)
->   └── K_search_root
->         ├── K_b2c_text_index_shard(shard_id)
->         ├── K_b2b_text_index_shard(tenant_id, shard_id)
->         └── K_bloom_index_shard(shard_id)
-> ```
->
-> Per-tenant keys allow cryptographic separation of B2B
-> organizational data from personal B2C data — a leaked B2C
-> shard key cannot decrypt a B2B shard with the same
-> `shard_id` and vice-versa. The integration test
-> `b2b_tenant_key_isolation` in
-> `crates/core/tests/phase8_multi_scope_search.rs` exercises
-> the cross-tenant decrypt-rejection contract end-to-end. See
-> PHASES.md Phase 8 and PROPOSAL.md §7.10.
+The archive layer inserts a `K_archive_epoch(epoch_id)`
+indirection between `K_archive_root` and per-segment /
+per-manifest keys. The orchestration layer rotates epochs on a
+monthly cadence (matching `time_bucket`) and recovers prior-epoch
+keys by unwrapping them from the manifest chain.
 
 ZK Object Fabric backups use Pattern C, derived deterministically
 from the plaintext + tenant ID. The Rust path must produce
@@ -1521,51 +920,26 @@ sequenceDiagram
     Off-->>Sys: "OffloadResult { freed_bytes, evicted_count }"
 ```
 
-> Phase 3 implementation:
->
-> * Storage usage probing and pressure-level computation live in
->   `offload::budget` (`StorageBudget`, `StorageUsage`,
->   `BudgetAssessment`, `PressureLevel::{None, Warning, Critical,
->   Extreme}`, `StorageBudgetEnforcer::assess`).
-> * Per-candidate scoring lives in `offload::scoring`
->   (`ContentKind::weight`, 30-day half-life recency decay,
->   16 MiB-normalised size bonus, `compute_eviction_score`).
->   Pinned candidates short-circuit to `f64::NEG_INFINITY`.
-> * Plan / execute live in `offload::eviction`. `plan_eviction`
->   filters pinned + not-archived candidates, sorts by score
->   descending, accumulates until `target_bytes`.
->   `plan_eviction_with_pressure` is the pressure-aware variant:
->   originals (video / documents / images / voice) are eligible at
->   `Warning+`, thumbnails at `Critical+`, cold text bodies at
->   `Extreme` only.
->   `execute_eviction` issues the state-machine demotion against
->   `media_asset`.
-> * **Tiered eviction policy** (PROPOSAL §5.4 / §5.7): media
->   originals on a user-cloud sink (`storage_sink != "kchat_backend"`)
->   are evicted first because the original is still recoverable
->   from the configured `MediaBlobSink` (cheap rehydration), and
->   only if that pool underruns the byte target does the planner
->   fall through to a second pass over assets whose only remote
->   copy is in the KChat archive.
->   `EvictionTier::{CloudOffload, FullEviction}` classifies each
->   `EvictionCandidate` by its `storage_sink`;
->   `plan_tiered_eviction` partitions the candidate pool, runs
->   `plan_eviction_with_pressure` once per pool, and combines the
->   two `EvictionPlan`s into a `TieredEvictionPlan` with
->   `target_bytes` / `total_bytes` accounting.
-> * `offload::hydration::HydrationQueue` drives the rehydration
->   side: a deduplicating priority queue ordered by
->   `HydrationReason` (P0..P5) with FIFO tiebreaker, plus
->   `enqueue_prefetch_window` for viewport adjacency.
-> * `CoreImpl::enforce_storage_budget` wires the budget enforcer
->   in: it harvests rows via `collect_eviction_candidates`,
->   runs `plan_tiered_eviction`, and executes the cloud-offload
->   plan and the full-eviction plan in order. The combined
->   `freed_bytes` / `evicted_count` is reported to the caller via
->   `BudgetEnforcementReport`. The end-to-end pipeline is
->   exercised by
->   [`crates/core/tests/storage_budget_enforcement.rs`](../crates/core/tests/storage_budget_enforcement.rs)
->   across every `PressureLevel` and both `EvictionTier` branches.
+The offload pipeline is split into three composable layers under
+`crates/core/src/offload/`:
+
+- **Budget** — probes current device storage and computes a
+  `PressureLevel` (`None`, `Warning`, `Critical`, `Extreme`).
+- **Scoring** — ranks each eviction candidate by content kind,
+  recency (30-day half-life), and size. Pinned candidates are
+  excluded.
+- **Planning and execution** — partitions candidates into a
+  `CloudOffload` tier (assets whose original is recoverable from
+  a user-cloud `MediaBlobSink`) and a `FullEviction` tier (assets
+  whose only remote copy is in the KChat archive), plans each
+  tier under the active `PressureLevel`, and runs the
+  state-machine demotion. The combined plan is a
+  `TieredEvictionPlan` with `target_bytes` and `total_bytes`
+  accounting.
+
+Rehydration uses a deduplicating priority queue ordered by
+`HydrationReason` (P0–P5) with a FIFO tiebreaker, plus a viewport
+prefetch window to warm scroll-back.
 
 ### 8.3 Rehydration
 
@@ -1722,243 +1096,98 @@ to the UI; restore never silently re-roots.
 
 ### 9.5 Backup sub-module layout
 
-The Rust modules implementing the diagrams above:
+The backup pipeline is split into composable Rust modules under
+`crates/core/src/backup/`:
 
-* `crates/core/src/backup/event_journal.rs` — typed
-  `BackupEventType` taxonomy, `BackupEvent` row, and
-  `BackupEventJournal` with `write_event`, `read_events_since`,
-  `read_unsegmented`, `advance_cursor`. The journal is written
-  inside the same SAVEPOINT as the matching `archive_event_journal`
-  row by `MessagePersister`.
-* `crates/core/src/backup/segment_builder.rs` —
-  `BackupSegmentBuilder::build_segment` (CBOR encode → zstd
-  compress → XChaCha20-Poly1305 seal under `K_backup_segment`)
-  and `decrypt_backup_segment` for the inverse path.
-* `crates/core/src/backup/manifest_builder.rs` —
-  `build_backup_manifest` (genesis → gen-N chain, hybrid Ed25519
-  + ML-DSA-65 over canonical CBOR with both signature fields
-  cleared, AEAD-seal under `K_backup_manifest` with
-  `device_id` mixed into the AAD).
-* `crates/core/src/backup/compaction.rs` — `CompactionPolicy::plan`
-  drives the daily → weekly → monthly merge; `apply_tombstones`
-  drops events superseded by `MessageDeleted` /
-  `ConversationDeleted` / `MediaDeleted`. The
-  `CoreImpl::compact_backup` orchestration ingests the plan and
-  re-seals each merged group.
-* `crates/core/src/backup/sinks/mod.rs` — object-safe `BackupSink`
-  trait (`upload_backup_segment`, `upload_backup_manifest`,
-  `fetch_backup_manifest`, `fetch_backup_segment`,
-  `list_backup_manifests`) plus `NoopBackupSink` for tests.
-* `crates/core/src/backup/sinks/zk_fabric.rs` — `ZkofBackupSink`
-  uploads sealed manifests to `backups/{manifest_id}` and sealed
-  segments to `backups/segments/{segment_id}` against a
-  configured S3 bucket. Pattern C convergent encryption from
-  `crypto::convergent::derive_convergent_dek` keeps the
-  ciphertext bit-identical to the Go SDK at
-  `kennguy3n/zk-object-fabric/encryption/client_sdk/`.
-* `crates/core/src/backup/sinks/icloud.rs` — `ICloudBackupSink`
-  wraps an `Arc<dyn ICloudBackupBridge>` exposing
-  `upload_file` / `download_file` / `list_files` /
-  `delete_file`; the iOS / macOS bridge implements the actual
-  CloudKit calls. Manifests map to record name
-  `backups/{manifest_id}` and segments to
-  `backups/segments/{segment_id}`. `NoopICloudBackupBridge`
-  returns `Error::NotImplemented("icloud_backup_bridge")` for
-  tests.
-* `crates/core/src/backup/sinks/android.rs` — `AndroidBackupSink`
-  splits storage by record size: manifest envelopes (under
-  Android Auto Backup's 25 MiB cap per record) flow through
-  `AndroidBackupBridge::write_auto_backup` /
-  `read_auto_backup`; full-size segments flow through
-  `write_saf` / `read_saf` (Storage Access Framework, no size
-  cap). `list_backup_manifests` filters Auto Backup entries to
-  manifests-only so a stale segment URI never surfaces as a
-  manifest candidate. `NoopAndroidBackupBridge` stub for tests.
+| Module           | Responsibility                                                                          |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| `event_journal`  | Append-only journal of `BackupEvent`s written inside each message-mutation SAVEPOINT.   |
+| `segment_builder`| CBOR-encode → zstd-compress → XChaCha20-Poly1305 seal under `K_backup_segment`.         |
+| `manifest_builder`| Chained backup manifests (genesis → gen-N); hybrid Ed25519 + ML-DSA-65 signature.      |
+| `compaction`     | Daily → weekly → monthly merge; tombstone application for deleted messages.             |
+| `sinks/`         | Pluggable `BackupSink` implementations (ZKOF, iCloud, Android Auto Backup + SAF).       |
 
 #### 9.5.1 Backup sink architecture
 
-All four backup sinks (`ZkofBackupSink`, `ICloudBackupSink`,
-`AndroidBackupSink`, plus the `NoopBackupSink` test stub) share
-the same `BackupSink` trait surface so the upper layers
-(`run_incremental_backup`, `RestorePipeline`,
-`compact_backup`) treat sinks uniformly. The differences between
-sinks are confined to two dimensions:
+All backup sinks share the same `BackupSink` trait so the upper
+layers (`run_incremental_backup`, `RestorePipeline`,
+`compact_backup`) treat sinks uniformly. The differences are
+confined to two dimensions:
 
-| Sink             | Authentication path                                     | Record / object naming                                    |
-| ---------------- | ------------------------------------------------------- | --------------------------------------------------------- |
-| `ZkofBackupSink` | ZKOF tenant credentials via `Arc<dyn S3Client>`         | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
-| `ICloudBackupSink` | Per-user CloudKit container via `ICloudBackupBridge`   | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
-| `AndroidBackupSink` | `BackupAgent` (Auto Backup) + SAF tree URI             | Manifest = Auto Backup entry; segment = SAF blob          |
-| `NoopBackupSink` | n/a                                                     | n/a — every method returns `Error::NotImplemented`        |
+| Sink                | Authentication path                                       | Record / object naming                                    |
+| ------------------- | --------------------------------------------------------- | --------------------------------------------------------- |
+| `ZkofBackupSink`    | ZKOF tenant credentials via an `S3Client` implementation  | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
+| `ICloudBackupSink`  | Per-user CloudKit container via `ICloudBackupBridge`      | `backups/{manifest_id}` + `backups/segments/{segment_id}` |
+| `AndroidBackupSink` | Auto Backup (manifests) + Storage Access Framework (segments) | Manifest = Auto Backup entry; segment = SAF blob       |
+| `NoopBackupSink`    | n/a                                                       | n/a — every method returns `NotImplemented` for tests     |
 
 The naming convention is identical wherever it can be (every
 sink that addresses by free-form key uses `backups/...`); the
-Android sink is the only one that splits storage by record
-size, because that is forced by the platform's 25 MiB Auto
-Backup cap.
+Android sink is the only one that splits storage by record size,
+because that is forced by the platform's 25 MiB Auto Backup cap.
 
 `CoreImpl` only ever holds a single `Box<dyn BackupSink>` at a
 time, but the platform layer can swap sinks at runtime (e.g. a
-desktop client first restoring from iCloud, then continuing
-with ZKOF). All sinks operate on already-sealed segments and
+desktop client first restoring from iCloud, then continuing with
+ZKOF). All sinks operate on already-sealed segments and
 manifests — they do not see plaintext bytes — so a malicious or
 compromised sink cannot leak user content beyond the metadata
 already exposed by `(manifest_id, segment_id, byte length)`.
 
-`CoreImpl::run_incremental_backup` is the orchestrator: read
-`BackupEventJournal::read_unsegmented` → derive
-`K_backup_segment` → build via `BackupSegmentBuilder` → build +
-sign manifest → advance cursor.
-
 ### 9.6 Restore sub-module layout
 
-* `crates/core/src/restore/state_machine.rs` — persistence
-  helpers (`load`, `save`, `transition`, `reset`) for the
-  single-row `restore_state` table layered on
-  `local_store::state_machines::RestoreState`.
-* `crates/core/src/restore/manifest_verifier.rs` —
-  `verify_manifest_chain` walks gen 0 → latest, verifies both
-  legs of every hybrid Ed25519 + ML-DSA-65 signature, and
-  enforces the
-  `previous_manifest_hash == compute_manifest_hash(prev)`
-  invariant. Returns structured `EmptyChain` /
-  `SignatureInvalid { generation }` /
-  `ChainBreak { generation, expected, actual }` /
-  `GapDetected { missing_generation }` /
-  `GenesisHashNotZero { actual }` /
-  `HashComputationFailed { generation }`.
-* `crates/core/src/restore/pipeline.rs` — `RestorePipeline`
-  drives the priority sequence (conversation list → skeletons
-  → search shards → recent bodies → enable lazy media) and
-  persists every `RestoreState` transition between steps.
-* `crates/core/src/restore/key_recovery.rs` — Phase-4 key
-  recovery foundation. Three independent paths share a single
-  module so the secret-handling guarantees stay uniform:
-  * **Recovery key** — `RecoveryKey` is a 256-bit secret that
-    AES-256-KW-wraps `K_user_master` and is rendered as a
-    64-character lowercase-hex string for write-down during
-    setup. `generate_recovery_key` / `recover_from_key`
-    round-trip; wrong / tampered keys fail the AES-KW
-    integrity-check value before any further work runs.
-  * **Device transfer** — `DeviceTransferEnvelope` is an
-    XChaCha20-Poly1305-sealed bundle of
-    `(K_user_master, K_archive_root, K_backup_root,
-    K_search_root)` under a transfer key derived from a numeric /
-    QR transfer code via HKDF-SHA-256.
-    `prepare_device_transfer` / `accept_device_transfer`
-    round-trip the envelope and validate code length. The
-    envelope itself derives `Zeroize` + `ZeroizeOnDrop`, and
-    every CBOR / AEAD-opened plaintext flows through
-    `Zeroizing<Vec<u8>>` so transfer-time secret material never
-    lingers on the heap.
-  * **Passphrase** — `PassphraseRecoveryEnvelope { salt,
-    wrapped_key, argon2_params }` AES-256-KW-wraps
-    `K_user_master` under a 32-byte KEK derived via Argon2id from
-    the user's passphrase + a random 16-byte salt.
-    `wrap_master_key_with_passphrase` /
-    `unwrap_master_key_with_passphrase` use the OWASP-mobile
-    parameter triple (`m_cost = 65536`, `t_cost = 3`,
-    `p_cost = 1`) by default; the parameters are stored on the
-    envelope so a future bump can re-derive against older
-    blobs. The unwrap path returns `Zeroizing<[u8; 32]>` and
-    surfaces wrong-passphrase / tampered-envelope failures via
-    the AES-KW integrity-check value (no oracle on the Argon2
-    output itself).
-  Server escrow remains OFF by default per
-  `docs/PHASES.md §Phase 4`. The three recovery paths are
-  designed to be combined: a user can publish a recovery key
-  and a passphrase envelope simultaneously, so device loss
-  plus passphrase loss does not strand them.
+The restore pipeline is split into parallel layers under
+`crates/core/src/restore/`:
+
+| Module             | Responsibility                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `state`            | Persisted `restore_state` row; transition between restore phases.                    |
+| `manifest_verifier`| Walk the manifest chain genesis → latest; verify hybrid signatures.                  |
+| `pipeline`         | Skeleton-first orchestrator: conversations → skeletons → bodies → media.             |
+| `recovery_key`     | Generate, verify, and consume the user-facing 32-character recovery key.             |
+| `device_transfer`  | Old-device → new-device handshake export of `K_user_master`.                         |
 
 ### 9.7 Search-shard sub-module layout
 
-* `crates/core/src/search/shard_builder.rs` — encrypted search
-  index shards used for backup / restore.
-  `build_text_search_shard` / `build_fuzzy_search_shard` read
-  `search_fts` / `search_fuzzy_words` rows for a
-  `(conversation_id, time_bucket)` pair, encode through
-  `formats::SearchIndexShard` (`IndexType::Text` /
-  `IndexType::Fuzzy`), zstd-compress, and AEAD-seal under
-  per-shard keys derived from `K_search_root`.
-  `restore_text_search_shard` / `restore_fuzzy_search_shard`
-  invert the path. Tests cover round-trip, wrong-key, and
-  multilingual content (Latin / CJK / Arabic).
-* `crates/core/src/search/cold_shard_source.rs` — concrete
-  `ColdShardSource` adapter. `TransportColdShardSource` bridges
-  a `dyn TransportClient` and a `ShardKeyRegistry`
-  (`(conversation_id, time_bucket, IndexType) → KeyMaterial`)
-  into the trait by hashing the conversation id under
-  `K_conversation_hash`, calling
-  `TransportClient::fetch_index_shards`, and decrypting via
-  `restore_text_search_shard` / `restore_fuzzy_search_shard`.
-  `GracefulCold` wraps any `ColdShardSource` and swallows
-  `Error::Transport` / `Error::Storage` so the orchestration
-  layer can degrade to local-only results without aborting the
-  query (Phase 7 graceful-degradation).
-* `CoreImpl::upload_search_shards` — encrypted-shard upload
-  pipeline. Takes the FTS / fuzzy rows for a bucket, builds +
-  seals through the same `build_*_search_shard` helpers,
-  CBOR-encodes the `SearchIndexShard` frame, and ferries it to
-  `TransportClient::upload_index_shard`. Returns an
-  `UploadedSearchShards` receipt (per-shard `shard_id`,
-  `doc_count`, `ciphertext_len`, `ciphertext_sha256`) so
-  callers can record the entry in their own search-shard
-  ledger.
-* `CoreImpl::run_incremental_backup_with_search_shards` —
-  Phase-5, Task-1 wrapper that piggy-backs on
-  `run_incremental_backup_inner`. Once the backup commits the
-  affected `(conversation_id, time_bucket)` rows, the wrapper
-  builds + seals fresh text + fuzzy shards under per-shard
-  keys derived from `K_search_root`, encodes the
-  `SearchIndexShard` frame, and uploads via
-  `TransportClient::upload_index_shard`. Existing call sites
-  keep using `run_incremental_backup`; new orchestration code
-  opts into the shard-aware variant.
-* `CoreImpl::fetch_and_restore_cold_shards` — Phase-5, Task-2
-  on-device entry point for the cold-search restore path.
-  Calls `search::shard_prefetch::batch_prefetch_shards` for a
-  bucket, AEAD-opens each `PrefetchedShard` under the
-  appropriate per-shard key derived from `K_search_root`, and
-  replays the decrypted entries through
-  `restore_text_search_shard` /
-  `restore_fuzzy_search_shard` so the local FTS5 / fuzzy
-  indexes match the cold ones. Returns a structured
-  `RestoredShardSummary` with per-type row counts.
-* `CoreImpl::hydrate_cold_search_results` — Phase-5, Task-3
-  cold-result hydration write-back. After
-  `search_and_prefetch_cold` identifies cold hits, the
-  routine fetches the archive segment via
-  `archive::prefetch::batch_prefetch_bucket`, decrypts under
-  the bucket's epoch key, extracts the message body from the
-  `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope
-  (`crates/core/src/archive/body_payload.rs`), and calls
-  `LocalStoreDb::rehydrate_message_body` so `body_state`
-  flips from `remote_archive_only` to `local_plain_available`
-  and the body is re-indexed into both `search_fts` and
-  `search_fuzzy`. Idempotent re-runs are a no-op.
+The encrypted search-shard plumbing lives under
+`crates/core/src/search/` alongside the regular search engine:
+
+| Module              | Responsibility                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `shard_builder`     | Build text / fuzzy / vector / media / bloom shards from local rows; seal under per-shard keys derived from `K_search_root`. |
+| `cold_shard_source` | Trait abstraction over the cold-shard backend; bridges transport + key registry into the search engine. |
+| `shard_cache`       | On-device LRU cache of decrypted shards (default 50 MB).                             |
+| `shard_prefetch`    | Batch-by-bucket cold-shard fetch with optional dummy-request padding.                |
+
+The orchestration entry points on `CoreImpl` are
+`upload_search_shards`, `run_incremental_backup_with_search_shards`,
+`fetch_and_restore_cold_shards`, and `hydrate_cold_search_results`.
+Together they implement the cold-shard build → upload → fetch →
+decrypt → search → rehydrate loop.
 
 ### 9.8 Archive compaction at production scale
 
-* `crates/core/src/archive/compaction.rs` —
-  `apply_archive_tombstones` mirrors the backup compaction
-  helper but filters `ArchiveEvent` (drops `MessageDeleted` /
-  `ConversationDeleted` events themselves and any earlier
-  events for tombstoned ids). `ArchiveCompactionResult` carries
-  per-bucket counters (`buckets_inspected`, `buckets_compacted`,
-  `segments_superseded`, `segments_emitted`, `bytes_before`,
-  `bytes_after`).
-* `CoreImpl::compact_archive` orchestrates the five-phase
-  flow: (A) `SELECT` `archive_verified` segments for the
-  `(conversation_id, time_bucket)` pair, (B) decrypt each via
-  `ArchiveSegmentRouter` (which dispatches per-row to the
-  KChat transport or the ZKOF S3 client), (C) concatenate +
-  `apply_archive_tombstones`, (D) re-seal via
-  `ArchiveSegmentBuilder::build_segment`, (E) atomically
-  transition superseded rows to `archive_compacted` inside a
-  SAVEPOINT and emit the new compact segment via the caller's
-  upload callback.
+Archive compaction mirrors backup compaction but operates on
+already-sealed archive segments. The five-phase flow is:
 
----
+1. Select `archive_verified` segments for the
+   `(conversation_id, time_bucket)` pair.
+2. Decrypt each segment via the `ArchiveSegmentRouter` (which
+   dispatches per-row to the KChat transport or the ZKOF S3
+   client).
+3. Concatenate events and apply archive tombstones (drops
+   `MessageDeleted` / `ConversationDeleted` events themselves and
+   any earlier events for tombstoned ids).
+4. Re-seal the compacted result via the same segment builder.
+5. Atomically transition superseded rows to `archive_compacted`
+   inside a SAVEPOINT and emit the new compact segment via the
+   caller's upload callback.
+
+The compaction result reports per-bucket counters
+(`buckets_inspected`, `buckets_compacted`, `segments_superseded`,
+`segments_emitted`, `bytes_before`, `bytes_after`) so operators
+can observe progress at production scale.
+
 
 ## 10. Transport Layer
 
@@ -2041,60 +1270,6 @@ sequenceDiagram
     Core->>Core: "update FTS / fuzzy / vector / media indexes"
 ```
 
-> **Phase 1 transport implementation note.** `transport` is now a
-> Phase-1-implemented module (see §2): `core::transport::DeliveryClient`
-> is the narrower trait the message-ingest path calls into,
-> `RawDeliveryMessage` / `FetchResult` describe the wire shape, and
-> `TransportError` flattens provider-specific failures into
-> `Network` / `Auth` / `Server`. `CoreImpl::ingest_remote_messages`
-> takes a `Box<dyn DeliveryClient>` (installed via
-> `with_transport(config, key, client)` or
-> `set_delivery_client(client)`), forwards `after_cursor` verbatim,
-> converts each `RawDeliveryMessage` into the internal
-> `IngestedMessage`, and runs the page through the existing
-> `MessagePersister` pipeline so deduplication, FTS / fuzzy
-> indexing, and journal writes happen exactly as in the local
-> `send_text` path. When no client is configured the trait method
-> returns `Err(Error::Transport("no delivery client configured"))`
-> so callers fail fast instead of silently no-oping.
->
-> The broader **`TransportClient`** trait (also in
-> `core::transport`) carries the full §10 surface that Phases
-> 2–4 will share: `fetch_messages` (cursor-paginated, returning
-> `FetchMessagesResponse`), `init_blob_upload` /
-> `upload_chunk` / `commit_blob` (chunked upload with
-> whole-object Merkle verification through
-> `BlobUploadHandle` / `ChunkReceipt` /
-> `CommitBlobResponse`), `fetch_blob_range` (range
-> download for resumable hydration), `fetch_archive_manifests`
-> (returning `EncryptedManifest` so the manifest chain stays
-> AEAD-sealed end-to-end), `fetch_archive_segment`, and
-> `fetch_index_shards`. The `BlobClass` enum
-> (`Media`, `ArchiveSegment`, `SearchIndexShard`,
-> `BackupSegment`, `Manifest`) is shared between the
-> per-chunk AAD constructed by `crypto::aead` and the
-> `init_blob_upload` argument so the wire-level AAD and the
-> upload-control message cannot disagree about what the blob
-> is. `NoopTransportClient` returns
-> `Error::NotImplemented("transport")` from every method —
-> it is what `CoreImpl` builds against today, and the
-> Phase-2+ HTTP / gRPC implementation drops in by replacing
-> the noop without changing any of the calling code.
-
-> **Conversation-metadata auto-update.** Both message-receive paths
-> (`MessagePersister::persist_ingested_message` for transport-driven
-> ingest and `MessagePersister::persist_outbox_entry` for the local
-> `send_text` flow) call
-> `LocalStoreDb::update_conversation_last_message(conversation_id,
-> message_id, created_at_ms)` from inside the same `SAVEPOINT` that
-> writes the skeleton + body + FTS row + journal entry. The
-> conversation row's `last_message_id` and `last_activity_ms` columns
-> therefore stay in lock-step with the message timeline atomically:
-> `KChatCore::list_conversations` re-orders to reflect the latest
-> activity without any additional call from the binding layer, and a
-> mid-ingest crash cannot leave the conversation row pointing at a
-> message that does not exist.
-
 ---
 
 ## 11. Platform Integration
@@ -2152,345 +1327,143 @@ sequenceDiagram
 | Model warm-up              | XLM-R session created eagerly at startup; kept resident                                                      |
 | Search integration         | Optional Windows Search integration for app-internal anchors                                                 |
 
-> The DirectML EP is best-effort: session creation attempts
-> DirectML first, and falls back to CPU EP if DirectML
-> initialization fails (e.g., no compatible GPU, driver issues).
-> This mirrors the cv-guard `OnnxInferenceBridge` pattern
-> (`kennguy3n/cv-guard`,
-> `desktop/native/windows/Sources/CVGuardAddon/OnnxInferenceBridge.cpp`).
-> The Rust scaffold lives in
-> `crates/core/src/models/embeddings_onnx.rs` (XLM-R) and
-> `crates/core/src/models/clip.rs` (MobileCLIP-S2). The
-> EP-selection state machine is factored as a pure function over
-> a `DirectMlProbe` trait so it can be exhaustively unit-tested
-> on non-Windows hosts.
+The DirectML EP is best-effort: session creation attempts
+DirectML first and falls back to CPU EP if DirectML initialization
+fails (e.g. no compatible GPU, or driver issues). The EP-selection
+logic is factored as a pure state machine over a `DirectMlProbe`
+trait so the routing can be exhaustively unit-tested on
+non-Windows hosts.
 
-### 11.5 ML seams: `TextEmbedder` / `ImageEmbedder` / `OcrBridge`
+### 11.5 ML seams: text, image, OCR, audio, document, and video
 
-The Phase 6 model surface is intentionally a set of thin
-object-safe traits in `crates/core/src/models/` that the
-platform bridges implement. The Rust core never owns an HTTP
-client, never decodes images on its own, and never calls into
-Vision / ML Kit / Windows.Media.Ocr directly.
+The on-device ML surface is a set of small, object-safe traits in
+`crates/core/src/models/` that the platform bridges implement.
+Core never owns an HTTP client, never decodes images on its own,
+and never calls Vision / ML Kit / Windows.Media.Ocr directly.
 
-* `models::embeddings::TextEmbedder` — `fn embed(&self, text:
-  &str) -> Result<Vec<f32>>`. The `NoopTextEmbedder` returns
-  `Error::NotImplemented("text_embedder")`; the
-  `MockTextEmbedder` returns deterministic INT8-quantizable
-  vectors for tests; the ONNX-backed implementation lives behind
-  `#[cfg(feature = "onnx-runtime")]` in `embeddings_onnx.rs` and
-  pipes `tokenize → pad/truncate → session.run → mean-pool →
-  L2-normalize`. Installed on the core via
-  `CoreImpl::install_text_embedder`.
-* `models::clip::ImageEmbedder` — `fn embed_image(&self, bytes:
-  &[u8], mime: &str) -> Result<Vec<f32>>`. Same shape as
-  `TextEmbedder`; `Noop` / `Mock` plus an ONNX-gated
-  implementation that runs `decode → resize 224×224 → RGB
-  NCHW → ImageNet-normalize → session.run → L2-normalize`.
-  Installed via `CoreImpl::install_image_embedder`.
-* `models::ocr::OcrBridge` — `fn recognize_text(&self, bytes:
-  &[u8], mime: &str) -> Result<Vec<OcrResult>>` returning text
-  + language + confidence + optional bounding box. Platform
-  implementations are `VNRecognizeTextRequest` (iOS / macOS), ML
-  Kit Text Recognition v2 (Android), `Windows.Media.Ocr` /
-  Tesseract (Windows). Installed via
-  `CoreImpl::install_ocr_bridge`.
+| Trait                 | Purpose                                         | Default backend                                  |
+| --------------------- | ----------------------------------------------- | ------------------------------------------------ |
+| `TextEmbedder`        | Multilingual text embedding (XLM-R)             | ONNX Runtime (INT8 mobile, INT4 tight storage)   |
+| `ImageEmbedder`       | Image embedding (MobileCLIP-S2)                 | ONNX Runtime                                     |
+| `OcrBridge`           | Multilingual OCR on still images                | Vision (iOS / macOS), ML Kit (Android), `Windows.Media.Ocr` |
+| `WhisperTranscriber`  | Audio transcription (Whisper-base)              | Apple MLX on Apple Silicon, ONNX Runtime elsewhere |
+| `DocumentExtractor`   | Text extraction from PDF / Word documents       | Platform-native text extractor                   |
+| `VideoKeyframeSampler`| Sample representative keyframes from video      | Platform-native AV pipeline                      |
 
-All three traits are `Send + Sync` and object-safe so they live
-behind a `Mutex<Option<Box<dyn …>>>` (or `Arc` for `OcrBridge` /
-`ResourceProbe`) on `CoreImpl`. This lets the bridge crates swap
-in a real implementation without recompiling the core, and keeps
-the test surface small (mock ↔ real swap is a one-line install).
+Every trait is `Send + Sync + Debug` and object-safe, so it lives
+behind a `Mutex<Option<Box<dyn …>>>` or `Arc<dyn …>` on
+`CoreImpl`. The bridge crates swap in real implementations without
+recompiling the core; the test surface uses no-op and mock
+doubles.
 
 ### 11.6 `ModelManager` lifecycle
 
-`crates/core/src/models/model_manager.rs` owns the on-disk
-artifact lifecycle, but **not** the download itself.
-
-```
-ModelManager::ensure(model_id, version) ──┐
-   ├─ artifact already on disk?  → return cached  ModelArtifact
-   ├─ otherwise → ModelDownloader::download_model(...) → register
-   └─ verify_integrity (SHA-256) before handing back to the caller
-```
-
-Surface: `register_model`, `ensure_model`, `verify_integrity`,
-`list_models`, `delete_model`, `select_quantization(model_id,
-storage)` (returns `Quantization::Int4` on tight cache budgets,
-`Int8` otherwise). `ModelDownloader` is the
-`Send + Sync` HTTP seam; `NoopModelDownloader` returns
-`Error::NotImplemented("model_downloader")`. The bridge crates
-ship the real downloader so the core stays free of TLS / cert
-plumbing.
+The `ModelManager` handles model download, caching, version
+pinning, quantization variants, and resource gating. It is
+deliberately a small façade around three primitives: a
+`ModelStore` (where models live on disk), a `ModelSource` (how
+they are fetched), and the `ResourceGate` policy (when downloads
+and inference may run). The bridge crates choose how to expose
+download UI; the core handles integrity verification
+(SHA-256 + size + manifest signature) and version pinning.
 
 ### 11.7 `ResourceGate` policy
 
-`crates/core/src/models/resource_gate.rs` keeps the on-device
-"is it OK to run this work right now?" decision as pure logic:
-
-```
-DeviceResources { battery_level, is_charging, thermal_state, network_type }
-      │
-      ▼
-ResourcePolicy { min_battery, require_charging_for_heavy,
-                 max_thermal, require_wifi_for_download }
-      │
-      ▼
-ResourceGate::should_run_embedding   (cheap, runs at moderate battery)
-ResourceGate::should_run_ocr         (medium, gated on thermal headroom)
-ResourceGate::should_run_transcription (expensive, strictest gate)
-ResourceGate::should_download_model  (gated on Wi-Fi by default)
-```
-
-Live readings come from a `ResourceProbe` trait the platform
-implements; `NoopResourceProbe` returns an "all-clear"
-`DeviceResources` so unit tests don't have to fake battery
-readings. Installed via `CoreImpl::install_resource_probe`.
+The `ResourceGate` decides whether an ML model can be downloaded
+or executed based on battery, thermal, network, and storage
+conditions. The policy is encoded as a pure state machine over
+`DeviceState { battery_percent, charging, thermal_state,
+network, available_storage_bytes }`, so the gating logic can be
+unit-tested deterministically. The default policy gates downloads
+behind charging + Wi-Fi + cool thermal state; inference is gated
+behind a softer policy that still runs on battery for foreground
+operations.
 
 ### 11.8 Semantic search pipeline
 
-The on-device semantic path runs entirely inside the Rust core
-once a `TextEmbedder` is installed:
+Semantic search lives alongside (not above) text search. The
+search engine runs the text query through `TextEmbedder` once,
+fans out to the per-conversation `search_vector` rows, and merges
+the cosine-similarity scores into the same ranking pipeline as
+FTS5 / fuzzy results (§6.3). Image search runs the input image
+through `ImageEmbedder`, opens the configured `OcrBridge` and the
+caption / transcript / tag entries in `media_search_index`, and
+combines the matches.
 
-```
-QueryEngine::execute_search_with_semantic
-   ├─ run existing FTS5 + fuzzy fan-out (BM25 + fuzzy scores per row)
-   ├─ if a TextEmbedder is installed AND the query is non-empty:
-   │     ├─ embed the query string → q_vec
-   │     ├─ SemanticSearchEngine::search_semantic(q_vec, conv_filter, top_k)
-   │     │     └─ brute-force cosine over `search_vector` rows
-   │     │        for the conversation; INT8 codec is decoded via
-   │     │        `dequantize_int8`
-   │     ├─ merge into the candidate set keyed by message_id
-   │     └─ for rows that hit BOTH surfaces:
-   │           combined = BM25_WEIGHT  * bm25
-   │                    + FUZZY_WEIGHT * fuzzy
-   │                    + SEMANTIC_WEIGHT * cosine
-   ├─ apply recency × content-kind weighting to semantic-only hits
-   └─ re-sort and truncate
-```
+Two reranking stages run on-device: a lightweight
+`semantic_score` (vector cosine) is combined with the ranking
+formula in §6.3; an optional cross-encoder reranker rescore is
+applied to the top-k locally, never on the backend.
 
-`BM25_WEIGHT = 2.0`, `FUZZY_WEIGHT = 1.0`,
-`SEMANTIC_WEIGHT = 1.5` per PROPOSAL §7.5. The path is a strict
-opt-in: with no embedder installed, `execute_search_with_semantic`
-falls back to the existing FTS5 + fuzzy result set so a missing
-model never breaks the search surface. The cross-pipeline
-`EmbeddingCache` (PROPOSAL §7.6.1) is what keeps inference work
-out of the hot path: a guardrail-pipeline write on the same
-`(message_id, "xlmr@v1")` key is read straight back by the
-search pipeline without re-embedding.
+### 11.9 Quantization selection: INT4 vs INT8
 
-The HNSW upgrade lands in batch-5 (2026-05-04). Brute-force
-cosine remains the implementation for slots smaller than
-`HNSW_FALLBACK_THRESHOLD = 1000` rows where it is still cheaper
-than building an ANN graph; for larger slots
-`SemanticSearchEngine::search_semantic_auto` builds an
-`instant-distance` HNSW graph lazily on the first query and
-caches it in `HnswIndexCache` keyed by
-`(conversation_id, model_version)`. Inserts call
-`HnswIndexCache::invalidate(slot)` so the next query rebuilds
-the graph. The HNSW path returns `Vec<SemanticHit>` with the
-same `cosine_similarity` shape as the brute-force path, so the
-public API contract is unchanged.
+The `ModelManager` picks a quantization variant based on
+available storage and platform capability:
 
-### 11.9 ML seams (continued): `WhisperTranscriber` / `DocumentExtractor` / `VideoKeyframeSampler`
+| Variant     | Trade-off                                                          | Default for                                   |
+| ----------- | ------------------------------------------------------------------ | --------------------------------------------- |
+| INT8        | Smaller model size, modest quality drop                            | Mobile (iOS / Android) and constrained desktop |
+| INT4        | Much smaller model size, larger quality drop                       | Tight-storage devices                         |
+| FP16 / FP32 | Highest quality, largest size                                      | High-RAM desktop (opt-in)                     |
 
-Three additional Phase-6 inference seams round out the
-multilingual media-search surface. All three follow the exact
-shape of §11.5 — object-safe `Send + Sync + Debug` traits in
-`crates/core/src/models/`, with a `Noop*` returning
-`Error::NotImplemented` and a `Mock*` returning a deterministic
-BLAKE3-derived result for tests, plus an
-`install_*` / `has_*` pair on `CoreImpl`.
+Vector storage on-disk is INT8 by default; an INT4 codec is also
+supported for the on-device `search_vector` rows when storage is
+tight.
 
-* `models::whisper::WhisperTranscriber` — `fn transcribe(&self,
-  audio_data: &[u8], mime_type: &str) ->
-  Result<TranscriptionResult>` where
-  `TranscriptionResult { text, language: Option<String>,
-  segments: Vec<TranscriptionSegment> }` and
-  `TranscriptionSegment { start_ms, end_ms, text }`.
-  `select_whisper_backend` (Apple MLX
-  `whisper-base-mlx` on Apple Silicon, ONNX Runtime
-  `whisper-base` ~140 MB INT8 elsewhere, `whisper-tiny` ~75 MB
-  on low-end Android) lives next to the trait. Wired into
-  `CoreImpl::send_media`: when `mime_type.starts_with("audio/")`
-  and a transcriber is installed, the result lands in
-  `media_search_index` keyed `(asset_id, "transcript")`.
-  Best-effort.
-* `models::document::DocumentExtractor` — `fn extract_text(&self,
-  data: &[u8], mime_type: &str) -> Result<Vec<DocumentPage>>`
-  where `DocumentPage { page_number, text, language }`. Wired
-  into `CoreImpl::send_media`: when `mime_type` is
-  `application/pdf` or
-  `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
-  and an extractor is installed, each page lands in
-  `media_search_index` keyed `(asset_id, "caption")` with
-  `text = "[page {n}] {body}"`. Best-effort.
-* `models::video::VideoKeyframeSampler` — `fn extract_keyframes(&self,
-  video_data: &[u8], mime_type: &str, max_frames: usize) ->
-  Result<Vec<Keyframe>>` where
-  `Keyframe { timestamp_ms, image_data, mime_type }`. Wired
-  into `CoreImpl::send_media`: when `mime_type.starts_with("video/")`
-  and both a sampler and an `ImageEmbedder` are installed, up
-  to five keyframes are extracted; the first frame is embedded
-  through the existing MobileCLIP-S2 seam and the resulting
-  512-dim vector lands in `search_vector` keyed
-  `(message_id, "mobileclip_s2@v1")` so videos participate in
-  the same semantic-search fan-out as still images.
-  Best-effort.
+### 11.10 Runtime policy seams
 
-All three paths absorb inference failures (logged, never
-propagated) — the same contract as `maybe_embed_text_message` /
-`maybe_embed_image_message`. `media_search_index` is the
-shared text-search surface for transcripts, document pages, and
-OCR; `search_vector` is the shared vector surface for image and
-video embeddings.
+Two further object-safe traits round out the runtime-policy
+surface:
 
-### 11.10 Quantization selection: INT4 vs INT8
+- `OfflineDetector` returns whether the device currently has
+  network. The core uses it to short-circuit backup and cold-shard
+  search when offline (operations return a `deferred = true`
+  result and are retried on the next event).
+- `PerfCollector` collects per-operation latency traces. Hot
+  paths emit traces with operation-specific metadata (batch
+  sizes, query length, result counts, pressure level) so that
+  per-platform p95 dashboards can be assembled from a single
+  collector backend.
 
-`crates/core/src/models/model_manager.rs::select_quantization`
-returns `Quantization::Int4` whenever
-`available_storage_bytes < TIGHT_STORAGE_THRESHOLD_BYTES`
-(512 MiB), else `Quantization::Int8`. `ModelArtifactSpec`
-defines four compile-time constants — `XLMR_INT8_ARTIFACT`,
-`XLMR_INT4_ARTIFACT`, `MOBILECLIP_S2_INT8_ARTIFACT`,
-`MOBILECLIP_S2_INT4_ARTIFACT` — pinning the expected ONNX
-filenames so artifact integrity check + on-disk lookup stay
-deterministic across platform builds.
-`ModelManager::resolve_artifact(model_id, quant)` maps the
-`(model, quantization)` pair to the right `ModelArtifactSpec`
-so `ensure_model` can pick the right file at lazy-download
-time. `embeddings_onnx::create_xlmr_session_int4` and
-`clip::create_mobileclip_session_int4` configure the ONNX
-session with `MatMulNBits` optimization behind
-`#[cfg(feature = "onnx-runtime")]`; without the feature both
-helpers return `Error::NotImplemented`. The
-`INT4`-vs-`INT8` cosine-correlation benchmark using the
-multilingual relevance regression suite is queued for the
-platform-bridge follow-up.
+### 11.11 Phase 7 service seams
 
-### 11.11 Phase-7 seams: `OfflineDetector` and `PerfCollector`
+Four additional object-safe traits add desktop and B2B
+operational support:
 
-Two object-safe traits in the Phase-7 layer round out the
-runtime-policy surface. Both follow the §11.5 contract
-(`Send + Sync + Debug`, object-safe, `install_*` / `has_*` on
-`CoreImpl`).
+- `ExecutionProviderSelector` chooses the ONNX execution provider
+  per platform (CoreML on macOS / iOS, NNAPI on Android, DirectML
+  on Windows + GPU, CPU as the universal fallback) and can
+  incorporate runtime EP benchmarks.
+- `BackgroundScheduler` runs scheduled tasks (backup,
+  archive compaction, index maintenance, media cache eviction)
+  on a platform-appropriate background runtime — WorkManager on
+  Android, BGTaskScheduler on iOS, Windows Task Scheduler on
+  Windows, and an in-process thread pool on macOS / Linux. Task
+  deduplication prevents the same task from being scheduled twice.
+- `MediaMigration` plans and executes the cross-sink migration of
+  media originals (e.g. moving from the KChat archive to iCloud or
+  to ZK Object Fabric). Migration verifies the chunk Merkle root
+  on the destination side and rewrites both the `media_asset`
+  row and the in-flight `MediaDescriptor` in one transaction.
+- `DedupAnalytics` is a read-only telemetry surface over the ZK
+  Object Fabric ContentIndex. It returns opaque dedup ratios and
+  byte-savings figures — never plaintext, never tokens, never
+  embeddings — for backup and media sinks that opt in.
 
-* `transport::offline::OfflineDetector` — `fn is_online(&self)
-  -> bool`. Implementations: `NoopOfflineDetector` (always
-  online — fail-open), `AlwaysOfflineDetector` (always
-  offline, for tests), `ToggleOfflineDetector` (mid-test
-  flip). Wired into `CoreImpl` via
-  `install_offline_detector` / `is_online`.
-  `CoreImpl::run_incremental_backup` short-circuits with
-  `BackupResult.deferred = true` when offline (no segment is
-  built; no upload is attempted) and produces a non-deferred
-  result on the next call once the detector reports online.
-  `CoreImpl::hydrate_message` short-circuits with
-  `HydratedMessage { is_cold: true, offline: true,
-  text_content: None }` when the body is `RemoteArchiveOnly`
-  and the device is offline. Both paths are exercised by
-  `tests/failure_scenarios.rs::offline_during_backup_*` and
-  `tests/failure_scenarios.rs::offline_during_hydration_*`.
-* `perf::PerfCollector` — `fn record(&self, trace: PerfTrace)`.
-  `PerfTrace { operation: String, start_ns: u64, end_ns: u64,
-  metadata: HashMap<String, String> }`. Implementations:
-  `NoopPerfCollector` (discards), `InMemoryPerfCollector`
-  (`Mutex<Vec<PerfTrace>>` for tests). Wired into `CoreImpl`
-  via `install_perf_collector` / `has_perf_collector` /
-  `collect_perf_stats`. Hot paths `ingest_messages`, `search`,
-  and `enforce_storage_budget` emit traces with operation-
-  specific metadata: input batch size + new / duplicate
-  counts; query length + scope + result count; pressure level
-  + freed bytes + evicted count. Every code path — success,
-  error, offline / no-pressure short-circuit — closes the
-  trace before returning.
+### 11.12 Desktop crate platform surfaces
 
-### 11.12 Phase-7 batch-5 seams: `ExecutionProviderSelector`, `InProcessScheduler`, `MediaMigration`, `DedupAnalytics`, desktop crate
+`crates/desktop/` adds platform-agnostic trait scaffolds for the
+desktop bridges alongside the existing `#[cfg(target_os = …)]`
+modules. The headline surfaces are:
 
-The 2026-05-04 batch-5 push lands four additional Phase-7
-seams on `CoreImpl` plus a platform-agnostic `crates/desktop`
-trait scaffold. All four follow the §11.5 contract
-(`Send + Sync + Debug`, object-safe where appropriate,
-`install_*` / `has_*` on `CoreImpl`).
-
-* `models::ep_tuning::ExecutionProviderSelector` — pure-data
-  EP-selection state machine. `select_ep(platform,
-  device_capabilities) -> ExecutionProvider` returns the
-  preferred EP for `(macOS, iOS) → CoreMl`,
-  `Android → Nnapi`, `Windows + GPU → DirectMl`,
-  `Linux → Cpu`, with an explicit CPU fallback for every
-  platform. `EpBenchmark { ep, latency_ms, batch_size }` lets
-  the selector record runtime measurements so future selection
-  can lean on observed performance. The `DesktopMlEpSelector`
-  in `crates/desktop/src/ml_ep.rs` forwards to this selector
-  with the desktop platform pinned.
-* `scheduler::in_process::InProcessScheduler` — Rust-native
-  scheduler that runs scheduled tasks on a background thread
-  pool implementing the `BackgroundScheduler` trait. Public
-  surface: `schedule_backup`, `schedule_archive_compaction`,
-  `schedule_index_maintenance`,
-  `schedule_media_cache_eviction`, `cancel_all`,
-  `is_task_pending(task_type)`. Task deduplication ensures the
-  same task type is never scheduled twice. `Drop` cancels
-  every pending task, so a graceful shutdown leaks no
-  background work.
-* `media::migration::{MediaMigrationPlan, MediaMigrationItem,
-  MigrationProgress, plan_media_migration,
-  execute_media_migration}` — cross-platform media-blob
-  migration. `plan_media_migration(db, source_sink,
-  target_sink)` reads `media_asset` rows where
-  `storage_sink = source_sink` into a plan; the executor
-  fetches each chunk from the source sink, uploads to the
-  target sink, verifies the BLAKE3 transit hash, and rewrites
-  `media_asset.storage_sink` plus `MediaDescriptor.storage_sink`
-  in a single SAVEPOINT. Optional `delete_source_after_success`
-  drains the source sink in idempotent re-runs. The
-  `MigrationProgress` callback trait reports per-item /
-  per-byte progress to UI surfaces. Wired into `CoreImpl`
-  via `plan_media_migration` / `migrate_media_sink`.
-* `transport::dedup_analytics::DedupAnalytics` — read-only
-  telemetry trait surfaced over the ZK Object Fabric
-  ContentIndex.
-  `query_dedup_ratio(tenant_id) -> Result<DedupStats>` returns
-  `DedupStats { total_objects, unique_objects,
-  dedup_ratio_percent, total_bytes, unique_bytes }`;
-  `query_storage_savings(tenant_id) -> Result<StorageSavings>`
-  returns `StorageSavings { bytes_saved, objects_deduped,
-  last_updated_ms }`. `NoopDedupAnalytics` returns
-  `Error::NotImplemented("dedup_analytics")`;
-  `FixedDedupAnalytics` is the unit-test test double. Privacy
-  contract: only opaque ciphertext-side metrics cross the
-  boundary — never plaintext, never derived plaintext such as
-  tokens or embeddings. Wired into `CoreImpl` via
-  `install_dedup_analytics` / `query_dedup_stats` /
-  `query_storage_savings`.
-
-The `crates/desktop/` crate gains a platform-agnostic batch-5
-trait scaffold alongside the existing
-`#[cfg(target_os = …)]`-gated `macos.rs` / `windows.rs`
-modules:
-
-* `crates/desktop/src/spotlight.rs` — `SpotlightAnchor` trait
-  + `NoopSpotlightAnchor`. Object-safe `Send + Sync + Debug`
-  surface for index / deindex / search-anchor calls into
-  Spotlight on macOS.
-* `crates/desktop/src/windows_search.rs` —
-  `WindowsSearchAnchor` trait + `NoopWindowsSearchAnchor`.
-  Mirrors the Spotlight surface for the Windows Search
-  protocol handler.
-* `crates/desktop/src/background.rs` — `DesktopScheduler`
-  trait + `NoopDesktopScheduler` implementing the
-  `BackgroundScheduler` trait from
-  `crates/core/src/scheduler/mod.rs` so the desktop bridge
-  can plug straight into `CoreImpl::install_scheduler`.
-* `crates/desktop/src/ml_ep.rs` — `DesktopMlEpSelector` that
-  forwards to `kchat_core::models::ep_tuning::ExecutionProviderSelector`
-  with the desktop platform pinned, plus a `DirectMl`
-  vs `CoreMl` vs `Cpu` fallback ladder.
-
----
-
+- `SpotlightAnchor` / `WindowsSearchAnchor` for OS search
+  integration (Spotlight on macOS, Windows Search on Windows).
+- `DesktopScheduler` implementing the core `BackgroundScheduler`
+  trait so `CoreImpl::install_scheduler` is uniform across mobile
+  and desktop.
+- `DesktopMlEpSelector` forwarding to the core
+  `ExecutionProviderSelector` with the desktop platform pinned,
+  plus the DirectML → CoreML → CPU fallback ladder.
 ## 12. Data Flow Diagrams
 
 ### 12.1 Message receive

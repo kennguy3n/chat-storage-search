@@ -2,17 +2,8 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 0 — Protocol and Test Vectors (`COMPLETE`). Phase 1 —
-> Local Store + Text Search + MLS Integration (`In progress | ~96%`).
-> Phase 2 — Media Encryption and Blob Service (`In progress | ~98%`).
-> Phase 3 — Personal Archive and Offload (`In progress | ~99%`).
-> Phase 4 — Backup and Restore (`In progress | ~90%`).
-> Phase 5 — Search — Fuzzy + Encrypted Shards (`In progress | ~98%`).
-> Phase 6 — Media and Semantic Search (`In progress | ~95%`).
-> Phase 7 — Desktop + Optimization (`In progress | ~85%`).
-> Phase 8 — Multi-Scope, Multi-Tenant Search (`In progress | ~98%`).
-> This document defines the target architecture. See
-> [PROGRESS.md](PROGRESS.md) for the live build tracker.
+This document defines the target architecture. See
+[PROGRESS.md](PROGRESS.md) for current implementation status.
 
 ---
 
@@ -178,22 +169,23 @@ labelled `info` strings (`"kchat-archive-root-v1"`,
 etc.). Versioned info strings let us rotate a derivation path
 without colliding with deployed manifests.
 
-> **Phase 8 extension.** The key hierarchy gains per-tenant B2B
-> isolation:
->
-> ```
-> K_user_master
->   ├── K_b2c_archive_root              (personal B2C archive)
->   ├── K_b2b_tenant_root(tenant_id)    (per-tenant B2B archive)
->   │     └── K_b2b_archive_epoch(tenant_id, epoch_id)
->   └── K_search_root
->         ├── K_b2c_text_index_shard(shard_id)
->         ├── K_b2b_text_index_shard(tenant_id, shard_id)
->         └── K_bloom_index_shard(shard_id)   ← NEW
-> ```
->
-> Per-tenant keys allow cryptographic separation of B2B
-> organizational data from personal B2C data. See PHASES.md Phase 8.
+**B2B tenant extension.** For multi-tenant B2B deployments, the
+key hierarchy is extended with per-tenant subtrees so that one
+tenant's data cannot be decrypted with another tenant's keys:
+
+```
+K_user_master
+  ├── K_b2c_archive_root              (personal B2C archive)
+  ├── K_b2b_tenant_root(tenant_id)    (per-tenant B2B archive)
+  │     └── K_b2b_archive_epoch(tenant_id, epoch_id)
+  └── K_search_root
+        ├── K_b2c_text_index_shard(shard_id)
+        ├── K_b2b_text_index_shard(tenant_id, shard_id)
+        └── K_bloom_index_shard(shard_id)
+```
+
+Per-tenant keys allow cryptographic separation of B2B
+organizational data from personal B2C data. See §7.10.
 
 Archive epoch rotation: `K_archive_epoch(epoch_id)` is derived from
 `K_archive_root` with `info = "kchat-archive-epoch-v1" || epoch_id`.
@@ -333,12 +325,11 @@ CREATE TABLE media_search_index (
 );
 ```
 
-> **Phase 8 extension (§3.2.1).** The `conversation` table gains
-> `conversation_type`, `scope`, `tenant_id`, `community_id`, and
-> `domain_id` columns to support the multi-scope, multi-tenant
-> search architecture. The `archive_segment_map` table likewise
-> gains a `tenant_id` column so cold-bucket fan-out can prune by
-> tenant. See PHASES.md Phase 8 and PROPOSAL.md §7.10.
+**Multi-scope schema extension.** For multi-scope and multi-tenant
+search (§7.10), the `conversation` table carries `conversation_type`,
+`scope`, `tenant_id`, `community_id`, and `domain_id` columns, and
+the `archive_segment_map` table carries a `tenant_id` column so
+cold-bucket fan-out can prune by tenant.
 
 ### 3.3 FTS5 tokenizer choice
 
@@ -1002,18 +993,15 @@ database is open).
 | macOS    | MLX (preferred for Whisper) or Core ML or ONNX Runtime CoreML EP | `VNRecognizeTextRequest` (Vision)  | Desktop-class resources; can keep models resident. INT8 default; INT4 available as a per-device opt-in for shared-disk laptops. |
 | Windows  | ONNX Runtime DirectML EP (preferred) or CPU EP (fallback) | Multilingual OCR via Tesseract / Windows.Media.Ocr | DirectML EP for GPU-equipped machines; CPU EP fallback for CPU-only laptops; INT8/INT4 (`MatMulNBits`) quantized models essential. INT4 is the default on Windows tablets / low-storage SKUs. |
 
-> On Apple Silicon, `Whisper-base` runs via Apple MLX
-> ([`mlx-community/whisper-base-mlx`](https://huggingface.co/mlx-community/whisper-base-mlx)),
-> which routes to the Neural Engine for significantly lower
-> latency and battery cost than ONNX Runtime CPU EP. ONNX Runtime
-> CPU EP remains the fallback on non-Apple-Silicon Macs (Intel
-> hardware) and on all other platforms (Android, Windows, Linux).
-> The runtime selection is implemented in
-> `crates/core/src/models/whisper.rs` as a pure
-> [`select_whisper_backend`] state machine (mirrors the
-> DirectML → CPU pattern from
-> [`crate::models::embeddings_onnx`]) so the routing logic is
-> exhaustively unit-tested on any host.
+On Apple Silicon, `Whisper-base` runs via Apple MLX
+([`mlx-community/whisper-base-mlx`](https://huggingface.co/mlx-community/whisper-base-mlx)),
+which routes to the Neural Engine for significantly lower latency
+and battery cost than ONNX Runtime CPU EP. ONNX Runtime CPU EP
+remains the fallback on non-Apple-Silicon Macs (Intel hardware)
+and on all other platforms (Android, Windows, Linux). The runtime
+selection is a pure state machine that mirrors the DirectML → CPU
+pattern used by the text embedding runtime, so the routing logic
+is exhaustively unit-tested on any host.
 
 #### 7.7.1 Model warm-up strategy
 
@@ -1106,22 +1094,6 @@ B2B tenant isolation is cryptographic: each tenant derives its own
 per-tenant archive and search shard keys. A `TenantSearchPolicy`
 controls whether a tenant's data participates in global search.
 
-> **Phase 8 batch 6 — landed.** All ten of the items 1–6 plus
-> background shard warming, bridge surface, latency benchmarks,
-> and integration tests are implemented under their respective
-> source files
-> (`crates/core/src/search/{query_engine,shard_cache,shard_prefetch}.rs`,
-> `crates/core/src/crypto/key_hierarchy.rs`,
-> `crates/core/src/config.rs`,
-> `crates/core/src/models/resource_gate.rs`,
-> `crates/core/src/scheduler/mod.rs`,
-> `crates/{android-bridge,ios-bridge}/src/lib.rs`,
-> `crates/ios-bridge/src/kchat.udl`,
-> `crates/core/benches/phase8_benchmarks.rs`,
-> `crates/core/tests/phase8_multi_scope_search.rs`). Items 4
-> (parallel bucket fetch) and 5 (progressive / streaming
-> results) remain deferred. See PHASES.md Phase 8 and
-> PROGRESS.md Phase 8 for the per-task checklist + test names.
 
 See PHASES.md Phase 8 for the full checklist and priority order.
 
