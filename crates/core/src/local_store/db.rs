@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
     BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
-    StorageBackend, TimelineRow, SCHEMA_SQL,
+    StorageBackend, TimelineRow, LATEST_USER_VERSION, MIGRATIONS, SCHEMA_SQL,
 };
 use super::state_machines::{ArchiveState, BackupState, BodyState, MediaState};
 
@@ -1618,12 +1618,210 @@ pub fn update_archive_state(
 }
 
 // ---------------------------------------------------------------------------
+// Backup orchestration state (Phase 5 hardening — Task 2)
+// ---------------------------------------------------------------------------
+
+/// One row of the `backup_segment_ledger` table.
+///
+/// Mirrors the column shape declared in
+/// [`crate::local_store::schema::MIGRATION_V2_SQL`]. The fields
+/// are plain data — the orchestrator layer
+/// ([`crate::core_impl::CoreImpl`]) wraps / unwraps `k_segment`
+/// under `K_backup_root` to materialise the in-memory
+/// `TrackedBackupSegment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupSegmentLedgerRow {
+    /// Sealed segment id (UUID v7).
+    pub segment_id: String,
+    /// Mirror of `SegmentType` ("events", "message_delta", ...).
+    pub segment_type: String,
+    /// 24-byte XChaCha20-Poly1305 nonce.
+    pub nonce: Vec<u8>,
+    /// AEAD ciphertext (zstd-compressed CBOR).
+    pub ciphertext: Vec<u8>,
+    /// 32-byte BLAKE3 over the plaintext payload.
+    pub merkle_root: Vec<u8>,
+    /// Number of events sealed in the segment.
+    pub event_count: i64,
+    /// Compaction tier ("daily" | "weekly" | "monthly").
+    pub tier: String,
+    /// Earliest event timestamp covered (ms epoch).
+    pub min_event_ms: i64,
+    /// Latest event timestamp covered (ms epoch).
+    pub max_event_ms: i64,
+    /// 40-byte AES-256-KW (RFC 3394) of `K_backup_segment(segment_id)`
+    /// under `K_backup_root`.
+    pub wrapped_k_segment: Vec<u8>,
+    /// Wall-clock at insertion (ms epoch).
+    pub created_at_ms: i64,
+}
+
+impl LocalStoreDb {
+    /// Persist the latest backup manifest to the
+    /// `backup_manifest_chain` single-row table.
+    ///
+    /// Idempotent upsert — the table is constrained to a single
+    /// row (`CHECK (id = 1)`), so subsequent calls replace the
+    /// previous manifest. `manifest_cbor` is the canonical
+    /// `serde_cbor` encoding of
+    /// [`crate::formats::manifest::BackupManifest`]; `generation`
+    /// mirrors the manifest's `generation` field and is exposed
+    /// for diagnostic queries.
+    pub fn save_backup_manifest(
+        &self,
+        manifest_cbor: &[u8],
+        generation: i64,
+        updated_at_ms: i64,
+    ) -> DbResult<()> {
+        self.conn.execute(
+            "INSERT INTO backup_manifest_chain (id, generation, manifest_cbor, updated_at_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                generation    = excluded.generation,
+                manifest_cbor = excluded.manifest_cbor,
+                updated_at_ms = excluded.updated_at_ms",
+            params![generation, manifest_cbor, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Load the latest backup manifest CBOR, if any.
+    ///
+    /// Returns `None` before the first backup has been persisted
+    /// (the "genesis" state); the orchestrator treats this as
+    /// "no previous manifest to chain under".
+    pub fn load_backup_manifest(&self) -> DbResult<Option<Vec<u8>>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT manifest_cbor FROM backup_manifest_chain WHERE id = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Bulk-replace the backup segment ledger.
+    ///
+    /// Used by the compaction path that rewrites the ledger in
+    /// one shot: every existing row is removed and `rows` is
+    /// inserted inside a single SAVEPOINT so a crash leaves the
+    /// ledger either at the pre-compaction state or the
+    /// post-compaction state — never half-applied. We use a
+    /// SAVEPOINT (rather than `Connection::transaction`) because
+    /// every other `LocalStoreDb` method takes `&self`; nesting
+    /// inside an outer SAVEPOINT is safe.
+    pub fn replace_backup_segment_ledger(&self, rows: &[BackupSegmentLedgerRow]) -> DbResult<()> {
+        self.conn
+            .execute_batch("SAVEPOINT replace_backup_segment_ledger;")?;
+        let inner = (|| -> DbResult<()> {
+            self.conn.execute("DELETE FROM backup_segment_ledger", [])?;
+            for row in rows {
+                insert_backup_segment_ledger_row(&self.conn, row)?;
+            }
+            Ok(())
+        })();
+        match inner {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT replace_backup_segment_ledger;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT replace_backup_segment_ledger; \
+                     RELEASE SAVEPOINT replace_backup_segment_ledger;",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Insert a single row into the backup segment ledger.
+    ///
+    /// Used by the incremental-backup path which appends one row
+    /// per sealed segment.
+    pub fn insert_backup_segment_ledger_row(&self, row: &BackupSegmentLedgerRow) -> DbResult<()> {
+        insert_backup_segment_ledger_row(&self.conn, row)
+    }
+
+    /// Load every row in the backup segment ledger.
+    ///
+    /// Ordered by `created_at_ms ASC` so callers see the segments
+    /// in the same order they were appended to the in-memory
+    /// ledger; the compaction planner is order-insensitive but
+    /// stable ordering keeps test fixtures deterministic.
+    pub fn load_backup_segment_ledger(&self) -> DbResult<Vec<BackupSegmentLedgerRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT segment_id, segment_type, nonce, ciphertext, merkle_root,
+                    event_count, tier, min_event_ms, max_event_ms,
+                    wrapped_k_segment, created_at_ms
+             FROM backup_segment_ledger
+             ORDER BY created_at_ms ASC, segment_id ASC",
+        )?;
+        let rows = stmt.query_map([], decode_backup_segment_ledger_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+
+fn insert_backup_segment_ledger_row(
+    conn: &Connection,
+    row: &BackupSegmentLedgerRow,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO backup_segment_ledger (
+            segment_id, segment_type, nonce, ciphertext, merkle_root,
+            event_count, tier, min_event_ms, max_event_ms,
+            wrapped_k_segment, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            row.segment_id,
+            row.segment_type,
+            row.nonce,
+            row.ciphertext,
+            row.merkle_root,
+            row.event_count,
+            row.tier,
+            row.min_event_ms,
+            row.max_event_ms,
+            row.wrapped_k_segment,
+            row.created_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn decode_backup_segment_ledger_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BackupSegmentLedgerRow> {
+    Ok(BackupSegmentLedgerRow {
+        segment_id: row.get(0)?,
+        segment_type: row.get(1)?,
+        nonce: row.get(2)?,
+        ciphertext: row.get(3)?,
+        merkle_root: row.get(4)?,
+        event_count: row.get(5)?,
+        tier: row.get(6)?,
+        min_event_ms: row.get(7)?,
+        max_event_ms: row.get(8)?,
+        wrapped_k_segment: row.get(9)?,
+        created_at_ms: row.get(10)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Connection bring-up
 // ---------------------------------------------------------------------------
 
 /// Run the post-open setup: `PRAGMA key`, `PRAGMA foreign_keys`,
-/// schema bring-up (with unicode61 fallback), and a sanity check.
-/// Returns whether the FTS5 ICU tokenizer was available.
+/// schema bring-up via [`run_migrations`] (with unicode61 fallback
+/// for migration v1 on platforms without FTS5 ICU), and a sanity
+/// check. Returns whether the FTS5 ICU tokenizer was available.
 fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
     set_key(conn, key)?;
     // Foreign keys must be enabled per-connection in SQLite.
@@ -1633,13 +1831,93 @@ fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
     conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
 
     let icu_available = fts5_icu_available(conn);
-    let schema = if icu_available {
-        SCHEMA_SQL.to_string()
-    } else {
-        create_schema_with_unicode61_fallback()
-    };
-    conn.execute_batch(&schema)?;
+    run_migrations(conn, icu_available)?;
     Ok(icu_available)
+}
+
+/// Read the current `PRAGMA user_version` for `conn`.
+///
+/// SQLite initialises `user_version` to `0` for a freshly-created
+/// database, which the migration framework treats as the "no
+/// migration has ever run" state.
+fn read_user_version(conn: &Connection) -> DbResult<i32> {
+    let v: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+    Ok(v)
+}
+
+/// Write the `PRAGMA user_version` value.
+///
+/// SQLite does not allow positional parameters in `PRAGMA`
+/// statements, so we format the integer directly. The value
+/// comes from [`MIGRATIONS`] (compile-time constant) so there
+/// is no injection surface.
+fn write_user_version(conn: &Connection, v: i32) -> DbResult<()> {
+    conn.execute_batch(&format!("PRAGMA user_version = {v};"))?;
+    Ok(())
+}
+
+/// Apply every outstanding migration in [`MIGRATIONS`] to `conn`.
+///
+/// Reads `PRAGMA user_version`. For every entry whose target
+/// version is greater than the current version, the SQL is
+/// executed inside a savepoint so a failure rolls back the
+/// partial schema and leaves the DB at the previous version.
+/// After each successful migration `user_version` is updated to
+/// the migration's target.
+///
+/// Migration `1` is the original [`SCHEMA_SQL`] block. On
+/// platforms whose SQLCipher build does not link the FTS5 ICU
+/// tokenizer the `tokenize = 'icu'` literal is rewritten to the
+/// `unicode61` fallback (`icu_available = false`). Later
+/// migrations are emitted verbatim.
+///
+/// The function is idempotent: running on a DB that is already
+/// at [`LATEST_USER_VERSION`] is a no-op.
+pub fn run_migrations(conn: &Connection, icu_available: bool) -> DbResult<()> {
+    let mut current = read_user_version(conn)?;
+    for (target, sql) in MIGRATIONS {
+        if *target <= current {
+            continue;
+        }
+        // Migration v1 contains the FTS5 ICU literal that must be
+        // rewritten on platforms without ICU. Every other migration
+        // is emitted verbatim.
+        let owned: String;
+        let sql_to_run: &str = if *target == 1 && !icu_available {
+            owned = sql.replace(
+                "tokenize = 'icu'",
+                "tokenize = 'unicode61 remove_diacritics 2'",
+            );
+            owned.as_str()
+        } else {
+            sql
+        };
+
+        let savepoint = format!("migration_v{target}");
+        conn.execute_batch(&format!("SAVEPOINT {savepoint};"))?;
+        match conn.execute_batch(sql_to_run) {
+            Ok(()) => match write_user_version(conn, *target) {
+                Ok(()) => {
+                    conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint};"))?;
+                    current = *target;
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch(&format!(
+                        "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};"
+                    ));
+                    return Err(e);
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};"
+                ));
+                return Err(DbError::from(e));
+            }
+        }
+    }
+    debug_assert!(current == LATEST_USER_VERSION || current >= LATEST_USER_VERSION);
+    Ok(())
 }
 
 /// Set `PRAGMA key = x'...'` from a 32-byte raw key.
@@ -1773,6 +2051,160 @@ mod tests {
                 .unwrap();
             assert!(exists > 0, "missing table: {table}");
         }
+    }
+
+    #[test]
+    fn fresh_db_runs_all_migrations_to_latest_user_version() {
+        // Fresh in-memory DB must reach `LATEST_USER_VERSION`
+        // unconditionally — `init_connection` invokes
+        // `run_migrations`, which iterates `MIGRATIONS` in order.
+        let db = fresh_db();
+        let v = read_user_version(db.connection()).unwrap();
+        assert_eq!(v, LATEST_USER_VERSION);
+    }
+
+    #[test]
+    fn migration_v2_adds_backup_chain_and_segment_ledger_tables() {
+        // Pin Task-2 hardening: the v2 migration must materialise
+        // both tables on every fresh open.
+        let db = fresh_db();
+        for table in ["backup_manifest_chain", "backup_segment_ledger"] {
+            let exists: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE name = ?1 AND type = 'table'",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists > 0, "missing migration-v2 table: {table}");
+        }
+    }
+
+    #[test]
+    fn run_migrations_is_idempotent_when_already_at_latest() {
+        // Running migrations again on an up-to-date DB is a no-op
+        // and must not error. The PRAGMA stays unchanged.
+        let db = fresh_db();
+        let before = read_user_version(db.connection()).unwrap();
+        run_migrations(db.connection(), db.icu_available()).unwrap();
+        let after = read_user_version(db.connection()).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after, LATEST_USER_VERSION);
+    }
+
+    #[test]
+    fn run_migrations_resumes_from_v1_fixture() {
+        // Simulate a DB that was created under the v1 schema only
+        // (i.e. before migration v2 existed): apply migration v1
+        // by hand, set user_version=1, then call run_migrations
+        // and assert it advances to LATEST_USER_VERSION and adds
+        // the v2 tables without touching v1 tables.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Match init_connection's foreign-keys / sanity-check
+        // setup so the fixture mirrors a real on-disk v1 DB.
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // Apply just migration v1, mimicking the old
+        // `init_connection` that ran `SCHEMA_SQL` without setting
+        // `user_version`.
+        let icu_available = fts5_icu_available(&conn);
+        let v1_sql = if icu_available {
+            SCHEMA_SQL.to_string()
+        } else {
+            create_schema_with_unicode61_fallback()
+        };
+        conn.execute_batch(&v1_sql).unwrap();
+        write_user_version(&conn, 1).unwrap();
+        // Sanity: v2 tables are NOT present yet.
+        let pre_v2: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE name = 'backup_segment_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre_v2, 0);
+
+        // Run the migration framework — it must apply v2 only.
+        run_migrations(&conn, icu_available).unwrap();
+        let after = read_user_version(&conn).unwrap();
+        assert_eq!(after, LATEST_USER_VERSION);
+
+        for table in ["backup_manifest_chain", "backup_segment_ledger"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE name = ?1 AND type = 'table'",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists > 0, "v2 migration did not add {table}");
+        }
+
+        // v1 tables remain intact and untouched.
+        for table in TABLES {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE name = ?1 AND (type = 'table' OR type = 'virtual')",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists > 0, "v1 table dropped by v2 migration: {table}");
+        }
+    }
+
+    #[test]
+    fn run_migrations_failure_leaves_user_version_unchanged() {
+        // Build a v1 fixture, then call `run_migrations` with a
+        // doctored MIGRATIONS-style table whose SQL is malformed.
+        // The savepoint rollback in `run_migrations` must leave
+        // user_version pinned at the last successful migration.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let icu_available = fts5_icu_available(&conn);
+        let v1_sql = if icu_available {
+            SCHEMA_SQL.to_string()
+        } else {
+            create_schema_with_unicode61_fallback()
+        };
+        conn.execute_batch(&v1_sql).unwrap();
+        write_user_version(&conn, 1).unwrap();
+
+        // Mimic `run_migrations` for a single broken migration so
+        // the assertion targets the savepoint/rollback logic in
+        // isolation. The real `run_migrations` has the same shape
+        // — see the inner match in `run_migrations` above. We use
+        // an outright syntax error (SQLite is lenient about column
+        // *types* but will reject malformed DDL).
+        let bad = "CREATE TABLE __not_a_table (id INTEGER); THIS IS NOT VALID SQL;";
+        let savepoint = "migration_v_test";
+        conn.execute_batch(&format!("SAVEPOINT {savepoint};"))
+            .unwrap();
+        let result = conn.execute_batch(bad);
+        let _ = conn.execute_batch(&format!(
+            "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};"
+        ));
+        assert!(result.is_err(), "doctored migration must fail to apply");
+
+        // user_version still pinned to the last successful
+        // migration (v1) — the rollback restored consistency.
+        let after = read_user_version(&conn).unwrap();
+        assert_eq!(after, 1);
+        // No half-built table left behind.
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE name = '__not_a_table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
     }
 
     #[test]

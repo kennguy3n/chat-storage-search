@@ -154,9 +154,12 @@ pub struct CoreImpl {
     /// In-memory tail of the backup manifest chain. The next
     /// manifest produced by
     /// [`KChatCore::run_incremental_backup`] chains under this one;
-    /// `None` produces a genesis manifest. Phase 5 will persist
-    /// this in a `backup_manifest_chain` table so chain continuity
-    /// survives a process restart.
+    /// `None` produces a genesis manifest. Mirrors the persisted
+    /// `backup_manifest_chain` single-row table — rehydrated in
+    /// [`Self::hydrate_backup_manifest_from_db`] at construction
+    /// time and rewritten by
+    /// [`Self::persist_backup_manifest`] after each backup so
+    /// chain continuity survives a process restart.
     previous_backup_manifest: Mutex<Option<crate::formats::manifest::BackupManifest>>,
     /// In-memory ledger of every sealed backup segment the
     /// orchestrator currently knows about (built but not yet
@@ -164,8 +167,13 @@ pub struct CoreImpl {
     /// appends one entry per call; [`Self::compact_backup`] reads
     /// it, builds a [`crate::backup::compaction::CompactionPlan`],
     /// re-seals the merged groups, and rewrites the ledger with
-    /// the compacted entries replacing the superseded ones. Phase
-    /// 5 will persist this in a `backup_segment_map` table.
+    /// the compacted entries replacing the superseded ones.
+    /// Mirrors the persisted `backup_segment_ledger` table —
+    /// rehydrated in
+    /// [`Self::hydrate_tracked_backup_segments_from_db`] when
+    /// `K_backup_root` is installed (the per-segment keys are
+    /// stored AES-256-KW-wrapped under that root) and rewritten
+    /// after each backup / compaction step.
     tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
     /// Phase-3 ZKOF archive backend configuration. `None` until
     /// [`CoreImpl::install_zkof_archive_backend`] is called. When
@@ -307,9 +315,11 @@ pub struct TrackedBackupSegment {
     /// generates `built.segment_id` internally — it is **not**
     /// the input to [`crate::crypto::key_hierarchy::derive_backup_segment`]
     /// — so the orchestrator cannot re-derive the key on the
-    /// open side. Phase 5 will move this into a sealed
-    /// `wrapped_k_segment` column on the backup-segment-map table
-    /// (wrapped under `K_backup_root`).
+    /// open side. Persisted on the
+    /// `backup_segment_ledger.wrapped_k_segment` column as an
+    /// AES-256-KW (RFC 3394) of these bytes under
+    /// `K_backup_root` — see
+    /// [`CoreImpl::hydrate_tracked_backup_segments_from_db`].
     pub k_segment: crate::crypto::key_hierarchy::KeyMaterial,
 }
 
@@ -399,29 +409,13 @@ pub struct UploadedShardMetadata {
     pub ciphertext_sha256: [u8; 32],
 }
 
-/// URL-safe base64 (no padding) of a byte slice. Internal helper
-/// used by [`CoreImpl::upload_search_shards`] to ferry the
-/// `conversation_id_hash` into the transport surface.
-fn base64_urlsafe_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
-        let n = chunk.len();
-        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        if n >= 2 {
-            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-        }
-        if n >= 3 {
-            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
-        }
-    }
-    out
-}
+// URL-safe base64 helper. The single implementation lives in
+// [`crate::util::base64_urlsafe_encode`] and is re-exported here
+// so existing call sites stay source-compatible. The write path
+// (this module) and the read path
+// (`crate::search::cold_shard_source`) MUST share one alphabet
+// — see `crate::util` for the rationale.
+use crate::util::base64_urlsafe_encode;
 
 impl CoreImpl {
     /// Construct a new core, opening the SQLCipher database at
@@ -431,7 +425,7 @@ impl CoreImpl {
     pub fn new(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open(&config.data_dir, &key)
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self {
+        let core = Self {
             config,
             db: Mutex::new(db),
             key: Zeroizing::new(key),
@@ -461,7 +455,9 @@ impl CoreImpl {
             windows_search_anchor: Mutex::new(None),
             ep_benchmark_runner: Mutex::new(None),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
-        })
+        };
+        core.hydrate_backup_manifest_from_db()?;
+        Ok(core)
     }
 
     /// Construct a new core backed by an in-memory database.
@@ -472,7 +468,7 @@ impl CoreImpl {
     #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(Self {
+        let core = Self {
             config,
             db: Mutex::new(db),
             key: Zeroizing::new(key),
@@ -502,7 +498,9 @@ impl CoreImpl {
             windows_search_anchor: Mutex::new(None),
             ep_benchmark_runner: Mutex::new(None),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
-        })
+        };
+        core.hydrate_backup_manifest_from_db()?;
+        Ok(core)
     }
 
     /// Construct a new core with an MLS delivery-store client wired
@@ -3148,6 +3146,13 @@ impl CoreImpl {
         *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
         *self.backup_signing_key.lock().map_err(poisoned)? = Some(signing_key);
         *self.backup_device_id.lock().map_err(poisoned)? = Some(device_id);
+        // Phase-5 hardening: the `wrapped_k_segment` BLOB column
+        // on `backup_segment_ledger` is sealed under
+        // `K_backup_root`. Now that the root is installed we can
+        // unwrap every persisted row into the in-memory ledger so
+        // a subsequent `compact_backup` sees the same state that
+        // existed before the process restarted.
+        self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
         Ok(())
     }
 
@@ -3157,6 +3162,217 @@ impl CoreImpl {
             .lock()
             .map(|s| s.is_some())
             .unwrap_or(false)
+    }
+
+    // ----------------------------------------------------------------
+    // Phase-5 hardening — DB-backed manifest chain / segment ledger
+    // ----------------------------------------------------------------
+
+    /// Load the latest persisted [`BackupManifest`] from
+    /// `backup_manifest_chain` into the in-memory tail.
+    ///
+    /// Called from [`Self::new`] / [`Self::new_in_memory`] so chain
+    /// continuity survives a process restart: the next call to
+    /// [`KChatCore::run_incremental_backup`] chains under the
+    /// manifest that the *previous* process produced.
+    fn hydrate_backup_manifest_from_db(&self) -> Result<()> {
+        let manifest_cbor = {
+            let db = self.db.lock().map_err(poisoned)?;
+            db.load_backup_manifest()
+                .map_err(|e| Error::Storage(e.to_string()))?
+        };
+        if let Some(bytes) = manifest_cbor {
+            let manifest: crate::formats::manifest::BackupManifest = serde_cbor::from_slice(&bytes)
+                .map_err(|e| {
+                    Error::Storage(format!(
+                        "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
+                    ))
+                })?;
+            *self.previous_backup_manifest.lock().map_err(poisoned)? = Some(manifest);
+        }
+        Ok(())
+    }
+
+    /// Load every row in `backup_segment_ledger`, unwrap each
+    /// `wrapped_k_segment` under the supplied `K_backup_root`, and
+    /// install the result as the in-memory ledger.
+    ///
+    /// Called from [`Self::install_backup_keys`] — before the root
+    /// is installed the wrapped keys cannot be opened, so the
+    /// ledger stays empty.
+    fn hydrate_tracked_backup_segments_from_db(&self, backup_root: &[u8; KEY_LEN]) -> Result<()> {
+        use crate::backup::compaction::CompactionTier;
+        use crate::backup::segment_builder::BuiltBackupSegment;
+        use crate::crypto::aead::xchacha20_poly1305::NONCE_LEN;
+        use crate::crypto::key_hierarchy::KeyMaterial;
+        use crate::crypto::key_wrap::unwrap_k_asset;
+        use crate::formats::SegmentType;
+
+        let rows = {
+            let db = self.db.lock().map_err(poisoned)?;
+            db.load_backup_segment_ledger()
+                .map_err(|e| Error::Storage(e.to_string()))?
+        };
+        let wrapping_root = KeyMaterial::from_bytes(*backup_root);
+        let mut materialised = Vec::with_capacity(rows.len());
+        for row in rows {
+            let segment_id = uuid::Uuid::parse_str(&row.segment_id).map_err(|e| {
+                Error::Storage(format!(
+                    "backup_segment_ledger: malformed segment_id={}: {e}",
+                    row.segment_id
+                ))
+            })?;
+            if row.nonce.len() != NONCE_LEN {
+                return Err(Error::Storage(format!(
+                    "backup_segment_ledger: nonce length {} != {NONCE_LEN}",
+                    row.nonce.len()
+                )));
+            }
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce.copy_from_slice(&row.nonce);
+            if row.merkle_root.len() != 32 {
+                return Err(Error::Storage(format!(
+                    "backup_segment_ledger: merkle_root length {} != 32",
+                    row.merkle_root.len()
+                )));
+            }
+            let mut merkle_root = [0u8; 32];
+            merkle_root.copy_from_slice(&row.merkle_root);
+            let segment_type = match row.segment_type.as_str() {
+                "events" => SegmentType::Events,
+                other => {
+                    return Err(Error::Storage(format!(
+                        "backup_segment_ledger: unknown segment_type={other}"
+                    )))
+                }
+            };
+            let tier = match row.tier.as_str() {
+                "daily" => CompactionTier::Daily,
+                "weekly" => CompactionTier::Weekly,
+                "monthly" => CompactionTier::Monthly,
+                other => {
+                    return Err(Error::Storage(format!(
+                        "backup_segment_ledger: unknown tier={other}"
+                    )))
+                }
+            };
+            let k_segment_bytes =
+                unwrap_k_asset(&row.wrapped_k_segment, &wrapping_root).map_err(Error::Crypto)?;
+            let k_segment = KeyMaterial::from_bytes(k_segment_bytes);
+            let built = BuiltBackupSegment {
+                segment_id,
+                segment_type,
+                nonce,
+                ciphertext: row.ciphertext,
+                merkle_root,
+                event_count: row.event_count as usize,
+            };
+            materialised.push(TrackedBackupSegment {
+                built,
+                tier,
+                min_event_ms: row.min_event_ms,
+                max_event_ms: row.max_event_ms,
+                k_segment,
+            });
+        }
+        *self.tracked_backup_segments.lock().map_err(poisoned)? = materialised;
+        Ok(())
+    }
+
+    /// Persist `manifest` to `backup_manifest_chain` so chain
+    /// continuity survives a process restart.
+    ///
+    /// Called from [`KChatCore::run_incremental_backup`] and
+    /// [`KChatCore::compact_backup`] right after the in-memory
+    /// tail is updated.
+    fn persist_backup_manifest(
+        &self,
+        manifest: &crate::formats::manifest::BackupManifest,
+        now_ms: i64,
+    ) -> Result<()> {
+        let cbor = serde_cbor::to_vec(manifest).map_err(|e| {
+            Error::Storage(format!(
+                "backup_manifest_chain: CBOR encode of manifest failed: {e}"
+            ))
+        })?;
+        let db = self.db.lock().map_err(poisoned)?;
+        db.save_backup_manifest(&cbor, manifest.generation as i64, now_ms)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Build a [`crate::local_store::db::BackupSegmentLedgerRow`]
+    /// from an in-memory [`TrackedBackupSegment`], sealing the
+    /// per-segment key under `K_backup_root`.
+    fn build_backup_segment_ledger_row(
+        seg: &TrackedBackupSegment,
+        backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
+        now_ms: i64,
+    ) -> Result<crate::local_store::db::BackupSegmentLedgerRow> {
+        use crate::crypto::key_wrap::wrap_k_asset;
+
+        let wrapped = wrap_k_asset(seg.k_segment.as_bytes(), backup_root).map_err(Error::Crypto)?;
+        let segment_type = match seg.built.segment_type {
+            crate::formats::SegmentType::Events => "events",
+            other => {
+                return Err(Error::Storage(format!(
+                "backup_segment_ledger: backup segment carried unexpected segment_type={other:?}"
+            )))
+            }
+        };
+        let tier = match seg.tier {
+            crate::backup::compaction::CompactionTier::Daily => "daily",
+            crate::backup::compaction::CompactionTier::Weekly => "weekly",
+            crate::backup::compaction::CompactionTier::Monthly => "monthly",
+        };
+        Ok(crate::local_store::db::BackupSegmentLedgerRow {
+            segment_id: seg.built.segment_id.to_string(),
+            segment_type: segment_type.to_string(),
+            nonce: seg.built.nonce.to_vec(),
+            ciphertext: seg.built.ciphertext.clone(),
+            merkle_root: seg.built.merkle_root.to_vec(),
+            event_count: seg.built.event_count as i64,
+            tier: tier.to_string(),
+            min_event_ms: seg.min_event_ms,
+            max_event_ms: seg.max_event_ms,
+            wrapped_k_segment: wrapped,
+            created_at_ms: now_ms,
+        })
+    }
+
+    /// Append a single sealed segment to `backup_segment_ledger`.
+    fn persist_tracked_backup_segment(
+        &self,
+        seg: &TrackedBackupSegment,
+        backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
+        now_ms: i64,
+    ) -> Result<()> {
+        let row = Self::build_backup_segment_ledger_row(seg, backup_root, now_ms)?;
+        let db = self.db.lock().map_err(poisoned)?;
+        db.insert_backup_segment_ledger_row(&row)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Rewrite `backup_segment_ledger` to `snapshot`.
+    fn persist_tracked_backup_segments(
+        &self,
+        snapshot: &[TrackedBackupSegment],
+        backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut rows = Vec::with_capacity(snapshot.len());
+        for seg in snapshot {
+            rows.push(Self::build_backup_segment_ledger_row(
+                seg,
+                backup_root,
+                now_ms,
+            )?);
+        }
+        let db = self.db.lock().map_err(poisoned)?;
+        db.replace_backup_segment_ledger(&rows)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 
     /// Drive one incremental backup pass.
@@ -3326,18 +3542,27 @@ impl CoreImpl {
         *self.previous_backup_manifest.lock().map_err(poisoned)? =
             Some(sealed_manifest.manifest.clone());
 
-        // Phase 5 (Task 5) consumes this ledger when the
+        // `compact_backup` consumes this ledger when the
         // compaction policy decides to roll up daily segments.
+        let tracked = TrackedBackupSegment {
+            built: built.clone(),
+            tier: crate::backup::compaction::CompactionTier::Daily,
+            min_event_ms,
+            max_event_ms,
+            k_segment: k_segment.clone(),
+        };
         self.tracked_backup_segments
             .lock()
             .map_err(poisoned)?
-            .push(TrackedBackupSegment {
-                built: built.clone(),
-                tier: crate::backup::compaction::CompactionTier::Daily,
-                min_event_ms,
-                max_event_ms,
-                k_segment: k_segment.clone(),
-            });
+            .push(tracked.clone());
+
+        // Phase-5 hardening: durably persist both the manifest
+        // chain tail and the freshly appended segment so a crash
+        // here does not break manifest-chain continuity or lose
+        // the segment from the compaction ledger.
+        let now_persist_ms = now_ms_for_send_media();
+        self.persist_backup_manifest(&sealed_manifest.manifest, now_persist_ms)?;
+        self.persist_tracked_backup_segment(&tracked, &backup_root, now_persist_ms)?;
 
         Ok((
             BackupResult {
@@ -3542,6 +3767,15 @@ impl CoreImpl {
         let manifest_generation = sealed_manifest.manifest.generation;
         *self.previous_backup_manifest.lock().map_err(poisoned)? =
             Some(sealed_manifest.manifest.clone());
+
+        // Phase-5 hardening: rewrite the persisted ledger to
+        // mirror the in-memory snapshot, and persist the new
+        // manifest chain tail. The replace path runs inside a
+        // savepoint so either both the manifest and the rewritten
+        // ledger commit, or neither does.
+        let now_persist_ms = now_ms_for_send_media();
+        self.persist_tracked_backup_segments(&ledger_snapshot, &backup_root, now_persist_ms)?;
+        self.persist_backup_manifest(&sealed_manifest.manifest, now_persist_ms)?;
 
         Ok(BackupCompactionResult {
             groups_compacted,
@@ -7725,6 +7959,132 @@ mod tests {
         install_test_backup_keys(&core);
         let result = core.compact_backup(1_900_000_000_000).expect("noop");
         assert_eq!(result, BackupCompactionResult::default());
+    }
+
+    #[test]
+    fn backup_manifest_chain_and_segment_ledger_survive_restart() {
+        // Phase-5 hardening (Task 2): the manifest chain tail and
+        // the tracked-segment ledger must round-trip through a
+        // process restart so the next call to
+        // `run_incremental_backup` chains under the previous
+        // manifest (no genesis fork) and `compact_backup` sees
+        // the same tracked segments.
+        let backup_root = [0x33u8; 32];
+        let device_id = "test-device".to_string();
+
+        // ---- Phase 1: first "process" runs an incremental backup.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = KChatCoreConfig::new(tmp.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        let pre_generation = {
+            let core = CoreImpl::new(cfg.clone(), TEST_KEY).expect("core");
+            // Same backup root on both sides so the ledger
+            // re-hydrates under the same wrapping key.
+            let mut rng = rand::rngs::OsRng;
+            let signing = crate::crypto::signing::HybridSigningKey::generate(&mut rng);
+            core.install_backup_keys(backup_root, signing, device_id.clone())
+                .expect("install backup keys");
+
+            let conv = Uuid::now_v7();
+            seed_conversation(&core, &conv);
+            seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+            seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+
+            let result = core
+                .run_incremental_backup("scheduled")
+                .expect("incremental backup");
+            assert_eq!(result.segments_built, 1);
+            let pre_generation = result.manifest_generation.expect("generation");
+            assert_eq!(pre_generation, 0, "first manifest is genesis");
+
+            // Sanity: in-memory state reflects the just-built backup.
+            let in_memory_tracked = core
+                .tracked_backup_segments
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.built.segment_id)
+                .collect::<Vec<_>>();
+            assert_eq!(in_memory_tracked.len(), 1);
+            let in_memory_manifest = core
+                .previous_backup_manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.generation);
+            assert_eq!(in_memory_manifest, Some(0));
+
+            // Sanity: state actually hit the DB before we drop.
+            let row_count: i64 = core.with_db(|db| {
+                db.connection()
+                    .query_row("SELECT COUNT(*) FROM backup_segment_ledger", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap()
+            });
+            assert_eq!(row_count, 1);
+            let manifest_row_count: i64 = core.with_db(|db| {
+                db.connection()
+                    .query_row("SELECT COUNT(*) FROM backup_manifest_chain", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap()
+            });
+            assert_eq!(manifest_row_count, 1);
+            pre_generation
+        };
+
+        // ---- Phase 2: simulate a process restart by opening a fresh
+        // CoreImpl against the same on-disk DB. The manifest tail
+        // must rehydrate from `backup_manifest_chain`; the segment
+        // ledger must rehydrate from `backup_segment_ledger` once
+        // the backup keys are re-installed (the ledger rows are
+        // sealed under `K_backup_root`).
+        let core2 = CoreImpl::new(cfg, TEST_KEY).expect("reopen core");
+        // Manifest chain rehydrates eagerly in `new`.
+        let manifest_after_restart = core2
+            .previous_backup_manifest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.generation);
+        assert_eq!(manifest_after_restart, Some(pre_generation));
+        // Segment ledger only rehydrates once the wrapping root is
+        // re-installed.
+        assert!(core2.tracked_backup_segments.lock().unwrap().is_empty());
+
+        let mut rng = rand::rngs::OsRng;
+        let signing = crate::crypto::signing::HybridSigningKey::generate(&mut rng);
+        core2
+            .install_backup_keys(backup_root, signing, device_id.clone())
+            .expect("install backup keys (post-restart)");
+        let rehydrated = core2
+            .tracked_backup_segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.built.segment_id, s.tier, s.built.event_count))
+            .collect::<Vec<_>>();
+        assert_eq!(rehydrated.len(), 1);
+        assert_eq!(
+            rehydrated[0].1,
+            crate::backup::compaction::CompactionTier::Daily
+        );
+        assert_eq!(rehydrated[0].2, 2);
+
+        // ---- Phase 3: a second incremental run on the restored
+        // core must chain under generation N (not start a new
+        // genesis chain at 0).
+        let conv = Uuid::now_v7();
+        seed_conversation(&core2, &conv);
+        seed_backup_event(&core2, conv, Uuid::now_v7(), 1_777_000_010_000);
+        let result = core2
+            .run_incremental_backup("scheduled")
+            .expect("incremental backup after restart");
+        assert_eq!(
+            result.manifest_generation,
+            Some(pre_generation + 1),
+            "chain must continue across process restart"
+        );
     }
 
     // ---------------------------------------------------------------

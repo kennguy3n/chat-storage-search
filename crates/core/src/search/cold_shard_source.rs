@@ -234,31 +234,13 @@ impl ColdShardSource for TransportColdShardSource<'_> {
 
 /// URL-safe base64 (no padding) encoding of a byte slice.
 ///
-/// Replicates the same alphabet the transport surface expects in
-/// the `conversation_hash` parameter — RFC 4648 §5 with `=`
-/// padding stripped, matching the wire shape used by the existing
-/// search-shard fetch tests.
-fn base64_encode_urlsafe(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let chunks = bytes.chunks(3);
-    for chunk in chunks {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
-        let n = chunk.len();
-        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        if n >= 2 {
-            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-        }
-        if n >= 3 {
-            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
-        }
-    }
-    out
-}
+/// Thin alias around [`crate::util::base64_urlsafe_encode`] so the
+/// `base64_encode_urlsafe` call sites in this module stay
+/// source-compatible. The single implementation must be shared
+/// with [`crate::core_impl`] (write path) — a private re-encoder
+/// here historically went out of sync with the upload path and
+/// produced silent "shard not found" misses.
+use crate::util::base64_urlsafe_encode as base64_encode_urlsafe;
 
 #[allow(missing_debug_implementations)] // F is FnMut, not Debug
 /// `ColdShardSource` wrapper that swallows transient transport /

@@ -107,6 +107,11 @@ dictionary SearchResult {
   string? snippet;
   f64 rank_score;
   boolean is_cold;
+  // Raw cosine similarity from the semantic re-rank pass, when
+  // the hit went through `crate::search::merge_results`. `null`
+  // for FTS-only hits and for paths that never invoked the
+  // semantic ranker. Mirrors `kchat_core::SearchResult::semantic_score`.
+  f64? semantic_score;
 };
 
 // ---------------------------------------------------------------------------
