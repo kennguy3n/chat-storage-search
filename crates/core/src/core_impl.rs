@@ -3536,8 +3536,6 @@ impl CoreImpl {
                 .advance_cursor(db.connection(), last_seq)
                 .map_err(|e| Error::Storage(e.to_string()))?;
         }
-        *self.previous_backup_manifest.lock().map_err(poisoned)? =
-            Some(sealed_manifest.manifest.clone());
 
         // `compact_backup` consumes this ledger when the
         // compaction policy decides to roll up daily segments.
@@ -3548,15 +3546,14 @@ impl CoreImpl {
             max_event_ms,
             k_segment: k_segment.clone(),
         };
-        self.tracked_backup_segments
-            .lock()
-            .map_err(poisoned)?
-            .push(tracked.clone());
 
         // Phase-5 hardening: atomically persist both the manifest
         // chain tail and the freshly appended segment inside a
         // single SAVEPOINT so a crash cannot leave one persisted
-        // without the other.
+        // without the other. The persist MUST happen before the
+        // in-memory `Mutex` updates below: if persist fails, `?`
+        // propagates the error and we leave the in-memory state at
+        // the pre-call values (matching the un-mutated DB).
         let now_persist_ms = now_ms_for_send_media();
         self.persist_incremental_backup_atomic(
             &tracked,
@@ -3564,6 +3561,14 @@ impl CoreImpl {
             &backup_root,
             now_persist_ms,
         )?;
+
+        // Persist succeeded — commit the in-memory state.
+        *self.previous_backup_manifest.lock().map_err(poisoned)? =
+            Some(sealed_manifest.manifest.clone());
+        self.tracked_backup_segments
+            .lock()
+            .map_err(poisoned)?
+            .push(tracked);
 
         Ok((
             BackupResult {
@@ -3731,23 +3736,19 @@ impl CoreImpl {
             });
         }
 
-        // Rewrite the ledger: drop the superseded entries, append
-        // the compacted ones.
-        {
-            let mut slot = self.tracked_backup_segments.lock().map_err(poisoned)?;
-            slot.retain(|s| !superseded_ids.contains(&s.built.segment_id));
-            slot.extend(compacted_outputs.iter().cloned());
-        }
+        // Build the post-compaction view as a local `Vec` without
+        // mutating the in-memory ledger yet — `snapshot` is already
+        // a clone of the current ledger taken at the top of this
+        // method, so applying `retain` + `extend` to it produces
+        // the post-compaction state without touching the `Mutex`.
+        let mut new_ledger_local: Vec<TrackedBackupSegment> = snapshot;
+        new_ledger_local.retain(|s| !superseded_ids.contains(&s.built.segment_id));
+        new_ledger_local.extend(compacted_outputs.iter().cloned());
 
-        // Cut a new manifest over the rewritten ledger so the
-        // chain reflects the compaction.
-        let ledger_snapshot = self
-            .tracked_backup_segments
-            .lock()
-            .map_err(poisoned)?
-            .clone();
+        // Cut a new manifest over the post-compaction ledger so
+        // the chain reflects the compaction.
         let segments_for_manifest: Vec<_> =
-            ledger_snapshot.iter().map(|s| s.built.clone()).collect();
+            new_ledger_local.iter().map(|s| s.built.clone()).collect();
         let previous_owned = self
             .previous_backup_manifest
             .lock()
@@ -3766,21 +3767,27 @@ impl CoreImpl {
         };
         let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
-        *self.previous_backup_manifest.lock().map_err(poisoned)? =
-            Some(sealed_manifest.manifest.clone());
 
         // Phase-5 hardening: atomically rewrite the persisted
         // ledger and the manifest chain tail inside a single
         // SAVEPOINT so a crash cannot leave the ledger compacted
         // while the manifest still references the pre-compaction
-        // generation.
+        // generation. The persist MUST happen before the
+        // in-memory `Mutex` updates below: if persist fails, `?`
+        // propagates the error and we leave the in-memory state at
+        // the pre-call values (matching the un-mutated DB).
         let now_persist_ms = now_ms_for_send_media();
         self.persist_compaction_backup_atomic(
-            &ledger_snapshot,
+            &new_ledger_local,
             &sealed_manifest.manifest,
             &backup_root,
             now_persist_ms,
         )?;
+
+        // Persist succeeded — swap the in-memory state.
+        *self.tracked_backup_segments.lock().map_err(poisoned)? = new_ledger_local;
+        *self.previous_backup_manifest.lock().map_err(poisoned)? =
+            Some(sealed_manifest.manifest.clone());
 
         Ok(BackupCompactionResult {
             groups_compacted,
@@ -8089,6 +8096,132 @@ mod tests {
             result.manifest_generation,
             Some(pre_generation + 1),
             "chain must continue across process restart"
+        );
+    }
+
+    /// Force any subsequent `backup_segment_ledger` write to fail
+    /// by dropping the table. Used by the persist-failure tests
+    /// below; after this the only safe operations on the DB are
+    /// reads from other tables — anything that touches the ledger
+    /// will error.
+    fn drop_backup_segment_ledger_table(core: &CoreImpl) {
+        core.with_db(|db| {
+            db.connection()
+                .execute("DROP TABLE backup_segment_ledger", [])
+                .expect("drop backup_segment_ledger");
+        });
+    }
+
+    #[test]
+    fn run_incremental_backup_persist_failure_leaves_in_memory_state_unchanged() {
+        // Phase-5 hardening: if the persist step in
+        // `run_incremental_backup_inner` fails, the in-memory
+        // manifest and segment ledger must remain at the
+        // pre-call values. Otherwise the next call within the
+        // same process would chain under an unpersisted manifest,
+        // and a restart would fork the chain.
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+        seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+
+        // Pre-call in-memory state.
+        assert!(core.previous_backup_manifest.lock().unwrap().is_none());
+        assert!(core.tracked_backup_segments.lock().unwrap().is_empty());
+
+        // Force the persist to fail.
+        drop_backup_segment_ledger_table(&core);
+
+        let result = core.run_incremental_backup("scheduled");
+        assert!(
+            result.is_err(),
+            "persist must fail when backup_segment_ledger is missing"
+        );
+
+        // In-memory state must be unchanged.
+        assert!(
+            core.previous_backup_manifest.lock().unwrap().is_none(),
+            "previous_backup_manifest must not advance on persist failure"
+        );
+        assert!(
+            core.tracked_backup_segments.lock().unwrap().is_empty(),
+            "tracked_backup_segments must not gain entries on persist failure"
+        );
+    }
+
+    #[test]
+    fn compact_backup_persist_failure_leaves_in_memory_state_unchanged() {
+        // Phase-5 hardening: if the persist step in
+        // `compact_backup` fails, the in-memory manifest and
+        // segment ledger must remain at the pre-compaction
+        // values. Otherwise subsequent operations in the same
+        // process operate on a ledger the DB never wrote, and a
+        // restart would reload stale pre-compaction state.
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Build three aged daily segments (10 days old) so the
+        // compaction planner has work to do.
+        build_aged_segments(&core, conv, 10, 3, now_ms);
+
+        // Snapshot the pre-compaction in-memory state.
+        let pre_ledger_ids: Vec<uuid::Uuid> = core
+            .tracked_backup_segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.built.segment_id)
+            .collect();
+        assert_eq!(pre_ledger_ids.len(), 3);
+        let pre_manifest_generation = core
+            .previous_backup_manifest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.generation);
+        assert!(pre_manifest_generation.is_some());
+
+        // Force the persist to fail.
+        drop_backup_segment_ledger_table(&core);
+
+        let result = core.compact_backup(now_ms);
+        assert!(
+            result.is_err(),
+            "persist must fail when backup_segment_ledger is missing"
+        );
+
+        // In-memory ledger must still hold the pre-compaction
+        // entries — superseded segments must NOT have been
+        // removed and compacted entries must NOT have been
+        // appended.
+        let post_ledger_ids: Vec<uuid::Uuid> = core
+            .tracked_backup_segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.built.segment_id)
+            .collect();
+        assert_eq!(
+            post_ledger_ids, pre_ledger_ids,
+            "in-memory ledger must not change on compaction persist failure"
+        );
+
+        // Manifest tail must still be at the pre-compaction
+        // generation.
+        let post_manifest_generation = core
+            .previous_backup_manifest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.generation);
+        assert_eq!(
+            post_manifest_generation, pre_manifest_generation,
+            "manifest tail must not advance on compaction persist failure"
         );
     }
 
