@@ -3279,26 +3279,15 @@ impl CoreImpl {
         Ok(())
     }
 
-    /// Persist `manifest` to `backup_manifest_chain` so chain
-    /// continuity survives a process restart.
-    ///
-    /// Called from [`KChatCore::run_incremental_backup`] and
-    /// [`KChatCore::compact_backup`] right after the in-memory
-    /// tail is updated.
-    fn persist_backup_manifest(
-        &self,
+    /// Encode the given manifest to CBOR for DB persistence.
+    fn encode_manifest_cbor(
         manifest: &crate::formats::manifest::BackupManifest,
-        now_ms: i64,
-    ) -> Result<()> {
-        let cbor = serde_cbor::to_vec(manifest).map_err(|e| {
+    ) -> Result<Vec<u8>> {
+        serde_cbor::to_vec(manifest).map_err(|e| {
             Error::Storage(format!(
                 "backup_manifest_chain: CBOR encode of manifest failed: {e}"
             ))
-        })?;
-        let db = self.db.lock().map_err(poisoned)?;
-        db.save_backup_manifest(&cbor, manifest.generation as i64, now_ms)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+        })
     }
 
     /// Build a [`crate::local_store::db::BackupSegmentLedgerRow`]
@@ -3340,24 +3329,31 @@ impl CoreImpl {
         })
     }
 
-    /// Append a single sealed segment to `backup_segment_ledger`.
-    fn persist_tracked_backup_segment(
+    /// Atomically append one sealed segment **and** upsert the
+    /// manifest chain tail in a single SAVEPOINT. Acquires the DB
+    /// lock once.
+    fn persist_incremental_backup_atomic(
         &self,
         seg: &TrackedBackupSegment,
+        manifest: &crate::formats::manifest::BackupManifest,
         backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
         now_ms: i64,
     ) -> Result<()> {
         let row = Self::build_backup_segment_ledger_row(seg, backup_root, now_ms)?;
+        let cbor = Self::encode_manifest_cbor(manifest)?;
         let db = self.db.lock().map_err(poisoned)?;
-        db.insert_backup_segment_ledger_row(&row)
+        db.atomic_append_segment_and_manifest(&row, &cbor, manifest.generation as i64, now_ms)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
-    /// Rewrite `backup_segment_ledger` to `snapshot`.
-    fn persist_tracked_backup_segments(
+    /// Atomically replace the full segment ledger **and** upsert
+    /// the manifest chain tail in a single SAVEPOINT. Acquires
+    /// the DB lock once.
+    fn persist_compaction_backup_atomic(
         &self,
         snapshot: &[TrackedBackupSegment],
+        manifest: &crate::formats::manifest::BackupManifest,
         backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
         now_ms: i64,
     ) -> Result<()> {
@@ -3369,8 +3365,9 @@ impl CoreImpl {
                 now_ms,
             )?);
         }
+        let cbor = Self::encode_manifest_cbor(manifest)?;
         let db = self.db.lock().map_err(poisoned)?;
-        db.replace_backup_segment_ledger(&rows)
+        db.atomic_replace_ledger_and_manifest(&rows, &cbor, manifest.generation as i64, now_ms)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
@@ -3556,13 +3553,17 @@ impl CoreImpl {
             .map_err(poisoned)?
             .push(tracked.clone());
 
-        // Phase-5 hardening: durably persist both the manifest
-        // chain tail and the freshly appended segment so a crash
-        // here does not break manifest-chain continuity or lose
-        // the segment from the compaction ledger.
+        // Phase-5 hardening: atomically persist both the manifest
+        // chain tail and the freshly appended segment inside a
+        // single SAVEPOINT so a crash cannot leave one persisted
+        // without the other.
         let now_persist_ms = now_ms_for_send_media();
-        self.persist_backup_manifest(&sealed_manifest.manifest, now_persist_ms)?;
-        self.persist_tracked_backup_segment(&tracked, &backup_root, now_persist_ms)?;
+        self.persist_incremental_backup_atomic(
+            &tracked,
+            &sealed_manifest.manifest,
+            &backup_root,
+            now_persist_ms,
+        )?;
 
         Ok((
             BackupResult {
@@ -3768,14 +3769,18 @@ impl CoreImpl {
         *self.previous_backup_manifest.lock().map_err(poisoned)? =
             Some(sealed_manifest.manifest.clone());
 
-        // Phase-5 hardening: rewrite the persisted ledger to
-        // mirror the in-memory snapshot, and persist the new
-        // manifest chain tail. The replace path runs inside a
-        // savepoint so either both the manifest and the rewritten
-        // ledger commit, or neither does.
+        // Phase-5 hardening: atomically rewrite the persisted
+        // ledger and the manifest chain tail inside a single
+        // SAVEPOINT so a crash cannot leave the ledger compacted
+        // while the manifest still references the pre-compaction
+        // generation.
         let now_persist_ms = now_ms_for_send_media();
-        self.persist_tracked_backup_segments(&ledger_snapshot, &backup_root, now_persist_ms)?;
-        self.persist_backup_manifest(&sealed_manifest.manifest, now_persist_ms)?;
+        self.persist_compaction_backup_atomic(
+            &ledger_snapshot,
+            &sealed_manifest.manifest,
+            &backup_root,
+            now_persist_ms,
+        )?;
 
         Ok(BackupCompactionResult {
             groups_compacted,

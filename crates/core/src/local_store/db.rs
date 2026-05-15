@@ -1746,6 +1746,98 @@ impl LocalStoreDb {
         insert_backup_segment_ledger_row(&self.conn, row)
     }
 
+    /// Atomically append one segment row **and** upsert the
+    /// manifest chain tail inside a single SAVEPOINT.
+    ///
+    /// If either the segment insert or the manifest upsert fails,
+    /// both are rolled back so the on-disk ledger and manifest
+    /// remain consistent.
+    pub fn atomic_append_segment_and_manifest(
+        &self,
+        segment_row: &BackupSegmentLedgerRow,
+        manifest_cbor: &[u8],
+        generation: i64,
+        updated_at_ms: i64,
+    ) -> DbResult<()> {
+        self.conn
+            .execute_batch("SAVEPOINT atomic_backup_persist;")?;
+        let inner = (|| -> DbResult<()> {
+            insert_backup_segment_ledger_row(&self.conn, segment_row)?;
+            self.conn.execute(
+                "INSERT INTO backup_manifest_chain (id, generation, manifest_cbor, updated_at_ms)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    generation    = excluded.generation,
+                    manifest_cbor = excluded.manifest_cbor,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![generation, manifest_cbor, updated_at_ms],
+            )?;
+            Ok(())
+        })();
+        match inner {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT atomic_backup_persist;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT atomic_backup_persist; \
+                     RELEASE SAVEPOINT atomic_backup_persist;",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically replace the entire segment ledger **and** upsert
+    /// the manifest chain tail inside a single SAVEPOINT.
+    ///
+    /// Used by the compaction path: superseded segments are removed
+    /// and compacted entries inserted. If any step fails, the
+    /// entire operation rolls back so the on-disk ledger and
+    /// manifest remain consistent with each other.
+    pub fn atomic_replace_ledger_and_manifest(
+        &self,
+        rows: &[BackupSegmentLedgerRow],
+        manifest_cbor: &[u8],
+        generation: i64,
+        updated_at_ms: i64,
+    ) -> DbResult<()> {
+        self.conn
+            .execute_batch("SAVEPOINT atomic_compact_persist;")?;
+        let inner = (|| -> DbResult<()> {
+            self.conn.execute("DELETE FROM backup_segment_ledger", [])?;
+            for row in rows {
+                insert_backup_segment_ledger_row(&self.conn, row)?;
+            }
+            self.conn.execute(
+                "INSERT INTO backup_manifest_chain (id, generation, manifest_cbor, updated_at_ms)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    generation    = excluded.generation,
+                    manifest_cbor = excluded.manifest_cbor,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![generation, manifest_cbor, updated_at_ms],
+            )?;
+            Ok(())
+        })();
+        match inner {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT atomic_compact_persist;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT atomic_compact_persist; \
+                     RELEASE SAVEPOINT atomic_compact_persist;",
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Load every row in the backup segment ledger.
     ///
     /// Ordered by `created_at_ms ASC` so callers see the segments
@@ -3738,5 +3830,112 @@ mod tests {
         assert_eq!(super::escape_like_pattern("a\\%b"), "a\\\\\\%b");
         // Multibyte / non-ASCII passes through unchanged.
         assert_eq!(super::escape_like_pattern("héllo世界"), "héllo世界");
+    }
+
+    // ---------------------------------------------------------------
+    // Atomic backup-persist tests
+    // ---------------------------------------------------------------
+
+    fn sample_segment_row(id: &str, now_ms: i64) -> BackupSegmentLedgerRow {
+        BackupSegmentLedgerRow {
+            segment_id: id.to_string(),
+            segment_type: "events".to_string(),
+            nonce: vec![0u8; 24],
+            ciphertext: vec![0xCA, 0xFE],
+            merkle_root: vec![0u8; 32],
+            event_count: 3,
+            tier: "daily".to_string(),
+            min_event_ms: now_ms - 1000,
+            max_event_ms: now_ms,
+            wrapped_k_segment: vec![0xDE, 0xAD],
+            created_at_ms: now_ms,
+        }
+    }
+
+    #[test]
+    fn atomic_append_segment_and_manifest_commits_both() {
+        let db = fresh_db();
+        let row = sample_segment_row("seg-1", 1000);
+        let manifest = b"manifest-cbor-1";
+        db.atomic_append_segment_and_manifest(&row, manifest, 0, 1000)
+            .expect("atomic append");
+        let loaded_manifest = db.load_backup_manifest().unwrap();
+        assert_eq!(loaded_manifest, Some(manifest.to_vec()));
+        let ledger = db.load_backup_segment_ledger().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].segment_id, "seg-1");
+    }
+
+    #[test]
+    fn atomic_replace_ledger_and_manifest_commits_both() {
+        let db = fresh_db();
+        // Seed two rows first.
+        let r1 = sample_segment_row("seg-old-1", 1000);
+        let r2 = sample_segment_row("seg-old-2", 1001);
+        db.insert_backup_segment_ledger_row(&r1).unwrap();
+        db.insert_backup_segment_ledger_row(&r2).unwrap();
+        db.save_backup_manifest(b"old-manifest", 0, 1000).unwrap();
+
+        // Replace with a single compacted row + new manifest.
+        let compacted = sample_segment_row("seg-compacted", 2000);
+        let new_manifest = b"new-manifest";
+        db.atomic_replace_ledger_and_manifest(&[compacted], new_manifest, 1, 2000)
+            .expect("atomic replace");
+
+        let loaded_manifest = db.load_backup_manifest().unwrap();
+        assert_eq!(loaded_manifest, Some(new_manifest.to_vec()));
+        let ledger = db.load_backup_segment_ledger().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].segment_id, "seg-compacted");
+    }
+
+    #[test]
+    fn atomic_replace_rolls_back_on_ledger_error() {
+        let db = fresh_db();
+        // Seed initial state.
+        let r1 = sample_segment_row("seg-keep", 1000);
+        db.insert_backup_segment_ledger_row(&r1).unwrap();
+        db.save_backup_manifest(b"keep-manifest", 0, 1000).unwrap();
+
+        // Try to replace with a row that has a duplicate segment_id
+        // within the same batch — the second insert will violate the
+        // PRIMARY KEY constraint, causing the SAVEPOINT to roll back.
+        let dup = sample_segment_row("seg-dup", 2000);
+        let result = db.atomic_replace_ledger_and_manifest(
+            &[dup.clone(), dup],
+            b"should-not-persist",
+            1,
+            2000,
+        );
+        assert!(result.is_err(), "duplicate PK must fail");
+
+        // Both ledger and manifest must be unchanged.
+        let manifest = db.load_backup_manifest().unwrap();
+        assert_eq!(manifest, Some(b"keep-manifest".to_vec()));
+        let ledger = db.load_backup_segment_ledger().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].segment_id, "seg-keep");
+    }
+
+    #[test]
+    fn atomic_append_rolls_back_on_duplicate_segment() {
+        let db = fresh_db();
+        // Seed a segment + manifest.
+        let r1 = sample_segment_row("seg-existing", 1000);
+        db.atomic_append_segment_and_manifest(&r1, b"manifest-v0", 0, 1000)
+            .unwrap();
+
+        // Attempt to re-insert the same segment_id — PK violation.
+        let dup = sample_segment_row("seg-existing", 2000);
+        let result =
+            db.atomic_append_segment_and_manifest(&dup, b"manifest-v1-should-not-persist", 1, 2000);
+        assert!(result.is_err(), "duplicate PK must fail");
+
+        // Manifest must still be at v0, not v1.
+        let manifest = db.load_backup_manifest().unwrap();
+        assert_eq!(manifest, Some(b"manifest-v0".to_vec()));
+        let ledger = db.load_backup_segment_ledger().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].segment_id, "seg-existing");
     }
 }
