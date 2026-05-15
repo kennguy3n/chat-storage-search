@@ -3143,16 +3143,24 @@ impl CoreImpl {
         signing_key: crate::crypto::signing::HybridSigningKey,
         device_id: String,
     ) -> Result<()> {
+        // Phase-5 hardening: the `wrapped_k_segment` BLOB column
+        // on `backup_segment_ledger` is sealed under
+        // `K_backup_root`. Hydrate the in-memory ledger BEFORE
+        // installing any of the key `Mutex`es, so a hydration
+        // failure (corrupt row, AES-KW unwrap mismatch under a
+        // different root key, etc.) leaves the orchestrator in
+        // the "no keys, no ledger" state instead of the divergent
+        // "keys installed, ledger empty" state. Without this
+        // ordering, `has_backup_keys()` would return `true` after
+        // a hydrate failure and the next backup operation would
+        // proceed against an empty in-memory ledger — the first
+        // compaction would then drop every pre-existing segment.
+        self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
+
+        // Hydration succeeded — commit the keys.
         *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
         *self.backup_signing_key.lock().map_err(poisoned)? = Some(signing_key);
         *self.backup_device_id.lock().map_err(poisoned)? = Some(device_id);
-        // Phase-5 hardening: the `wrapped_k_segment` BLOB column
-        // on `backup_segment_ledger` is sealed under
-        // `K_backup_root`. Now that the root is installed we can
-        // unwrap every persisted row into the in-memory ledger so
-        // a subsequent `compact_backup` sees the same state that
-        // existed before the process restarted.
-        self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
         Ok(())
     }
 
@@ -3329,21 +3337,35 @@ impl CoreImpl {
         })
     }
 
-    /// Atomically append one sealed segment **and** upsert the
-    /// manifest chain tail in a single SAVEPOINT. Acquires the DB
-    /// lock once.
+    /// Atomically advance the backup event cursor, append one
+    /// sealed segment, and upsert the manifest chain tail in a
+    /// single SAVEPOINT. Acquires the DB lock once.
+    ///
+    /// Folding the cursor advance into the same SAVEPOINT closes
+    /// the data-loss window that would otherwise exist if the
+    /// cursor was advanced via autocommit before this call: a
+    /// persist failure would leave the cursor past the events
+    /// without ever recording the corresponding segment or
+    /// manifest, so the next backup run would skip them.
     fn persist_incremental_backup_atomic(
         &self,
         seg: &TrackedBackupSegment,
         manifest: &crate::formats::manifest::BackupManifest,
         backup_root: &crate::crypto::key_hierarchy::KeyMaterial,
+        cursor_seq: i64,
         now_ms: i64,
     ) -> Result<()> {
         let row = Self::build_backup_segment_ledger_row(seg, backup_root, now_ms)?;
         let cbor = Self::encode_manifest_cbor(manifest)?;
         let db = self.db.lock().map_err(poisoned)?;
-        db.atomic_append_segment_and_manifest(&row, &cbor, manifest.generation as i64, now_ms)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        db.atomic_append_segment_and_manifest(
+            &row,
+            &cbor,
+            manifest.generation as i64,
+            cursor_seq,
+            now_ms,
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -3528,15 +3550,6 @@ impl CoreImpl {
         let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
 
-        // Phase 3 — advance the cursor under the db lock.
-        {
-            let db = self.db.lock().map_err(poisoned)?;
-            let journal = BackupEventJournal::new();
-            journal
-                .advance_cursor(db.connection(), last_seq)
-                .map_err(|e| Error::Storage(e.to_string()))?;
-        }
-
         // `compact_backup` consumes this ledger when the
         // compaction policy decides to roll up daily segments.
         let tracked = TrackedBackupSegment {
@@ -3547,18 +3560,27 @@ impl CoreImpl {
             k_segment: k_segment.clone(),
         };
 
-        // Phase-5 hardening: atomically persist both the manifest
-        // chain tail and the freshly appended segment inside a
-        // single SAVEPOINT so a crash cannot leave one persisted
-        // without the other. The persist MUST happen before the
-        // in-memory `Mutex` updates below: if persist fails, `?`
-        // propagates the error and we leave the in-memory state at
-        // the pre-call values (matching the un-mutated DB).
+        // Phase-5 hardening: atomically advance the
+        // `backup_event_cursor`, persist the segment ledger row,
+        // and upsert the manifest chain tail inside a single
+        // SAVEPOINT. The persist MUST happen before the in-memory
+        // `Mutex` updates below: if persist fails, `?` propagates
+        // the error and we leave the in-memory state at the
+        // pre-call values (matching the un-mutated DB).
+        //
+        // Folding the cursor advance into the same SAVEPOINT
+        // closes the data-loss window that would exist if the
+        // cursor was advanced separately: a persist failure
+        // would otherwise leave the cursor past the events
+        // without ever recording the corresponding segment or
+        // manifest, so the next backup run would skip them
+        // permanently.
         let now_persist_ms = now_ms_for_send_media();
         self.persist_incremental_backup_atomic(
             &tracked,
             &sealed_manifest.manifest,
             &backup_root,
+            last_seq,
             now_persist_ms,
         )?;
 
@@ -8117,9 +8139,16 @@ mod tests {
         // Phase-5 hardening: if the persist step in
         // `run_incremental_backup_inner` fails, the in-memory
         // manifest and segment ledger must remain at the
-        // pre-call values. Otherwise the next call within the
-        // same process would chain under an unpersisted manifest,
-        // and a restart would fork the chain.
+        // pre-call values **and** the persisted
+        // `backup_event_cursor` must stay at its pre-call value.
+        // Otherwise the next call within the same process would
+        // chain under an unpersisted manifest, a restart would
+        // fork the chain, and any events past the pre-failure
+        // cursor would be permanently skipped on the next run
+        // (because `read_unsegmented` only returns events strictly
+        // greater than `last_seq`).
+        use crate::backup::event_journal::BackupEventJournal;
+
         let core = fresh_core();
         install_test_backup_keys(&core);
         let conv = Uuid::now_v7();
@@ -8130,6 +8159,15 @@ mod tests {
         // Pre-call in-memory state.
         assert!(core.previous_backup_manifest.lock().unwrap().is_none());
         assert!(core.tracked_backup_segments.lock().unwrap().is_empty());
+
+        // Snapshot the pre-call cursor — should be 0 since no
+        // backup has ever advanced it.
+        let pre_cursor = core.with_db(|db| {
+            BackupEventJournal::new()
+                .read_cursor(db.connection())
+                .expect("pre-call cursor read")
+        });
+        assert_eq!(pre_cursor, 0);
 
         // Force the persist to fail.
         drop_backup_segment_ledger_table(&core);
@@ -8148,6 +8186,21 @@ mod tests {
         assert!(
             core.tracked_backup_segments.lock().unwrap().is_empty(),
             "tracked_backup_segments must not gain entries on persist failure"
+        );
+
+        // The cursor MUST remain at the pre-call value. If it had
+        // been advanced under autocommit before the atomic
+        // persist (as in the previous implementation), the events
+        // the failed call attempted to segment would be silently
+        // dropped on the next call.
+        let post_cursor = core.with_db(|db| {
+            BackupEventJournal::new()
+                .read_cursor(db.connection())
+                .expect("post-call cursor read")
+        });
+        assert_eq!(
+            post_cursor, pre_cursor,
+            "backup_event_cursor must not advance on persist failure"
         );
     }
 
@@ -8222,6 +8275,91 @@ mod tests {
         assert_eq!(
             post_manifest_generation, pre_manifest_generation,
             "manifest tail must not advance on compaction persist failure"
+        );
+    }
+
+    #[test]
+    fn install_backup_keys_hydration_failure_leaves_no_keys_installed() {
+        // Phase-5 hardening: if
+        // `hydrate_tracked_backup_segments_from_db` fails (e.g.
+        // because a `wrapped_k_segment` row has been corrupted on
+        // disk and the AES-KW integrity check rejects the
+        // unwrap), `install_backup_keys` must return `Err` *and*
+        // leave the three key `Mutex` slots empty. Otherwise
+        // `has_backup_keys()` would return `true` after the
+        // failure and the next backup would proceed against an
+        // empty in-memory ledger — the first compaction would
+        // then silently drop every pre-existing segment because
+        // it would see "no superseded segments" in the snapshot.
+        let backup_root = [0x33u8; 32];
+        let device_id = "test-device".to_string();
+
+        // ---- Phase 1: seed a real ledger row on disk so a
+        // subsequent `install_backup_keys` on a fresh core has
+        // something to hydrate.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = KChatCoreConfig::new(tmp.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        {
+            let core = CoreImpl::new(cfg.clone(), TEST_KEY).expect("core");
+            let mut rng = rand::rngs::OsRng;
+            let signing = crate::crypto::signing::HybridSigningKey::generate(&mut rng);
+            core.install_backup_keys(backup_root, signing, device_id.clone())
+                .expect("install backup keys (seed)");
+            let conv = Uuid::now_v7();
+            seed_conversation(&core, &conv);
+            seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_000_000);
+            seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
+            core.run_incremental_backup("scheduled")
+                .expect("seed incremental backup");
+        }
+
+        // ---- Phase 2: simulate a process restart, then corrupt
+        // the wrapped_k_segment BLOB before installing the keys.
+        // AES-KW carries an 8-byte integrity prefix, so any
+        // corruption of the wrapped bytes makes the unwrap
+        // fail.
+        let core2 = CoreImpl::new(cfg, TEST_KEY).expect("reopen core");
+
+        // Sanity: the manifest tail rehydrated from
+        // `backup_manifest_chain` (manifest hydration runs in
+        // `new` and is independent of the wrap key).
+        assert!(
+            core2.previous_backup_manifest.lock().unwrap().is_some(),
+            "manifest tail should rehydrate eagerly"
+        );
+
+        // Corrupt every row in the segment ledger.
+        core2.with_db(|db| {
+            db.connection()
+                .execute(
+                    "UPDATE backup_segment_ledger SET wrapped_k_segment = ?",
+                    rusqlite::params![vec![0xFFu8; 40]],
+                )
+                .expect("corrupt wrapped_k_segment");
+        });
+
+        // ---- Phase 3: installing the keys must fail because
+        // hydration can no longer unwrap the segment key. The
+        // three key `Mutex` slots must remain unset so
+        // `has_backup_keys()` returns `false`.
+        let mut rng = rand::rngs::OsRng;
+        let signing = crate::crypto::signing::HybridSigningKey::generate(&mut rng);
+        let result = core2.install_backup_keys(backup_root, signing, device_id);
+        assert!(
+            result.is_err(),
+            "install_backup_keys must fail when a ledger row's wrapped_k_segment is corrupt"
+        );
+        assert!(
+            !core2.has_backup_keys(),
+            "has_backup_keys() must return false after a hydration failure — \
+             otherwise the next backup would proceed with no in-memory ledger"
+        );
+        // Ledger must still be empty (hydration writes the
+        // result in one shot at the end, so a per-row failure
+        // leaves the in-memory Vec untouched).
+        assert!(
+            core2.tracked_backup_segments.lock().unwrap().is_empty(),
+            "tracked_backup_segments must remain empty when hydration fails"
         );
     }
 

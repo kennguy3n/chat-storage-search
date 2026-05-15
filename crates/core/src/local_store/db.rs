@@ -54,6 +54,14 @@ pub enum DbError {
     /// database file).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A precondition checked inside a transaction did not hold —
+    /// e.g. a monotonic-cursor advance was passed a smaller value
+    /// than the persisted one. Used by
+    /// [`LocalStoreDb::atomic_append_segment_and_manifest`] to
+    /// reject backwards cursor motion.
+    #[error("invariant violated: {0}")]
+    InvariantViolation(String),
 }
 
 /// `Result` alias used by the database surface.
@@ -1746,22 +1754,53 @@ impl LocalStoreDb {
         insert_backup_segment_ledger_row(&self.conn, row)
     }
 
-    /// Atomically append one segment row **and** upsert the
-    /// manifest chain tail inside a single SAVEPOINT.
+    /// Atomically advance the backup event cursor, append one
+    /// segment row, and upsert the manifest chain tail inside a
+    /// single SAVEPOINT.
     ///
-    /// If either the segment insert or the manifest upsert fails,
-    /// both are rolled back so the on-disk ledger and manifest
-    /// remain consistent.
+    /// If any of the three steps fails, all of them are rolled
+    /// back so the on-disk cursor, ledger, and manifest remain
+    /// consistent. In particular, a persist failure leaves the
+    /// cursor at its pre-call value so the next backup run can
+    /// retry the same events.
+    ///
+    /// The cursor advance preserves monotonicity: passing a
+    /// `cursor_seq` smaller than the persisted value is rejected
+    /// with `DbError::InvariantViolation` so backup runs can
+    /// never re-publish already-segmented events.
     pub fn atomic_append_segment_and_manifest(
         &self,
         segment_row: &BackupSegmentLedgerRow,
         manifest_cbor: &[u8],
         generation: i64,
+        cursor_seq: i64,
         updated_at_ms: i64,
     ) -> DbResult<()> {
         self.conn
             .execute_batch("SAVEPOINT atomic_backup_persist;")?;
         let inner = (|| -> DbResult<()> {
+            // Monotonic cursor advance — read inside the SAVEPOINT
+            // so the check and the UPSERT see a consistent
+            // snapshot.
+            let current_cursor: i64 = self
+                .conn
+                .query_row(
+                    "SELECT cursor_seq FROM backup_event_cursor WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if cursor_seq < current_cursor {
+                return Err(DbError::InvariantViolation(format!(
+                    "backup cursor cannot go backwards (current={current_cursor}, requested={cursor_seq})"
+                )));
+            }
+            self.conn.execute(
+                "INSERT INTO backup_event_cursor(id, cursor_seq) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET cursor_seq = excluded.cursor_seq",
+                params![cursor_seq],
+            )?;
             insert_backup_segment_ledger_row(&self.conn, segment_row)?;
             self.conn.execute(
                 "INSERT INTO backup_manifest_chain (id, generation, manifest_cbor, updated_at_ms)
@@ -3857,7 +3896,7 @@ mod tests {
         let db = fresh_db();
         let row = sample_segment_row("seg-1", 1000);
         let manifest = b"manifest-cbor-1";
-        db.atomic_append_segment_and_manifest(&row, manifest, 0, 1000)
+        db.atomic_append_segment_and_manifest(&row, manifest, 0, 0, 1000)
             .expect("atomic append");
         let loaded_manifest = db.load_backup_manifest().unwrap();
         assert_eq!(loaded_manifest, Some(manifest.to_vec()));
@@ -3922,13 +3961,18 @@ mod tests {
         let db = fresh_db();
         // Seed a segment + manifest.
         let r1 = sample_segment_row("seg-existing", 1000);
-        db.atomic_append_segment_and_manifest(&r1, b"manifest-v0", 0, 1000)
+        db.atomic_append_segment_and_manifest(&r1, b"manifest-v0", 0, 0, 1000)
             .unwrap();
 
         // Attempt to re-insert the same segment_id — PK violation.
         let dup = sample_segment_row("seg-existing", 2000);
-        let result =
-            db.atomic_append_segment_and_manifest(&dup, b"manifest-v1-should-not-persist", 1, 2000);
+        let result = db.atomic_append_segment_and_manifest(
+            &dup,
+            b"manifest-v1-should-not-persist",
+            1,
+            0,
+            2000,
+        );
         assert!(result.is_err(), "duplicate PK must fail");
 
         // Manifest must still be at v0, not v1.
