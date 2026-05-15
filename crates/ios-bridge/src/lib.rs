@@ -344,6 +344,11 @@ pub struct SearchResult {
     pub snippet: Option<String>,
     pub rank_score: f64,
     pub is_cold: bool,
+    /// Raw cosine similarity from the semantic re-rank pass, when
+    /// the hit went through `kchat_core::search::merge_results`.
+    /// `None` for FTS-only hits and for paths that never invoked
+    /// the semantic ranker.
+    pub semantic_score: Option<f64>,
 }
 
 impl From<CoreSearchResult> for SearchResult {
@@ -356,6 +361,7 @@ impl From<CoreSearchResult> for SearchResult {
             snippet: r.snippet,
             rank_score: r.rank_score,
             is_cold: r.is_cold,
+            semantic_score: r.semantic_score,
         }
     }
 }
@@ -1004,6 +1010,41 @@ mod tests {
                 "udl variant {udl:?} must map to {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn search_result_semantic_score_round_trips_through_bridge() {
+        // The bridge `SearchResult` must propagate the optional
+        // `semantic_score` field from `kchat_core::SearchResult`
+        // unchanged so Swift can read it via the UDL dictionary.
+        // Two cases: present (semantic re-rank pass ran) and
+        // absent (FTS-only).
+        let msg = Uuid::now_v7();
+        let conv = Uuid::now_v7();
+
+        let with_semantic = CoreSearchResult {
+            message_id: msg,
+            conversation_id: conv,
+            sender_id: "sender-a".into(),
+            created_at_ms: 1_700_000_000_000,
+            snippet: Some("hello".into()),
+            rank_score: 0.42,
+            is_cold: false,
+            semantic_score: Some(0.87),
+        };
+        let bridged: SearchResult = with_semantic.clone().into();
+        assert_eq!(bridged.semantic_score, Some(0.87));
+        assert_eq!(bridged.message_id, msg.to_string());
+        assert_eq!(bridged.conversation_id, conv.to_string());
+        assert_eq!(bridged.rank_score, 0.42);
+        assert!(!bridged.is_cold);
+
+        let fts_only = CoreSearchResult {
+            semantic_score: None,
+            ..with_semantic
+        };
+        let bridged_fts: SearchResult = fts_only.into();
+        assert_eq!(bridged_fts.semantic_score, None);
     }
 
     #[test]

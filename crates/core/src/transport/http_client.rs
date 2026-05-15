@@ -115,12 +115,25 @@ struct EncryptedManifestWire {
 /// it per call would spawn a fresh runtime on every chunk upload —
 /// the field-level cache avoids that.
 #[cfg(feature = "http-transport")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpTransportClient {
     base_url: String,
     auth_token: String,
     client: reqwest::blocking::Client,
     upload_client: reqwest::blocking::Client,
+}
+
+// Manual `Debug` impl that redacts the bearer token so it cannot
+// leak through logs / crash reports / panic messages. Mirrors the
+// pattern used by `crate::core_impl::CoreImpl::fmt`.
+#[cfg(feature = "http-transport")]
+impl std::fmt::Debug for HttpTransportClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransportClient")
+            .field("base_url", &self.base_url)
+            .field("auth_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "http-transport")]
@@ -689,6 +702,33 @@ mod tests {
         assert!(!response_status_is_retryable(
             reqwest::StatusCode::NOT_FOUND
         ));
+    }
+
+    #[test]
+    fn http_client_debug_redacts_auth_token() {
+        // PR-level invariant: the bearer token must never appear
+        // in `Debug` output (which is what flows into logs,
+        // crash reports, `assert!` panic messages, and the
+        // structured trace metadata in `crate::perf`).
+        let secret = "super-secret-bearer-token-xyz";
+        let c = HttpTransportClient::new("https://example.com", secret).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains(secret),
+            "Debug output leaked auth token: {dbg}"
+        );
+        // The redaction marker is present so reviewers can spot
+        // the field at a glance.
+        assert!(
+            dbg.contains("<redacted>"),
+            "missing redaction marker: {dbg}"
+        );
+        // The non-secret base URL still surfaces so the Debug is
+        // useful for incident triage.
+        assert!(
+            dbg.contains("example.com"),
+            "base_url missing from Debug: {dbg}"
+        );
     }
 
     #[test]

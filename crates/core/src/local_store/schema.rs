@@ -233,6 +233,97 @@ pub const TABLES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Forward-only migrations
+// ---------------------------------------------------------------------------
+
+/// SQL applied by migration `2`. Adds the Phase-5 backup
+/// orchestration tables (`backup_manifest_chain` and
+/// `backup_segment_ledger`) that promote the previously in-memory
+/// state owned by [`crate::core_impl::CoreImpl`] to durable
+/// SQLCipher rows.
+///
+/// Splitting this string out of [`SCHEMA_SQL`] (rather than appending
+/// to the v1 bring-up) means a freshly opened DB and an already-v1
+/// DB land on identical schemas after the migration framework
+/// (`crate::local_store::db::run_migrations`) finishes — the v1 →
+/// v2 fixture test in `db.rs` pins that invariant.
+pub const MIGRATION_V2_SQL: &str = r#"
+-- Phase 5 (2026-05-04 hardening) — backup manifest chain.
+--
+-- A single-row table that records the latest manifest produced
+-- by `KChatCore::run_incremental_backup` / `compact_backup`. The
+-- next manifest the orchestrator builds chains under this one
+-- via `BackupManifestBuildRequest::previous`; a missing row is
+-- the explicit "genesis manifest" signal.
+--
+-- `manifest_cbor` is the canonical `serde_cbor` encoding of
+-- `kchat_core::formats::manifest::BackupManifest`. Stored as a
+-- BLOB so it round-trips losslessly across version upgrades —
+-- the encoder is pinned in `crate::formats::manifest`.
+CREATE TABLE IF NOT EXISTS backup_manifest_chain (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    generation      INTEGER NOT NULL,
+    manifest_cbor   BLOB NOT NULL,
+    updated_at_ms   INTEGER NOT NULL
+);
+
+-- Phase 5 (2026-05-04 hardening) — backup segment ledger.
+--
+-- One row per sealed `BuiltBackupSegment` the orchestrator
+-- currently knows about. `compact_backup` reads this ledger,
+-- builds a `CompactionPlan`, re-seals the merged groups, and
+-- rewrites the ledger with the compacted entries replacing the
+-- superseded ones.
+--
+-- `wrapped_k_segment` is AES-256-KW (RFC 3394) of the 32-byte
+-- `K_backup_segment(segment_id)` under `K_backup_root` — see
+-- `crate::crypto::key_wrap::wrap_k_asset`. Persisting only the
+-- wrapped key means a stolen DB file cannot decrypt the sealed
+-- segment payloads without the backup-root key, which itself is
+-- only ever materialised after `KChatCore::install_backup_keys`
+-- on this device.
+CREATE TABLE IF NOT EXISTS backup_segment_ledger (
+    segment_id           TEXT PRIMARY KEY,        -- UUID v7
+    segment_type         TEXT NOT NULL,           -- 'events', ...
+    nonce                BLOB NOT NULL,           -- 24-byte XChaCha20 nonce
+    ciphertext           BLOB NOT NULL,           -- AEAD-sealed payload
+    merkle_root          BLOB NOT NULL,           -- 32-byte BLAKE3
+    event_count          INTEGER NOT NULL,
+    tier                 TEXT NOT NULL,           -- 'daily' | 'weekly' | 'monthly'
+    min_event_ms         INTEGER NOT NULL,
+    max_event_ms         INTEGER NOT NULL,
+    wrapped_k_segment    BLOB NOT NULL,           -- 40 bytes, AES-KW under K_backup_root
+    created_at_ms        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backup_segment_ledger_tier_min
+    ON backup_segment_ledger(tier, min_event_ms);
+"#;
+
+/// Ordered table of forward migrations.
+///
+/// Each entry is `(target_user_version, sql_to_apply)`. Migrations
+/// run in `(version, …)` order; the migration framework in
+/// `crate::local_store::db::run_migrations` reads the current
+/// `PRAGMA user_version`, applies every later entry inside a
+/// single transaction, and writes the target version after each
+/// success.
+///
+/// `1` is the original [`SCHEMA_SQL`] block (the FTS5 ICU literal
+/// is rewritten to the `unicode61` fallback on platforms without
+/// ICU; see [`crate::local_store::db::create_schema_with_unicode61_fallback`]).
+/// `2` is [`MIGRATION_V2_SQL`].
+///
+/// Adding a new migration is append-only: bump
+/// [`LATEST_USER_VERSION`], add the entry, and never edit an
+/// older one.
+pub const MIGRATIONS: &[(i32, &str)] = &[(1, SCHEMA_SQL), (2, MIGRATION_V2_SQL)];
+
+/// The highest `user_version` produced by [`MIGRATIONS`]. Kept in
+/// sync with the last entry's first column — the
+/// `migrations_table_targets_latest_user_version` test pins it.
+pub const LATEST_USER_VERSION: i32 = 2;
+
+// ---------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------
 
@@ -636,6 +727,40 @@ mod tests {
         // `unicode61` fallback substitutes the literal in
         // `search::tokenizer::FTS5_TOKENIZE_UNICODE61`.
         assert!(SCHEMA_SQL.contains("tokenize = 'icu'"));
+    }
+
+    #[test]
+    fn migrations_table_targets_latest_user_version() {
+        // The migration framework hard-codes `LATEST_USER_VERSION`
+        // as the upper bound when iterating `MIGRATIONS`; both
+        // values must stay in lock-step or a fresh open will stop
+        // short of applying the last migration.
+        let max = MIGRATIONS
+            .iter()
+            .map(|(v, _)| *v)
+            .max()
+            .expect("at least one migration");
+        assert_eq!(max, LATEST_USER_VERSION);
+    }
+
+    #[test]
+    fn migrations_versions_are_dense_starting_at_one() {
+        // Migration discovery treats `user_version = 0` as a
+        // fresh DB and applies every entry in order; gaps would
+        // silently skip schema state.
+        for (i, (v, _)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(*v, i as i32 + 1, "migration #{i} must target v{}", i + 1);
+        }
+    }
+
+    #[test]
+    fn migration_v2_adds_backup_manifest_chain_and_segment_ledger() {
+        // The Task-2 hardening requires both tables; pin them
+        // here so a future migration cannot silently rename or
+        // remove them.
+        assert!(MIGRATION_V2_SQL.contains("CREATE TABLE IF NOT EXISTS backup_manifest_chain"));
+        assert!(MIGRATION_V2_SQL.contains("CREATE TABLE IF NOT EXISTS backup_segment_ledger"));
+        assert!(MIGRATION_V2_SQL.contains("wrapped_k_segment"));
     }
 
     #[test]

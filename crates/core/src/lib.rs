@@ -55,6 +55,7 @@ pub mod restore;
 pub mod scheduler;
 pub mod search;
 pub mod transport;
+pub mod util;
 
 pub use config::KChatCoreConfig;
 pub use core_impl::CoreImpl;
