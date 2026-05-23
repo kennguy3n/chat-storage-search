@@ -21,8 +21,13 @@
 //! Retry policy: 3 attempts at 1 s / 2 s / 4 s backoff for any
 //! transient failure. Two failure classes trigger a retry:
 //!
-//! * Transport-level [`reqwest::Error`]s that report
-//!   `is_timeout` / `is_connect` (DNS / TCP / TLS failure).
+//! * Transport-level [`reqwest::Error`]s classified as transient by
+//!   [`err_is_retryable`]: `is_timeout` / `is_connect` (DNS / TCP /
+//!   TLS failure), `is_request` (request-sending failure such as
+//!   HTTP/2 framing or an interrupted body upload), and `is_body`
+//!   (connection drop while reading the response body). The retry
+//!   set is kept in sync with [`HttpTransportClient::map_err`]’s
+//!   `TransportError::Network` classifier.
 //! * Completed HTTP exchanges whose response status is `429`
 //!   or any `5xx`. Status-code classification happens on the
 //!   [`reqwest::blocking::Response`] returned by `send`, not on
@@ -188,8 +193,12 @@ impl HttpTransportClient {
     /// at 1 s / 2 s / 4 s exponential backoff.
     ///
     /// Retries on:
-    ///   - Transport-level [`reqwest::Error`]s that report
-    ///     `is_timeout` / `is_connect`.
+    ///   - Transport-level [`reqwest::Error`]s classified as
+    ///     transient by [`err_is_retryable`]: `is_timeout`,
+    ///     `is_connect`, `is_request`, or `is_body`. The retry set
+    ///     is intentionally kept in sync with the
+    ///     `TransportError::Network` classifier in
+    ///     [`HttpTransportClient::map_err`].
     ///   - HTTP responses with status `429` or any `5xx`.
     ///
     /// `reqwest::blocking::Client::send` returns `Ok(Response)` for
@@ -324,19 +333,17 @@ fn response_status_is_retryable(status: reqwest::StatusCode) -> bool {
 /// (retryable at the caller layer) is also retried at the inner
 /// short-backoff layer (1 s / 2 s / 4 s). The semantics are:
 ///
-/// * `is_timeout()`  — server did not reply before our timeout
-///                    fired (transient).
-/// * `is_connect()`  — TCP / TLS handshake failure (transient).
-/// * `is_request()`  — `Kind::Request`: generic request-sending
-///                    failure, e.g. HTTP/2 framing issue or an
-///                    interrupted body upload. Our request bodies
-///                    are owned byte vectors, so retrying is safe;
-///                    we don't ship streaming bodies through this
-///                    transport.
-/// * `is_body()`     — `Kind::Body`: connection drop while we are
-///                    reading the response body. The partial payload
-///                    is unusable but the server is healthy; a quick
-///                    retry typically recovers the whole response.
+/// * `is_timeout()` — server did not reply before our timeout
+///   fired (transient).
+/// * `is_connect()` — TCP / TLS handshake failure (transient).
+/// * `is_request()` — `Kind::Request`: generic request-sending
+///   failure, e.g. HTTP/2 framing issue or an interrupted body
+///   upload. Our request bodies are owned byte vectors, so retrying
+///   is safe; we don't ship streaming bodies through this transport.
+/// * `is_body()` — `Kind::Body`: connection drop while we are reading
+///   the response body. The partial payload is unusable but the
+///   server is healthy; a quick retry typically recovers the whole
+///   response.
 ///
 /// Status-code-bearing errors (from `error_for_status`) are not
 /// produced by our call sites, so we deliberately do not classify
