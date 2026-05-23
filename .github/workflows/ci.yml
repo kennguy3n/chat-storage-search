@@ -45,8 +45,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   # -------------------------------------------------------------------------
-  # Unit + integration tests — full workspace, default features. The
-  # `--all-features` matrix is covered by clippy in the `lint` job.
+  # Unit + integration tests — full workspace, default features plus the
+  # explicit `kchat-core/test-support` feature so the `crates/core/tests/`
+  # integration tests can reach `CoreImpl::new_in_memory` / `with_db`,
+  # which are gated behind `#[cfg(any(test, feature = "test-support"))]`
+  # to keep them out of `cargo build --release`. The `--all-features`
+  # matrix is still covered by clippy in the `lint` job (which also
+  # exercises `onnx-runtime` and `http-transport` for the lint surface).
   # -------------------------------------------------------------------------
   test:
     name: Test
@@ -56,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --features kchat-core/test-support --verbose
 
   # -------------------------------------------------------------------------
   # Comprehensive end-to-end demo — exercises the full pipeline
@@ -73,7 +78,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: E2E Demo
-        run: cargo test --test e2e_demo --verbose
+        # E2E demo lives in `crates/core/tests/e2e_demo.rs` and pulls
+        # `LocalStoreDb::open_in_memory` (and, transitively via
+        # other test helpers, `CoreImpl::new_in_memory`). Both are
+        # `cfg`-gated behind `test-support` (see
+        # `crates/core/Cargo.toml`), so we run with
+        # `-p kchat-core --features test-support` to link them in.
+        run: cargo test -p kchat-core --features test-support --test e2e_demo --verbose
 
   # -------------------------------------------------------------------------
   # Supply-chain audit — `cargo-deny check` runs all four sections
@@ -101,6 +112,22 @@ jobs:
   # (Linux x86_64, macOS Apple Silicon, Android arm64, Windows x86_64). Runs
   # `cargo check` rather than a full build so the job stays under ~3 min;
   # the bridges' real binary builds happen in the iOS / Android repo CI.
+  #
+  # NOTE: this job runs `cargo check` TWICE per rustup target:
+  #   1. Default features only — validates the *production* build shape
+  #      on every target. With `--all-features` the `test-support` gate
+  #      from Phase A.4 would be turned on and a cross-target break in
+  #      production-only code paths could slip through.
+  #   2. Production opt-in features (`onnx-runtime,http-transport`) —
+  #      validates the optional-feature surface across macOS / Windows /
+  #      Linux including the Windows `directml` ort variant gated on
+  #      `cfg(target_os = "windows")`. The lint job runs
+  #      `--all-features` but only on `ubuntu-latest`, so without this
+  #      step a platform-specific break (e.g. a Windows-only ORT EP)
+  #      would not be caught by CI.
+  # The Android `cross check` step stays default-features-only because
+  # `cross` does not ship a working ORT toolchain for Android — onnx-runtime
+  # is not in the Android ship shape.
   # -------------------------------------------------------------------------
   cross-compile:
     name: Cross-compile (${{ matrix.label }})
@@ -152,10 +179,20 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: cargo check (rustup)
+      - name: cargo check (rustup, default features)
         if: matrix.tool == 'rustup'
-        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }} --all-features
-      - name: cargo check (cross)
+        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }}
+      - name: cargo check (rustup, production opt-in features)
+        if: matrix.tool == 'rustup'
+        # Explicit feature list — NOT `--all-features` — because
+        # `--all-features` would re-enable `test-support` and defeat
+        # the production-shape check above. The `directml` variant
+        # of ort kicks in automatically on Windows via the
+        # `[target.'cfg(target_os = "windows")']` block in
+        # `crates/core/Cargo.toml`, so listing `onnx-runtime` here
+        # is sufficient to exercise it.
+        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }} --features kchat-core/onnx-runtime,kchat-core/http-transport
+      - name: cargo check (cross, default features)
         if: matrix.tool == 'cross'
         run: cross check ${{ matrix.packages }} --target ${{ matrix.target }}
 

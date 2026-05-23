@@ -170,6 +170,18 @@ impl LocalStoreDb {
     }
 
     /// Open an ephemeral in-memory database, suitable for tests.
+    ///
+    /// Gated behind the `test-support` feature (always available
+    /// under `cfg(test)` for the crate's own unit tests). The
+    /// in-memory SQLCipher handle holds nothing persistent, so a
+    /// production caller that reached it would silently lose
+    /// every write across process restarts; closing the symbol
+    /// off at the linker layer prevents that class of misuse —
+    /// the same rationale as
+    /// [`crate::core_impl::CoreImpl::new_in_memory`]. See the
+    /// `test-support` feature comment in
+    /// `crates/core/Cargo.toml` for the broader policy.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_in_memory(key: &[u8; 32]) -> DbResult<Self> {
         let conn = Connection::open_in_memory()?;
         let icu_available = init_connection(&conn, key)?;

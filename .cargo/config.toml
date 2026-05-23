@@ -1,0 +1,26 @@
+# Workspace-level Cargo configuration.
+#
+# Phase A.4 (production-hardening foundation): the integration
+# tests in `crates/core/tests/` and three of the Criterion bench
+# targets call `LocalStoreDb::open_in_memory` /
+# `CoreImpl::new_in_memory`, both of which are gated behind
+# `#[cfg(any(test, feature = "test-support"))]` so a production
+# `cargo build --release` cannot link them. CI passes
+# `--features kchat-core/test-support` on every gating-aware job;
+# the aliases below give local developers the same flag without
+# having to remember it.
+#
+# Usage:
+#   cargo t          # = cargo test --workspace --features kchat-core/test-support
+#   cargo bw         # = cargo bench -p kchat-core --features test-support
+#   cargo lw         # = cargo clippy --workspace --all-targets --all-features -- -D warnings
+#
+# These are aliases, not policy — drop the flag (or invoke the
+# raw `cargo test` directly) if you specifically want to verify
+# that the in-memory path stays unlinked from a production
+# build. See `crates/core/Cargo.toml` for the feature's
+# rationale.
+[alias]
+t  = "test --workspace --features kchat-core/test-support"
+bw = "bench -p kchat-core --features test-support"
+lw = "clippy --workspace --all-targets --all-features -- -D warnings"

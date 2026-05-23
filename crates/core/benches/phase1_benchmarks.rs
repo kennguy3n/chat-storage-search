@@ -9,7 +9,7 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo bench -p kchat-core --bench phase1_benchmarks
+//! cargo bench -p kchat-core --features test-support --bench phase1_benchmarks
 //! ```
 //!
 //! Criterion's HTML reports land under `target/criterion/`.
