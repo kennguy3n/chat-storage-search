@@ -103,15 +103,21 @@ pub fn upload_chunked_media(
             chunk.chunk_sha256,
         )?;
         if receipt.chunk_idx != idx_u32 {
-            return Err(Error::Storage(format!(
-                "upload_chunked_media: server echoed chunk_idx {got} for upload {idx_u32}",
-                got = receipt.chunk_idx
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "upload_chunked_media: server echoed chunk_idx {got} for upload {idx_u32}",
+                    got = receipt.chunk_idx
+                )
+                .into(),
+            ));
         }
         if receipt.sha256 != chunk.chunk_sha256 {
-            return Err(Error::Storage(format!(
-                "upload_chunked_media: server echoed mismatched SHA-256 for chunk {idx_u32}"
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "upload_chunked_media: server echoed mismatched SHA-256 for chunk {idx_u32}"
+                )
+                .into(),
+            ));
         }
     }
 
@@ -150,7 +156,7 @@ pub fn resume_upload(
             "resume_upload: completed_chunks length {state_len} != sealed_chunks length {chunks_len}",
             state_len = state.completed_chunks.len(),
             chunks_len = sealed_chunks.len(),
-        )));
+        ).into()));
     }
 
     let _ = blob_class; // The init_blob_upload call already happened on the first attempt.
@@ -168,9 +174,9 @@ pub fn resume_upload(
             chunk.chunk_sha256,
         )?;
         if receipt.sha256 != chunk.chunk_sha256 || receipt.chunk_idx != idx_u32 {
-            return Err(Error::Storage(format!(
-                "resume_upload: receipt mismatch for chunk {idx_u32}"
-            )));
+            return Err(Error::Storage(
+                format!("resume_upload: receipt mismatch for chunk {idx_u32}").into(),
+            ));
         }
         state.completed_chunks[chunk_idx] = true;
     }
@@ -480,7 +486,9 @@ mod tests {
         let chunks = dummy_chunks(1);
         let res = upload_chunked_media(&mock, &chunks, client_root, BlobClass::Media);
         match res {
-            Err(Error::Storage(msg)) => assert!(msg.contains("BLAKE3 root mismatch"), "{msg}"),
+            Err(Error::Storage(msg)) => {
+                assert!(msg.to_string().contains("BLAKE3 root mismatch"), "{msg}")
+            }
             other => panic!("expected merkle mismatch error, got {other:?}"),
         }
     }

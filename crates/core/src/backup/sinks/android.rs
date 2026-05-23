@@ -215,7 +215,7 @@ mod tests {
                 .unwrap()
                 .get(key)
                 .cloned()
-                .ok_or_else(|| Error::Storage(format!("no auto-backup key: {key}")))
+                .ok_or_else(|| Error::Storage(format!("no auto-backup key: {key}").into()))
         }
 
         fn write_saf(&self, uri: &str, data: &[u8]) -> Result<(), Error> {
@@ -229,7 +229,7 @@ mod tests {
                 .unwrap()
                 .get(uri)
                 .cloned()
-                .ok_or_else(|| Error::Storage(format!("no SAF uri: {uri}")))
+                .ok_or_else(|| Error::Storage(format!("no SAF uri: {uri}").into()))
         }
 
         fn list_saf(&self, prefix: &str) -> Result<Vec<String>, Error> {

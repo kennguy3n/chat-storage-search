@@ -91,11 +91,14 @@ pub struct DecodedArchiveSegmentBlob<'a> {
 /// [`encode_archive_segment_blob`].
 pub fn decode_archive_segment_blob(bytes: &[u8]) -> Result<DecodedArchiveSegmentBlob<'_>, Error> {
     if bytes.len() < ARCHIVE_SEGMENT_BLOB_HEADER_LEN {
-        return Err(Error::Storage(format!(
-            "archive segment blob is {} bytes (expected at least {})",
-            bytes.len(),
-            ARCHIVE_SEGMENT_BLOB_HEADER_LEN
-        )));
+        return Err(Error::Storage(
+            format!(
+                "archive segment blob is {} bytes (expected at least {})",
+                bytes.len(),
+                ARCHIVE_SEGMENT_BLOB_HEADER_LEN
+            )
+            .into(),
+        ));
     }
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&bytes[0..16]);
@@ -149,8 +152,12 @@ pub fn decrypt_archive_segment(
     let aad = build_segment_aad(&decoded.segment_id, &decoded.merkle_root);
     let compressed =
         open(k_archive_segment, &decoded.nonce, decoded.ciphertext, &aad).map_err(Error::Crypto)?;
-    let cbor = zstd::stream::decode_all(&compressed[..])
-        .map_err(|e| Error::Storage(format!("archive segment zstd decode: {e}")))?;
+    let cbor = zstd::stream::decode_all(&compressed[..]).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::Zstd {
+            context: "archive segment decode",
+            source: e,
+        })
+    })?;
     if content_hash(&cbor) != decoded.merkle_root {
         return Err(Error::Storage(
             "archive segment plaintext merkle_root mismatch".into(),
@@ -169,8 +176,12 @@ pub fn decrypt_archive_segment(
 /// alternative payload shapes (skeleton-only segments, search
 /// shard segments, etc.) once those land.
 pub fn decode_archive_segment<T: DeserializeOwned>(plaintext_cbor: &[u8]) -> Result<T, Error> {
-    let payload: T = crate::cbor::from_slice(plaintext_cbor)
-        .map_err(|e| Error::Storage(format!("archive segment cbor decode: {e}")))?;
+    let payload: T = crate::cbor::from_slice(plaintext_cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "archive segment",
+            source: e,
+        })
+    })?;
     Ok(payload)
 }
 
@@ -448,10 +459,29 @@ mod tests {
         fn fetch_archive_segment(&self, segment_id: &str) -> TransportResult<Vec<u8>> {
             *self.calls.lock().unwrap().borrow_mut() += 1;
             if let Some(err) = self.fail_segments.lock().unwrap().get(segment_id) {
+                // Mock stores `Error` values to replay; we don't need
+                // to preserve the underlying typed sub-enum here because
+                // the production code only surfaces the `Display` text.
+                // Re-encode as `StorageError::Custom` so the mock stays
+                // independent of whether the sub-enums implement `Clone`.
+                //
+                // `Error::Storage(inner)` MUST take the inner
+                // `StorageError`'s Display text (not the outer
+                // `Error`'s) to avoid a doubled `"storage: storage: ..."`
+                // prefix on round-trip: `Error::Storage(...).to_string()`
+                // yields `"storage: <inner>"`, which if re-wrapped into
+                // another `Error::Storage(StorageError::Custom(...))`
+                // would re-prefix on the outer Display. Same trap for
+                // `Search` / `Message` / `Model` / `Transport` if the
+                // mock ever needs to replay them.
                 return Err(match err {
                     Error::NotImplemented(s) => Error::NotImplemented(s),
-                    Error::Storage(s) => Error::Storage(s.clone()),
-                    other => Error::Storage(other.to_string()),
+                    Error::Storage(inner) => Error::Storage(inner.to_string().into()),
+                    Error::Search(inner) => Error::Search(inner.to_string().into()),
+                    Error::Message(inner) => Error::Message(inner.to_string().into()),
+                    Error::Model(inner) => Error::Model(inner.to_string().into()),
+                    Error::Transport(inner) => Error::Transport(inner.to_string().into()),
+                    other => Error::Storage(other.to_string().into()),
                 });
             }
             self.segments
@@ -459,7 +489,7 @@ mod tests {
                 .unwrap()
                 .get(segment_id)
                 .cloned()
-                .ok_or_else(|| Error::Storage(format!("missing segment {segment_id}")))
+                .ok_or_else(|| Error::Storage(format!("missing segment {segment_id}").into()))
         }
 
         fn fetch_index_shards(
@@ -608,7 +638,10 @@ mod tests {
 
         let err = fetch_and_decrypt_segment(&transport, &segment_id.to_string(), &k).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("transport unavailable"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("transport unavailable"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage error, got {other:?}"),
         }
         assert_eq!(transport.call_count(), 1);
@@ -636,7 +669,7 @@ mod tests {
         let cbor = crate::cbor::to_vec(&tampered).unwrap();
         let err = decode_archive_segment_payload(&cbor).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("magic mismatch"), "got {msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("magic mismatch"), "got {msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }

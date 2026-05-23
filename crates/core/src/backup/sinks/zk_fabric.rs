@@ -143,9 +143,9 @@ impl ZkofBackupSink {
     pub fn pattern_c_seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let hash = content_hash(plaintext);
         let dek = derive_convergent_dek(&hash, &self.tenant_id)
-            .map_err(|e| Error::Storage(format!("ZkofBackupSink: derive DEK: {e}")))?;
+            .map_err(|e| Error::Storage(format!("ZkofBackupSink: derive DEK: {e}").into()))?;
         encrypt_object_pattern_c(plaintext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("ZkofBackupSink: pattern C seal: {e}")))
+            .map_err(|e| Error::Storage(format!("ZkofBackupSink: pattern C seal: {e}").into()))
     }
 
     /// Pattern C `open` — inverse of [`Self::pattern_c_seal`].
@@ -158,9 +158,9 @@ impl ZkofBackupSink {
         plaintext_hash: &[u8; 32],
     ) -> Result<Vec<u8>, Error> {
         let dek = derive_convergent_dek(plaintext_hash, &self.tenant_id)
-            .map_err(|e| Error::Storage(format!("ZkofBackupSink: derive DEK: {e}")))?;
+            .map_err(|e| Error::Storage(format!("ZkofBackupSink: derive DEK: {e}").into()))?;
         decrypt_object_pattern_c(ciphertext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("ZkofBackupSink: pattern C open: {e}")))
+            .map_err(|e| Error::Storage(format!("ZkofBackupSink: pattern C open: {e}").into()))
     }
 }
 
@@ -292,7 +292,7 @@ mod tests {
             let objects = self.objects.lock().unwrap();
             let bytes = objects
                 .get(&(bucket.to_string(), key.to_string()))
-                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}").into()))?;
             let start = range.start.min(bytes.len() as u64) as usize;
             let end = range.end.min(bytes.len() as u64) as usize;
             Ok(bytes[start..end].to_vec())
@@ -335,7 +335,7 @@ mod tests {
     fn rejects_empty_tenant_id() {
         let s3 = Arc::new(InMemoryS3::new());
         let err = ZkofBackupSink::new(s3, fresh_config(), "").unwrap_err();
-        assert!(matches!(err, Error::Storage(msg) if msg.contains("tenant_id")));
+        assert!(matches!(err, Error::Storage(msg) if msg.to_string().contains("tenant_id")));
     }
 
     #[test]
@@ -420,7 +420,7 @@ mod tests {
         let bogus_hash = [0u8; 32];
         let err = sink.pattern_c_open(&fetched, &bogus_hash).unwrap_err();
         assert!(
-            matches!(&err, Error::Storage(msg) if msg.contains("pattern C open")),
+            matches!(&err, Error::Storage(msg) if msg.to_string().contains("pattern C open")),
             "got {err:?}"
         );
     }

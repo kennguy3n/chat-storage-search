@@ -103,12 +103,14 @@ impl ThumbnailGenerator {
     ) -> Result<ThumbnailResult, Error> {
         if plaintext.is_empty() {
             return Err(Error::Message(
-                "thumbnail generation requires non-empty input".to_string(),
+                "thumbnail generation requires non-empty input"
+                    .to_string()
+                    .into(),
             ));
         }
         if max_dimension == 0 {
             return Err(Error::Message(
-                "thumbnail max_dimension must be > 0".to_string(),
+                "thumbnail max_dimension must be > 0".to_string().into(),
             ));
         }
 
@@ -116,9 +118,12 @@ impl ThumbnailGenerator {
 
         let mut reader = ImageReader::new(Cursor::new(plaintext));
         reader.set_format(format);
-        let img = reader
-            .decode()
-            .map_err(|e| Error::Message(format!("failed to decode image: {e}")))?;
+        let img = reader.decode().map_err(|e| {
+            Error::Message(crate::message::MessageError::ImageCodec {
+                op: "decode",
+                detail: e.to_string(),
+            })
+        })?;
 
         let resized = img.resize(max_dimension, max_dimension, FilterType::Triangle);
         let (width, height) = (resized.width(), resized.height());
@@ -126,7 +131,12 @@ impl ThumbnailGenerator {
         let mut out = Vec::new();
         resized
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-            .map_err(|e| Error::Message(format!("failed to encode thumbnail: {e}")))?;
+            .map_err(|e| {
+                Error::Message(crate::message::MessageError::ImageCodec {
+                    op: "encode_thumbnail",
+                    detail: e.to_string(),
+                })
+            })?;
 
         Ok(ThumbnailResult {
             thumbnail_bytes: out,
@@ -144,9 +154,10 @@ fn image_format_for_mime(mime_type: &str) -> Result<ImageFormat, Error> {
     match mime_type {
         "image/png" => Ok(ImageFormat::Png),
         "image/jpeg" | "image/jpg" => Ok(ImageFormat::Jpeg),
-        other => Err(Error::Message(format!(
-            "thumbnail generation not supported for mime_type {other:?}"
-        ))),
+        other => Err(Error::Message(crate::message::MessageError::ImageCodec {
+            op: "select_format",
+            detail: format!("thumbnail generation not supported for mime_type {other:?}"),
+        })),
     }
 }
 

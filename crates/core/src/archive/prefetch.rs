@@ -43,12 +43,15 @@ fn ensure_all_kchat_backend(rows: &[(String, String, String)]) -> Result<(), Err
         let backend =
             StorageBackend::from_str(storage_backend).unwrap_or(StorageBackend::KChatBackend);
         if backend != StorageBackend::KChatBackend {
-            return Err(Error::Storage(format!(
-                "batch_prefetch_bucket: segment {segment_id} uses storage_backend \
+            return Err(Error::Storage(
+                format!(
+                    "batch_prefetch_bucket: segment {segment_id} uses storage_backend \
                  '{storage_backend}'; the legacy KChat-only entry point cannot route \
                  it. Use batch_prefetch_bucket_with_router with an ArchiveSegmentRouter \
                  built via ArchiveSegmentRouter::with_zkof(...)."
-            )));
+                )
+                .into(),
+            ));
         }
     }
     Ok(())
@@ -99,7 +102,7 @@ pub fn batch_prefetch_bucket(
                FROM archive_segment_map
               WHERE conversation_id = ?1 AND time_bucket = ?2",
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let rows = stmt
         .query_map(params![conversation_id.to_string(), time_bucket], |row| {
@@ -109,12 +112,12 @@ pub fn batch_prefetch_bucket(
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let mut materialised = Vec::new();
     for row in rows {
         let (segment_id, blob_id, storage_backend) =
-            row.map_err(|e| Error::Storage(e.to_string()))?;
+            row.map_err(|e| Error::Storage(e.to_string().into()))?;
         materialised.push((segment_id, blob_id, storage_backend));
     }
 
@@ -154,7 +157,7 @@ pub fn batch_prefetch_bucket_with_router(
                FROM archive_segment_map
               WHERE conversation_id = ?1 AND time_bucket = ?2",
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let rows = stmt
         .query_map(params![conversation_id.to_string(), time_bucket], |row| {
@@ -164,12 +167,12 @@ pub fn batch_prefetch_bucket_with_router(
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let mut materialised = Vec::new();
     for row in rows {
         let (segment_id, blob_id, storage_backend) =
-            row.map_err(|e| Error::Storage(e.to_string()))?;
+            row.map_err(|e| Error::Storage(e.to_string().into()))?;
         materialised.push((segment_id, blob_id, storage_backend));
     }
 
@@ -220,7 +223,7 @@ pub fn batch_prefetch_bucket_with_padding(
                FROM archive_segment_map
               WHERE conversation_id = ?1 AND time_bucket = ?2",
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
     let rows = stmt
         .query_map(params![conversation_id.to_string(), time_bucket], |row| {
             Ok((
@@ -229,14 +232,14 @@ pub fn batch_prefetch_bucket_with_padding(
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let mut real_rows: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     let mut backend_check: Vec<(String, String, String)> = Vec::new();
     for row in rows {
         let (segment_id, blob_id, storage_backend) =
-            row.map_err(|e| Error::Storage(e.to_string()))?;
+            row.map_err(|e| Error::Storage(e.to_string().into()))?;
         backend_check.push((segment_id.clone(), blob_id.clone(), storage_backend.clone()));
         real_rows.insert(segment_id, (blob_id, storage_backend));
     }
@@ -358,9 +361,9 @@ mod tests {
                 .get(segment_id)
                 .cloned()
                 .ok_or_else(|| {
-                    Error::Storage(format!(
-                        "FixtureTransport: no canned response for {segment_id}"
-                    ))
+                    Error::Storage(
+                        format!("FixtureTransport: no canned response for {segment_id}").into(),
+                    )
                 })
         }
 
@@ -594,7 +597,7 @@ mod tests {
             let store = self.objects.lock().unwrap();
             let bytes = store
                 .get(&(bucket.to_string(), key.to_string()))
-                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}").into()))?;
             let start = range.start.min(bytes.len() as u64) as usize;
             let end = range.end.min(bytes.len() as u64) as usize;
             Ok(bytes[start..end].to_vec())
@@ -676,7 +679,7 @@ mod tests {
             .fetch(StorageBackend::ZkObjectFabric, "seg-Z")
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Storage(msg) if msg.contains("zk_object_fabric")),
+            matches!(&err, Error::Storage(msg) if msg.to_string().contains("zk_object_fabric")),
             "got {err:?}"
         );
     }
@@ -744,10 +747,11 @@ mod tests {
         let err = batch_prefetch_bucket(db.connection(), &transport, conv, bucket).unwrap_err();
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("seg-Z"), "got: {msg}");
-                assert!(msg.contains("zk_object_fabric"), "got: {msg}");
+                assert!(msg.to_string().contains("seg-Z"), "got: {msg}");
+                assert!(msg.to_string().contains("zk_object_fabric"), "got: {msg}");
                 assert!(
-                    msg.contains("batch_prefetch_bucket_with_router"),
+                    msg.to_string()
+                        .contains("batch_prefetch_bucket_with_router"),
                     "got: {msg}"
                 );
             }
@@ -779,9 +783,10 @@ mod tests {
                 .unwrap_err();
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("zk_object_fabric"), "got: {msg}");
+                assert!(msg.to_string().contains("zk_object_fabric"), "got: {msg}");
                 assert!(
-                    msg.contains("batch_prefetch_bucket_with_router"),
+                    msg.to_string()
+                        .contains("batch_prefetch_bucket_with_router"),
                     "got: {msg}"
                 );
             }

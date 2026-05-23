@@ -213,7 +213,7 @@ pub fn open_sealed_backup_manifest(
     )
     .map_err(Error::Crypto)?;
     let manifest: BackupManifest = crate::cbor::from_slice(&plaintext)
-        .map_err(|e| Error::Storage(format!("manifest CBOR decode: {e}")))?;
+        .map_err(|e| Error::Storage(format!("manifest CBOR decode: {e}").into()))?;
     Ok(manifest)
 }
 

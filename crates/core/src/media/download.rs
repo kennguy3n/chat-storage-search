@@ -101,9 +101,7 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 fn blob_id_to_aad_bytes(blob_id: &str) -> Result<[u8; 16], Error> {
     let bytes = uuid::Uuid::parse_str(blob_id)
         .map_err(|e| {
-            Error::Storage(format!(
-                "download: blob_id {blob_id:?} is not a valid UUID: {e}"
-            ))
+            Error::Storage(format!("download: blob_id {blob_id:?} is not a valid UUID: {e}").into())
         })?
         .as_bytes()
         .to_owned();
@@ -154,9 +152,9 @@ pub fn download_chunked_media(
     for chunk_idx in 0..chunk_count {
         let ciphertext = transport.fetch_blob_range(blob_id, chunk_range(chunk_idx))?;
         if ciphertext.is_empty() {
-            return Err(Error::Storage(format!(
-                "download_chunked_media: chunk {chunk_idx} returned an empty range"
-            )));
+            return Err(Error::Storage(
+                format!("download_chunked_media: chunk {chunk_idx} returned an empty range").into(),
+            ));
         }
         // Per-chunk SHA-256 fast-fail. The download path can't compare
         // against a server-asserted digest (it would be circular), but
@@ -221,15 +219,15 @@ pub fn download_single_chunk(
     if chunk_idx >= chunk_count {
         return Err(Error::Storage(format!(
             "download_single_chunk: chunk_idx {chunk_idx} out of range for chunk_count {chunk_count}"
-        )));
+        ).into()));
     }
     let blob_id_bytes = blob_id_to_aad_bytes(blob_id)?;
 
     let ciphertext = transport.fetch_blob_range(blob_id, chunk_range(chunk_idx))?;
     if ciphertext.is_empty() {
-        return Err(Error::Storage(format!(
-            "download_single_chunk: chunk {chunk_idx} returned an empty range"
-        )));
+        return Err(Error::Storage(
+            format!("download_single_chunk: chunk {chunk_idx} returned an empty range").into(),
+        ));
     }
     let _digest = sha256_of(&ciphertext);
 
@@ -285,41 +283,50 @@ pub struct RehydrationPlan {
 pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<RehydrationPlan, Error> {
     let row = db
         .get_media_asset(asset_id)
-        .map_err(|e| Error::Storage(e.to_string()))?
+        .map_err(|e| Error::Storage(e.to_string().into()))?
         .ok_or_else(|| {
-            Error::Storage(format!(
-                "rehydrate_media_asset: no media_asset row for {asset_id}"
-            ))
+            Error::Storage(
+                format!("rehydrate_media_asset: no media_asset row for {asset_id}").into(),
+            )
         })?;
 
     let from_state = match row.media_state {
         MediaState::Evicted | MediaState::RemoteOriginal => row.media_state,
         MediaState::OriginalLocal => {
-            return Err(Error::Storage(format!(
-                "rehydrate_media_asset: asset {asset_id} is already original_local"
-            )));
+            return Err(Error::Storage(
+                format!("rehydrate_media_asset: asset {asset_id} is already original_local").into(),
+            ));
         }
         other => {
-            return Err(Error::Storage(format!(
-                "rehydrate_media_asset: asset {asset_id} in state {other:?} cannot rehydrate"
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "rehydrate_media_asset: asset {asset_id} in state {other:?} cannot rehydrate"
+                )
+                .into(),
+            ));
         }
     };
 
     if row.merkle_root.len() != 32 {
-        return Err(Error::Storage(format!(
-            "rehydrate_media_asset: merkle_root for {asset_id} is {} bytes (expected 32)",
-            row.merkle_root.len()
-        )));
+        return Err(Error::Storage(
+            format!(
+                "rehydrate_media_asset: merkle_root for {asset_id} is {} bytes (expected 32)",
+                row.merkle_root.len()
+            )
+            .into(),
+        ));
     }
     let mut merkle_root = [0u8; 32];
     merkle_root.copy_from_slice(&row.merkle_root);
 
     let chunk_count: u32 = u32::try_from(row.chunk_count.max(0)).map_err(|_| {
-        Error::Storage(format!(
-            "rehydrate_media_asset: chunk_count {} out of range",
-            row.chunk_count
-        ))
+        Error::Storage(
+            format!(
+                "rehydrate_media_asset: chunk_count {} out of range",
+                row.chunk_count
+            )
+            .into(),
+        )
     })?;
 
     Ok(RehydrationPlan {
@@ -370,9 +377,9 @@ pub fn execute_rehydration_download(
         "icloud" | "google_drive" | "zk_object_fabric" => Err(Error::NotImplemented(
             "rehydrate_media_asset: MediaBlobSink rehydration",
         )),
-        other => Err(Error::Storage(format!(
-            "rehydrate_media_asset: unknown storage_sink {other:?}"
-        ))),
+        other => Err(Error::Storage(
+            format!("rehydrate_media_asset: unknown storage_sink {other:?}").into(),
+        )),
     }
 }
 
@@ -400,7 +407,7 @@ pub fn commit_rehydration(
 ) -> Result<(), Error> {
     let conn = db.connection();
     conn.execute_batch("SAVEPOINT rehydrate_media_state;")
-        .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint open: {e}")))?;
+        .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint open: {e}").into()))?;
     let result: Result<(), Error> = (|| {
         transition_media_state(db, asset_id, from_state, MediaState::DownloadInProgress)?;
         transition_media_state(
@@ -413,21 +420,26 @@ pub fn commit_rehydration(
         // on disk. SAVEPOINT-scoped so a partial failure rolls back
         // alongside the state transitions.
         let bytes_local = i64::try_from(plaintext_len).map_err(|_| {
-            Error::Storage(format!(
-                "rehydrate_media_asset: plaintext_len {plaintext_len} does not fit in i64"
-            ))
+            Error::Storage(
+                format!("rehydrate_media_asset: plaintext_len {plaintext_len} does not fit in i64")
+                    .into(),
+            )
         })?;
         conn.execute(
             "UPDATE media_asset SET bytes_local = ?1 WHERE asset_id = ?2",
             rusqlite::params![bytes_local, asset_id],
         )
-        .map_err(|e| Error::Storage(format!("rehydrate_media_state bytes_local update: {e}")))?;
+        .map_err(|e| {
+            Error::Storage(format!("rehydrate_media_state bytes_local update: {e}").into())
+        })?;
         Ok(())
     })();
     match &result {
         Ok(_) => conn
             .execute_batch("RELEASE SAVEPOINT rehydrate_media_state;")
-            .map_err(|e| Error::Storage(format!("rehydrate_media_state savepoint release: {e}")))?,
+            .map_err(|e| {
+                Error::Storage(format!("rehydrate_media_state savepoint release: {e}").into())
+            })?,
         Err(_) => {
             // Best-effort rollback. We deliberately swallow rollback
             // errors so the original transition error is what surfaces
@@ -566,24 +578,28 @@ mod tests {
         fn fetch_blob_range(&self, blob_id: &str, range: Range<u64>) -> TransportResult<Vec<u8>> {
             let state = self.chunks.lock().unwrap();
             let chunks = state.get(blob_id).ok_or_else(|| {
-                crate::Error::Storage(format!(
-                    "InMemoryBlobTransport: unknown blob_id {blob_id:?}"
-                ))
+                crate::Error::Storage(
+                    format!("InMemoryBlobTransport: unknown blob_id {blob_id:?}").into(),
+                )
             })?;
             // Translate the byte range back to a chunk index using
             // the same formula the download path uses to compute it.
             let stride = DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64;
             if !range.start.is_multiple_of(stride) {
-                return Err(crate::Error::Storage(format!(
-                    "InMemoryBlobTransport: range start {} not aligned to chunk stride",
-                    range.start
-                )));
+                return Err(crate::Error::Storage(
+                    format!(
+                        "InMemoryBlobTransport: range start {} not aligned to chunk stride",
+                        range.start
+                    )
+                    .into(),
+                ));
             }
             let chunk_idx = (range.start / stride) as usize;
             chunks.get(chunk_idx).cloned().ok_or_else(|| {
-                crate::Error::Storage(format!(
-                    "InMemoryBlobTransport: blob {blob_id:?} has no chunk {chunk_idx}"
-                ))
+                crate::Error::Storage(
+                    format!("InMemoryBlobTransport: blob {blob_id:?} has no chunk {chunk_idx}")
+                        .into(),
+                )
             })
         }
 
@@ -765,7 +781,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("blob_id"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("blob_id"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -784,7 +800,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("chunk_count"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("chunk_count"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -802,7 +818,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("UUID"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("UUID"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -819,7 +835,7 @@ mod tests {
         let err = download_chunked_media(&transport, &blob_id, 1, root, &k, BlobClass::Media)
             .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("empty range"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("empty range"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -871,7 +887,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("out of range"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("out of range"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -1048,7 +1064,10 @@ mod tests {
 
         let err = rehydrate_media_asset(&db, "a-3", &transport, &wrapping).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("already original_local"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("already original_local"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -1116,7 +1135,9 @@ mod tests {
         let transport = InMemoryBlobTransport::new();
         let err = rehydrate_media_asset(&db, "nope", &transport, &wrapping).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("no media_asset row"), "got {msg}"),
+            Error::Storage(msg) => {
+                assert!(msg.to_string().contains("no media_asset row"), "got {msg}")
+            }
             other => panic!("expected Storage error, got {other:?}"),
         }
     }

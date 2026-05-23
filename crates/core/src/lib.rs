@@ -72,10 +72,24 @@ use uuid::Uuid;
 
 use crate::message::processor::IngestResult;
 
-/// Top-level error type for the core library. Phase 0 carried crypto
-/// and configuration errors only; Phase 1 widens the surface for
-/// storage / search / message / transport failures so the bridge
-/// crates can pattern-match on the right variant.
+/// Top-level error type for the core library.
+///
+/// Each variant wraps a typed sub-enum from the module that owns
+/// the corresponding failure modes so callers can pattern-match on
+/// specific failure routing decisions (e.g.
+/// [`local_store::StorageError::DatabaseLocked`],
+/// [`transport::TransportError::Auth`]) instead of parsing
+/// `Display` text.
+///
+/// # Migration note (Phase B.3 / workstream B.8)
+///
+/// The string-typed variants (`Storage(String)`, `Search(String)`,
+/// `Message(String)`, `Transport(String)`, `Model(String)`) were
+/// replaced with typed sub-enum wrappers in workstream B.8 so the
+/// reader pool / retry loops / tests can route on intent. Existing
+/// `format!("...: {e}")` call sites map to the `Custom(String)`
+/// variant on each sub-enum via the bridging `From<String>` impls
+/// below; new code should prefer a typed variant.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A crypto primitive (key derivation, AEAD seal/open, hashing)
@@ -83,33 +97,36 @@ pub enum Error {
     #[error("crypto: {0}")]
     Crypto(#[from] crypto::CryptoError),
 
-    /// A storage-layer call failed (SQLCipher open, AEAD-seal-on-write,
-    /// schema migration, …).
+    /// A storage-layer call failed. See [`local_store::StorageError`]
+    /// for the structured failure modes (SQLCipher driver, schema
+    /// migration, CBOR encode/decode, lock poisoning, subsystem
+    /// install errors, …).
     #[error("storage: {0}")]
-    Storage(String),
+    Storage(#[from] local_store::StorageError),
 
-    /// A search-layer call failed (FTS5 query parse, fuzzy / vector
-    /// fan-out, ranking, …).
+    /// A search-layer call failed. See [`search::SearchError`] for
+    /// the structured failure modes (query parse, FTS5 driver,
+    /// cold-source fetch, …).
     #[error("search: {0}")]
-    Search(String),
+    Search(#[from] search::SearchError),
 
-    /// A message-pipeline call failed (validation, idempotency,
-    /// outbox bookkeeping).
+    /// A message-pipeline call failed. See [`message::MessageError`]
+    /// for the structured failure modes (validation, idempotency,
+    /// image-codec, …).
     #[error("message: {0}")]
-    Message(String),
+    Message(#[from] message::MessageError),
 
-    /// A transport-layer call failed (blob fetch, archive manifest
-    /// fetch, MLS delivery cursor, …).
+    /// A transport-layer call failed. See [`transport::TransportError`]
+    /// for the structured failure modes (network, auth, server).
     #[error("transport: {0}")]
-    Transport(String),
+    Transport(#[from] transport::TransportError),
 
-    /// An on-device ML model call failed (ONNX Runtime session
-    /// create / inference, tokenizer, image decode, …). Phase 6 —
-    /// `docs/PROPOSAL.md §7.6 / §7.7`. Wraps the upstream `ort` /
-    /// tokenizer / image-codec error message verbatim so callers
-    /// can surface it in telemetry without parsing free-form text.
+    /// An on-device ML model call failed. See [`models::ModelError`]
+    /// for the structured failure modes (ONNX Runtime, tokenizer,
+    /// image / video decode, EP-tuning cache, model-not-cached).
+    /// Phase 6 — `docs/PROPOSAL.md §7.6 / §7.7`.
     #[error("model: {0}")]
-    Model(String),
+    Model(#[from] models::ModelError),
 
     /// The requested API is part of the public trait surface but its
     /// implementation has not landed yet. The string is the method
@@ -121,6 +138,93 @@ pub enum Error {
 
 /// Crate-wide [`Result`] alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ---------------------------------------------------------------------------
+// Transitional ergonomics for the workstream-B.8 migration.
+//
+// Most of the codebase still constructs the old string-typed
+// variants — `Error::Storage(format!("...").into())` etc. The
+// `From<&str>` / `From<String>` impls below let those call sites
+// keep compiling while wave-by-wave the typed
+// `StorageError::DatabaseLocked` / `SearchError::QueryParse` /
+// `MessageError::Validation` variants replace them. Once the
+// migration finishes and no string-typed constructions remain, these
+// impls can be removed.
+// ---------------------------------------------------------------------------
+
+impl From<String> for local_store::StorageError {
+    fn from(s: String) -> Self {
+        local_store::StorageError::Custom(s)
+    }
+}
+
+impl From<&str> for local_store::StorageError {
+    fn from(s: &str) -> Self {
+        local_store::StorageError::Custom(s.to_string())
+    }
+}
+
+impl From<String> for search::SearchError {
+    fn from(s: String) -> Self {
+        search::SearchError::Custom(s)
+    }
+}
+
+impl From<&str> for search::SearchError {
+    fn from(s: &str) -> Self {
+        search::SearchError::Custom(s.to_string())
+    }
+}
+
+impl From<String> for message::MessageError {
+    fn from(s: String) -> Self {
+        message::MessageError::Custom(s)
+    }
+}
+
+impl From<&str> for message::MessageError {
+    fn from(s: &str) -> Self {
+        message::MessageError::Custom(s.to_string())
+    }
+}
+
+impl From<String> for models::ModelError {
+    fn from(s: String) -> Self {
+        models::ModelError::Custom(s)
+    }
+}
+
+impl From<&str> for models::ModelError {
+    fn from(s: &str) -> Self {
+        models::ModelError::Custom(s.to_string())
+    }
+}
+
+// `transport::TransportError` is reused as-is from the transport
+// module. Pre-B.8 call sites construct `Error::Transport(some_string)`
+// — until they migrate to `TransportError::Network` /
+// `TransportError::Auth` / `TransportError::Server`, the bridging
+// `From<String>` / `From<&str>` impls below map the legacy string
+// form onto [`TransportError::Custom`], whose Display emits the
+// wrapped string verbatim (no `server:` / `network:` / `auth:`
+// prefix). This mirrors the [`StorageError::Custom`] /
+// [`SearchError::Custom`] / [`MessageError::Custom`] /
+// [`ModelError::Custom`] pattern and preserves the exact pre-B.8
+// observable message through the bridge layer's `.to_string()` —
+// avoiding the doubled-prefix scenario
+// (`"transport: server: connection reset"`) the bridge comments
+// guard against.
+impl From<String> for transport::TransportError {
+    fn from(s: String) -> Self {
+        transport::TransportError::Custom(s)
+    }
+}
+
+impl From<&str> for transport::TransportError {
+    fn from(s: &str) -> Self {
+        transport::TransportError::Custom(s.to_string())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API types — `docs/PROPOSAL.md §12`

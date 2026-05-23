@@ -109,10 +109,13 @@ pub fn route_media_download(
     chunk_idx: u32,
 ) -> Result<Vec<u8>, Error> {
     if blob_ref.storage_sink != storage_sink {
-        return Err(Error::Storage(format!(
-            "route_media_download: blob_ref.storage_sink {:?} does not match {:?}",
-            blob_ref.storage_sink, storage_sink
-        )));
+        return Err(Error::Storage(
+            format!(
+                "route_media_download: blob_ref.storage_sink {:?} does not match {:?}",
+                blob_ref.storage_sink, storage_sink
+            )
+            .into(),
+        ));
     }
     if storage_sink == KCHAT_BACKEND_SINK {
         let start = (chunk_idx as u64) * (DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64);
@@ -122,7 +125,7 @@ pub fn route_media_download(
     let Some(sink) = media_blob_sink else {
         return Err(Error::Storage(format!(
             "route_media_download: storage_sink {storage_sink:?} requires a MediaBlobSink but none was provided"
-        )));
+        ).into()));
     };
     sink.fetch_media_chunk(blob_ref, chunk_idx)
 }
@@ -524,7 +527,7 @@ mod tests {
         let err =
             route_media_download("zk_object_fabric", &transport, None, &blob_ref, 0).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("MediaBlobSink"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("MediaBlobSink"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -542,7 +545,7 @@ mod tests {
             .unwrap_err();
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("does not match"), "{msg}");
+                assert!(msg.to_string().contains("does not match"), "{msg}");
             }
             other => panic!("expected Storage error, got {other:?}"),
         }

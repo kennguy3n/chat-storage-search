@@ -72,9 +72,9 @@ impl BackupEventType {
             "conversation_created" => Self::ConversationCreated,
             "conversation_deleted" => Self::ConversationDeleted,
             other => {
-                return Err(Error::Storage(format!(
-                    "unknown backup event_type {other:?}"
-                )))
+                return Err(Error::Storage(
+                    format!("unknown backup event_type {other:?}").into(),
+                ))
             }
         })
     }
@@ -142,7 +142,7 @@ impl BackupEventJournal {
                 event.created_at_ms,
             ],
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -165,7 +165,7 @@ impl BackupEventJournal {
                   ORDER BY event_seq ASC
                   LIMIT ?2",
             )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let rows = stmt
             .query_map(params![after_seq, limit as i64], |row| {
                 let seq: i64 = row.get(0)?;
@@ -176,12 +176,12 @@ impl BackupEventJournal {
                 let created_at_ms: i64 = row.get(5)?;
                 Ok((seq, type_str, conv_str, mid_str, payload, created_at_ms))
             })
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
 
         let mut out = Vec::new();
         for row in rows {
             let (seq, type_str, conv_str, mid_str, payload, created_at_ms) =
-                row.map_err(|e| Error::Storage(e.to_string()))?;
+                row.map_err(|e| Error::Storage(e.to_string().into()))?;
             // Skip rows whose `event_type` is not part of the
             // typed taxonomy. Legacy phases wrote ad-hoc tags
             // such as `"outbox_pending"` / `"outbox_sent"`
@@ -194,14 +194,22 @@ impl BackupEventJournal {
             };
             let conversation_id = conv_str
                 .map(|s| {
-                    Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}")))
+                    Uuid::parse_str(&s).map_err(|e| {
+                        Error::Storage(crate::local_store::StorageError::InvalidId {
+                            kind: "conversation_id",
+                            source: e,
+                        })
+                    })
                 })
                 .transpose()?;
             let message_id = mid_str
                 .map(|s| {
-                    Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("invalid message_id: {e}")))
+                    Uuid::parse_str(&s).map_err(|e| {
+                        Error::Storage(crate::local_store::StorageError::InvalidId {
+                            kind: "message_id",
+                            source: e,
+                        })
+                    })
                 })
                 .transpose()?;
             out.push((
@@ -227,7 +235,7 @@ impl BackupEventJournal {
             |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map_err(|e| Error::Storage(e.to_string()))
+        .map_err(|e| Error::Storage(e.to_string().into()))
         .map(|opt| opt.unwrap_or(0))
     }
 
@@ -244,16 +252,19 @@ impl BackupEventJournal {
     ) -> Result<(), Error> {
         let current = self.read_cursor(conn)?;
         if new_cursor < current {
-            return Err(Error::Storage(format!(
-                "backup cursor cannot go backwards (current={current}, requested={new_cursor})"
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "backup cursor cannot go backwards (current={current}, requested={new_cursor})"
+                )
+                .into(),
+            ));
         }
         conn.execute(
             "INSERT INTO backup_event_cursor(id, cursor_seq) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET cursor_seq = excluded.cursor_seq",
             params![new_cursor],
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(())
     }
 

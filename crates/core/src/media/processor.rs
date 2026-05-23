@@ -175,28 +175,33 @@ pub fn transition_media_state(
     to: MediaState,
 ) -> Result<(), Error> {
     MediaState::try_transition(from, to)
-        .map_err(|e| Error::Storage(format!("media_state transition: {e}")))?;
+        .map_err(|e| Error::Storage(format!("media_state transition: {e}").into()))?;
     let asset = db
         .get_media_asset(asset_id)
-        .map_err(|e| Error::Storage(format!("media_state lookup: {e}")))?
+        .map_err(|e| Error::Storage(format!("media_state lookup: {e}").into()))?
         .ok_or_else(|| {
-            Error::Storage(format!(
-                "transition_media_state: no media_asset row for asset_id {asset_id:?}"
-            ))
+            Error::Storage(
+                format!("transition_media_state: no media_asset row for asset_id {asset_id:?}")
+                    .into(),
+            )
         })?;
     if asset.media_state != from {
-        return Err(Error::Storage(format!(
-            "transition_media_state: expected media_state = {from} for {asset_id:?}, found {}",
-            asset.media_state
-        )));
+        return Err(Error::Storage(
+            format!(
+                "transition_media_state: expected media_state = {from} for {asset_id:?}, found {}",
+                asset.media_state
+            )
+            .into(),
+        ));
     }
     let rows = db
         .update_media_state(asset_id, to)
-        .map_err(|e| Error::Storage(format!("media_state update: {e}")))?;
+        .map_err(|e| Error::Storage(format!("media_state update: {e}").into()))?;
     if rows == 0 {
-        return Err(Error::Storage(format!(
-            "transition_media_state: update affected 0 rows for asset_id {asset_id:?}"
-        )));
+        return Err(Error::Storage(
+            format!("transition_media_state: update affected 0 rows for asset_id {asset_id:?}")
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -419,7 +424,7 @@ mod tests {
             transition_media_state(&db, "a-2", MediaState::ThumbnailOnly, MediaState::Deleted)
                 .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("transition"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("transition"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
         // The DB row must not have changed.
@@ -453,7 +458,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("no media_asset row"), "{msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("no media_asset row"), "{msg}"),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -466,7 +471,9 @@ mod tests {
             transition_media_state(&db, "a-5", MediaState::OriginalLocal, MediaState::Evicted)
                 .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("expected media_state"), "{msg}"),
+            Error::Storage(msg) => {
+                assert!(msg.to_string().contains("expected media_state"), "{msg}")
+            }
             other => panic!("expected Storage error, got {other:?}"),
         }
     }

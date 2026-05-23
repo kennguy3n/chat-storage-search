@@ -204,7 +204,7 @@ pub fn open_sealed_archive_manifest(
     let plaintext =
         open(k_archive_manifest, &sealed.nonce, &sealed.ciphertext, &aad).map_err(Error::Crypto)?;
     let manifest: ArchiveManifest = crate::cbor::from_slice(&plaintext)
-        .map_err(|e| Error::Storage(format!("manifest CBOR decode: {e}")))?;
+        .map_err(|e| Error::Storage(format!("manifest CBOR decode: {e}").into()))?;
     Ok(manifest)
 }
 

@@ -165,12 +165,12 @@ impl From<kchat_core::Error> for BridgeError {
         // (`"core: transport: transport: foo"`).
         let (category, message) = match e {
             kchat_core::Error::Crypto(inner) => ("crypto", inner.to_string()),
-            kchat_core::Error::Storage(s) => ("storage", s),
-            kchat_core::Error::Search(s) => ("search", s),
-            kchat_core::Error::Message(s) => ("message", s),
-            kchat_core::Error::Transport(s) => ("transport", s),
+            kchat_core::Error::Storage(s) => ("storage", s.to_string()),
+            kchat_core::Error::Search(s) => ("search", s.to_string()),
+            kchat_core::Error::Message(s) => ("message", s.to_string()),
+            kchat_core::Error::Transport(s) => ("transport", s.to_string()),
             kchat_core::Error::NotImplemented(m) => ("not_implemented", m.to_string()),
-            kchat_core::Error::Model(s) => ("model", s),
+            kchat_core::Error::Model(s) => ("model", s.to_string()),
         };
         BridgeError::Core {
             category: category.to_string(),
@@ -970,7 +970,7 @@ impl CoreGoogleDriveBridge for GoogleDriveBridgeImpl {
     ) -> std::result::Result<String, kchat_core::Error> {
         self.callback
             .upload_file(asset_id.to_string(), bytes.to_vec())
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 
     fn download_file_range(
@@ -984,13 +984,13 @@ impl CoreGoogleDriveBridge for GoogleDriveBridgeImpl {
                 range.start,
                 range.end.saturating_sub(range.start),
             )
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 
     fn delete_file(&self, file_id: &str) -> std::result::Result<(), kchat_core::Error> {
         self.callback
             .delete_file(file_id.to_string())
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 }
 

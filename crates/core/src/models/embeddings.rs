@@ -193,7 +193,7 @@ impl EmbeddingCache for LocalStoreEmbeddingCache<'_> {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .map_err(|e| crate::Error::Storage(format!("search_vector lookup: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("search_vector lookup: {e}").into()))?;
         Ok(blob.map(|b| dequantize_int8(&b)))
     }
 
@@ -207,7 +207,7 @@ impl EmbeddingCache for LocalStoreEmbeddingCache<'_> {
                  DO UPDATE SET embedding = excluded.embedding",
                 params![message_id, blob, model_version],
             )
-            .map_err(|e| crate::Error::Storage(format!("search_vector upsert: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("search_vector upsert: {e}").into()))?;
         Ok(())
     }
 }

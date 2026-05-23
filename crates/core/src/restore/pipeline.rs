@@ -221,9 +221,9 @@ impl RestorePipeline {
         shards: &[SealedSearchShardEntry<'_>],
     ) -> Result<Vec<RestoredShardSummary>, Error> {
         let mut summary = Vec::with_capacity(shards.len());
-        let tx = conn
-            .transaction()
-            .map_err(|e| Error::Storage(format!("restore_search_index_shards: begin tx: {e}")))?;
+        let tx = conn.transaction().map_err(|e| {
+            Error::Storage(format!("restore_search_index_shards: begin tx: {e}").into())
+        })?;
         for entry in shards {
             match entry.shard.index_type {
                 IndexType::Text => {
@@ -243,9 +243,10 @@ impl RestorePipeline {
                             ],
                         )
                         .map_err(|e| {
-                            Error::Storage(format!(
-                                "restore_search_index_shards: insert search_fts: {e}"
-                            ))
+                            Error::Storage(
+                                format!("restore_search_index_shards: insert search_fts: {e}")
+                                    .into(),
+                            )
                         })?;
                     }
                     summary.push(RestoredShardSummary {
@@ -263,9 +264,10 @@ impl RestorePipeline {
                             rusqlite::params![row.token, row.script, row.message_id],
                         )
                         .map_err(|e| {
-                            Error::Storage(format!(
-                                "restore_search_index_shards: insert search_fuzzy: {e}"
-                            ))
+                            Error::Storage(
+                                format!("restore_search_index_shards: insert search_fuzzy: {e}")
+                                    .into(),
+                            )
                         })?;
                     }
                     summary.push(RestoredShardSummary {
@@ -287,8 +289,9 @@ impl RestorePipeline {
                 }
             }
         }
-        tx.commit()
-            .map_err(|e| Error::Storage(format!("restore_search_index_shards: commit: {e}")))?;
+        tx.commit().map_err(|e| {
+            Error::Storage(format!("restore_search_index_shards: commit: {e}").into())
+        })?;
         Ok(summary)
     }
 

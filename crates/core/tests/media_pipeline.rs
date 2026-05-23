@@ -247,10 +247,10 @@ impl MediaBlobSink for CapturingMediaBlobSink {
     ) -> kchat_core::Result<Vec<u8>> {
         let guard = self.uploads.lock().unwrap();
         let chunks = guard.get(&blob_ref.blob_id).ok_or_else(|| {
-            kchat_core::Error::Storage(format!("unknown asset {:?}", blob_ref.blob_id))
+            kchat_core::Error::Storage(format!("unknown asset {:?}", blob_ref.blob_id).into())
         })?;
         chunks.get(chunk_idx as usize).cloned().ok_or_else(|| {
-            kchat_core::Error::Storage(format!("chunk_idx {chunk_idx} out of range"))
+            kchat_core::Error::Storage(format!("chunk_idx {chunk_idx} out of range").into())
         })
     }
 

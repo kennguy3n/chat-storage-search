@@ -30,13 +30,13 @@ pub fn load(conn: &Connection) -> Result<Option<(RestoreState, Option<String>)>,
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .optional()
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
     let parsed = row
         .map(|(state_str, notes)| {
             state_str
                 .parse::<RestoreState>()
                 .map(|st| (st, notes))
-                .map_err(|e| Error::Storage(format!("invalid restore_state: {e}")))
+                .map_err(|e| Error::Storage(format!("invalid restore_state: {e}").into()))
         })
         .transpose()?;
     Ok(parsed)
@@ -53,7 +53,7 @@ pub fn save(conn: &Connection, state: RestoreState, notes: Option<&str>) -> Resu
                                        notes = excluded.notes",
         params![state.to_string(), notes],
     )
-    .map_err(|e| Error::Storage(e.to_string()))?;
+    .map_err(|e| Error::Storage(e.to_string().into()))?;
     Ok(())
 }
 
@@ -72,17 +72,20 @@ pub fn transition(
     match current {
         None => {
             if to != RestoreState::IdentityRestored {
-                return Err(Error::Storage(format!(
-                    "restore_state row missing — initial state must be \
+                return Err(Error::Storage(
+                    format!(
+                        "restore_state row missing — initial state must be \
                      identity_restored, got {to}"
-                )));
+                    )
+                    .into(),
+                ));
             }
             save(conn, to, notes)?;
             Ok(to)
         }
         Some((from, _)) => {
             let next = RestoreState::try_transition(from, to)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             save(conn, next, notes)?;
             Ok(next)
         }
@@ -94,7 +97,7 @@ pub fn transition(
 /// scratch.
 pub fn reset(conn: &Connection) -> Result<(), Error> {
     conn.execute("DELETE FROM restore_state WHERE id = 1", [])
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
     Ok(())
 }
 

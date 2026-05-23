@@ -21,8 +21,13 @@
 //! Retry policy: 3 attempts at 1 s / 2 s / 4 s backoff for any
 //! transient failure. Two failure classes trigger a retry:
 //!
-//! * Transport-level [`reqwest::Error`]s that report
-//!   `is_timeout` / `is_connect` (DNS / TCP / TLS failure).
+//! * Transport-level [`reqwest::Error`]s classified as transient by
+//!   [`err_is_retryable`]: `is_timeout` / `is_connect` (DNS / TCP /
+//!   TLS failure), `is_request` (request-sending failure such as
+//!   HTTP/2 framing or an interrupted body upload), and `is_body`
+//!   (connection drop while reading the response body). The retry
+//!   set is kept in sync with [`HttpTransportClient::map_err`]’s
+//!   `TransportError::Network` classifier.
 //! * Completed HTTP exchanges whose response status is `429`
 //!   or any `5xx`. Status-code classification happens on the
 //!   [`reqwest::blocking::Response`] returned by `send`, not on
@@ -146,14 +151,28 @@ impl HttpTransportClient {
     /// timeouts (it does not, in practice, but the Result keeps the
     /// signature future-proof).
     pub fn new(base_url: &str, auth_token: &str) -> crate::Result<Self> {
+        // Client builder failures are deterministic configuration
+        // errors (TLS backend init, invalid default header, invalid
+        // timeout value) — retrying produces the same failure. Route
+        // them onto `TransportError::Server` (non-retryable) so
+        // callers don't burn retry budget on a permanent config
+        // problem.
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TRANSPORT_REQUEST_TIMEOUT_SECS))
             .build()
-            .map_err(|e| crate::Error::Transport(format!("reqwest builder: {e}")))?;
+            .map_err(|e| {
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                    "reqwest builder: {e}"
+                )))
+            })?;
         let upload_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TRANSPORT_BLOB_UPLOAD_TIMEOUT_SECS))
             .build()
-            .map_err(|e| crate::Error::Transport(format!("reqwest upload builder: {e}")))?;
+            .map_err(|e| {
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                    "reqwest upload builder: {e}"
+                )))
+            })?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token: auth_token.to_string(),
@@ -174,8 +193,12 @@ impl HttpTransportClient {
     /// at 1 s / 2 s / 4 s exponential backoff.
     ///
     /// Retries on:
-    ///   - Transport-level [`reqwest::Error`]s that report
-    ///     `is_timeout` / `is_connect`.
+    ///   - Transport-level [`reqwest::Error`]s classified as
+    ///     transient by [`err_is_retryable`]: `is_timeout`,
+    ///     `is_connect`, `is_request`, or `is_body`. The retry set
+    ///     is intentionally kept in sync with the
+    ///     `TransportError::Network` classifier in
+    ///     [`HttpTransportClient::map_err`].
     ///   - HTTP responses with status `429` or any `5xx`.
     ///
     /// `reqwest::blocking::Client::send` returns `Ok(Response)` for
@@ -210,15 +233,84 @@ impl HttpTransportClient {
     }
 
     fn map_err(label: &str, err: reqwest::Error) -> crate::Error {
-        crate::Error::Transport(format!("{label}: {err}"))
+        let msg = format!("{label}: {err}");
+        // Categorise the reqwest::Error onto TransportError variants
+        // so callers can route on intent (retryable vs not).
+        //
+        // Retryable — `TransportError::Network`:
+        //   * `is_timeout()`  — server didn't reply before the client
+        //                       timeout fired. Walks the cause chain;
+        //                       can fire on any `Kind` if the source
+        //                       contains a `TimedOut`.
+        //   * `is_connect()`  — TCP/TLS handshake failure. Walks the
+        //                       cause chain for hyper connect errors;
+        //                       again `Kind`-orthogonal.
+        //   * `is_request()`  — `Kind::Request`: generic
+        //                       request-sending failure (body stream
+        //                       interrupted, HTTP/2 framing issue,
+        //                       etc.).
+        //   * `is_body()`     — `Kind::Body`: connection drop while
+        //                       reading the response body. The server
+        //                       had started replying but the stream
+        //                       was truncated mid-flight; the partial
+        //                       payload is unusable. Retrying the
+        //                       whole request typically recovers.
+        //                       Critical: this Kind is NOT covered by
+        //                       `is_request()`, so without an explicit
+        //                       check these transient mid-body drops
+        //                       would misclassify as non-retryable.
+        //
+        // Non-retryable — `TransportError::Server`:
+        //   * `is_builder()`  — `Kind::Builder`: client config issue
+        //                       (handled at construction sites, this
+        //                       branch is a defensive fallthrough).
+        //   * `is_redirect()` — `Kind::Redirect`: redirect policy
+        //                       loop / too-many-hops. Deterministic
+        //                       at the same URL.
+        //   * `is_status()`   — `Kind::Status`: HTTP error status
+        //                       surfaced by `error_for_status()`. The
+        //                       caller path normally invokes
+        //                       `map_status` explicitly, but the
+        //                       fallback is to treat the status
+        //                       itself as the failure signal.
+        //   * `is_decode()`   — `Kind::Decode`: the server replied
+        //                       with a malformed payload. Retrying
+        //                       returns the same broken response.
+        //   * `is_upgrade()`  — `Kind::Upgrade`: HTTP upgrade
+        //                       negotiation failed.
+        //
+        // Default: any future `reqwest::Kind` value the classifier
+        // doesn't recognise falls through to `Server` so the caller
+        // surfaces the unfamiliar error rather than burning retry
+        // budget. This is the safer default for a classifier that
+        // wants to err toward visibility over resilience.
+        let category = if err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+        {
+            crate::transport::TransportError::Network(msg)
+        } else {
+            crate::transport::TransportError::Server(msg)
+        };
+        crate::Error::Transport(category)
     }
 
     fn map_status(label: &str, status: reqwest::StatusCode, body: &str) -> crate::Error {
-        crate::Error::Transport(format!(
+        // Map HTTP status onto the structured `TransportError`
+        // categories so the upper layers can pattern-match on
+        // intent: `Auth` for 401/403, `Network` for retryable 5xx,
+        // `Server` for everything else.
+        let msg = format!(
             "{label}: HTTP {} — {}",
             status.as_u16(),
             body.chars().take(256).collect::<String>()
-        ))
+        );
+        let category = if status.as_u16() == 401 || status.as_u16() == 403 {
+            crate::transport::TransportError::Auth(msg)
+        } else if status.as_u16() >= 500 || status.as_u16() == 429 {
+            crate::transport::TransportError::Network(msg)
+        } else {
+            crate::transport::TransportError::Server(msg)
+        };
+        crate::Error::Transport(category)
     }
 }
 
@@ -233,12 +325,38 @@ fn response_status_is_retryable(status: reqwest::StatusCode) -> bool {
 }
 
 /// Whether a transport-level [`reqwest::Error`] should trigger a
-/// retry: timeouts and connect errors only. Status-code-bearing
-/// errors (from `error_for_status`) are not produced by our call
-/// sites, so we deliberately do not classify on `e.status()`.
+/// retry by the inner [`HttpTransportClient::with_retry`] loop.
+///
+/// Kept in sync with the categorisation in
+/// [`HttpTransportClient::map_err`]: any `reqwest::Error` that
+/// `map_err` would classify as [`crate::transport::TransportError::Network`]
+/// (retryable at the caller layer) is also retried at the inner
+/// short-backoff layer (1 s / 2 s / 4 s). The semantics are:
+///
+/// * `is_timeout()` — server did not reply before our timeout
+///   fired (transient).
+/// * `is_connect()` — TCP / TLS handshake failure (transient).
+/// * `is_request()` — `Kind::Request`: generic request-sending
+///   failure, e.g. HTTP/2 framing issue or an interrupted body
+///   upload. Our request bodies are owned byte vectors, so retrying
+///   is safe; we don't ship streaming bodies through this transport.
+/// * `is_body()` — `Kind::Body`: connection drop while we are reading
+///   the response body. The partial payload is unusable but the
+///   server is healthy; a quick retry typically recovers the whole
+///   response.
+///
+/// Status-code-bearing errors (from `error_for_status`) are not
+/// produced by our call sites, so we deliberately do not classify
+/// on `e.status()`. HTTP retryability is decided separately on the
+/// `Response` path via [`response_status_is_retryable`].
+///
+/// Must be kept in sync with [`HttpTransportClient::map_err`]: if
+/// you teach `map_err` about a new retryable `reqwest::Kind`, teach
+/// this predicate too, otherwise the inner loop will surface the
+/// error to the caller layer without ever attempting a retry.
 #[cfg(feature = "http-transport")]
 fn err_is_retryable(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
+    e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
 }
 
 #[cfg(feature = "http-transport")]
@@ -343,8 +461,15 @@ impl TransportClient for HttpTransportClient {
             .json::<ChunkReceiptWire>()
             .map_err(|e| Self::map_err("upload_chunk decode", e))?;
         let mut bytes = [0u8; 32];
-        hex_decode_into(&wire.sha256_hex, &mut bytes)
-            .map_err(|e| crate::Error::Transport(format!("upload_chunk: {e}")))?;
+        // Response-payload decode failure: the server returned a 200
+        // but the hex string in the body is malformed. Retrying will
+        // produce the same result — surface as `Server`
+        // (non-retryable) rather than `Network`.
+        hex_decode_into(&wire.sha256_hex, &mut bytes).map_err(|e| {
+            crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                "upload_chunk: {e}"
+            )))
+        })?;
         Ok(ChunkReceipt {
             blob_id: wire.blob_id,
             chunk_idx: wire.chunk_idx,
@@ -371,8 +496,12 @@ impl TransportClient for HttpTransportClient {
             .json::<CommitBlobWire>()
             .map_err(|e| Self::map_err("commit_blob decode", e))?;
         let mut root = [0u8; 32];
-        hex_decode_into(&wire.merkle_root_hex, &mut root)
-            .map_err(|e| crate::Error::Transport(format!("commit_blob: {e}")))?;
+        // Response-payload decode failure: see note in `upload_chunk`.
+        hex_decode_into(&wire.merkle_root_hex, &mut root).map_err(|e| {
+            crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                "commit_blob: {e}"
+            )))
+        })?;
         Ok(CommitBlobResponse {
             blob_id: wire.blob_id,
             chunk_count: wire.chunk_count,
@@ -432,10 +561,18 @@ impl TransportClient for HttpTransportClient {
         let mut out = Vec::with_capacity(wires.len());
         for w in wires {
             let mut hash = [0u8; 32];
-            hex_decode_into(&w.previous_manifest_hash_hex, &mut hash)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}")))?;
-            let payload = base64_decode(&w.payload_b64)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}")))?;
+            // Response-payload decode failure: see note in
+            // `upload_chunk`.
+            hex_decode_into(&w.previous_manifest_hash_hex, &mut hash).map_err(|e| {
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                    "fetch_archive_manifests: {e}"
+                )))
+            })?;
+            let payload = base64_decode(&w.payload_b64).map_err(|e| {
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
+                    "fetch_archive_manifests: {e}"
+                )))
+            })?;
             out.push(EncryptedManifest {
                 generation: w.generation,
                 previous_manifest_hash: hash,

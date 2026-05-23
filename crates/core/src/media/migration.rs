@@ -77,7 +77,8 @@ pub trait MigrationDbHandle {
 
 impl MigrationDbHandle for LocalStoreDb {
     fn get_media_asset(&self, asset_id: &str) -> Result<Option<MediaAsset>, Error> {
-        LocalStoreDb::get_media_asset(self, asset_id).map_err(|e| Error::Storage(e.to_string()))
+        LocalStoreDb::get_media_asset(self, asset_id)
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     fn update_media_storage_sink(
@@ -88,7 +89,7 @@ impl MigrationDbHandle for LocalStoreDb {
     ) -> Result<(), Error> {
         LocalStoreDb::update_media_storage_sink(self, asset_id, storage_sink, blob_id)
             .map(|_| ())
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 }
 
@@ -126,7 +127,8 @@ impl<'a> MigrationDbHandle for LockingDbHandle<'a> {
             .db
             .lock()
             .map_err(|_| Error::Storage("LocalStoreDb mutex poisoned".into()))?;
-        LocalStoreDb::get_media_asset(&guard, asset_id).map_err(|e| Error::Storage(e.to_string()))
+        LocalStoreDb::get_media_asset(&guard, asset_id)
+            .map_err(|e| Error::Storage(e.to_string().into()))
         // `guard` drops at end of scope — lock is released here.
     }
 
@@ -142,7 +144,7 @@ impl<'a> MigrationDbHandle for LockingDbHandle<'a> {
             .map_err(|_| Error::Storage("LocalStoreDb mutex poisoned".into()))?;
         LocalStoreDb::update_media_storage_sink(&guard, asset_id, storage_sink, blob_id)
             .map(|_| ())
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
         // `guard` drops at end of scope.
     }
 }
@@ -578,7 +580,7 @@ mod tests {
                 .get(&(blob_ref.blob_id.clone(), chunk_idx))
                 .cloned()
                 .ok_or_else(|| {
-                    Error::Storage(format!("missing chunk {}/{chunk_idx}", blob_ref.blob_id))
+                    Error::Storage(format!("missing chunk {}/{chunk_idx}", blob_ref.blob_id).into())
                 })
         }
         fn delete_media_blob(&self, blob_ref: &MediaBlobReference) -> crate::Result<()> {

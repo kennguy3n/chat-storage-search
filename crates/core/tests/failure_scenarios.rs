@@ -53,7 +53,7 @@ use kchat_core::{Error, SearchQuery, SearchScope};
 /// Programmable transport that:
 /// * succeeds on `init_blob_upload` and the first
 ///   `fail_after_n_chunks` calls to `upload_chunk`
-/// * returns `Error::Transport("connection reset")` on any
+/// * returns `Error::Transport("connection reset".into())` on any
 ///   subsequent `upload_chunk`
 /// * counts every call so tests can assert the resume path
 ///   skipped completed chunks
@@ -262,7 +262,9 @@ fn chunk_upload_interrupted_then_resumed_succeeds() {
     )
     .expect_err("must fail with connection reset after 2 chunks");
     match err {
-        Error::Transport(msg) => assert!(msg.contains("connection reset"), "got: {msg}"),
+        Error::Transport(msg) => {
+            assert!(msg.to_string().contains("connection reset"), "got: {msg}")
+        }
         other => panic!("expected Error::Transport, got {other:?}"),
     }
 
@@ -332,11 +334,11 @@ fn corrupted_chunk_ciphertext_fails_sha256_fast_fail() {
     match err {
         Error::Storage(msg) => {
             assert!(
-                msg.contains("SHA-256 mismatch"),
+                msg.to_string().contains("SHA-256 mismatch"),
                 "expected SHA-256 fast-fail, got: {msg}"
             );
             assert!(
-                msg.contains("chunk 1"),
+                msg.to_string().contains("chunk 1"),
                 "error must name the failing chunk index, got: {msg}"
             );
         }
@@ -376,7 +378,7 @@ fn tampered_merkle_root_in_descriptor_fails_blake3_root_check() {
     // Surfaces as Error::Crypto from xchacha20_poly1305::open.
     match err {
         Error::Crypto(_) => {}
-        Error::Storage(msg) if msg.contains("BLAKE3") => {}
+        Error::Storage(msg) if msg.to_string().contains("BLAKE3") => {}
         other => panic!(
             "expected Error::Crypto (AEAD tag mismatch) or BLAKE3 root mismatch, got {other:?}"
         ),
@@ -915,7 +917,7 @@ fn low_storage_condition_during_restore_surfaces_resumable_storage_error() {
     // Simulate a low-storage condition by destroying the
     // `restore_state` table — every subsequent
     // `state_machine::transition` write raises
-    // `Error::Storage("no such table: restore_state")`, which is
+    // `Error::Storage("no such table: restore_state".into())`, which is
     // exactly the rusqlite shape SQLCipher produces under SQLITE_FULL.
     db.connection()
         .execute("DROP TABLE restore_state", [])
@@ -940,7 +942,7 @@ fn low_storage_condition_during_restore_surfaces_resumable_storage_error() {
         "expected Error::Storage, got {err:?}",
     );
     assert!(
-        msg.contains("restore_state") || msg.contains("no such table"),
+        msg.to_string().contains("restore_state") || msg.to_string().contains("no such table"),
         "Storage error must mention the missing restore_state table: {msg}",
     );
 
@@ -1239,7 +1241,7 @@ impl BackupSink for FlakyManifestSink {
 
     fn upload_backup_manifest(&self, manifest_id: &str, sealed: &[u8]) -> kchat_core::Result<()> {
         if let Some(msg) = self.fail_next.lock().unwrap().take() {
-            return Err(Error::Transport(msg));
+            return Err(Error::Transport(msg.into()));
         }
         self.uploaded_manifests
             .lock()
@@ -1332,8 +1334,17 @@ fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
         .upload_backup_manifest(&gen1_id, &gen1_bytes)
         .expect_err("first attempt must fail");
     match err {
-        Error::Transport(msg) => assert_eq!(msg, "connection reset"),
-        other => panic!("expected Error::Transport, got {other:?}"),
+        // The mock surfaces the failure as a free-form transport
+        // error; the legacy `String` payload travels through the
+        // [`TransportError::Custom`] bridging conversion, which
+        // preserves the message verbatim (no `network:` / `auth:` /
+        // `server:` prefix). Pattern-match on the typed variant so
+        // the assertion is structural rather than relying on the
+        // `Display` text.
+        Error::Transport(kchat_core::transport::TransportError::Custom(msg)) => {
+            assert_eq!(msg, "connection reset")
+        }
+        other => panic!("expected Error::Transport(Custom(_)), got {other:?}"),
     }
     assert!(
         sink.uploaded().is_empty(),

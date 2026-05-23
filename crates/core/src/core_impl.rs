@@ -625,10 +625,10 @@ impl CoreImpl {
     /// [`CoreImpl::set_delivery_client`] to add one.
     pub fn new(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open(&config.data_dir, &key)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let db_readers = db
             .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let core = Self {
             config,
             db_writer: Mutex::new(db),
@@ -677,10 +677,11 @@ impl CoreImpl {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
-        let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string()))?;
+        let db =
+            LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string().into()))?;
         let db_readers = db
             .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let core = Self {
             config,
             db_writer: Mutex::new(db),
@@ -737,9 +738,9 @@ impl CoreImpl {
     /// client construct a fresh [`CoreImpl`] instead.
     pub fn set_delivery_client(&self, client: Arc<dyn DeliveryClient>) -> Result<()> {
         self.delivery_client.set(client).map_err(|_| {
-            Error::Storage(
-                "delivery_client already installed (set_delivery_client is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "delivery_client",
+            ))
         })
     }
 
@@ -938,7 +939,7 @@ impl CoreImpl {
             let engine = QueryEngine::new(reader.connection(), reader.icu_available());
             engine
                 .execute_search(&query, &scope)
-                .map_err(|e| Error::Search(e.to_string()))
+                .map_err(|e| Error::Search(e.to_string().into()))
         });
         let results = results?;
         let cold_count = results.iter().filter(|r| r.is_cold).count();
@@ -1133,7 +1134,7 @@ impl CoreImpl {
                 conversation_hash_key,
             )?;
             let bytes = crate::cbor::to_vec(&built.shard).map_err(|e| {
-                Error::Storage(format!("upload_search_shards: text shard cbor: {e}"))
+                Error::Storage(format!("upload_search_shards: text shard cbor: {e}").into())
             })?;
             match transport.upload_index_shard(&conv_hash_b64, time_bucket, "text", &bytes) {
                 Ok(()) => {
@@ -1160,7 +1161,7 @@ impl CoreImpl {
                 conversation_hash_key,
             )?;
             let bytes = crate::cbor::to_vec(&built.shard).map_err(|e| {
-                Error::Storage(format!("upload_search_shards: fuzzy shard cbor: {e}"))
+                Error::Storage(format!("upload_search_shards: fuzzy shard cbor: {e}").into())
             })?;
             match transport.upload_index_shard(&conv_hash_b64, time_bucket, "fuzzy", &bytes) {
                 Ok(()) => {
@@ -1318,7 +1319,7 @@ impl CoreImpl {
                             "SELECT token, script, message_id FROM search_fuzzy
                               WHERE message_id = ?1",
                         )
-                        .map_err(|e| Error::Storage(e.to_string()))?;
+                        .map_err(|e| Error::Storage(e.to_string().into()))?;
                     let rows = stmt
                         .query_map(rusqlite::params![mid], |row| {
                             Ok(crate::search::shard_builder::FuzzyRow {
@@ -1327,9 +1328,9 @@ impl CoreImpl {
                                 message_id: row.get::<_, String>(2)?,
                             })
                         })
-                        .map_err(|e| Error::Storage(e.to_string()))?;
+                        .map_err(|e| Error::Storage(e.to_string().into()))?;
                     for r in rows {
-                        fuzzy_rows.push(r.map_err(|e| Error::Storage(e.to_string()))?);
+                        fuzzy_rows.push(r.map_err(|e| Error::Storage(e.to_string().into()))?);
                     }
                 }
                 (fts_rows, fuzzy_rows)
@@ -1463,12 +1464,18 @@ impl CoreImpl {
                     // ZKOF is the configured backend but the
                     // wiring is missing — surface a structured
                     // error rather than silently falling through
-                    // to KChat-only.
+                    // to KChat-only. The typed variant lets the
+                    // platform glue distinguish "never installed"
+                    // from "wrong backend" without parsing the
+                    // message text. The Display form
+                    // `subsystem `zkof_archive_backend` not
+                    // installed` directly names the installer the
+                    // operator needs to call
+                    // (`install_zkof_archive_backend`).
                     None => Err(Error::Storage(
-                        "archive_backend = zkof but no ZKOF backend installed; \
-                         call CoreImpl::install_zkof_archive_backend before \
-                         calling rehydrate_timeline_skeletons"
-                            .into(),
+                        crate::local_store::StorageError::SubsystemNotInstalled(
+                            "zkof_archive_backend",
+                        ),
                     )),
                 }
             }
@@ -1514,7 +1521,9 @@ impl CoreImpl {
         scheduler: Arc<dyn crate::scheduler::BackgroundScheduler>,
     ) -> Result<()> {
         self.scheduler.set(scheduler).map_err(|_| {
-            Error::Storage("scheduler already installed (install_scheduler is write-once)".into())
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "scheduler",
+            ))
         })
     }
 
@@ -1542,10 +1551,9 @@ impl CoreImpl {
         anchor: Arc<dyn crate::desktop_index::SpotlightAnchor>,
     ) -> Result<()> {
         self.spotlight_anchor.set(anchor).map_err(|_| {
-            Error::Storage(
-                "spotlight_anchor already installed (install_spotlight_anchor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "spotlight_anchor",
+            ))
         })
     }
 
@@ -1576,10 +1584,9 @@ impl CoreImpl {
         anchor: Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
     ) -> Result<()> {
         self.windows_search_anchor.set(anchor).map_err(|_| {
-            Error::Storage(
-                "windows_search_anchor already installed (install_windows_search_anchor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "windows_search_anchor",
+            ))
         })
     }
 
@@ -1618,10 +1625,9 @@ impl CoreImpl {
         runner: Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
     ) -> Result<()> {
         self.ep_benchmark_runner.set(runner).map_err(|_| {
-            Error::Storage(
-                "ep_benchmark_runner already installed (install_ep_benchmark_runner is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "ep_benchmark_runner",
+            ))
         })
     }
 
@@ -1721,9 +1727,9 @@ impl CoreImpl {
         embedder: Arc<dyn crate::models::embeddings::TextEmbedder>,
     ) -> Result<()> {
         self.text_embedder.set(embedder).map_err(|_| {
-            Error::Storage(
-                "text_embedder already installed (install_text_embedder is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "text_embedder",
+            ))
         })
     }
 
@@ -1744,9 +1750,9 @@ impl CoreImpl {
         embedder: Arc<dyn crate::models::clip::ImageEmbedder>,
     ) -> Result<()> {
         self.image_embedder.set(embedder).map_err(|_| {
-            Error::Storage(
-                "image_embedder already installed (install_image_embedder is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "image_embedder",
+            ))
         })
     }
 
@@ -1763,7 +1769,9 @@ impl CoreImpl {
     /// been installed.
     pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
         self.ocr_bridge.set(bridge).map_err(|_| {
-            Error::Storage("ocr_bridge already installed (install_ocr_bridge is write-once)".into())
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "ocr_bridge",
+            ))
         })
     }
 
@@ -1784,9 +1792,9 @@ impl CoreImpl {
         probe: Arc<dyn crate::models::resource_gate::ResourceProbe>,
     ) -> Result<()> {
         self.resource_probe.set(probe).map_err(|_| {
-            Error::Storage(
-                "resource_probe already installed (install_resource_probe is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "resource_probe",
+            ))
         })
     }
 
@@ -1807,10 +1815,9 @@ impl CoreImpl {
         transcriber: Arc<dyn crate::models::whisper::WhisperTranscriber>,
     ) -> Result<()> {
         self.whisper_transcriber.set(transcriber).map_err(|_| {
-            Error::Storage(
-                "whisper_transcriber already installed (install_whisper_transcriber is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "whisper_transcriber",
+            ))
         })
     }
 
@@ -1832,10 +1839,9 @@ impl CoreImpl {
         extractor: Arc<dyn crate::models::document::DocumentExtractor>,
     ) -> Result<()> {
         self.document_extractor.set(extractor).map_err(|_| {
-            Error::Storage(
-                "document_extractor already installed (install_document_extractor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "document_extractor",
+            ))
         })
     }
 
@@ -1858,10 +1864,9 @@ impl CoreImpl {
         sampler: Arc<dyn crate::models::video::VideoKeyframeSampler>,
     ) -> Result<()> {
         self.video_keyframe_sampler.set(sampler).map_err(|_| {
-            Error::Storage(
-                "video_keyframe_sampler already installed (install_video_keyframe_sampler is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "video_keyframe_sampler",
+            ))
         })
     }
 
@@ -1882,10 +1887,9 @@ impl CoreImpl {
         detector: Arc<dyn crate::transport::offline::OfflineDetector>,
     ) -> Result<()> {
         self.offline_detector.set(detector).map_err(|_| {
-            Error::Storage(
-                "offline_detector already installed (install_offline_detector is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "offline_detector",
+            ))
         })
     }
 
@@ -1911,9 +1915,9 @@ impl CoreImpl {
         collector: Arc<dyn crate::perf::PerfCollector>,
     ) -> Result<()> {
         self.perf_collector.set(collector).map_err(|_| {
-            Error::Storage(
-                "perf_collector already installed (install_perf_collector is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "perf_collector",
+            ))
         })
     }
 
@@ -1995,9 +1999,9 @@ impl CoreImpl {
         probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
     ) -> Result<()> {
         self.dedup_analytics.set(probe).map_err(|_| {
-            Error::Storage(
-                "dedup_analytics already installed (install_dedup_analytics is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "dedup_analytics",
+            ))
         })
     }
 
@@ -2083,10 +2087,9 @@ impl CoreImpl {
         resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver>,
     ) -> Result<()> {
         self.conversation_group_resolver.set(resolver).map_err(|_| {
-            Error::Storage(
-                "conversation_group_resolver already installed (install_conversation_group_resolver is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "conversation_group_resolver",
+            ))
         })
     }
 
@@ -2107,7 +2110,7 @@ impl CoreImpl {
     ) -> Result<crate::media::migration::MediaMigrationPlan> {
         let db = self.db_writer.lock().map_err(poisoned)?;
         crate::media::migration::plan_media_migration(&db, source_sink, target_sink)
-            .map_err(|e| crate::Error::Storage(e.to_string()))
+            .map_err(|e| crate::Error::Storage(e.to_string().into()))
     }
 
     /// Phase 7, batch-5 — execute a previously-built migration
@@ -2231,7 +2234,7 @@ impl CoreImpl {
                 reader.icu_available(),
             )
             .execute_search_with_target(query, scope, target, resolver.as_ref(), limit)
-            .map_err(|e| crate::Error::Search(e.to_string()))
+            .map_err(|e| crate::Error::Search(e.to_string().into()))
         });
         result
     }
@@ -2323,7 +2326,7 @@ impl CoreImpl {
                 Error::Storage(format!(
                     "fetch_and_restore_cold_shards: shard cbor decode failed for ({conversation_id}, {time_bucket}, {:?}): {e}",
                     ps.shard_type,
-                ))
+                ).into())
             })?;
             let k = key_registry
                 .get(conversation_id, time_bucket, ps.shard_type)
@@ -2331,7 +2334,7 @@ impl CoreImpl {
                     Error::Storage(format!(
                         "fetch_and_restore_cold_shards: missing shard key for ({conversation_id}, {time_bucket}, {:?})",
                         ps.shard_type,
-                    ))
+                    ).into())
                 })?
                 .clone();
             owned.push((ps.shard_type, shard, k));
@@ -2571,7 +2574,7 @@ impl CoreImpl {
                 };
                 let landed = db
                     .upsert_skeleton_from_archive(&stub)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
                 if landed {
                     inserted.push(stub);
                 }
@@ -2617,7 +2620,7 @@ impl CoreImpl {
             let db = self.db_writer.lock().map_err(poisoned)?;
             let Some(asset) = db
                 .get_media_asset_by_message(&mid)
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .map_err(|e| Error::Storage(e.to_string().into()))?
             else {
                 return Ok(None);
             };
@@ -2760,7 +2763,7 @@ impl CoreImpl {
                     span.record("error", err_str.as_str());
                     trace.finish();
                     self.record_perf_trace(trace);
-                    return Err(Error::Message(err_str));
+                    return Err(Error::Message(err_str.into()));
                 }
             }
         }
@@ -3276,7 +3279,7 @@ impl CoreImpl {
             ..Default::default()
         };
         db.insert_conversation(&conv)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(())
     }
 
@@ -3288,7 +3291,7 @@ impl CoreImpl {
     pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
         self.db_readers
             .with_reader(|r| r.list_conversations())
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     /// Fetch a single conversation by id. Returns `Ok(None)` when
@@ -3300,7 +3303,7 @@ impl CoreImpl {
         let id = conversation_id.to_string();
         self.db_readers
             .with_reader(|r| r.get_conversation(&id))
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     /// Update the `pinned` flag for `conversation_id`. Errors with
@@ -3310,11 +3313,11 @@ impl CoreImpl {
         let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .update_conversation_pin(&conversation_id.to_string(), pinned)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            )));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -3325,11 +3328,11 @@ impl CoreImpl {
         let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .update_conversation_mute(&conversation_id.to_string(), muted)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            )));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -3353,7 +3356,7 @@ impl CoreImpl {
         let id = conversation_id.to_string();
         self.db_readers
             .with_reader(|r| r.get_timeline(&id, before_ms, limit))
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     /// Fetch a single message's skeleton plus its (optional) body
@@ -3377,7 +3380,7 @@ impl CoreImpl {
         let id = message_id.to_string();
         self.db_readers
             .with_reader(|r| r.get_message_with_body(&id))
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     /// Fetch a single message's body, if any. Returns `Ok(None)`
@@ -3392,7 +3395,7 @@ impl CoreImpl {
         let id = message_id.to_string();
         self.db_readers
             .with_reader(|r| r.get_message_body(&id))
-            .map_err(|e| Error::Storage(e.to_string()))
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     /// Rehydrate a cold message body in place using
@@ -3420,10 +3423,10 @@ impl CoreImpl {
         let db = self.db_writer.lock().map_err(poisoned)?;
         let conn = db.connection();
         conn.execute_batch("SAVEPOINT rehydrate_message_body_locally;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let result = (|| -> Result<()> {
             db.rehydrate_message_body(&message_id.to_string(), text_content, new_body_state)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             // Refresh fuzzy tokens — the engine's index_message is
             // idempotent thanks to the (token, script, message_id)
             // primary key but stale tokens from a previous body are
@@ -3431,16 +3434,16 @@ impl CoreImpl {
             let engine = crate::search::fuzzy_search::FuzzyIndexWriter::new(&db);
             engine
                 .remove_message(&message_id.to_string())
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             engine
                 .index_message(&message_id.to_string(), text_content)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             Ok(())
         })();
         match &result {
             Ok(_) => {
                 conn.execute_batch("RELEASE SAVEPOINT rehydrate_message_body_locally;")
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
             }
             Err(_) => {
                 let _ = conn.execute_batch(
@@ -3519,14 +3522,17 @@ impl CoreImpl {
         let manifest_cbor = {
             let db = self.db_writer.lock().map_err(poisoned)?;
             db.load_backup_manifest()
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .map_err(|e| Error::Storage(e.to_string().into()))?
         };
         if let Some(bytes) = manifest_cbor {
             let manifest: crate::formats::manifest::BackupManifest =
                 crate::cbor::from_slice(&bytes).map_err(|e| {
-                    Error::Storage(format!(
-                        "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
-                    ))
+                    Error::Storage(
+                        format!(
+                            "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
+                        )
+                        .into(),
+                    )
                 })?;
             *self.previous_backup_manifest.lock().map_err(poisoned)? = Some(manifest);
         }
@@ -3551,39 +3557,48 @@ impl CoreImpl {
         let rows = {
             let db = self.db_writer.lock().map_err(poisoned)?;
             db.load_backup_segment_ledger()
-                .map_err(|e| Error::Storage(e.to_string()))?
+                .map_err(|e| Error::Storage(e.to_string().into()))?
         };
         let wrapping_root = KeyMaterial::from_bytes(*backup_root);
         let mut materialised = Vec::with_capacity(rows.len());
         for row in rows {
             let segment_id = uuid::Uuid::parse_str(&row.segment_id).map_err(|e| {
-                Error::Storage(format!(
-                    "backup_segment_ledger: malformed segment_id={}: {e}",
-                    row.segment_id
-                ))
+                Error::Storage(
+                    format!(
+                        "backup_segment_ledger: malformed segment_id={}: {e}",
+                        row.segment_id
+                    )
+                    .into(),
+                )
             })?;
             if row.nonce.len() != NONCE_LEN {
-                return Err(Error::Storage(format!(
-                    "backup_segment_ledger: nonce length {} != {NONCE_LEN}",
-                    row.nonce.len()
-                )));
+                return Err(Error::Storage(
+                    format!(
+                        "backup_segment_ledger: nonce length {} != {NONCE_LEN}",
+                        row.nonce.len()
+                    )
+                    .into(),
+                ));
             }
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(&row.nonce);
             if row.merkle_root.len() != 32 {
-                return Err(Error::Storage(format!(
-                    "backup_segment_ledger: merkle_root length {} != 32",
-                    row.merkle_root.len()
-                )));
+                return Err(Error::Storage(
+                    format!(
+                        "backup_segment_ledger: merkle_root length {} != 32",
+                        row.merkle_root.len()
+                    )
+                    .into(),
+                ));
             }
             let mut merkle_root = [0u8; 32];
             merkle_root.copy_from_slice(&row.merkle_root);
             let segment_type = match row.segment_type.as_str() {
                 "events" => SegmentType::Events,
                 other => {
-                    return Err(Error::Storage(format!(
-                        "backup_segment_ledger: unknown segment_type={other}"
-                    )))
+                    return Err(Error::Storage(
+                        format!("backup_segment_ledger: unknown segment_type={other}").into(),
+                    ))
                 }
             };
             let tier = match row.tier.as_str() {
@@ -3591,9 +3606,9 @@ impl CoreImpl {
                 "weekly" => CompactionTier::Weekly,
                 "monthly" => CompactionTier::Monthly,
                 other => {
-                    return Err(Error::Storage(format!(
-                        "backup_segment_ledger: unknown tier={other}"
-                    )))
+                    return Err(Error::Storage(
+                        format!("backup_segment_ledger: unknown tier={other}").into(),
+                    ))
                 }
             };
             let k_segment_bytes =
@@ -3624,9 +3639,9 @@ impl CoreImpl {
         manifest: &crate::formats::manifest::BackupManifest,
     ) -> Result<Vec<u8>> {
         crate::cbor::to_vec(manifest).map_err(|e| {
-            Error::Storage(format!(
-                "backup_manifest_chain: CBOR encode of manifest failed: {e}"
-            ))
+            Error::Storage(
+                format!("backup_manifest_chain: CBOR encode of manifest failed: {e}").into(),
+            )
         })
     }
 
@@ -3644,9 +3659,12 @@ impl CoreImpl {
         let segment_type = match seg.built.segment_type {
             crate::formats::SegmentType::Events => "events",
             other => {
-                return Err(Error::Storage(format!(
+                return Err(Error::Storage(
+                    format!(
                 "backup_segment_ledger: backup segment carried unexpected segment_type={other:?}"
-            )))
+            )
+                    .into(),
+                ))
             }
         };
         let tier = match seg.tier {
@@ -3697,7 +3715,7 @@ impl CoreImpl {
             cursor_seq,
             now_ms,
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(())
     }
 
@@ -3722,7 +3740,7 @@ impl CoreImpl {
         let cbor = Self::encode_manifest_cbor(manifest)?;
         let db = self.db_writer.lock().map_err(poisoned)?;
         db.atomic_replace_ledger_and_manifest(&rows, &cbor, manifest.generation as i64, now_ms)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(())
     }
 
@@ -3780,7 +3798,7 @@ impl CoreImpl {
             let journal = BackupEventJournal::new();
             let events = journal
                 .read_unsegmented(db.connection(), MAX_EVENTS_PER_BACKUP_SEGMENT)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             let last_seq = events.last().map(|(seq, _)| *seq);
             (events, last_seq)
         };
@@ -3833,9 +3851,9 @@ impl CoreImpl {
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
-                Error::Storage(
-                    "run_incremental_backup: backup keys not installed (call install_backup_keys first)".into(),
-                )
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "backup_keys",
+                ))
             })?
             .clone();
         let backup_root = KeyMaterial::from_bytes(*root_key);
@@ -3975,10 +3993,9 @@ impl CoreImpl {
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
-                Error::Storage(
-                    "compact_backup: backup keys not installed (call install_backup_keys first)"
-                        .into(),
-                )
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "backup_keys",
+                ))
             })?
             .clone();
         let backup_root = KeyMaterial::from_bytes(*root_key);
@@ -4026,10 +4043,13 @@ impl CoreImpl {
                     .iter()
                     .find(|s| s.built.segment_id == member.segment_id)
                     .ok_or_else(|| {
-                        Error::Storage(format!(
-                            "compact_backup: superseded segment {} missing from ledger",
-                            member.segment_id
-                        ))
+                        Error::Storage(
+                            format!(
+                                "compact_backup: superseded segment {} missing from ledger",
+                                member.segment_id
+                            )
+                            .into(),
+                        )
                     })?;
                 bytes_before += tracked.built.ciphertext.len() as u64;
                 group_min_ms = group_min_ms.min(tracked.min_event_ms);
@@ -4250,17 +4270,17 @@ impl CoreImpl {
                          AND time_bucket = ?2
                          AND state = 'archive_verified'",
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             let rows = stmt
                 .query_map(
                     rusqlite::params![conversation_id.to_string(), time_bucket],
                     |row| row.get::<_, String>(0),
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             let mut eligible_ids: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             for row in rows {
-                eligible_ids.insert(row.map_err(|e| Error::Storage(e.to_string()))?);
+                eligible_ids.insert(row.map_err(|e| Error::Storage(e.to_string().into()))?);
             }
             drop(stmt);
             if eligible_ids.len() < 2 {
@@ -4335,7 +4355,7 @@ impl CoreImpl {
             let db = self.db_writer.lock().map_err(poisoned)?;
             let conn = db.connection();
             conn.execute_batch("SAVEPOINT compact_archive;")
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             let res = (|| -> Result<()> {
                 for sid in &superseded_ids {
                     conn.execute(
@@ -4343,14 +4363,14 @@ impl CoreImpl {
                           WHERE segment_id = ?1",
                         rusqlite::params![sid],
                     )
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
                 }
                 Ok(())
             })();
             match res {
                 Ok(()) => {
                     conn.execute_batch("RELEASE compact_archive;")
-                        .map_err(|e| Error::Storage(e.to_string()))?;
+                        .map_err(|e| Error::Storage(e.to_string().into()))?;
                 }
                 Err(e) => {
                     let _ =
@@ -4462,7 +4482,7 @@ impl KChatCore for CoreImpl {
 
     fn initialize(&mut self, config: KChatCoreConfig) -> Result<()> {
         let db = LocalStoreDb::open(&config.data_dir, &self.key)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         // Rebuild the reader pool against the freshly-opened
         // writer. Without this, the pool would keep handing out
         // readers attached to the *old* `data_dir`, so every
@@ -4476,7 +4496,7 @@ impl KChatCore for CoreImpl {
         // than half-migrated.
         let db_readers = db
             .open_reader_pool(&self.key, DEFAULT_READER_POOL_SIZE)
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         self.config = config;
         self.db_writer = Mutex::new(db);
         self.db_readers = db_readers;
@@ -4499,12 +4519,12 @@ impl KChatCore for CoreImpl {
         reply_to: Option<Uuid>,
     ) -> Result<ClientMessageId> {
         let entry = MessageProcessor::create_outbox_entry(conversation_id, text, reply_to)
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|e| Error::Message(e.to_string().into()))?;
         let db = self.db_writer.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         let mid = persister
             .persist_outbox_entry(&entry)
-            .map_err(|e| Error::Message(e.to_string()))?;
+            .map_err(|e| Error::Message(e.to_string().into()))?;
         Ok(mid)
     }
 
@@ -4561,7 +4581,7 @@ impl KChatCore for CoreImpl {
         // mutex below can be acquired without nesting.
         let fetch = {
             let client = self.delivery_client.get().ok_or_else(|| {
-                let err = Error::Transport("no delivery client configured".to_string());
+                let err = Error::Transport("no delivery client configured".to_string().into());
                 let err_str = err.to_string();
                 span.record("error", err_str.as_str());
                 err
@@ -4570,7 +4590,7 @@ impl KChatCore for CoreImpl {
             client.fetch_messages(&conversation_id.to_string(), cursor_owned.as_deref())
         };
         let fetched = fetch.map_err(|e| {
-            let err = Error::Transport(e.to_string());
+            let err = Error::Transport(e.to_string().into());
             let err_str = err.to_string();
             span.record("error", err_str.as_str());
             err
@@ -4646,7 +4666,7 @@ impl KChatCore for CoreImpl {
             let engine = QueryEngine::new(reader.connection(), reader.icu_available());
             engine
                 .execute_search(&query, &scope)
-                .map_err(|e| Error::Search(e.to_string()))
+                .map_err(|e| Error::Search(e.to_string().into()))
         });
         let results = match results {
             Ok(r) => r,
@@ -4681,7 +4701,7 @@ impl KChatCore for CoreImpl {
         let persister = MessagePersister::new(&db);
         persister
             .edit_message(&message_id.to_string(), new_text)
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|e| Error::Message(e.to_string().into()))
     }
 
     fn delete_for_me(&self, message_id: Uuid) -> Result<()> {
@@ -4689,7 +4709,7 @@ impl KChatCore for CoreImpl {
         let persister = MessagePersister::new(&db);
         persister
             .delete_for_me(&message_id.to_string())
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|e| Error::Message(e.to_string().into()))
     }
 
     fn delete_for_everyone(&self, message_id: Uuid) -> Result<()> {
@@ -4697,18 +4717,18 @@ impl KChatCore for CoreImpl {
         let persister = MessagePersister::new(&db);
         persister
             .delete_for_everyone(&message_id.to_string())
-            .map_err(|e| Error::Message(e.to_string()))
+            .map_err(|e| Error::Message(e.to_string().into()))
     }
 
     fn delete_conversation(&self, conversation_id: Uuid) -> Result<()> {
         let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .delete_conversation(&conversation_id.to_string())
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            )));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -4723,7 +4743,7 @@ impl KChatCore for CoreImpl {
         let pair = self
             .db_readers
             .with_reader(|r| r.get_message_with_body(&id))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         match pair {
             None => Ok(None),
             Some((skel, body)) => Ok(Some(skeleton_and_body_to_view(skel, body)?)),
@@ -4746,12 +4766,12 @@ impl KChatCore for CoreImpl {
         let out: Result<Vec<MessageView>> = self.db_readers.with_reader(|r| {
             let skels = r
                 .get_conversation_messages(&conv_id, before_ms, limit)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
             let mut views = Vec::with_capacity(skels.len());
             for skel in skels {
                 let body = r
                     .get_message_body(&skel.message_id)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
                 views.push(skeleton_and_body_to_view(skel, body)?);
             }
             Ok(views)
@@ -4805,7 +4825,7 @@ impl KChatCore for CoreImpl {
         let db = self.db_writer.lock().map_err(poisoned)?;
         let conn = db.connection();
         conn.execute_batch("SAVEPOINT send_media;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
 
         let result = (|| -> Result<SendMediaResult> {
             let skel = MessageSkeleton {
@@ -4824,7 +4844,7 @@ impl KChatCore for CoreImpl {
                 deleted_at_ms: None,
             };
             db.insert_message_skeleton(&skel)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
 
             // Caption (if any) is persisted as the message body and
             // mirrored into the FTS / fuzzy indexes so it shows up
@@ -4839,7 +4859,7 @@ impl KChatCore for CoreImpl {
                     rich_meta: None,
                 };
                 db.insert_message_body(&body)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
                 conn.execute(
                     "INSERT INTO search_fts(
                         message_id, conversation_id, sender_id,
@@ -4853,10 +4873,10 @@ impl KChatCore for CoreImpl {
                         caption,
                     ],
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
                 FuzzyIndexWriter::new(&db)
                     .index_message(&skel.message_id, caption)
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
             }
 
             let asset = MediaAsset {
@@ -4879,7 +4899,7 @@ impl KChatCore for CoreImpl {
                     .unwrap_or_else(|| "kchat_backend".to_string()),
             };
             db.insert_media_asset(&asset)
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
 
             // Phase 6, Task 9: best-effort MobileCLIP-S2 image
             // embedding. Runs only when (a) an
@@ -4940,7 +4960,7 @@ impl KChatCore for CoreImpl {
                 &skel.message_id,
                 skel.created_at_ms,
             )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
 
             // Append a backup_event_journal entry so the Phase 4
             // backup drainer sees this media message during
@@ -4962,7 +4982,7 @@ impl KChatCore for CoreImpl {
                 payload: payload.clone(),
                 created_at_ms: skel.created_at_ms,
             })
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
 
             // Mirror the media send into the Phase-3 archive event
             // journal so the segment builder pulls the asset into
@@ -4980,7 +5000,7 @@ impl KChatCore for CoreImpl {
                         created_at_ms: skel.created_at_ms,
                     },
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                .map_err(|e| Error::Storage(e.to_string().into()))?;
 
             Ok(SendMediaResult {
                 client_message_id: ClientMessageId(message_id),
@@ -4992,7 +5012,7 @@ impl KChatCore for CoreImpl {
         match &result {
             Ok(_) => {
                 conn.execute_batch("RELEASE send_media;")
-                    .map_err(|e| Error::Storage(e.to_string()))?;
+                    .map_err(|e| Error::Storage(e.to_string().into()))?;
             }
             Err(_) => {
                 let _ = conn.execute_batch("ROLLBACK TO send_media; RELEASE send_media;");
@@ -5051,7 +5071,7 @@ impl KChatCore for CoreImpl {
                 self.db_readers.with_reader(|r| -> Result<_> {
                     let Some((skeleton, body)) = r
                         .get_message_with_body(&mid_str)
-                        .map_err(|e| Error::Storage(e.to_string()))?
+                        .map_err(|e| Error::Storage(e.to_string().into()))?
                     else {
                         return Ok(None);
                     };
@@ -5077,7 +5097,9 @@ impl KChatCore for CoreImpl {
             };
             if skeleton.body_state == BodyState::DeletedForEveryone {
                 return Err(Error::Message(
-                    "hydrate_message: message has been deleted for everyone".to_string(),
+                    "hydrate_message: message has been deleted for everyone"
+                        .to_string()
+                        .into(),
                 ));
             }
             let conversation_id = Uuid::parse_str(&skeleton.conversation_id).ok();
@@ -5394,7 +5416,9 @@ impl KChatCore for CoreImpl {
 }
 
 fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
-    Error::Storage("local store mutex poisoned".to_string())
+    Error::Storage(crate::local_store::StorageError::LockPoisoned(
+        "local_store",
+    ))
 }
 
 /// Map a UI-supplied reason string to a [`HydrationReason`].
@@ -5434,13 +5458,14 @@ fn now_ms_for_send_media() -> i64 {
 /// id format is dictated by the delivery store.
 fn raw_delivery_to_ingested(raw: &RawDeliveryMessage) -> Result<IngestedMessage> {
     let message_id = Uuid::parse_str(&raw.message_id)
-        .map_err(|e| Error::Transport(format!("invalid message_id: {e}")))?;
+        .map_err(|e| Error::Transport(format!("invalid message_id: {e}").into()))?;
     let conversation_id = Uuid::parse_str(&raw.conversation_id)
-        .map_err(|e| Error::Transport(format!("invalid conversation_id: {e}")))?;
+        .map_err(|e| Error::Transport(format!("invalid conversation_id: {e}").into()))?;
     let reply_to = match &raw.reply_to {
         None => None,
         Some(s) => Some(
-            Uuid::parse_str(s).map_err(|e| Error::Transport(format!("invalid reply_to: {e}")))?,
+            Uuid::parse_str(s)
+                .map_err(|e| Error::Transport(format!("invalid reply_to: {e}").into()))?,
         ),
     };
     Ok(IngestedMessage {
@@ -5463,16 +5488,26 @@ fn skeleton_and_body_to_view(
     skel: MessageSkeleton,
     body: Option<MessageBody>,
 ) -> Result<MessageView> {
-    let message_id = Uuid::parse_str(&skel.message_id)
-        .map_err(|e| Error::Storage(format!("invalid message_id in store: {e}")))?;
-    let conversation_id = Uuid::parse_str(&skel.conversation_id)
-        .map_err(|e| Error::Storage(format!("invalid conversation_id in store: {e}")))?;
+    let message_id = Uuid::parse_str(&skel.message_id).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::InvalidId {
+            kind: "message_id",
+            source: e,
+        })
+    })?;
+    let conversation_id = Uuid::parse_str(&skel.conversation_id).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::InvalidId {
+            kind: "conversation_id",
+            source: e,
+        })
+    })?;
     let reply_to = match &skel.reply_to {
         None => None,
-        Some(s) => Some(
-            Uuid::parse_str(s)
-                .map_err(|e| Error::Storage(format!("invalid reply_to in store: {e}")))?,
-        ),
+        Some(s) => Some(Uuid::parse_str(s).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::InvalidId {
+                kind: "reply_to",
+                source: e,
+            })
+        })?),
     };
     let text_content = body.and_then(|b| b.text_content);
     Ok(MessageView {
@@ -7378,9 +7413,9 @@ mod tests {
                 .get(segment_id)
                 .cloned()
                 .ok_or_else(|| {
-                    Error::Storage(format!(
-                        "FixtureTransport: no canned response for {segment_id}"
-                    ))
+                    Error::Storage(
+                        format!("FixtureTransport: no canned response for {segment_id}").into(),
+                    )
                 })
         }
 
@@ -7642,7 +7677,7 @@ mod tests {
             let objects = self.objects.lock().unwrap();
             let bytes = objects
                 .get(&(bucket.into(), key.into()))
-                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}").into()))?;
             let start = range.start.min(bytes.len() as u64) as usize;
             let end = range.end.min(bytes.len() as u64) as usize;
             Ok(bytes[start..end].to_vec())
@@ -7702,9 +7737,21 @@ mod tests {
         let core = CoreImpl::new_in_memory(cfg, TEST_KEY).unwrap();
         let transport = FixtureTransport::default();
         let err = core.build_archive_router(&transport).unwrap_err();
+        // Pattern-match the typed `SubsystemNotInstalled` variant
+        // directly so the test stays stable across message-text
+        // refactors. The previous `msg.to_string().contains(...)`
+        // assertion would have broken on any wording change; the
+        // typed match locks in the structural contract: this code
+        // path produces a `SubsystemNotInstalled` for the
+        // `zkof_archive_backend` subsystem and nothing else.
         assert!(
-            matches!(err, Error::Storage(msg) if msg.contains("ZKOF backend installed")),
-            "expected install-missing storage error"
+            matches!(
+                err,
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "zkof_archive_backend"
+                ))
+            ),
+            "expected SubsystemNotInstalled(\"zkof_archive_backend\")"
         );
     }
 
@@ -7969,20 +8016,24 @@ mod tests {
             // the same formula the download path uses to compute it.
             let stride = crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64;
             if !range.start.is_multiple_of(stride) {
-                return Err(Error::Storage(format!(
-                    "GatedTransport: range start {} is not chunk-aligned",
-                    range.start
-                )));
+                return Err(Error::Storage(
+                    format!(
+                        "GatedTransport: range start {} is not chunk-aligned",
+                        range.start
+                    )
+                    .into(),
+                ));
             }
             let chunk_idx = (range.start / stride) as usize;
             let chunks = self.chunks.lock().unwrap();
-            let entries = chunks
-                .get(blob_id)
-                .ok_or_else(|| Error::Storage(format!("GatedTransport: no blob {blob_id}")))?;
+            let entries = chunks.get(blob_id).ok_or_else(|| {
+                Error::Storage(format!("GatedTransport: no blob {blob_id}").into())
+            })?;
             let chunk = entries.get(chunk_idx).cloned().ok_or_else(|| {
-                Error::Storage(format!(
-                    "GatedTransport: chunk {chunk_idx} out of range for blob {blob_id}"
-                ))
+                Error::Storage(
+                    format!("GatedTransport: chunk {chunk_idx} out of range for blob {blob_id}")
+                        .into(),
+                )
             })?;
             Ok(chunk)
         }
@@ -8400,8 +8451,8 @@ mod tests {
             .run_incremental_backup("scheduled")
             .expect_err("must fail without keys");
         match err {
-            Error::Storage(msg) => {
-                assert!(msg.contains("backup keys not installed"), "{msg}")
+            Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(name)) => {
+                assert_eq!(name, "backup_keys", "unexpected subsystem name")
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -10178,7 +10229,9 @@ mod tests {
             .expect_err("wrong key must surface as Err");
         let msg = err.to_string();
         assert!(
-            msg.contains("aead") || msg.contains("AEAD") || msg.contains("decrypt"),
+            msg.to_string().contains("aead")
+                || msg.to_string().contains("AEAD")
+                || msg.to_string().contains("decrypt"),
             "expected AEAD-style error, got {msg}"
         );
 
@@ -10536,7 +10589,7 @@ mod tests {
     /// so a bucket whose `archive_segment_map` rows carry
     /// `storage_backend = 'zk_object_fabric'` lands the body
     /// via the installed S3 client instead of erroring with
-    /// `Error::Storage("ZKOF row encountered ...")` from the
+    /// `Error::Storage("ZKOF row encountered ...".into())` from the
     /// KChat-only `batch_prefetch_bucket` variant.
     #[test]
     fn hydrate_cold_search_results_routes_zkof_segments_through_s3_client() {

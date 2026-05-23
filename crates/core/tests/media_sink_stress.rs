@@ -91,10 +91,9 @@ impl MediaBlobSink for InMemorySink {
             .get(&(blob_ref.blob_id.clone(), chunk_idx))
             .cloned()
             .ok_or_else(|| {
-                kchat_core::Error::Storage(format!(
-                    "missing chunk {}/{chunk_idx}",
-                    blob_ref.blob_id
-                ))
+                kchat_core::Error::Storage(
+                    format!("missing chunk {}/{chunk_idx}", blob_ref.blob_id).into(),
+                )
             })
     }
     fn delete_media_blob(&self, blob_ref: &MediaBlobReference) -> kchat_core::Result<()> {
@@ -319,7 +318,7 @@ impl ICloudBlobBridge for InMemoryICloudBridge {
         let store = self.store.lock().unwrap();
         let blob = store
             .get(record_name)
-            .ok_or_else(|| Error::Storage(format!("missing record {record_name}")))?;
+            .ok_or_else(|| Error::Storage(format!("missing record {record_name}").into()))?;
         let start = range.start as usize;
         let end = (range.end as usize).min(blob.len());
         if start >= blob.len() {
@@ -353,7 +352,7 @@ impl GoogleDriveBridge for InMemoryGoogleDriveBridge {
         let store = self.store.lock().unwrap();
         let blob = store
             .get(file_id)
-            .ok_or_else(|| Error::Storage(format!("missing file {file_id}")))?;
+            .ok_or_else(|| Error::Storage(format!("missing file {file_id}").into()))?;
         let start = range.start as usize;
         let end = (range.end as usize).min(blob.len());
         if start >= blob.len() {

@@ -241,10 +241,11 @@ impl ModelManager {
     /// distinguish "you never installed a downloader" from "the
     /// downloader returned an actual transport error".
     pub fn ensure_model(&self, model_id: &str, model_version: &str) -> Result<ModelArtifact> {
-        let guard = self
-            .artifacts
-            .read()
-            .map_err(|_| crate::Error::Model("ModelManager registry poisoned".into()))?;
+        let guard = self.artifacts.read().map_err(|_| {
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
+                "model_manager_registry",
+            ))
+        })?;
         guard
             .get(&(model_id.to_string(), model_version.to_string()))
             .cloned()
@@ -257,10 +258,11 @@ impl ModelManager {
     /// replaces the previous metadata. Callers should call
     /// [`Self::verify_integrity`] before registering.
     pub fn register_model(&self, artifact: ModelArtifact) -> Result<()> {
-        let mut guard = self
-            .artifacts
-            .write()
-            .map_err(|_| crate::Error::Model("ModelManager registry poisoned".into()))?;
+        let mut guard = self.artifacts.write().map_err(|_| {
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
+                "model_manager_registry",
+            ))
+        })?;
         let key = (artifact.model_id.clone(), artifact.model_version.clone());
         guard.insert(key, artifact);
         Ok(())
@@ -279,7 +281,7 @@ impl ModelManager {
         // hashes.
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(&artifact.file_path)
-            .map_err(|e| crate::Error::Storage(format!("model read: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("model read: {e}").into()))?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let got = hasher.finalize();
@@ -298,10 +300,11 @@ impl ModelManager {
     /// Returns `Ok(())` whether or not the row existed —
     /// idempotent.
     pub fn delete_model(&self, model_id: &str, model_version: &str) -> Result<()> {
-        let mut guard = self
-            .artifacts
-            .write()
-            .map_err(|_| crate::Error::Model("ModelManager registry poisoned".into()))?;
+        let mut guard = self.artifacts.write().map_err(|_| {
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
+                "model_manager_registry",
+            ))
+        })?;
         guard.remove(&(model_id.to_string(), model_version.to_string()));
         Ok(())
     }
@@ -404,16 +407,19 @@ impl ModelManager {
         // single version per model_id, but if multiple are
         // present any one is acceptable for the benchmark
         // (latency depends on the EP, not the artifact version).
-        let guard = self
-            .artifacts
-            .read()
-            .map_err(|_| crate::Error::Model("ModelManager registry poisoned".into()))?;
+        let guard = self.artifacts.read().map_err(|_| {
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
+                "model_manager_registry",
+            ))
+        })?;
         let artifact = guard
             .iter()
             .find(|((id, _), _)| id == model_id)
             .map(|(_, a)| a.clone())
             .ok_or_else(|| {
-                crate::Error::Model(format!("benchmark_ep: model_id {model_id} not registered"))
+                crate::Error::Model(crate::models::ModelError::Custom(format!(
+                    "benchmark_ep: model_id {model_id} not registered"
+                )))
             })?;
         drop(guard);
         runner.run_benchmark(ep, &artifact)

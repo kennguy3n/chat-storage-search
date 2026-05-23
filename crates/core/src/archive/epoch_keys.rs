@@ -112,14 +112,15 @@ impl EpochKeyManager {
         new_epoch_id: &str,
     ) -> Result<(), Error> {
         if new_epoch_id == self.current_epoch_id {
-            return Err(Error::Storage(format!(
-                "rotate_epoch: new_epoch_id {new_epoch_id:?} matches current epoch id"
-            )));
+            return Err(Error::Storage(
+                format!("rotate_epoch: new_epoch_id {new_epoch_id:?} matches current epoch id")
+                    .into(),
+            ));
         }
         if self.prior_epoch_keys.contains_key(new_epoch_id) {
-            return Err(Error::Storage(format!(
-                "rotate_epoch: new_epoch_id {new_epoch_id:?} already retired"
-            )));
+            return Err(Error::Storage(
+                format!("rotate_epoch: new_epoch_id {new_epoch_id:?} already retired").into(),
+            ));
         }
         // 1) Wrap the outgoing key under K_archive_root and stash
         //    it under the outgoing epoch id.
@@ -159,9 +160,12 @@ impl EpochKeyManager {
         k_archive_root: &KeyMaterial,
     ) -> Result<[u8; KEY_LEN], Error> {
         let wrapped = self.prior_epoch_keys.get(epoch_id).ok_or_else(|| {
-            Error::Storage(format!(
-                "unwrap_prior_epoch_key: epoch {epoch_id:?} is not retired or has been deleted"
-            ))
+            Error::Storage(
+                format!(
+                    "unwrap_prior_epoch_key: epoch {epoch_id:?} is not retired or has been deleted"
+                )
+                .into(),
+            )
         })?;
         let bytes = unwrap_key(k_archive_root.as_bytes(), wrapped).map_err(Error::from)?;
         Ok(bytes)
@@ -228,7 +232,7 @@ impl EpochKeyManager {
     ///
     /// The byte length is validated against the AES-256-KW
     /// wrapped-key length up front; an unexpected length surfaces
-    /// `Error::Storage(...)` rather than waiting for the
+    /// `Error::Storage(....into())` rather than waiting for the
     /// downstream unwrap to fail. Re-ingesting an `epoch_id` that
     /// already exists is rejected — the manifest chain must be
     /// the canonical source of truth.
@@ -237,23 +241,32 @@ impl EpochKeyManager {
         w: crate::formats::manifest::WrappedEpochKeyRef,
     ) -> Result<(), Error> {
         if w.epoch_id == self.current_epoch_id {
-            return Err(Error::Storage(format!(
-                "ingest_wrapped_prior_epoch_key: epoch_id {:?} matches current epoch",
-                w.epoch_id
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "ingest_wrapped_prior_epoch_key: epoch_id {:?} matches current epoch",
+                    w.epoch_id
+                )
+                .into(),
+            ));
         }
         if w.wrapped_key.len() != crate::crypto::key_wrap::WRAPPED_KEY_LEN {
-            return Err(Error::Storage(format!(
-                "ingest_wrapped_prior_epoch_key: wrapped_key length {} != expected {}",
-                w.wrapped_key.len(),
-                crate::crypto::key_wrap::WRAPPED_KEY_LEN
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "ingest_wrapped_prior_epoch_key: wrapped_key length {} != expected {}",
+                    w.wrapped_key.len(),
+                    crate::crypto::key_wrap::WRAPPED_KEY_LEN
+                )
+                .into(),
+            ));
         }
         if self.prior_epoch_keys.contains_key(&w.epoch_id) {
-            return Err(Error::Storage(format!(
-                "ingest_wrapped_prior_epoch_key: epoch_id {:?} already known",
-                w.epoch_id
-            )));
+            return Err(Error::Storage(
+                format!(
+                    "ingest_wrapped_prior_epoch_key: epoch_id {:?} already known",
+                    w.epoch_id
+                )
+                .into(),
+            ));
         }
         self.prior_epoch_keys.insert(w.epoch_id, w.wrapped_key);
         Ok(())
@@ -363,7 +376,10 @@ mod tests {
         let mut mgr = EpochKeyManager::new(&root, "2026-05").unwrap();
         let err = mgr.rotate_epoch(&root, "2026-05").unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("matches current epoch id"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("matches current epoch id"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -377,7 +393,9 @@ mod tests {
         // the prior_epoch_keys map, so this is rejected.
         let err = mgr.rotate_epoch(&root, "ep-a").unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("already retired"), "got {msg}"),
+            Error::Storage(msg) => {
+                assert!(msg.to_string().contains("already retired"), "got {msg}")
+            }
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
@@ -413,7 +431,7 @@ mod tests {
         let err = mgr.unwrap_prior_epoch_key("ep-a", &root).unwrap_err();
         match err {
             Error::Storage(msg) => assert!(
-                msg.contains("not retired") || msg.contains("deleted"),
+                msg.to_string().contains("not retired") || msg.to_string().contains("deleted"),
                 "got {msg}"
             ),
             other => panic!("expected Storage error, got {other:?}"),
