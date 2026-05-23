@@ -465,6 +465,14 @@ impl CoreImpl {
     /// Intended for unit / integration tests — the in-memory
     /// SQLCipher handle does not persist anywhere on disk and is
     /// not appropriate for production callers.
+    ///
+    /// Gated behind the `test-support` feature (always available
+    /// under `cfg(test)` for the crate's own unit tests). A
+    /// production `cargo build --release` cannot link this
+    /// constructor — the symbol does not exist. See the
+    /// `test-support` feature comment in `crates/core/Cargo.toml`
+    /// for the rationale.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string()))?;
@@ -2922,6 +2930,13 @@ impl CoreImpl {
     ///
     /// Intended for unit / integration tests. Production callers
     /// should go through the public API.
+    ///
+    /// Gated behind the `test-support` feature (same rationale as
+    /// [`Self::new_in_memory`]). Exposing the raw [`LocalStoreDb`]
+    /// handle to a production caller would let them bypass every
+    /// transactional / writer-pool guarantee `CoreImpl` makes, so
+    /// the symbol is omitted from non-test builds entirely.
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn with_db<F, T>(&self, f: F) -> T
     where

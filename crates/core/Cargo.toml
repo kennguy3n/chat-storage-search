@@ -8,6 +8,19 @@ description = "KChat Storage & Search — platform-agnostic core (E2EE local sto
 
 [features]
 default = []
+# Phase A.4 (production-hardening foundation): exposes the
+# `#[cfg(test)]`-only constructors and test helpers (currently
+# `CoreImpl::new_in_memory` and `CoreImpl::with_db`) to *integration*
+# tests and to external crates that depend on `kchat-core` for
+# their own tests. Off by default so a production build cannot
+# link an in-memory constructor by accident — the symbols simply
+# do not exist in `cargo build --release`. The kchat-core
+# integration tests in `crates/core/tests/` need this feature
+# turned on (the CI `test` job passes
+# `--features kchat-core/test-support`); external crates declare
+# `kchat-core = { ..., features = ["test-support"] }` under
+# their own `[dev-dependencies]` table.
+test-support = []
 # Enables the Phase 6 ONNX Runtime scaffold for XLM-R + MobileCLIP-S2.
 # Off by default so the standard `cargo build --workspace` and
 # `cargo test --workspace` do not pull the `ort` crate. The

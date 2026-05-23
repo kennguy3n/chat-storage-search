@@ -45,8 +45,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   # -------------------------------------------------------------------------
-  # Unit + integration tests — full workspace, default features. The
-  # `--all-features` matrix is covered by clippy in the `lint` job.
+  # Unit + integration tests — full workspace, default features plus the
+  # explicit `kchat-core/test-support` feature so the `crates/core/tests/`
+  # integration tests can reach `CoreImpl::new_in_memory` / `with_db`,
+  # which are gated behind `#[cfg(any(test, feature = "test-support"))]`
+  # to keep them out of `cargo build --release`. The `--all-features`
+  # matrix is still covered by clippy in the `lint` job (which also
+  # exercises `onnx-runtime` and `http-transport` for the lint surface).
   # -------------------------------------------------------------------------
   test:
     name: Test
@@ -56,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --features kchat-core/test-support --verbose
 
   # -------------------------------------------------------------------------
   # Comprehensive end-to-end demo — exercises the full pipeline
@@ -73,7 +78,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: E2E Demo
-        run: cargo test --test e2e_demo --verbose
+        # E2E demo lives in `crates/core/tests/e2e_demo.rs` and pulls
+        # `CoreImpl::new_in_memory`, which is `cfg`-gated behind
+        # `test-support` (see `crates/core/Cargo.toml`). Run it under
+        # `-p kchat-core --features test-support` so the symbol is
+        # linked in.
+        run: cargo test -p kchat-core --features test-support --test e2e_demo --verbose
 
   # -------------------------------------------------------------------------
   # Supply-chain audit — `cargo-deny check` runs all four sections
