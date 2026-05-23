@@ -770,12 +770,19 @@ impl CoreImpl {
         query: SearchQuery,
         scope: SearchScope,
     ) -> Result<(Vec<SearchResult>, usize)> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(db.connection(), db.icu_available());
-        let results = engine
-            .execute_search(&query, &scope)
-            .map_err(|e| Error::Search(e.to_string()))?;
-        drop(db);
+        // `QueryEngine::execute_search` only issues SELECTs, so we
+        // route through the reader pool rather than parking the
+        // writer mutex for the duration of the local-side query.
+        // Cold-bucket prefetch (`enqueue_cold_results_for_hydration`)
+        // runs *after* the pool checkout drops, so it never holds a
+        // reader connection while waiting on the hydration queue.
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine
+                .execute_search(&query, &scope)
+                .map_err(|e| Error::Search(e.to_string()))
+        });
+        let results = results?;
         let cold_count = results.iter().filter(|r| r.is_cold).count();
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
@@ -806,10 +813,17 @@ impl CoreImpl {
         scope: SearchScope,
         cold_source: &dyn ColdShardSource,
     ) -> Result<Vec<SearchResult>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(db.connection(), db.icu_available());
-        let results = engine.execute_search_with_cold_source(&query, &scope, cold_source)?;
-        drop(db);
+        // Same rationale as `search_and_prefetch_cold` above: the
+        // engine only issues SELECTs against the local DB, so the
+        // checkout uses a pool reader. Cold-shard fan-out happens
+        // inside `execute_search_with_cold_source` against the
+        // `ColdShardSource` callback (not the DB), and hydration
+        // enqueue runs after the checkout drops.
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine.execute_search_with_cold_source(&query, &scope, cold_source)
+        });
+        let results = results?;
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
         }
@@ -844,25 +858,28 @@ impl CoreImpl {
         cold_source: &dyn ColdShardSource,
         emit: F,
     ) -> Result<Vec<SearchResult>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(db.connection(), db.icu_available());
-        // Use the default tenant policy here for the streaming
-        // entry point — callers that need a custom policy
-        // already bypass `search_streaming` for
-        // `execute_search_with_cold_source_full`.
+        // Same rationale as `search_with_cold_source`: streaming
+        // execution only reads from the local DB. The `emit`
+        // closure runs synchronously inside the checkout, which
+        // is identical to the previous writer-locked semantics
+        // for downstream callers (events are emitted in order
+        // before the result list is returned).
         let policy = crate::config::TenantSearchPolicy::default();
-        let results = engine.execute_search_streaming(
-            &query,
-            &scope,
-            cold_source,
-            &policy,
-            None,
-            // Match `execute_search` (no `_with_limit`), which
-            // hardcodes 200 as the engine-default cap.
-            200,
-            emit,
-        )?;
-        drop(db);
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine.execute_search_streaming(
+                &query,
+                &scope,
+                cold_source,
+                &policy,
+                None,
+                // Match `execute_search` (no `_with_limit`), which
+                // hardcodes 200 as the engine-default cap.
+                200,
+                emit,
+            )
+        });
+        let results = results?;
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
         }
