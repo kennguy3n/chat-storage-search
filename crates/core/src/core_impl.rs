@@ -2037,7 +2037,11 @@ impl CoreImpl {
         target: &crate::SearchTarget,
         limit: usize,
     ) -> Result<Vec<crate::SearchResult>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
+        // Resolve the installed `ConversationGroupResolver` outside
+        // the reader-pool checkout so we don't hold a pool reader
+        // while contending on the resolver mutex. The resolver itself
+        // does not touch the DB — it only translates a `SearchTarget`
+        // into a conversation-id set inside `execute_search_with_target`.
         let installed = self
             .conversation_group_resolver
             .lock()
@@ -2049,9 +2053,20 @@ impl CoreImpl {
                     crate::search::search_target::NoopConversationGroupResolver::new(),
                 )
             });
-        crate::search::query_engine::QueryEngine::new(db.connection(), db.icu_available())
+        // SELECT-only path — route through the reader pool so we
+        // match the other search entry points (`search`,
+        // `search_and_prefetch_cold`, `search_with_cold_source`,
+        // `search_streaming`) and never park the writer mutex on a
+        // pure-read search.
+        let result: Result<Vec<crate::SearchResult>> = self.db_readers.with_reader(|reader| {
+            crate::search::query_engine::QueryEngine::new(
+                reader.connection(),
+                reader.icu_available(),
+            )
             .execute_search_with_target(query, scope, target, resolver.as_ref(), limit)
             .map_err(|e| crate::Error::Search(e.to_string()))
+        });
+        result
     }
 
     /// Replay the supplied search-index shards into the local
@@ -3198,8 +3213,12 @@ impl CoreImpl {
         before_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<crate::TimelineRow>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        db.get_timeline(&conversation_id.to_string(), before_ms, limit)
+        // Pure read — timeline JOINs skeletons with bodies once,
+        // both inside the same WAL snapshot the pool reader holds
+        // for the duration of the checkout.
+        let id = conversation_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_timeline(&id, before_ms, limit))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3219,8 +3238,11 @@ impl CoreImpl {
         &self,
         message_id: Uuid,
     ) -> Result<Option<(MessageSkeleton, Option<MessageBody>)>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        db.get_message_with_body(&message_id.to_string())
+        // Pure read — skeleton + body fetched inside a single pool
+        // checkout so both observe the same WAL snapshot.
+        let id = message_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_message_with_body(&id))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3232,8 +3254,10 @@ impl CoreImpl {
     /// Used by the hydration display path. Wraps
     /// [`LocalStoreDb::get_message_body`].
     pub fn get_message_body(&self, message_id: Uuid) -> Result<Option<MessageBody>> {
-        let db = self.db_writer.lock().map_err(poisoned)?;
-        db.get_message_body(&message_id.to_string())
+        // Pure read.
+        let id = message_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_message_body(&id))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -6926,14 +6950,24 @@ mod tests {
             .expect("send_text");
 
         // Snapshot pre-call body / fuzzy state so we can compare
-        // against post-rollback.
-        let before_body = core
-            .get_message_body(mid.0)
-            .unwrap()
-            .expect("body present pre-call")
-            .text_content
-            .clone()
-            .expect("text_content present");
+        // against post-rollback. We read through the writer
+        // connection (not `core.get_message_body`, which now goes
+        // through the reader pool) because this test exercises
+        // writer-side transactional semantics: a SAVEPOINT held
+        // open on the writer must be visible to the read that
+        // observes mid-transaction state, and on the in-memory
+        // shared-cache DB SQLite downgrades WAL to MEMORY journal
+        // mode (so the pool reader is `SQLITE_LOCKED` against the
+        // writer's open transaction).
+        let before_body = {
+            let db = core.db_writer.lock().unwrap();
+            db.get_message_body(&mid.0.to_string())
+                .unwrap()
+                .expect("body present pre-call")
+                .text_content
+                .clone()
+                .expect("text_content present")
+        };
         let pre_sodium = {
             let db = core.db_writer.lock().unwrap();
             let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
@@ -6957,15 +6991,19 @@ mod tests {
         .expect("rehydrate");
 
         // Sanity: post-rehydrate, body and fuzzy reflect new text.
+        // Same writer-connection rationale as the pre-call read
+        // above — we must observe the open-transaction state, not
+        // the pre-SAVEPOINT snapshot that the reader pool would
+        // return.
         {
-            let mid_body = core
-                .get_message_body(mid.0)
+            let db = core.db_writer.lock().unwrap();
+            let mid_body = db
+                .get_message_body(&mid.0.to_string())
                 .unwrap()
                 .unwrap()
                 .text_content
                 .unwrap();
             assert_eq!(mid_body, "completely different content about dogs");
-            let db = core.db_writer.lock().unwrap();
             let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             assert!(
                 engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
@@ -6985,13 +7023,19 @@ mod tests {
                 .expect("rollback outer savepoint");
         }
 
-        // Body must be restored to its pre-call text.
-        let after_body = core
-            .get_message_body(mid.0)
-            .unwrap()
-            .expect("body present post-rollback")
-            .text_content
-            .expect("text_content present");
+        // Body must be restored to its pre-call text. After the
+        // ROLLBACK the writer's transaction is closed, so the
+        // reader pool can serve this read; we still use the
+        // writer connection for symmetry with the pre/post reads
+        // above.
+        let after_body = {
+            let db = core.db_writer.lock().unwrap();
+            db.get_message_body(&mid.0.to_string())
+                .unwrap()
+                .expect("body present post-rollback")
+                .text_content
+                .expect("text_content present")
+        };
         assert_eq!(
             after_body, before_body,
             "body upsert must roll back with the outer SAVEPOINT"
