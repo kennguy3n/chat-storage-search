@@ -589,9 +589,10 @@ impl EpBenchmarkCache {
     }
 
     /// Persist the cache to `path` as CBOR. CBOR is used (not
-    /// JSON) because the core crate already depends on
-    /// `serde_cbor` and CBOR survives schema evolution slightly
-    /// more gracefully for this kind of typed cache.
+    /// JSON) because the core crate already depends on a CBOR
+    /// codec (`ciborium`, via [`crate::cbor`]) and CBOR survives
+    /// schema evolution slightly more gracefully for this kind
+    /// of typed cache.
     pub fn persist_to_path(&self, path: &std::path::Path) -> std::result::Result<(), crate::Error> {
         let bytes = crate::cbor::to_vec(self)
             .map_err(|e| crate::Error::Storage(format!("ep-cache serialize: {e}")))?;
@@ -599,16 +600,47 @@ impl EpBenchmarkCache {
             .map_err(|e| crate::Error::Storage(format!("ep-cache write {}: {e}", path.display())))
     }
 
-    /// Load a cache from `path`. A missing file resolves to an
-    /// empty cache.
+    /// Load a cache from `path`.
+    ///
+    /// Behaviour:
+    ///
+    /// * **Missing file** — returns [`Self::default`] (cold-start
+    ///   cache). This is the steady-state behaviour on first run.
+    /// * **I/O error reading the file** — returns
+    ///   [`crate::Error::Storage`]. I/O errors are operationally
+    ///   meaningful (disk full, permission denied, hardware fault)
+    ///   and should bubble up so the caller can surface them in
+    ///   logs / telemetry.
+    /// * **Parse failure (corrupt CBOR, format change, bit-rot)** —
+    ///   returns [`Self::default`] with a single stderr note. The
+    ///   cache is a performance optimisation, not authoritative
+    ///   state: re-benchmarking on the next run re-populates it.
+    ///   Hard-failing on parse error would brick a device with a
+    ///   corrupted cache file even though the user could trivially
+    ///   recover by deleting it, so we choose the recover-and-warn
+    ///   path here.
     pub fn load_from_path(path: &std::path::Path) -> std::result::Result<Self, crate::Error> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let bytes = std::fs::read(path)
             .map_err(|e| crate::Error::Storage(format!("ep-cache read {}: {e}", path.display())))?;
-        crate::cbor::from_slice(&bytes)
-            .map_err(|e| crate::Error::Storage(format!("ep-cache parse: {e}")))
+        match crate::cbor::from_slice::<Self>(&bytes) {
+            Ok(cache) => Ok(cache),
+            Err(e) => {
+                // A corrupt cache must NOT brick the device — the
+                // file is a perf optimisation, not authoritative
+                // state. Fall back to an empty cache; the next EP
+                // benchmark run will re-populate it. Emit a one-line
+                // note on stderr so the situation is visible to
+                // operators inspecting logs.
+                eprintln!(
+                    "[kchat-core/ep-cache] parse failure at {}: {e}; falling back to empty cache",
+                    path.display()
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Drop every entry whose `model_version` does not match
@@ -987,6 +1019,25 @@ mod tests {
         let path = dir.path().join("does-not-exist.cbor");
         let loaded = EpBenchmarkCache::load_from_path(&path).unwrap();
         assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn ep_benchmark_cache_load_corrupt_falls_back_to_empty() {
+        // A corrupt cache file (e.g. bit-rot, partial write, format
+        // change after upgrade) must NOT brick the caller. The cache
+        // is a perf optimisation; re-benchmarking on the next run
+        // re-populates it. The hard-error contract would force the
+        // user to manually delete the file to recover.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.cbor");
+        // 0xFF / 0xFF / 0xFF is not a valid start of any CBOR major
+        // type; ciborium will surface a Syntax error here.
+        std::fs::write(&path, [0xff, 0xff, 0xff, 0xff]).unwrap();
+
+        let loaded = EpBenchmarkCache::load_from_path(&path)
+            .expect("corrupt cache must fall back, not error");
+        assert!(loaded.entries.is_empty());
+        assert!(loaded.model_version.is_none());
     }
 
     #[test]

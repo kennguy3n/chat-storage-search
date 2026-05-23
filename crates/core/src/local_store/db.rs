@@ -1670,8 +1670,8 @@ impl LocalStoreDb {
     ///
     /// Idempotent upsert — the table is constrained to a single
     /// row (`CHECK (id = 1)`), so subsequent calls replace the
-    /// previous manifest. `manifest_cbor` is the canonical
-    /// `serde_cbor` encoding of
+    /// previous manifest. `manifest_cbor` is the canonical CBOR
+    /// encoding (via [`crate::cbor`]) of
     /// [`crate::formats::manifest::BackupManifest`]; `generation`
     /// mirrors the manifest's `generation` field and is exposed
     /// for diagnostic queries.

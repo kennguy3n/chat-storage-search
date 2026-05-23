@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_archive_segment_generic_round_trips_through_serde_cbor() {
+    fn decode_archive_segment_generic_round_trips_through_canonical_cbor() {
         let k = [0x99u8; 32];
         let (_segment_id, blob, expected_payload) = build_blob(&k);
         let plaintext = decrypt_archive_segment(&blob, &k).unwrap();
