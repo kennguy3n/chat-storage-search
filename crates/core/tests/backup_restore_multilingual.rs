@@ -40,7 +40,7 @@ use kchat_core::message::processor::{IngestedMessage, MessagePersister};
 use kchat_core::restore::manifest_verifier::verify_manifest_chain;
 use kchat_core::restore::pipeline::RestorePipeline;
 use kchat_core::restore::state_machine;
-use kchat_core::search::fuzzy_search::FuzzySearchEngine;
+use kchat_core::search::fuzzy_search::{FuzzyIndexWriter, FuzzySearchEngine};
 use kchat_core::search::text_search::TextSearchEngine;
 
 // ---------------------------------------------------------------------------
@@ -322,12 +322,13 @@ fn backup_restore_multilingual_corpus_round_trip() {
     // behind an ICU probe (same pattern as multilingual_search).
     let icu = source_db.icu_available();
     let text = TextSearchEngine::new(source_db.connection(), source_db.icu_available());
+    let fuzzy_writer = FuzzyIndexWriter::new(&source_db);
     let fuzzy = FuzzySearchEngine::new(source_db.connection());
     // For every persisted message, register its tokens with the
     // fuzzy engine so the typo-recall assertion below works.
     for entry in corpus() {
         let mid = id_for_tag[entry.tag].to_string();
-        fuzzy.index_message(&mid, entry.text).unwrap();
+        fuzzy_writer.index_message(&mid, entry.text).unwrap();
     }
 
     // Required (every build): English, Cyrillic, Arabic, Devanagari.

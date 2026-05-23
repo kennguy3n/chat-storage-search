@@ -59,7 +59,7 @@ use crate::offload::eviction::{
     collect_eviction_candidates, execute_eviction, plan_tiered_eviction,
 };
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
-use crate::search::fuzzy_search::FuzzySearchEngine;
+use crate::search::fuzzy_search::FuzzyIndexWriter;
 use crate::search::query_engine::{ColdShardSource, QueryEngine};
 use crate::transport::{DeliveryClient, RawDeliveryMessage, TransportClient};
 use crate::{
@@ -2807,7 +2807,7 @@ impl CoreImpl {
             EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
         };
         use crate::models::resource_gate::ResourceGate;
-        use crate::search::fuzzy_search::FuzzySearchEngine;
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
 
         if !mime_type.starts_with("audio/") {
             return;
@@ -2864,7 +2864,7 @@ impl CoreImpl {
                 transcript,
             ],
         );
-        let _ = FuzzySearchEngine::new(db.connection()).index_message(message_id, transcript);
+        let _ = FuzzyIndexWriter::new(db).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
         //     up the audio body.
@@ -2920,7 +2920,7 @@ impl CoreImpl {
         use crate::models::embeddings::{
             EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
         };
-        use crate::search::fuzzy_search::FuzzySearchEngine;
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
 
         if !is_supported_document_mime(mime_type) {
             return;
@@ -2963,7 +2963,7 @@ impl CoreImpl {
                     trimmed,
                 ],
             );
-            let _ = FuzzySearchEngine::new(db.connection()).index_message(&page_row_id, trimmed);
+            let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, trimmed);
 
             // (3) Optional XLM-R embedding per page.
             if let Ok(embedder_slot) = self.text_embedder.lock() {
@@ -3253,7 +3253,7 @@ impl CoreImpl {
             // idempotent thanks to the (token, script, message_id)
             // primary key but stale tokens from a previous body are
             // dropped first so search_fuzzy stays in sync.
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
+            let engine = crate::search::fuzzy_search::FuzzyIndexWriter::new(&db);
             engine
                 .remove_message(&message_id.to_string())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4687,7 +4687,7 @@ impl KChatCore for CoreImpl {
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
-                FuzzySearchEngine::new(db.connection())
+                FuzzyIndexWriter::new(&db)
                     .index_message(&skel.message_id, caption)
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }

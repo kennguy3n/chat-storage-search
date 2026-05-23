@@ -541,7 +541,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 ///
 /// `QueryEngine` itself only issues `SELECT` statements; the
 /// fuzzy-index *writes* that happen alongside the search path
-/// (e.g. `FuzzySearchEngine::index_message`) live in the
+/// (e.g. `FuzzyIndexWriter::index_message`) live in the
 /// writer-locked sections of `core_impl` / `message::processor`,
 /// not in `QueryEngine`.
 #[derive(Debug)]

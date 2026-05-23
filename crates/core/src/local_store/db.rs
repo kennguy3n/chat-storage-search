@@ -184,7 +184,12 @@ enum WriterBacking {
     /// URI (e.g. `file:kchat_mem_<uuid>?mode=memory&cache=shared`).
     /// As long as at least one connection is alive on the URI,
     /// the in-memory pages persist; closing every connection
-    /// destroys the database. Used only by `open_in_memory`.
+    /// destroys the database. Used only by `open_in_memory`,
+    /// which is itself gated behind `cfg(any(test, feature =
+    /// "test-support"))` — the variant inherits the same gate so
+    /// production builds without `test-support` do not carry a
+    /// never-constructed `InMemoryShared` arm.
+    #[cfg(any(test, feature = "test-support"))]
     InMemoryShared(String),
 }
 
@@ -292,6 +297,7 @@ impl LocalStoreDb {
     pub fn path(&self) -> Option<&Path> {
         match &self.backing {
             WriterBacking::OnDisk(p) => Some(p.as_path()),
+            #[cfg(any(test, feature = "test-support"))]
             WriterBacking::InMemoryShared(_) => None,
         }
     }
@@ -318,6 +324,7 @@ impl LocalStoreDb {
     ) -> DbResult<LocalStoreReaderPool> {
         match &self.backing {
             WriterBacking::OnDisk(path) => LocalStoreReaderPool::open(path, key, capacity),
+            #[cfg(any(test, feature = "test-support"))]
             WriterBacking::InMemoryShared(uri) => {
                 LocalStoreReaderPool::open_uri(uri, key, capacity)
             }
@@ -531,7 +538,7 @@ impl LocalStoreDb {
     /// timestamp out of `message_skeleton` and re-inserts it
     /// verbatim. The caller is responsible for re-indexing
     /// `search_fuzzy` separately (the fuzzy tokenizer lives at
-    /// [`crate::search::fuzzy_search::FuzzySearchEngine`] which
+    /// [`crate::search::fuzzy_search::FuzzyIndexWriter`] which
     /// already knows how to upsert idempotently).
     pub fn rehydrate_message_body(
         &self,
