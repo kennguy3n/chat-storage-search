@@ -30,7 +30,7 @@
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -286,19 +286,24 @@ pub struct CoreImpl {
     /// `None` until [`CoreImpl::install_image_embedder`] is
     /// called. Mirrors the [`Self::text_embedder`] wiring.
     image_embedder: Mutex<Option<Box<dyn crate::models::clip::ImageEmbedder>>>,
-    /// Phase-6 platform OCR bridge. `None` until
-    /// [`CoreImpl::install_ocr_bridge`] is called. Wrapped in
-    /// `Arc<dyn …>` so multiple async work items can fan out
-    /// against the same bridge without going through the
-    /// `Mutex` for every call.
-    ocr_bridge: Mutex<Option<std::sync::Arc<dyn crate::models::ocr::OcrBridge>>>,
+    /// Phase-6 platform OCR bridge. Write-once via
+    /// [`CoreImpl::install_ocr_bridge`]. Held in [`OnceLock`] so
+    /// reads on the media-ingest hot path are lock-free atomic
+    /// loads instead of mutex acquisitions, and the type system
+    /// enforces that any one core only ever sees a single OCR
+    /// bridge across its lifetime (matching the platform
+    /// reality — `Vision.framework` / Android `MlKit` register
+    /// once per process).
+    ocr_bridge: OnceLock<Arc<dyn crate::models::ocr::OcrBridge>>,
     /// Phase-6 resource-state probe (battery, charging, thermal,
-    /// network). `None` until
-    /// [`CoreImpl::install_resource_probe`] is called; the
-    /// resource-gated background workers treat `None` as
-    /// "always allowed" so unit tests don't need to install a
-    /// probe.
-    resource_probe: Mutex<Option<std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>>>,
+    /// network). Write-once via
+    /// [`CoreImpl::install_resource_probe`]; the resource-gated
+    /// background workers treat "not installed" as "always
+    /// allowed" so unit tests don't need to install a probe.
+    /// Held in [`OnceLock`] so the resource-gate check inside
+    /// every Whisper / Vision / video-keyframe operation is a
+    /// lock-free atomic load.
+    resource_probe: OnceLock<Arc<dyn crate::models::resource_gate::ResourceProbe>>,
     /// Phase-6 on-device Whisper transcription seam. `None` until
     /// [`CoreImpl::install_whisper_transcriber`] is called. When
     /// set, audio media writes a transcript row into
@@ -316,15 +321,18 @@ pub struct CoreImpl {
     /// the video keyframe → MobileCLIP-S2 → `search_vector`
     /// pipeline in `send_media`.
     video_keyframe_sampler: Mutex<Option<Box<dyn crate::models::video::VideoKeyframeSampler>>>,
-    /// Phase-6 offline-detection seam. `None` until
-    /// [`CoreImpl::install_offline_detector`] is called; the
-    /// orchestration layer treats `None` as "always online" so
-    /// unit tests don't need to install a detector. When set,
-    /// [`KChatCore::run_incremental_backup`] defers upload while
-    /// offline and [`KChatCore::hydrate_message`] returns a
-    /// skeleton with `offline = true` for cold messages instead
-    /// of attempting an archive fetch.
-    offline_detector: Mutex<Option<std::sync::Arc<dyn crate::transport::offline::OfflineDetector>>>,
+    /// Phase-6 offline-detection seam. Write-once via
+    /// [`CoreImpl::install_offline_detector`]; the
+    /// orchestration layer treats "not installed" as "always
+    /// online" so unit tests don't need to install a detector.
+    /// When set, [`KChatCore::run_incremental_backup`] defers
+    /// upload while offline and [`KChatCore::hydrate_message`]
+    /// returns a skeleton with `offline = true` for cold
+    /// messages instead of attempting an archive fetch. Held in
+    /// [`OnceLock`] so [`Self::is_online`] (called inside every
+    /// hydrate / cold-read / backup-defer path) is a lock-free
+    /// atomic load.
+    offline_detector: OnceLock<Arc<dyn crate::transport::offline::OfflineDetector>>,
     /// Phase-7 performance-trace collector. `None` until
     /// [`CoreImpl::install_perf_collector`] is called; when set,
     /// the hot paths (`ingest_messages`, `search`,
@@ -349,16 +357,23 @@ pub struct CoreImpl {
     conversation_group_resolver:
         Mutex<Option<std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>>>,
     /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
-    /// `None` until
-    /// [`CoreImpl::install_spotlight_anchor`] is called. The
+    /// Write-once via
+    /// [`CoreImpl::install_spotlight_anchor`]. The
     /// `ingest_messages` path forwards a redacted summary of
     /// every newly-ingested message to the installed anchor.
-    spotlight_anchor: Mutex<Option<std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>>>,
+    /// Held in [`OnceLock`] because
+    /// `CSSearchableIndex.default()` is itself a process-global
+    /// singleton on macOS — there is no production case for
+    /// swapping the anchor mid-process — and the fast-path check
+    /// in [`Self::maybe_index_in_desktop_search`] becomes a
+    /// lock-free atomic load.
+    spotlight_anchor: OnceLock<Arc<dyn crate::desktop_index::SpotlightAnchor>>,
     /// Phase-7 (2026-05-04 batch 10) Windows Search bridge.
-    /// `None` until
-    /// [`CoreImpl::install_windows_search_anchor`] is called.
-    windows_search_anchor:
-        Mutex<Option<std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>>>,
+    /// Write-once via
+    /// [`CoreImpl::install_windows_search_anchor`]. Held in
+    /// [`OnceLock`] for the same lock-free-read /
+    /// process-singleton reasons as [`Self::spotlight_anchor`].
+    windows_search_anchor: OnceLock<Arc<dyn crate::desktop_index::WindowsSearchAnchor>>,
     /// Phase-7 (2026-05-04 batch 10 — Task 8) on-device EP
     /// benchmark runner. `None` until
     /// [`CoreImpl::install_ep_benchmark_runner`] is called. When
@@ -522,17 +537,17 @@ impl CoreImpl {
             scheduler: Mutex::new(None),
             text_embedder: Mutex::new(None),
             image_embedder: Mutex::new(None),
-            ocr_bridge: Mutex::new(None),
-            resource_probe: Mutex::new(None),
+            ocr_bridge: OnceLock::new(),
+            resource_probe: OnceLock::new(),
             whisper_transcriber: Mutex::new(None),
             document_extractor: Mutex::new(None),
             video_keyframe_sampler: Mutex::new(None),
-            offline_detector: Mutex::new(None),
+            offline_detector: OnceLock::new(),
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
             conversation_group_resolver: Mutex::new(None),
-            spotlight_anchor: Mutex::new(None),
-            windows_search_anchor: Mutex::new(None),
+            spotlight_anchor: OnceLock::new(),
+            windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: Mutex::new(None),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
@@ -574,17 +589,17 @@ impl CoreImpl {
             scheduler: Mutex::new(None),
             text_embedder: Mutex::new(None),
             image_embedder: Mutex::new(None),
-            ocr_bridge: Mutex::new(None),
-            resource_probe: Mutex::new(None),
+            ocr_bridge: OnceLock::new(),
+            resource_probe: OnceLock::new(),
             whisper_transcriber: Mutex::new(None),
             document_extractor: Mutex::new(None),
             video_keyframe_sampler: Mutex::new(None),
-            offline_detector: Mutex::new(None),
+            offline_detector: OnceLock::new(),
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
             conversation_group_resolver: Mutex::new(None),
-            spotlight_anchor: Mutex::new(None),
-            windows_search_anchor: Mutex::new(None),
+            spotlight_anchor: OnceLock::new(),
+            windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: Mutex::new(None),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
@@ -1400,25 +1415,30 @@ impl CoreImpl {
     // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search anchors.
     // ----------------------------------------------------------------
 
-    /// Install (or replace) the macOS Spotlight bridge. The
+    /// Install the macOS Spotlight bridge. The
     /// [`crate::desktop_index::SpotlightAnchor`] surface lets the
     /// orchestration layer feed redacted message metadata into
-    /// `CSSearchableIndex`. Re-installing replaces the previous
-    /// bridge.
+    /// `CSSearchableIndex`. Write-once: returns
+    /// [`Error::Storage`] if a Spotlight bridge has already been
+    /// installed on this core (the underlying
+    /// `CSSearchableIndex.default()` is itself a process-global
+    /// singleton, so a second install would silently shadow the
+    /// first and produce confusing duplicate-index behaviour).
     pub fn install_spotlight_anchor(
         &self,
-        anchor: std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>,
+        anchor: Arc<dyn crate::desktop_index::SpotlightAnchor>,
     ) -> Result<()> {
-        *self.spotlight_anchor.lock().map_err(poisoned)? = Some(anchor);
-        Ok(())
+        self.spotlight_anchor.set(anchor).map_err(|_| {
+            Error::Storage(
+                "spotlight_anchor already installed (install_spotlight_anchor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_spotlight_anchor`] has been called.
     pub fn has_spotlight_anchor(&self) -> bool {
-        self.spotlight_anchor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.spotlight_anchor.get().is_some()
     }
 
     /// Push a batch of [`crate::desktop_index::SpotlightItem`]
@@ -1429,29 +1449,31 @@ impl CoreImpl {
         &self,
         items: &[crate::desktop_index::SpotlightItem],
     ) -> Result<()> {
-        let anchor = match self.spotlight_anchor.lock().map_err(poisoned)?.as_ref() {
-            Some(a) => std::sync::Arc::clone(a),
-            None => return Ok(()),
-        };
-        anchor.index_items(items)
+        match self.spotlight_anchor.get() {
+            Some(anchor) => anchor.index_items(items),
+            None => Ok(()),
+        }
     }
 
-    /// Install (or replace) the Windows Search bridge.
+    /// Install the Windows Search bridge. Write-once: returns
+    /// [`Error::Storage`] if a Windows Search bridge has already
+    /// been installed on this core.
     pub fn install_windows_search_anchor(
         &self,
-        anchor: std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
+        anchor: Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
     ) -> Result<()> {
-        *self.windows_search_anchor.lock().map_err(poisoned)? = Some(anchor);
-        Ok(())
+        self.windows_search_anchor.set(anchor).map_err(|_| {
+            Error::Storage(
+                "windows_search_anchor already installed (install_windows_search_anchor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_windows_search_anchor`] has been
     /// called.
     pub fn has_windows_search_anchor(&self) -> bool {
-        self.windows_search_anchor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.windows_search_anchor.get().is_some()
     }
 
     /// Push a batch of
@@ -1462,16 +1484,10 @@ impl CoreImpl {
         &self,
         items: &[crate::desktop_index::WindowsSearchItem],
     ) -> Result<()> {
-        let anchor = match self
-            .windows_search_anchor
-            .lock()
-            .map_err(poisoned)?
-            .as_ref()
-        {
-            Some(a) => std::sync::Arc::clone(a),
-            None => return Ok(()),
-        };
-        anchor.index_items(items)
+        match self.windows_search_anchor.get() {
+            Some(anchor) => anchor.index_items(items),
+            None => Ok(()),
+        }
     }
 
     // ----------------------------------------------------------------
@@ -1616,46 +1632,49 @@ impl CoreImpl {
             .unwrap_or(false)
     }
 
-    /// Install (or replace) the platform OCR bridge used by media
-    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped
-    /// in `Arc` so multiple background workers can fan out
-    /// against the same bridge without serializing through the
-    /// mutex.
+    /// Install the platform OCR bridge used by media ingest
+    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped in
+    /// `Arc` so multiple background workers can fan out against
+    /// the same bridge with no serialisation. Write-once:
+    /// returns [`Error::Storage`] if an OCR bridge has already
+    /// been installed.
     pub fn install_ocr_bridge(
         &self,
-        bridge: std::sync::Arc<dyn crate::models::ocr::OcrBridge>,
+        bridge: Arc<dyn crate::models::ocr::OcrBridge>,
     ) -> Result<()> {
-        *self.ocr_bridge.lock().map_err(poisoned)? = Some(bridge);
-        Ok(())
+        self.ocr_bridge.set(bridge).map_err(|_| {
+            Error::Storage(
+                "ocr_bridge already installed (install_ocr_bridge is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_ocr_bridge`] has been called.
     pub fn has_ocr_bridge(&self) -> bool {
-        self.ocr_bridge
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.ocr_bridge.get().is_some()
     }
 
-    /// Install (or replace) the device-resource probe used by the
+    /// Install the device-resource probe used by the
     /// resource-gated background workers
     /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 6). When unset,
     /// the gate defaults to "all-clear" so unit tests don't need
-    /// to install a probe.
+    /// to install a probe. Write-once: returns
+    /// [`Error::Storage`] if a resource probe has already been
+    /// installed.
     pub fn install_resource_probe(
         &self,
-        probe: std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>,
+        probe: Arc<dyn crate::models::resource_gate::ResourceProbe>,
     ) -> Result<()> {
-        *self.resource_probe.lock().map_err(poisoned)? = Some(probe);
-        Ok(())
+        self.resource_probe.set(probe).map_err(|_| {
+            Error::Storage(
+                "resource_probe already installed (install_resource_probe is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_resource_probe`] has been called.
     pub fn has_resource_probe(&self) -> bool {
-        self.resource_probe
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.resource_probe.get().is_some()
     }
 
     /// Install (or replace) the on-device Whisper transcriber
@@ -1726,26 +1745,33 @@ impl CoreImpl {
             .unwrap_or(false)
     }
 
-    /// Install (or replace) the offline-detection probe used by
-    /// the backup-defer / hydrate-offline paths (Phase 7,
-    /// Task 6 of the 2026-05-04 batch). Wrapped in `Arc` so
-    /// multiple workers can share one detector.
+    /// Install the offline-detection probe used by the
+    /// backup-defer / hydrate-offline paths (Phase 7, Task 6 of
+    /// the 2026-05-04 batch). Wrapped in `Arc` so multiple
+    /// workers can share one detector. Write-once: returns
+    /// [`Error::Storage`] if an offline detector has already
+    /// been installed.
     pub fn install_offline_detector(
         &self,
-        detector: std::sync::Arc<dyn crate::transport::offline::OfflineDetector>,
+        detector: Arc<dyn crate::transport::offline::OfflineDetector>,
     ) -> Result<()> {
-        *self.offline_detector.lock().map_err(poisoned)? = Some(detector);
-        Ok(())
+        self.offline_detector.set(detector).map_err(|_| {
+            Error::Storage(
+                "offline_detector already installed (install_offline_detector is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Current online state. `true` when no detector is installed
-    /// (the orchestration layer treats `None` as "always
-    /// online"); otherwise delegates to the installed detector.
+    /// (the orchestration layer treats "not installed" as
+    /// "always online"); otherwise delegates to the installed
+    /// detector. The probe lookup is a lock-free atomic load.
     pub fn is_online(&self) -> bool {
-        match self.offline_detector.lock() {
-            Ok(slot) => slot.as_ref().map(|d| d.is_online()).unwrap_or(true),
-            Err(_) => true,
-        }
+        self.offline_detector
+            .get()
+            .map(|d| d.is_online())
+            .unwrap_or(true)
     }
 
     /// Install (or replace) the performance-trace collector
@@ -2712,16 +2738,8 @@ impl CoreImpl {
         if messages.is_empty() {
             return;
         }
-        let has_spotlight = self
-            .spotlight_anchor
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false);
-        let has_windows = self
-            .windows_search_anchor
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false);
+        let has_spotlight = self.spotlight_anchor.get().is_some();
+        let has_windows = self.windows_search_anchor.get().is_some();
         if !has_spotlight && !has_windows {
             return;
         }
@@ -2865,13 +2883,12 @@ impl CoreImpl {
         }
         // Resource-gate transcription work. Whisper is the
         // strictest gate (`should_run_transcription`); skip
-        // entirely when the gate refuses.
-        if let Ok(slot) = self.resource_probe.lock() {
-            if let Some(probe) = slot.as_ref() {
-                let gate = ResourceGate::default();
-                if !gate.should_run_transcription(&probe.current_resources()) {
-                    return;
-                }
+        // entirely when the gate refuses. Lock-free atomic load
+        // — the resource probe is installed once at boot.
+        if let Some(probe) = self.resource_probe.get() {
+            let gate = ResourceGate::default();
+            if !gate.should_run_transcription(&probe.current_resources()) {
+                return;
             }
         }
 
