@@ -727,10 +727,15 @@ impl<'a> QueryEngine<'a> {
         // Local results first. mark_cold_results runs inside
         // execute_search_with_limit when scope is IncludeCold so
         // any local row whose body is offloaded already carries
-        // is_cold = true.
+        // is_cold = true. `e.into()` here routes through the
+        // `From<DbError> for SearchError` impl in `search/mod.rs`,
+        // which preserves `DbError::Rusqlite` as the typed
+        // `SearchError::Sqlite` variant (so future retry / routing
+        // logic can pattern-match on the underlying
+        // `rusqlite::Error` without re-parsing a stringified form).
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string().into()))?;
+            .map_err(|e| Error::Search(e.into()))?;
 
         // LocalOnly is the offline-only contract — never call the
         // cold source.
@@ -991,10 +996,12 @@ impl<'a> QueryEngine<'a> {
         // `LocalOnly` short-circuit, same `allow_global_search`
         // gate, same target_set / date pruning / policy cap)
         // and limits the parallel-specific code to the
-        // fetch + merge fan-out.
+        // fetch + merge fan-out. `e.into()` preserves the typed
+        // `SearchError::Sqlite` path for rusqlite-driven failures
+        // (same rationale as the sequential cold-source method).
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string().into()))?;
+            .map_err(|e| Error::Search(e.into()))?;
         if !matches!(scope, SearchScope::IncludeCold) {
             return Ok(local);
         }
@@ -1153,9 +1160,12 @@ impl<'a> QueryEngine<'a> {
         limit: usize,
         mut emit: F,
     ) -> Result<Vec<SearchResult>, Error> {
+        // `e.into()` preserves the typed `SearchError::Sqlite`
+        // path for rusqlite-driven failures, matching the
+        // sequential / parallel cold-source paths above.
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string().into()))?;
+            .map_err(|e| Error::Search(e.into()))?;
         emit(crate::SearchEvent::LocalResults(local.clone()));
 
         // Replicate every short-circuit branch from the
