@@ -2414,11 +2414,27 @@ impl CoreImpl {
     /// short-circuits inference — the cross-pipeline cache is
     /// shared with `kennguy3n/slm-guardrail`, so a guardrail-
     /// computed vector is not re-encoded by the search pipeline.
+    // The `#[tracing::instrument]` field names below are kept in
+    // lockstep with the `PerfTrace::insert_metadata` keys inside
+    // the method body. The mapping is:
+    //
+    //   tracing field     PerfTrace key      source
+    //   --------------    ---------------    ----------------------
+    //   messages_in       messages_in        input slice length
+    //   new_messages      new_messages       result.new_messages
+    //   duplicate_count   duplicate_count    result.duplicate_count
+    //   embeddings_computed embeddings_computed running counter
+    //
+    // Keeping the two surfaces aligned means a dashboard consumer
+    // can read the same value off either source without a rename
+    // table, and saves a maintainer from chasing two different
+    // names for the same thing.
     #[tracing::instrument(
         skip(self, messages),
         fields(
             messages_in = messages.len(),
-            messages_persisted = tracing::field::Empty,
+            new_messages = tracing::field::Empty,
+            duplicate_count = tracing::field::Empty,
             embeddings_computed = tracing::field::Empty,
         ),
     )]
@@ -2435,7 +2451,11 @@ impl CoreImpl {
         // surface into the OS log stream so the same hot path is
         // visible to both the in-app perf collector (PerfTrace)
         // and to a platform-native log subscriber (e.g. os_log /
-        // logcat) without duplicate plumbing.
+        // logcat) without duplicate plumbing. The deferred
+        // (`tracing::field::Empty`) fields are filled in via
+        // `Span::current().record` at the same point the PerfTrace
+        // metadata is recorded.
+        let span = tracing::Span::current();
         let mut trace = crate::perf::PerfTrace::new("ingest_messages");
         trace.insert_metadata("messages_in", messages.len().to_string());
 
@@ -2450,6 +2470,7 @@ impl CoreImpl {
         };
         let persister = MessagePersister::new(&db);
         let mut result = IngestResult::default();
+        let mut embeddings_computed: usize = 0;
         for msg in messages {
             match persister.persist_ingested_message(msg) {
                 Ok(_) => {
@@ -2460,8 +2481,13 @@ impl CoreImpl {
                     // search will still work for messages that DID
                     // embed successfully, and the next ingest will
                     // retry this row's embedding the moment a real
-                    // embedder is installed.
-                    self.maybe_embed_text_message(&db, msg);
+                    // embedder is installed. The bool return tells
+                    // us whether a vector was actually written so
+                    // the span field reflects real work done, not
+                    // attempted work.
+                    if self.maybe_embed_text_message(&db, msg) {
+                        embeddings_computed += 1;
+                    }
                 }
                 Err(ProcessorError::DuplicateMessage) => result.duplicate_count += 1,
                 Err(e) => {
@@ -2474,6 +2500,10 @@ impl CoreImpl {
         }
         trace.insert_metadata("new_messages", result.new_messages.to_string());
         trace.insert_metadata("duplicate_count", result.duplicate_count.to_string());
+        trace.insert_metadata("embeddings_computed", embeddings_computed.to_string());
+        span.record("new_messages", result.new_messages);
+        span.record("duplicate_count", result.duplicate_count);
+        span.record("embeddings_computed", embeddings_computed);
 
         // Phase 7 (2026-05-04 batch 10) — Task 5/6: forward the
         // batch to any installed Spotlight / Windows Search
@@ -2494,16 +2524,23 @@ impl CoreImpl {
     /// `(message_id, XLMR_MODEL_VERSION)`. All errors are
     /// swallowed — see [`Self::ingest_messages`] for the
     /// rationale.
-    fn maybe_embed_text_message(&self, db: &LocalStoreDb, msg: &IngestedMessage) {
+    /// Returns `true` when this call actually wrote a new vector to
+    /// the embedding cache. Cache hits, missing-embedder, missing
+    /// text body, poisoned mutex, and inference failure all return
+    /// `false`. The caller uses this to count *real* embedding work
+    /// done by an `ingest_messages` batch for the span /
+    /// `PerfTrace` `embeddings_computed` field — distinct from the
+    /// `new_messages` count (which counts persisted rows).
+    fn maybe_embed_text_message(&self, db: &LocalStoreDb, msg: &IngestedMessage) -> bool {
         use crate::models::embeddings::{
             EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
         };
 
         let Some(text) = msg.text_content.as_deref() else {
-            return;
+            return false;
         };
         let Ok(slot) = self.text_embedder.lock() else {
-            return;
+            return false;
         };
         let Some(embedder) = slot.as_ref() else {
             // No embedder installed — semantic search still works for
@@ -2517,7 +2554,7 @@ impl CoreImpl {
                 model = "xlmr",
                 "text_embedder not installed; skipping embedding"
             );
-            return;
+            return false;
         };
 
         let cache = LocalStoreEmbeddingCache::new(db.connection());
@@ -2526,18 +2563,17 @@ impl CoreImpl {
         // pipeline writes through the same SQLCipher row, so a
         // cross-pipeline hit is the norm in production.
         if let Ok(Some(_)) = cache.get(&mid, XLMR_MODEL_VERSION) {
-            return;
+            return false;
         }
         match embedder.embed(text) {
-            Ok(vec) => {
-                let _ = cache.put(&mid, XLMR_MODEL_VERSION, &vec);
-            }
+            Ok(vec) => cache.put(&mid, XLMR_MODEL_VERSION, &vec).is_ok(),
             Err(_) => {
                 // Inference failures are absorbed: the message is
                 // already searchable via FTS5 + fuzzy. Telemetry
                 // for the failure path is the bridge crate's job
                 // (it sees the raw embed error before installing
                 // its TextEmbedder).
+                false
             }
         }
     }
@@ -4248,12 +4284,17 @@ impl KChatCore for CoreImpl {
         Ok(result)
     }
 
+    // Field names mirror the `PerfTrace::insert_metadata` keys
+    // below (`query_len`, `scope`, `result_count`) so dashboards
+    // can read either surface interchangeably. The deferred
+    // `result_count` is recorded via `Span::current().record` at
+    // the same point the PerfTrace metadata is written.
     #[tracing::instrument(
         skip(self, query),
         fields(
             query_len = query.query_string.len(),
             scope = ?scope,
-            hits = tracing::field::Empty,
+            result_count = tracing::field::Empty,
         ),
     )]
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
@@ -4303,6 +4344,7 @@ impl KChatCore for CoreImpl {
             self.enqueue_cold_results_for_hydration(&results);
         }
         trace.insert_metadata("result_count", results.len().to_string());
+        tracing::Span::current().record("result_count", results.len());
         trace.finish();
         self.record_perf_trace(trace);
         Ok(results)
@@ -4618,6 +4660,10 @@ impl KChatCore for CoreImpl {
         result
     }
 
+    // Field names mirror the `PerfTrace::insert_metadata` keys
+    // below (`reason`, `is_cold`, `offline`). Deferred fields are
+    // filled in via `Span::current().record` next to the matching
+    // `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
         fields(
@@ -4715,6 +4761,8 @@ impl KChatCore for CoreImpl {
             let offline = !is_local && !self.is_online();
             trace_ref.insert_metadata("is_cold", (!is_local).to_string());
             trace_ref.insert_metadata("offline", offline.to_string());
+            tracing::Span::current().record("is_cold", !is_local);
+            tracing::Span::current().record("offline", offline);
             Ok(HydratedMessage {
                 message_id: message_id_uuid,
                 conversation_id,
@@ -4731,6 +4779,11 @@ impl KChatCore for CoreImpl {
         result
     }
 
+    // Field names mirror the `PerfTrace::insert_metadata` keys
+    // below (`reason`, `deferred`, `segments_built`,
+    // `events_segmented`). Deferred fields are filled in via
+    // `Span::current().record` next to the matching
+    // `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
         fields(
@@ -4760,6 +4813,7 @@ impl KChatCore for CoreImpl {
                 ..BackupResult::default()
             };
             trace.insert_metadata("deferred", "true");
+            tracing::Span::current().record("deferred", true);
             trace.finish();
             self.record_perf_trace(trace);
             return Ok(result);
@@ -4776,11 +4830,19 @@ impl KChatCore for CoreImpl {
         result.deferred = false;
         trace.insert_metadata("segments_built", result.segments_built.to_string());
         trace.insert_metadata("events_segmented", result.events_segmented.to_string());
+        let span = tracing::Span::current();
+        span.record("deferred", false);
+        span.record("segments_built", result.segments_built);
+        span.record("events_segmented", result.events_segmented);
         trace.finish();
         self.record_perf_trace(trace);
         Ok(result)
     }
 
+    // Field names mirror the `PerfTrace::insert_metadata` keys
+    // below (`pressure_level`, `freed_bytes`, `evicted_count`).
+    // Deferred fields are filled in via `Span::current().record`
+    // next to the matching `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
         fields(
@@ -4851,6 +4913,9 @@ impl KChatCore for CoreImpl {
         })();
         match outcome {
             Ok((out, pressure_str)) => {
+                tracing::Span::current().record("pressure_level", pressure_str.as_str());
+                tracing::Span::current().record("freed_bytes", out.freed_bytes);
+                tracing::Span::current().record("evicted_count", out.evicted_count);
                 trace.insert_metadata("pressure_level", pressure_str);
                 trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
                 trace.insert_metadata("evicted_count", out.evicted_count.to_string());
