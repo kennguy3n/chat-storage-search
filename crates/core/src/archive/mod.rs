@@ -13,6 +13,7 @@
 
 pub mod body_payload;
 pub mod compaction;
+pub(crate) mod coordinator;
 pub mod download;
 pub mod epoch_keys;
 pub mod event_journal;

@@ -37,7 +37,6 @@ use uuid::Uuid;
 
 use zeroize::Zeroizing;
 
-use crate::archive::epoch_keys::EpochKeyManager;
 use crate::archive::event_journal::{ArchiveEvent, ArchiveEventJournal, ArchiveEventType};
 use crate::config::KChatCoreConfig;
 use crate::crypto::aead::BlobClass;
@@ -129,28 +128,10 @@ pub(crate) struct BackupKeys {
     pub(crate) device_id: String,
 }
 
-/// Atomically-installed ZKOF archive backend wiring.
-///
-/// The Phase-3 ZKOF archive router needs both an
-/// [`crate::media::sinks::zk_fabric::S3Client`] (to talk to the
-/// ZKOF gateway) and a
-/// [`crate::media::sinks::zk_fabric::ZkFabricSinkConfig`] (to
-/// know which bucket, endpoint, and content addressing scheme to
-/// use) before it can route any
-/// `archive_segment_map.storage_backend = zk_object_fabric` row.
-/// Both halves are installed together by
-/// [`CoreImpl::install_zkof_archive_backend`]; bundling them
-/// into a single struct behind one [`Mutex`] makes the
-/// "installed atomically as a pair" invariant non-bypassable
-/// and lets [`CoreImpl::build_archive_router`] take one lock
-/// instead of two. Re-installing replaces the whole pair (still
-/// supported so tests can swap in a fresh `InMemoryS3` /
-/// configuration without spinning up a new core).
-#[derive(Clone)]
-pub(crate) struct ZkofArchiveBackend {
-    pub(crate) s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
-    pub(crate) config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
-}
+// `ZkofArchiveBackend` (and its atomic-install rationale) lives in
+// `crate::archive::coordinator` as of Phase B.9 — the `Coordinator`
+// there owns the bundle and the surrounding state previously held
+// directly on `CoreImpl`.
 
 // ---------------------------------------------------------------------------
 // CoreImpl
@@ -204,20 +185,26 @@ pub(crate) struct ZkofArchiveBackend {
 ///     atomic loads; the corresponding `install_*` /
 ///     `set_delivery_client` setters return
 ///     [`Error::Storage`] on double-install.
-///   * **Two write-once atomic bundles** (`BackupKeys`,
-///     `ZkofArchiveBackend`) stay in
+///   * **One write-once atomic bundle** (`BackupKeys`) stays in
 ///     [`Mutex`]`<`[`Option`]`<_>>` because the bundle is
-///     legitimately re-installable on key rotation /
-///     credentials refresh; the bundle struct itself makes the
-///     "all three pieces installed atomically" invariant
-///     non-bypassable.
-///   * **Genuinely-mutable in-flight state** (`current_epoch`,
-///     `previous_backup_manifest`, `tracked_backup_segments`,
+///     legitimately re-installable on key rotation; the bundle
+///     struct itself makes the "all three pieces installed
+///     atomically" invariant non-bypassable. The ZKOF archive
+///     bundle moved to
+///     [`crate::archive::coordinator::Coordinator`] in Phase B.9.
+///   * **Genuinely-mutable in-flight state**
+///     (`previous_backup_manifest`, `tracked_backup_segments`,
 ///     `hydration_queue`, `ep_benchmark_cache`) stays in
 ///     [`Mutex`]`<T>` / [`Mutex`]`<Option<T>>` because each is
-///     mutated mid-flight (epoch rotation, manifest chain
-///     append, segment ledger append, queue enqueue/dequeue,
-///     cache update).
+///     mutated mid-flight (manifest chain append, segment ledger
+///     append, queue enqueue/dequeue, cache update).
+///   * **Phase-B.9 archive coordinator** — the epoch-key
+///     lifecycle (`current_epoch`) and the ZKOF backend wiring
+///     (`zkof_archive`) are owned by
+///     [`crate::archive::coordinator::Coordinator`] (see the
+///     `archive` field below). `CoreImpl` no longer holds those
+///     mutexes directly; install / rotate / build-router methods
+///     delegate to the coordinator.
 ///   * The DB connections are split into
 ///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
 ///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
@@ -233,10 +220,13 @@ pub(crate) struct ZkofArchiveBackend {
 ///   1. **Subsystem lookup** — `OnceLock::get()` on the 16
 ///      bridge fields. Lock-free, no ordering constraint with
 ///      the locks below.
-///   2. **In-flight state** — `hydration_queue`, `current_epoch`,
-///      `ep_benchmark_cache` (each independent of the others;
-///      no method holds two of these simultaneously).
-///   3. **Backup bundles** — `backup_keys`, `zkof_archive`,
+///   2. **In-flight state** — `hydration_queue`,
+///      `archive` (its internal `current_epoch` /
+///      `zkof_archive` mutexes — see
+///      `crate::archive::coordinator`), `ep_benchmark_cache`
+///      (each independent of the others; no method holds two of
+///      these simultaneously).
+///   3. **Backup bundles** — `backup_keys`,
 ///      `previous_backup_manifest`, `tracked_backup_segments`.
 ///      `run_incremental_backup` acquires `backup_keys` first,
 ///      then `previous_backup_manifest`, then
@@ -253,7 +243,11 @@ pub(crate) struct ZkofArchiveBackend {
 /// The OnceLock conversion in Phase B.2 means installer methods
 /// no longer participate in this ordering (they are install-time
 /// only, not steady-state), and hot-path reads of the 16 bridge
-/// subsystems no longer take any lock at all.
+/// subsystems no longer take any lock at all. Phase B.9 moved
+/// archive epoch / ZKOF locks behind the
+/// [`crate::archive::coordinator::Coordinator`] facade — they
+/// retain the same ordering position but are no longer fields
+/// on `CoreImpl` directly.
 pub struct CoreImpl {
     config: KChatCoreConfig,
     /// The single SQLCipher writer. Every mutating SQL statement
@@ -290,15 +284,14 @@ pub struct CoreImpl {
     /// the orchestration layer can later pop pending fetches in
     /// priority order (`docs/PROPOSAL.md §5.5`).
     hydration_queue: Mutex<HydrationQueue>,
-    /// Phase-3 epoch key lifecycle (`docs/PROPOSAL.md §2.1`). The
-    /// manager is `None` until [`CoreImpl::install_epoch_key_manager`]
-    /// is called — typically after the device unlocks
-    /// `K_archive_root` from the platform keystore. The
-    /// orchestration layer consults this slot every time it needs
-    /// the active epoch key (segment seal, manifest seal) and
-    /// every time a manifest is cut (to harvest the
-    /// wrapped-prior-epoch-keys list).
-    current_epoch: Mutex<Option<EpochKeyManager>>,
+    /// Phase-B.9 archive coordinator — owns the epoch-key
+    /// lifecycle (`docs/PROPOSAL.md §2.1`) and the ZKOF backend
+    /// wiring previously held directly on `CoreImpl` as the
+    /// `current_epoch` and `zkof_archive` fields. All archive
+    /// epoch / router methods on `CoreImpl` delegate to this
+    /// coordinator. See `crate::archive::coordinator` for the
+    /// per-method documentation.
+    archive: crate::archive::coordinator::Coordinator,
     /// Phase-4 backup key material (`K_backup_root`, hybrid
     /// signing key, stable device id — `docs/PROPOSAL.md §6.2`).
     /// `None` until [`CoreImpl::install_backup_keys`] is called.
@@ -333,18 +326,6 @@ pub struct CoreImpl {
     /// stored AES-256-KW-wrapped under that root) and rewritten
     /// after each backup / compaction step.
     tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
-    /// Phase-3 ZKOF archive backend wiring (S3 client + gateway
-    /// config). `None` until
-    /// [`CoreImpl::install_zkof_archive_backend`] is called. When
-    /// set, the archive-segment router routes
-    /// `archive_segment_map.storage_backend = zk_object_fabric`
-    /// rows through ZKOF instead of the legacy KChat transport.
-    /// Bundled into a single [`ZkofArchiveBackend`] struct so the
-    /// S3 client and the config are always installed and observed
-    /// atomically. Wrapped in `Mutex<Option<_>>` (rather than
-    /// `OnceCell`) so tests can install / re-install in the same
-    /// process without spinning up a fresh core.
-    zkof_archive: Mutex<Option<ZkofArchiveBackend>>,
     /// Phase-5 background scheduler bridge. Write-once via
     /// [`CoreImpl::install_scheduler`] by the platform glue
     /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
@@ -629,6 +610,7 @@ impl CoreImpl {
         let db_readers = db
             .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
             .map_err(|e| Error::Storage(e.to_string().into()))?;
+        let archive_backend = config.archive_backend;
         let core = Self {
             config,
             db_writer: Mutex::new(db),
@@ -636,11 +618,10 @@ impl CoreImpl {
             key: Zeroizing::new(key),
             delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
-            current_epoch: Mutex::new(None),
+            archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive: Mutex::new(None),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
@@ -682,6 +663,7 @@ impl CoreImpl {
         let db_readers = db
             .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
             .map_err(|e| Error::Storage(e.to_string().into()))?;
+        let archive_backend = config.archive_backend;
         let core = Self {
             config,
             db_writer: Mutex::new(db),
@@ -689,11 +671,10 @@ impl CoreImpl {
             key: Zeroizing::new(key),
             delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
-            current_epoch: Mutex::new(None),
+            archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive: Mutex::new(None),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
@@ -774,7 +755,7 @@ impl CoreImpl {
     // Epoch key lifecycle (`docs/PROPOSAL.md §2.1`)
     // ----------------------------------------------------------------
 
-    /// Bootstrap a fresh [`EpochKeyManager`] for the supplied
+    /// Bootstrap a fresh `EpochKeyManager` for the supplied
     /// `K_archive_root` and `epoch_id` and install it as the
     /// active manager. Replaces any previously installed manager
     /// — callers usually call this once at unlock time.
@@ -783,115 +764,94 @@ impl CoreImpl {
     /// device-keystore wrap that the platform decrypts on unlock.
     /// The manager owns the **derived** epoch key in a `Zeroizing`
     /// buffer; the root never leaves the caller's stack.
+    ///
+    /// Phase-B.9 delegate: forwards to
+    /// [`crate::archive::coordinator::Coordinator::install_epoch_key_manager`].
     pub fn install_epoch_key_manager(
         &self,
         k_archive_root: &KeyMaterial,
         epoch_id: &str,
     ) -> Result<()> {
-        let manager = EpochKeyManager::new(k_archive_root, epoch_id)?;
-        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
-        *slot = Some(manager);
-        Ok(())
+        self.archive
+            .install_epoch_key_manager(k_archive_root, epoch_id)
     }
 
     /// Whether an epoch key manager is currently installed.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::has_epoch_key_manager`].
     pub fn has_epoch_key_manager(&self) -> bool {
-        let slot = self
-            .current_epoch
-            .lock()
-            .expect("current_epoch mutex poisoned");
-        slot.is_some()
+        self.archive.has_epoch_key_manager()
     }
 
     /// Snapshot of the currently active epoch identifier (if any).
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::current_epoch_id`].
     pub fn current_epoch_id(&self) -> Result<Option<String>> {
-        let slot = self.current_epoch.lock().map_err(poisoned)?;
-        Ok(slot.as_ref().map(|m| m.current_epoch_id().to_string()))
+        self.archive.current_epoch_id()
     }
 
     /// Borrow the bytes of the current epoch key into the supplied
-    /// closure. The closure runs with the [`EpochKeyManager`]
-    /// mutex held — keep its body short and side-effect free, and
+    /// closure. The closure runs with the `EpochKeyManager` mutex
+    /// held — keep its body short and side-effect free, and
     /// **never** hand the byte slice out of the closure.
     ///
     /// Returns `Error::Storage` when no manager is installed.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::with_current_epoch_key`].
     pub fn with_current_epoch_key<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&[u8; KEY_LEN]) -> T,
     {
-        let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
-        Ok(f(mgr.current_epoch_key()))
+        self.archive.with_current_epoch_key(f)
     }
 
-    /// Rotate the active epoch under `K_archive_root`, retiring the
-    /// outgoing epoch key by AES-256-KW wrapping it under
-    /// `K_archive_root` and returning the wrapped bytes paired with
-    /// the outgoing epoch id. The returned [`WrappedEpochKeyRef`]
-    /// is intended to be funneled into the next archive manifest's
-    /// `wrapped_prior_epoch_keys` slot.
+    /// Rotate the active epoch under `K_archive_root`, retiring
+    /// the outgoing epoch key by AES-256-KW wrapping it under
+    /// `K_archive_root` and returning the wrapped bytes paired
+    /// with the outgoing epoch id. The returned
+    /// [`WrappedEpochKeyRef`] is intended to be funneled into the
+    /// next archive manifest's `wrapped_prior_epoch_keys` slot.
     ///
     /// Returns `Error::Storage` when no manager is installed.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::rotate_archive_epoch`].
     pub fn rotate_archive_epoch(
         &self,
         k_archive_root: &KeyMaterial,
         new_epoch_id: &str,
     ) -> Result<WrappedEpochKeyRef> {
-        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_mut()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
-        let outgoing_id = mgr.current_epoch_id().to_string();
-        mgr.rotate_epoch(k_archive_root, new_epoch_id)?;
-        let wrapped = mgr
-            .wrapped_prior_epoch_key(&outgoing_id)
-            .cloned()
-            .ok_or_else(|| {
-                Error::Storage("rotate_archive_epoch: outgoing key not retired".into())
-            })?;
-        Ok(WrappedEpochKeyRef {
-            epoch_id: outgoing_id,
-            wrapped_key: wrapped,
-        })
+        self.archive
+            .rotate_archive_epoch(k_archive_root, new_epoch_id)
     }
 
     /// Recover a prior-epoch key from its wrapped manifest entry.
-    /// Wraps [`EpochKeyManager::unwrap_prior_epoch_key`]; the
-    /// returned bytes belong to the caller and should be wrapped in
-    /// a `Zeroizing` buffer at the call site.
+    /// Returned bytes belong to the caller and should be wrapped
+    /// in a `Zeroizing` buffer at the call site.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::recover_epoch_key`].
     pub fn recover_epoch_key(
         &self,
         epoch_id: &str,
         k_archive_root: &KeyMaterial,
     ) -> Result<[u8; KEY_LEN]> {
-        let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
-        mgr.unwrap_prior_epoch_key(epoch_id, k_archive_root)
+        self.archive.recover_epoch_key(epoch_id, k_archive_root)
     }
 
     /// Forward-secrecy delete of a retired epoch key. Returns
     /// `true` if a key was actually removed from the manager.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::delete_archive_epoch_key`].
     pub fn delete_archive_epoch_key(&self, epoch_id: &str) -> Result<bool> {
-        let mut slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_mut()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
-        Ok(mgr.delete_epoch_key(epoch_id))
+        self.archive.delete_archive_epoch_key(epoch_id)
     }
 
-    /// Snapshot of every retired epoch's wrapped key, ready to drop
-    /// into the next manifest's
+    /// Snapshot of every retired epoch's wrapped key, ready to
+    /// drop into the next manifest's
     /// [`crate::archive::manifest_builder::ManifestBuildRequest::wrapped_prior_epoch_keys`].
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::wrapped_prior_epoch_keys_for_manifest`].
     pub fn wrapped_prior_epoch_keys_for_manifest(&self) -> Result<Vec<WrappedEpochKeyRef>> {
-        let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
-        Ok(mgr.wrapped_prior_epoch_keys_for_manifest())
+        self.archive.wrapped_prior_epoch_keys_for_manifest()
     }
 
     /// Push every cold-flagged [`SearchResult`] into the
@@ -1436,53 +1396,21 @@ impl CoreImpl {
         )
     }
 
-    /// Build an [`ArchiveSegmentRouter`] honouring
+    /// Build an `ArchiveSegmentRouter` honouring
     /// [`KChatCoreConfig::archive_backend`]. When the backend is
     /// [`crate::config::ArchiveBackend::Zkof`] AND
     /// [`Self::install_zkof_archive_backend`] has been called, the
     /// router knows how to route segment rows tagged
     /// `storage_backend = zk_object_fabric` through ZKOF /
     /// S3 instead of the KChat transport.
+    ///
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::build_router`].
     fn build_archive_router<'a>(
         &self,
         transport: &'a dyn TransportClient,
     ) -> Result<crate::archive::download::ArchiveSegmentRouter<'a>> {
-        match self.config.archive_backend {
-            crate::config::ArchiveBackend::Zkof => {
-                let backend = self
-                    .zkof_archive
-                    .lock()
-                    .map_err(poisoned)?
-                    .as_ref()
-                    .cloned();
-                match backend {
-                    Some(ZkofArchiveBackend { s3, config }) => {
-                        Ok(crate::archive::download::ArchiveSegmentRouter::with_zkof(
-                            transport, s3, config,
-                        ))
-                    }
-                    // ZKOF is the configured backend but the
-                    // wiring is missing — surface a structured
-                    // error rather than silently falling through
-                    // to KChat-only. The typed variant lets the
-                    // platform glue distinguish "never installed"
-                    // from "wrong backend" without parsing the
-                    // message text. The Display form
-                    // `subsystem `zkof_archive_backend` not
-                    // installed` directly names the installer the
-                    // operator needs to call
-                    // (`install_zkof_archive_backend`).
-                    None => Err(Error::Storage(
-                        crate::local_store::StorageError::SubsystemNotInstalled(
-                            "zkof_archive_backend",
-                        ),
-                    )),
-                }
-            }
-            crate::config::ArchiveBackend::KChat => Ok(
-                crate::archive::download::ArchiveSegmentRouter::kchat_only(transport),
-            ),
-        }
+        self.archive.build_router(transport)
     }
 
     /// Install the Phase-3 ZKOF archive backend (S3 client +
@@ -1494,14 +1422,15 @@ impl CoreImpl {
     /// but the slots stay populated so a runtime
     /// reconfiguration to ZKOF picks up the wiring without
     /// re-installing.
+    ///
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::install_zkof_archive_backend`].
     pub fn install_zkof_archive_backend(
         &self,
         s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
         config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
     ) -> Result<()> {
-        config.validate()?;
-        *self.zkof_archive.lock().map_err(poisoned)? = Some(ZkofArchiveBackend { s3, config });
-        Ok(())
+        self.archive.install_zkof_archive_backend(s3, config)
     }
 
     /// Install a Phase-5 background scheduler bridge. The bridge
@@ -2372,11 +2301,10 @@ impl CoreImpl {
 
     /// Whether [`Self::install_zkof_archive_backend`] has been
     /// called.
+    /// Phase-B.9 delegate to
+    /// [`crate::archive::coordinator::Coordinator::has_zkof_archive_backend`].
     pub fn has_zkof_archive_backend(&self) -> bool {
-        self.zkof_archive
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.archive.has_zkof_archive_backend()
     }
 
     /// Cold-result hydration write-back (Phase 5, Task 3).
@@ -5415,7 +5343,7 @@ impl KChatCore for CoreImpl {
     }
 }
 
-fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
+pub(crate) fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
     Error::Storage(crate::local_store::StorageError::LockPoisoned(
         "local_store",
     ))
