@@ -47,9 +47,25 @@
 //! The internal mutexes retain the lock-ordering position they
 //! held when they were direct fields on `CoreImpl` (tier 3
 //! "Backup bundles" in the lock hierarchy documented on
-//! [`crate::core_impl::CoreImpl`]). The coordinator method
-//! signatures encode the same ordering as the previous
-//! orchestrator code:
+//! [`crate::core_impl::CoreImpl`]). The coordinator enforces a
+//! single canonical *intra-coordinator* lock order:
+//!
+//! ```text
+//! backup_keys -> previous_backup_manifest -> tracked_backup_segments
+//! ```
+//!
+//! Every method that acquires more than one inner lock takes them
+//! in this order ([`Coordinator::install_keys`],
+//! [`Coordinator::commit_incremental`],
+//! [`Coordinator::commit_compaction`]). The order is enforced by
+//! convention because the three locks are never released between
+//! acquisitions inside any single method — adding a future caller
+//! that violates the order would be a static review hazard and
+//! the doc here is the canonical reference.
+//!
+//! The recommended *caller* sequence for orchestrators that need
+//! to snapshot state, drop locks for I/O, and then atomically
+//! commit is:
 //!
 //!   1. `clone_keys` / `require_keys` first (read the bundle).
 //!   2. `previous_manifest` next (read the chain tail).
@@ -184,8 +200,18 @@ impl Coordinator {
         keys: BackupKeys,
         hydrated_segments: Vec<TrackedBackupSegment>,
     ) -> Result<()> {
-        let mut segs = self.tracked_backup_segments.lock().map_err(poisoned)?;
+        // Lock-ordering discipline: every method on this
+        // coordinator that takes more than one lock acquires them
+        // in `backup_keys -> previous_backup_manifest ->
+        // tracked_backup_segments` order (the module-doc
+        // hierarchy). `install_keys` does not touch the manifest
+        // tail, so it only acquires `backup_keys` then
+        // `tracked_backup_segments`, matching the head and tail
+        // of the documented order. Keeping every method aligned
+        // with the same total order rules out ABBA deadlocks
+        // statically even if a future caller is added.
         let mut k = self.backup_keys.lock().map_err(poisoned)?;
+        let mut segs = self.tracked_backup_segments.lock().map_err(poisoned)?;
         *segs = hydrated_segments;
         *k = Some(Arc::new(keys));
         Ok(())
@@ -307,8 +333,15 @@ impl Coordinator {
         manifest: BackupManifest,
         new_ledger: Vec<TrackedBackupSegment>,
     ) -> Result<()> {
-        let mut segs = self.tracked_backup_segments.lock().map_err(poisoned)?;
+        // Lock-ordering discipline: same
+        // `previous_backup_manifest -> tracked_backup_segments`
+        // order as [`Self::commit_incremental`]. A concurrent
+        // `run_incremental_backup` + `compact_backup` pair on
+        // the same core (both take `&self` and `CoreImpl` is
+        // `Send + Sync`) would otherwise hit an ABBA deadlock if
+        // these two helpers took the locks in opposite orders.
         let mut prev = self.previous_backup_manifest.lock().map_err(poisoned)?;
+        let mut segs = self.tracked_backup_segments.lock().map_err(poisoned)?;
         *segs = new_ledger;
         *prev = Some(manifest);
         Ok(())
