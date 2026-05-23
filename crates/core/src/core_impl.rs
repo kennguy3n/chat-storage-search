@@ -4273,7 +4273,7 @@ impl KChatCore for CoreImpl {
     // local-persist phase. Fields kept lean to avoid leaking
     // cursor opaque tokens or message payloads into traces.
     #[tracing::instrument(
-        skip(self),
+        skip(self, conversation_id, after_cursor),
         fields(
             conversation_id = %conversation_id,
             has_cursor = after_cursor.is_some(),
@@ -4342,7 +4342,7 @@ impl KChatCore for CoreImpl {
     // `Span::current().record` at the same point the PerfTrace
     // metadata is written.
     #[tracing::instrument(
-        skip(self, query),
+        skip(self, query, scope),
         fields(
             query_len = query.query_string.len(),
             scope = ?scope,
@@ -4723,10 +4723,10 @@ impl KChatCore for CoreImpl {
     // fields are filled in via `Span::current().record` next to
     // the matching `trace.insert_metadata` calls below.
     #[tracing::instrument(
-        skip(self),
+        skip(self, message_id, reason),
         fields(
             message_id = %message_id,
-            reason,
+            reason = reason,
             is_cold = tracing::field::Empty,
             offline = tracing::field::Empty,
             error = tracing::field::Empty,
@@ -4852,9 +4852,9 @@ impl KChatCore for CoreImpl {
     // in via `Span::current().record` next to the matching
     // `trace.insert_metadata` calls below.
     #[tracing::instrument(
-        skip(self),
+        skip(self, reason),
         fields(
-            reason,
+            reason = reason,
             deferred = tracing::field::Empty,
             segments_built = tracing::field::Empty,
             events_segmented = tracing::field::Empty,
@@ -4915,9 +4915,9 @@ impl KChatCore for CoreImpl {
     // via `Span::current().record` next to the matching
     // `trace.insert_metadata` calls below.
     #[tracing::instrument(
-        skip(self),
+        skip(self, reason),
         fields(
-            reason,
+            reason = reason,
             pressure_level = tracing::field::Empty,
             evicted_count = tracing::field::Empty,
             freed_bytes = tracing::field::Empty,
