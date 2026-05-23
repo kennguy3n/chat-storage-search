@@ -25,6 +25,7 @@
 //! transactions, FTS5 maintenance, and event-journal entries.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
@@ -302,19 +303,7 @@ impl LocalStoreDb {
 
     /// Fetch a conversation by id, if present.
     pub fn get_conversation(&self, conversation_id: &str) -> DbResult<Option<Conversation>> {
-        self.conn
-            .query_row(
-                "SELECT conversation_id, title_cipher, pinned, muted,
-                        last_message_id, last_activity_ms,
-                        conversation_type, scope, tenant_id,
-                        community_id, domain_id
-                 FROM conversation
-                 WHERE conversation_id = ?1",
-                params![conversation_id],
-                row_to_conversation,
-            )
-            .optional()
-            .map_err(DbError::from)
+        read_conversation(&self.conn, conversation_id)
     }
 
     /// List every conversation row, newest activity first.
@@ -323,18 +312,7 @@ impl LocalStoreDb {
     /// because the public KChatCore surface treats pinning as a
     /// recency-override flag.
     pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT conversation_id, title_cipher, pinned, muted,
-                    last_message_id, last_activity_ms,
-                    conversation_type, scope, tenant_id,
-                    community_id, domain_id
-               FROM conversation
-              ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC",
-        )?;
-        let rows = stmt
-            .query_map([], row_to_conversation)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        read_list_conversations(&self.conn)
     }
 
     /// List every conversation that belongs to `community_id`.
@@ -346,50 +324,25 @@ impl LocalStoreDb {
         &self,
         community_id: &str,
     ) -> DbResult<Vec<Conversation>> {
-        self.list_conversations_by_column("community_id", community_id)
+        read_list_conversations_by_column(&self.conn, "community_id", community_id)
     }
 
     /// List every conversation that belongs to `domain_id`.
     /// Phase 8 helper for [`crate::SearchTarget::Domain`].
     pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
-        self.list_conversations_by_column("domain_id", domain_id)
+        read_list_conversations_by_column(&self.conn, "domain_id", domain_id)
     }
 
     /// List every conversation that belongs to `tenant_id`.
     /// Phase 8 helper for [`crate::SearchTarget::Tenant`].
     pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
-        self.list_conversations_by_column("tenant_id", tenant_id)
+        read_list_conversations_by_column(&self.conn, "tenant_id", tenant_id)
     }
 
     /// List every conversation with the given `scope`. Phase 8
     /// helper for [`crate::SearchTarget::B2cAll`].
     pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
-        self.list_conversations_by_column("scope", scope)
-    }
-
-    fn list_conversations_by_column(
-        &self,
-        column: &str,
-        value: &str,
-    ) -> DbResult<Vec<Conversation>> {
-        // The column name is taken from a closed set of literals
-        // (`tenant_id`, `community_id`, `domain_id`, `scope`)
-        // chosen by the four wrapper methods above — never user
-        // input — so the inline format string is safe.
-        let sql = format!(
-            "SELECT conversation_id, title_cipher, pinned, muted,
-                    last_message_id, last_activity_ms,
-                    conversation_type, scope, tenant_id,
-                    community_id, domain_id
-               FROM conversation
-              WHERE {column} = ?1
-              ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![value], row_to_conversation)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        read_list_conversations_by_column(&self.conn, "scope", scope)
     }
 
     /// Toggle the `pinned` flag for `conversation_id`. Returns the
@@ -416,65 +369,12 @@ impl LocalStoreDb {
 
     /// Fetch a message skeleton by id, if present.
     pub fn get_message_skeleton(&self, message_id: &str) -> DbResult<Option<MessageSkeleton>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT message_id, conversation_id, sender_id,
-                        created_at_ms, received_at_ms, kind,
-                        body_state, media_state, archive_state, backup_state,
-                        reply_to, edited_at_ms, deleted_at_ms
-                 FROM message_skeleton
-                 WHERE message_id = ?1",
-                params![message_id],
-                |row| {
-                    let kind: String = row.get(5)?;
-                    let body_state: String = row.get(6)?;
-                    let media_state: Option<String> = row.get(7)?;
-                    let archive_state: String = row.get(8)?;
-                    let backup_state: String = row.get(9)?;
-                    Ok((MessageSkeletonRaw {
-                        message_id: row.get(0)?,
-                        conversation_id: row.get(1)?,
-                        sender_id: row.get(2)?,
-                        created_at_ms: row.get(3)?,
-                        received_at_ms: row.get(4)?,
-                        kind,
-                        body_state,
-                        media_state,
-                        archive_state,
-                        backup_state,
-                        reply_to: row.get(10)?,
-                        edited_at_ms: row.get(11)?,
-                        deleted_at_ms: row.get(12)?,
-                    },))
-                },
-            )
-            .optional()?;
-        match row {
-            None => Ok(None),
-            Some((raw,)) => Ok(Some(raw.into_skeleton()?)),
-        }
+        read_message_skeleton(&self.conn, message_id)
     }
 
     /// Fetch a message body by id, if present.
     pub fn get_message_body(&self, message_id: &str) -> DbResult<Option<MessageBody>> {
-        self.conn
-            .query_row(
-                "SELECT message_id, text_content, detected_language, rich_meta
-                 FROM message_body
-                 WHERE message_id = ?1",
-                params![message_id],
-                |row| {
-                    Ok(MessageBody {
-                        message_id: row.get(0)?,
-                        text_content: row.get(1)?,
-                        detected_language: row.get(2)?,
-                        rich_meta: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(DbError::from)
+        read_message_body(&self.conn, message_id)
     }
 
     /// Update `message_skeleton.body_state` for `message_id`.
@@ -1039,28 +939,7 @@ impl LocalStoreDb {
         query: &str,
         kind: Option<&str>,
     ) -> DbResult<Vec<MediaSearchResult>> {
-        let needle = format!("%{}%", escape_like_pattern(query));
-        let rows: Vec<MediaSearchResult> = match kind {
-            Some(k) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT asset_id, kind, text, language, confidence
-                       FROM media_search_index
-                      WHERE kind = ?1 AND text LIKE ?2 ESCAPE '\\' COLLATE NOCASE",
-                )?;
-                let it = stmt.query_map(params![k, needle], row_to_media_search_result)?;
-                it.collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT asset_id, kind, text, language, confidence
-                       FROM media_search_index
-                      WHERE text LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
-                )?;
-                let it = stmt.query_map(params![needle], row_to_media_search_result)?;
-                it.collect::<rusqlite::Result<Vec<_>>>()?
-            }
-        };
-        Ok(rows)
+        read_search_media_index(&self.conn, query, kind)
     }
 
     /// Replace `message_body.text_content` for `message_id`.
@@ -1184,42 +1063,7 @@ impl LocalStoreDb {
         before_ms: Option<i64>,
         limit: usize,
     ) -> DbResult<Vec<MessageSkeleton>> {
-        let mut stmt;
-        let rows = if let Some(before) = before_ms {
-            stmt = self.conn.prepare(
-                "SELECT message_id, conversation_id, sender_id,
-                        created_at_ms, received_at_ms, kind,
-                        body_state, media_state, archive_state, backup_state,
-                        reply_to, edited_at_ms, deleted_at_ms
-                   FROM message_skeleton
-                  WHERE conversation_id = ?1 AND created_at_ms < ?2
-                  ORDER BY created_at_ms DESC
-                  LIMIT ?3",
-            )?;
-            stmt.query_map(
-                params![conversation_id, before, limit as i64],
-                decode_skeleton_row,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt = self.conn.prepare(
-                "SELECT message_id, conversation_id, sender_id,
-                        created_at_ms, received_at_ms, kind,
-                        body_state, media_state, archive_state, backup_state,
-                        reply_to, edited_at_ms, deleted_at_ms
-                   FROM message_skeleton
-                  WHERE conversation_id = ?1
-                  ORDER BY created_at_ms DESC
-                  LIMIT ?2",
-            )?;
-            stmt.query_map(params![conversation_id, limit as i64], decode_skeleton_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for raw in rows {
-            out.push(raw.into_skeleton()?);
-        }
-        Ok(out)
+        read_conversation_messages(&self.conn, conversation_id, before_ms, limit)
     }
 
     /// Fetch a message skeleton plus its (optional) body in one go.
@@ -1230,45 +1074,7 @@ impl LocalStoreDb {
         &self,
         message_id: &str,
     ) -> DbResult<Option<(MessageSkeleton, Option<MessageBody>)>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT s.message_id, s.conversation_id, s.sender_id,
-                        s.created_at_ms, s.received_at_ms, s.kind,
-                        s.body_state, s.media_state, s.archive_state,
-                        s.backup_state, s.reply_to, s.edited_at_ms,
-                        s.deleted_at_ms,
-                        b.text_content, b.detected_language, b.rich_meta
-                   FROM message_skeleton s
-                   LEFT JOIN message_body b ON b.message_id = s.message_id
-                  WHERE s.message_id = ?1",
-                params![message_id],
-                |row| {
-                    let raw = decode_skeleton_row(row)?;
-                    let text_content: Option<String> = row.get(13)?;
-                    let detected_language: Option<String> = row.get(14)?;
-                    let rich_meta: Option<Vec<u8>> = row.get(15)?;
-                    let body_present = text_content.is_some()
-                        || detected_language.is_some()
-                        || rich_meta.is_some();
-                    let body = if body_present {
-                        Some(MessageBody {
-                            message_id: raw.message_id.clone(),
-                            text_content,
-                            detected_language,
-                            rich_meta,
-                        })
-                    } else {
-                        None
-                    };
-                    Ok((raw, body))
-                },
-            )
-            .optional()?;
-        match row {
-            None => Ok(None),
-            Some((raw, body)) => Ok(Some((raw.into_skeleton()?, body))),
-        }
+        read_message_with_body(&self.conn, message_id)
     }
 
     /// Return the messages in `conversation_id` joined against
@@ -1285,77 +1091,7 @@ impl LocalStoreDb {
         before_ms: Option<i64>,
         limit: usize,
     ) -> DbResult<Vec<TimelineRow>> {
-        // The query mirrors get_message_with_body's LEFT JOIN so a
-        // dropped message_body row (e.g. delete_for_everyone) still
-        // returns the skeleton with text_content == None. The
-        // `(created_at_ms < ?2 OR ?2 IS NULL)` pattern keeps the
-        // single statement valid for both paginated and non-paginated
-        // calls without a runtime branch on the SQL string.
-        let mut stmt = self.conn.prepare(
-            "SELECT s.message_id, s.conversation_id, s.sender_id,
-                    s.created_at_ms, s.kind, s.body_state,
-                    s.reply_to, s.edited_at_ms, s.deleted_at_ms,
-                    b.text_content
-               FROM message_skeleton s
-               LEFT JOIN message_body b ON b.message_id = s.message_id
-              WHERE s.conversation_id = ?1
-                AND (s.created_at_ms < ?2 OR ?2 IS NULL)
-              ORDER BY s.created_at_ms DESC
-              LIMIT ?3",
-        )?;
-        let raw_rows = stmt
-            .query_map(params![conversation_id, before_ms, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut out = Vec::with_capacity(raw_rows.len());
-        for (
-            message_id,
-            conversation_id_col,
-            sender_id,
-            created_at_ms,
-            kind_str,
-            body_state_str,
-            reply_to,
-            edited_at_ms,
-            deleted_at_ms,
-            text_content,
-        ) in raw_rows
-        {
-            let kind = match kind_str.as_str() {
-                "text" => MessageKind::Text,
-                "media" => MessageKind::Media,
-                "system" => MessageKind::System,
-                other => return Err(DbError::InvalidState(format!("kind={other}"))),
-            };
-            let body_state: BodyState = body_state_str
-                .parse()
-                .map_err(|_| DbError::InvalidState(format!("body_state={body_state_str}")))?;
-            out.push(TimelineRow {
-                message_id,
-                conversation_id: conversation_id_col,
-                sender_id,
-                created_at_ms,
-                kind,
-                body_state,
-                text_content,
-                reply_to,
-                edited_at_ms,
-                deleted_at_ms,
-            });
-        }
-        Ok(out)
+        read_timeline(&self.conn, conversation_id, before_ms, limit)
     }
 
     /// Delete a conversation along with every dependent row.
@@ -1961,10 +1697,46 @@ fn decode_backup_segment_ledger_row(
 // Connection bring-up
 // ---------------------------------------------------------------------------
 
-/// Run the post-open setup: `PRAGMA key`, `PRAGMA foreign_keys`,
-/// schema bring-up via [`run_migrations`] (with unicode61 fallback
-/// for migration v1 on platforms without FTS5 ICU), and a sanity
-/// check. Returns whether the FTS5 ICU tokenizer was available.
+/// Run the post-open setup for a **read-write** writer connection:
+/// `PRAGMA key`, `PRAGMA foreign_keys`, `PRAGMA journal_mode = WAL`,
+/// `PRAGMA busy_timeout`, schema bring-up via [`run_migrations`]
+/// (with unicode61 fallback for migration v1 on platforms without
+/// FTS5 ICU), and a sanity check. Returns whether the FTS5 ICU
+/// tokenizer was available.
+///
+/// **WAL mode**: enabling Write-Ahead Logging is what unlocks the
+/// [`LocalStoreReaderPool`] concurrency model. In the default
+/// `rollback journal` mode SQLite locks the entire database file
+/// for the duration of every transaction, so a reader and the
+/// writer cannot run concurrently. Under WAL, writers append to
+/// `kchat.db-wal` while readers see a consistent snapshot from
+/// the main file plus the WAL up to their checkpoint — readers
+/// and the writer do not block each other. The WAL is
+/// persisted across process restarts via the `-wal` and `-shm`
+/// sidecar files SQLite creates next to `kchat.db`. The
+/// `journal_mode` setting is itself persisted in the database
+/// header, so subsequent opens inherit WAL without having to
+/// re-issue the pragma — we still execute it on every open so a
+/// freshly-created database picks it up before any data is
+/// written.
+///
+/// **busy_timeout**: even under WAL, a writer can momentarily
+/// block another writer (e.g. during a checkpoint promotion).
+/// Setting `busy_timeout = 5000` ms lets SQLite spin and retry
+/// instead of immediately returning `SQLITE_BUSY` to the
+/// caller — the value is large enough to cover a stop-the-world
+/// checkpoint on a slow device but small enough that a genuinely
+/// deadlocked configuration surfaces within seconds.
+///
+/// **`:memory:` caveat**: SQLite silently downgrades WAL to the
+/// `MEMORY` journal mode for in-memory databases (see
+/// <https://www.sqlite.org/wal.html>). The pragma still succeeds;
+/// the runtime just behaves as if rollback journaling were in
+/// effect. Shared-cache URIs of the form
+/// `file:<name>?mode=memory&cache=shared` allow multiple
+/// connections to see the same in-memory database, which is how
+/// the test harness exercises the reader-pool path without an
+/// on-disk file.
 fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
     set_key(conn, key)?;
     // Foreign keys must be enabled per-connection in SQLite.
@@ -1972,10 +1744,754 @@ fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
     // Force-decrypt with a trivial query so a wrong key surfaces
     // immediately rather than lurking until the first table access.
     conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+    // Enable Write-Ahead Logging so the reader pool can run
+    // SELECTs concurrently with the writer's INSERT/UPDATE/DELETE
+    // — see the doc comment above for the rationale. For
+    // `:memory:` databases SQLite returns the actual mode (which
+    // is `MEMORY`) without raising an error, so this is safe to
+    // run unconditionally.
+    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    // 5-second busy timeout: see the doc comment above. The
+    // value matches the writer side of
+    // [`init_reader_connection`] so a `SQLITE_BUSY` from either
+    // side has the same retry budget.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
     let icu_available = fts5_icu_available(conn);
     run_migrations(conn, icu_available)?;
     Ok(icu_available)
+}
+
+/// Run the post-open setup for a **read-only** reader connection.
+///
+/// Differs from [`init_connection`] in three ways:
+///   1. No `PRAGMA journal_mode = WAL` — the writer's open
+///      already sticky-set WAL into the database header; a
+///      reader that re-issues the pragma would observe `wal`
+///      and return the same value, so the call is omitted to
+///      keep reader bring-up lean.
+///   2. No [`run_migrations`] call — the writer is the only path
+///      that ever creates or alters tables. A reader that finds
+///      the schema at an older version logs nothing and proceeds:
+///      the writer will have run the migrations first, so by the
+///      time the reader pool is initialised the schema is always
+///      current.
+///   3. The sanity-check `SELECT` still runs so an incorrect key
+///      surfaces synchronously, before the connection joins the
+///      pool.
+///
+/// **`PRAGMA query_only` is what enforces read-only**: the
+/// reader is opened with `SQLITE_OPEN_READ_WRITE`, not
+/// `SQLITE_OPEN_READ_ONLY`, because WAL mode requires every
+/// connection to have write access to the `<db>-shm`
+/// shared-memory file — see [`LocalStoreReader::open`] for the
+/// full rationale. The `query_only = 1` PRAGMA replaces the
+/// OS-level read-only flag: it makes the SQLite engine itself
+/// reject any `INSERT` / `UPDATE` / `DELETE` / `CREATE`
+/// statement issued through the connection.
+fn init_reader_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<()> {
+    set_key(conn, key)?;
+    // Foreign keys: idempotent across connections; safe to set
+    // again so a debugger attaching to a pool reader sees the
+    // same constraint regime as the writer.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // Force-decrypt: same rationale as the writer path — a wrong
+    // key surfaces here rather than on the first SELECT.
+    conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+    // Matching busy_timeout so a reader that hits a checkpoint
+    // contention spin sees the same retry budget as the writer.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    // `query_only = 1` is the read-only invariant: the
+    // connection itself is opened with `SQLITE_OPEN_READ_WRITE`
+    // (so the WAL `-shm` file works — see
+    // [`LocalStoreReader::open`]), and SQLite then rejects any
+    // INSERT / UPDATE / DELETE / CREATE issued on the
+    // connection at the engine layer.
+    conn.execute_batch("PRAGMA query_only = 1;")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Read-only free functions
+// ---------------------------------------------------------------------------
+//
+// Phase B.1 split: every read-only query that is exposed on both
+// the writer ([`LocalStoreDb`]) and the reader pool
+// ([`LocalStoreReader`] / [`LocalStoreReaderPool`]) has its body
+// extracted into a `pub(crate) fn read_xxx(conn: &Connection, ...)`
+// here, so there is exactly one canonical query body per logical
+// read. The methods on `LocalStoreDb` and `LocalStoreReader` are
+// one-line delegates over `&self.conn`, which is also the public
+// boundary documented by the doc comments on those methods.
+//
+// Each function below only needs `&Connection`, which is the
+// surface common to both writer and reader connections. The
+// reader connections additionally carry `PRAGMA query_only = 1`,
+// so any function listed here that attempted to mutate state
+// would surface immediately as `SQLITE_READONLY` at runtime on
+// the reader path — the read-vs-write separation is enforced
+// at SQLite, not just at the Rust type boundary.
+
+/// Read [`Conversation`] row keyed on `conversation_id`. See
+/// [`LocalStoreDb::get_conversation`] for caller-side docs.
+pub(crate) fn read_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> DbResult<Option<Conversation>> {
+    conn.query_row(
+        "SELECT conversation_id, title_cipher, pinned, muted,
+                last_message_id, last_activity_ms,
+                conversation_type, scope, tenant_id,
+                community_id, domain_id
+         FROM conversation
+         WHERE conversation_id = ?1",
+        params![conversation_id],
+        row_to_conversation,
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+/// List every [`Conversation`] row, newest-pinned-first. See
+/// [`LocalStoreDb::list_conversations`] for caller-side docs.
+pub(crate) fn read_list_conversations(conn: &Connection) -> DbResult<Vec<Conversation>> {
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id, title_cipher, pinned, muted,
+                last_message_id, last_activity_ms,
+                conversation_type, scope, tenant_id,
+                community_id, domain_id
+           FROM conversation
+          ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_conversation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// List every [`Conversation`] whose `column` equals `value`. See
+/// [`LocalStoreDb::list_conversations_by_community`] /
+/// `_by_domain` / `_by_tenant` / `_by_scope` for the four
+/// caller-side wrappers.
+///
+/// `column` must come from a closed set of literals
+/// (`tenant_id`, `community_id`, `domain_id`, `scope`) chosen by
+/// the caller — never user input — so the inline format string is
+/// safe.
+pub(crate) fn read_list_conversations_by_column(
+    conn: &Connection,
+    column: &str,
+    value: &str,
+) -> DbResult<Vec<Conversation>> {
+    let sql = format!(
+        "SELECT conversation_id, title_cipher, pinned, muted,
+                last_message_id, last_activity_ms,
+                conversation_type, scope, tenant_id,
+                community_id, domain_id
+           FROM conversation
+          WHERE {column} = ?1
+          ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![value], row_to_conversation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Fetch a [`MessageSkeleton`] by `message_id`. See
+/// [`LocalStoreDb::get_message_skeleton`].
+pub(crate) fn read_message_skeleton(
+    conn: &Connection,
+    message_id: &str,
+) -> DbResult<Option<MessageSkeleton>> {
+    let row = conn
+        .query_row(
+            "SELECT message_id, conversation_id, sender_id,
+                    created_at_ms, received_at_ms, kind,
+                    body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+             FROM message_skeleton
+             WHERE message_id = ?1",
+            params![message_id],
+            |row| {
+                let kind: String = row.get(5)?;
+                let body_state: String = row.get(6)?;
+                let media_state: Option<String> = row.get(7)?;
+                let archive_state: String = row.get(8)?;
+                let backup_state: String = row.get(9)?;
+                Ok((MessageSkeletonRaw {
+                    message_id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    sender_id: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                    received_at_ms: row.get(4)?,
+                    kind,
+                    body_state,
+                    media_state,
+                    archive_state,
+                    backup_state,
+                    reply_to: row.get(10)?,
+                    edited_at_ms: row.get(11)?,
+                    deleted_at_ms: row.get(12)?,
+                },))
+            },
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((raw,)) => Ok(Some(raw.into_skeleton()?)),
+    }
+}
+
+/// Fetch a [`MessageBody`] by `message_id`. See
+/// [`LocalStoreDb::get_message_body`].
+pub(crate) fn read_message_body(
+    conn: &Connection,
+    message_id: &str,
+) -> DbResult<Option<MessageBody>> {
+    conn.query_row(
+        "SELECT message_id, text_content, detected_language, rich_meta
+         FROM message_body
+         WHERE message_id = ?1",
+        params![message_id],
+        |row| {
+            Ok(MessageBody {
+                message_id: row.get(0)?,
+                text_content: row.get(1)?,
+                detected_language: row.get(2)?,
+                rich_meta: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+/// Fetch skeleton + optional body by `message_id`. See
+/// [`LocalStoreDb::get_message_with_body`].
+pub(crate) fn read_message_with_body(
+    conn: &Connection,
+    message_id: &str,
+) -> DbResult<Option<(MessageSkeleton, Option<MessageBody>)>> {
+    let row = conn
+        .query_row(
+            "SELECT s.message_id, s.conversation_id, s.sender_id,
+                    s.created_at_ms, s.received_at_ms, s.kind,
+                    s.body_state, s.media_state, s.archive_state,
+                    s.backup_state, s.reply_to, s.edited_at_ms,
+                    s.deleted_at_ms,
+                    b.text_content, b.detected_language, b.rich_meta
+               FROM message_skeleton s
+               LEFT JOIN message_body b ON b.message_id = s.message_id
+              WHERE s.message_id = ?1",
+            params![message_id],
+            |row| {
+                let raw = decode_skeleton_row(row)?;
+                let text_content: Option<String> = row.get(13)?;
+                let detected_language: Option<String> = row.get(14)?;
+                let rich_meta: Option<Vec<u8>> = row.get(15)?;
+                let body_present = text_content.is_some()
+                    || detected_language.is_some()
+                    || rich_meta.is_some();
+                let body = if body_present {
+                    Some(MessageBody {
+                        message_id: raw.message_id.clone(),
+                        text_content,
+                        detected_language,
+                        rich_meta,
+                    })
+                } else {
+                    None
+                };
+                Ok((raw, body))
+            },
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((raw, body)) => Ok(Some((raw.into_skeleton()?, body))),
+    }
+}
+
+/// Return paginated messages in `conversation_id`, newest-first.
+/// See [`LocalStoreDb::get_conversation_messages`].
+pub(crate) fn read_conversation_messages(
+    conn: &Connection,
+    conversation_id: &str,
+    before_ms: Option<i64>,
+    limit: usize,
+) -> DbResult<Vec<MessageSkeleton>> {
+    let mut stmt;
+    let rows = if let Some(before) = before_ms {
+        stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id,
+                    created_at_ms, received_at_ms, kind,
+                    body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+               FROM message_skeleton
+              WHERE conversation_id = ?1 AND created_at_ms < ?2
+              ORDER BY created_at_ms DESC
+              LIMIT ?3",
+        )?;
+        stmt.query_map(
+            params![conversation_id, before, limit as i64],
+            decode_skeleton_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt = conn.prepare(
+            "SELECT message_id, conversation_id, sender_id,
+                    created_at_ms, received_at_ms, kind,
+                    body_state, media_state, archive_state, backup_state,
+                    reply_to, edited_at_ms, deleted_at_ms
+               FROM message_skeleton
+              WHERE conversation_id = ?1
+              ORDER BY created_at_ms DESC
+              LIMIT ?2",
+        )?;
+        stmt.query_map(params![conversation_id, limit as i64], decode_skeleton_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for raw in rows {
+        out.push(raw.into_skeleton()?);
+    }
+    Ok(out)
+}
+
+/// Return the timeline (skeleton + body text) for
+/// `conversation_id`. See [`LocalStoreDb::get_timeline`].
+pub(crate) fn read_timeline(
+    conn: &Connection,
+    conversation_id: &str,
+    before_ms: Option<i64>,
+    limit: usize,
+) -> DbResult<Vec<TimelineRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.message_id, s.conversation_id, s.sender_id,
+                s.created_at_ms, s.kind, s.body_state,
+                s.reply_to, s.edited_at_ms, s.deleted_at_ms,
+                b.text_content
+           FROM message_skeleton s
+           LEFT JOIN message_body b ON b.message_id = s.message_id
+          WHERE s.conversation_id = ?1
+            AND (s.created_at_ms < ?2 OR ?2 IS NULL)
+          ORDER BY s.created_at_ms DESC
+          LIMIT ?3",
+    )?;
+    let raw_rows = stmt
+        .query_map(params![conversation_id, before_ms, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(raw_rows.len());
+    for (
+        message_id,
+        conversation_id_col,
+        sender_id,
+        created_at_ms,
+        kind_str,
+        body_state_str,
+        reply_to,
+        edited_at_ms,
+        deleted_at_ms,
+        text_content,
+    ) in raw_rows
+    {
+        let kind = match kind_str.as_str() {
+            "text" => MessageKind::Text,
+            "media" => MessageKind::Media,
+            "system" => MessageKind::System,
+            other => return Err(DbError::InvalidState(format!("kind={other}"))),
+        };
+        let body_state: BodyState = body_state_str
+            .parse()
+            .map_err(|_| DbError::InvalidState(format!("body_state={body_state_str}")))?;
+        out.push(TimelineRow {
+            message_id,
+            conversation_id: conversation_id_col,
+            sender_id,
+            created_at_ms,
+            kind,
+            body_state,
+            text_content,
+            reply_to,
+            edited_at_ms,
+            deleted_at_ms,
+        });
+    }
+    Ok(out)
+}
+
+/// Search `media_search_index` by substring across all kinds (or
+/// a specific `kind` filter). See
+/// [`LocalStoreDb::search_media_index`].
+pub(crate) fn read_search_media_index(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+) -> DbResult<Vec<MediaSearchResult>> {
+    let needle = format!("%{}%", escape_like_pattern(query));
+    let rows: Vec<MediaSearchResult> = match kind {
+        Some(k) => {
+            let mut stmt = conn.prepare(
+                "SELECT asset_id, kind, text, language, confidence
+                   FROM media_search_index
+                  WHERE kind = ?1 AND text LIKE ?2 ESCAPE '\\' COLLATE NOCASE",
+            )?;
+            let it = stmt.query_map(params![k, needle], row_to_media_search_result)?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT asset_id, kind, text, language, confidence
+                   FROM media_search_index
+                  WHERE text LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
+            )?;
+            let it = stmt.query_map(params![needle], row_to_media_search_result)?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+    };
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// LocalStoreReader
+// ---------------------------------------------------------------------------
+
+/// Read-only handle to the encrypted local-store database.
+///
+/// Opened with `OpenFlags::SQLITE_OPEN_READ_ONLY |
+/// SQLITE_OPEN_NO_MUTEX` plus `PRAGMA query_only = 1`, so the
+/// SQLite engine itself rejects any `INSERT` / `UPDATE` /
+/// `DELETE` / `CREATE` issued through this handle. Several
+/// readers can run `SELECT` statements concurrently with the
+/// writer's transactions under WAL mode — that's the concurrency
+/// win this type unlocks vs. the historical single-mutex
+/// [`LocalStoreDb`] layout.
+///
+/// The method surface is intentionally a strict subset of
+/// [`LocalStoreDb`]: every method delegates to the same
+/// `read_xxx(conn, ...)` free function that the corresponding
+/// writer-side method calls, so there is exactly one query body
+/// per logical read.
+///
+/// `LocalStoreReader` itself is `!Send` (because
+/// `rusqlite::Connection` is `!Send` when compiled without the
+/// `SQLITE_OPEN_FULLMUTEX` flag). The [`LocalStoreReaderPool`]
+/// owns the readers and serialises checkout / checkin behind a
+/// `Mutex<Vec<LocalStoreReader>>`, so the pool itself is `Send +
+/// Sync` and can be shared across the bridge crates.
+#[derive(Debug)]
+pub struct LocalStoreReader {
+    conn: Connection,
+}
+
+impl LocalStoreReader {
+    /// Open a new logically read-only connection to the
+    /// encrypted database at `path`. The schema is *not* re-run
+    /// — the writer is the only path that may alter the on-disk
+    /// shape.
+    ///
+    /// **OS-level open flags**: the connection is opened with
+    /// `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_NO_MUTEX` rather
+    /// than the more intuitive `SQLITE_OPEN_READ_ONLY`. This is
+    /// a SQLite WAL-mode requirement, not a relaxation: a WAL-
+    /// mode database needs every connection (including readers)
+    /// to have *write* access to the `<db>-shm` shared-memory
+    /// index file so readers can register their snapshot mark
+    /// against the writer's append cursor. Opening with
+    /// `SQLITE_OPEN_READ_ONLY` while the WAL is non-empty makes
+    /// SQLite return `SQLITE_CANTOPEN` (or `SQLITE_IOERR` on
+    /// some platforms) — see <https://www.sqlite.org/wal.html>
+    /// §"Read-Only Databases". The actual read-only invariant
+    /// is enforced by [`init_reader_connection`]'s
+    /// `PRAGMA query_only = 1`, which makes the SQLite engine
+    /// itself reject any `INSERT` / `UPDATE` / `DELETE` /
+    /// `CREATE` issued through this handle. Combined with the
+    /// fact that the only `pub` methods on `LocalStoreReader`
+    /// delegate to the `read_xxx` free functions (none of which
+    /// issue mutating statements), this gives the same
+    /// guarantees as the OS-level read-only flag without the
+    /// WAL compatibility problem.
+    pub fn open(path: &Path, key: &[u8; 32]) -> DbResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        init_reader_connection(&conn, key)?;
+        Ok(Self { conn })
+    }
+
+    /// Open a new logically read-only connection via an
+    /// explicit URI. Used by the in-memory test harness with a
+    /// `file:<unique-name>?mode=memory&cache=shared` URI. The
+    /// `SQLITE_OPEN_URI` flag must be in the flags set or SQLite
+    /// will treat the URI as a literal filename. See
+    /// [`LocalStoreReader::open`] for the rationale behind
+    /// `SQLITE_OPEN_READ_WRITE`.
+    pub fn open_uri(uri: &str, key: &[u8; 32]) -> DbResult<Self> {
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        init_reader_connection(&conn, key)?;
+        Ok(Self { conn })
+    }
+
+    /// Borrow the underlying read-only connection. Provided so
+    /// callers that need to compose multiple `read_xxx` free
+    /// functions inside a single deferred-read transaction can do
+    /// so without re-acquiring the pool slot. Holding this
+    /// borrow does NOT release the reader back to the pool — the
+    /// reader stays checked out for the lifetime of `&self`.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    // -------- Conversation reads --------
+
+    /// See [`LocalStoreDb::get_conversation`].
+    pub fn get_conversation(&self, conversation_id: &str) -> DbResult<Option<Conversation>> {
+        read_conversation(&self.conn, conversation_id)
+    }
+
+    /// See [`LocalStoreDb::list_conversations`].
+    pub fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
+        read_list_conversations(&self.conn)
+    }
+
+    /// See [`LocalStoreDb::list_conversations_by_community`].
+    pub fn list_conversations_by_community(
+        &self,
+        community_id: &str,
+    ) -> DbResult<Vec<Conversation>> {
+        read_list_conversations_by_column(&self.conn, "community_id", community_id)
+    }
+
+    /// See [`LocalStoreDb::list_conversations_by_domain`].
+    pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
+        read_list_conversations_by_column(&self.conn, "domain_id", domain_id)
+    }
+
+    /// See [`LocalStoreDb::list_conversations_by_tenant`].
+    pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
+        read_list_conversations_by_column(&self.conn, "tenant_id", tenant_id)
+    }
+
+    /// See [`LocalStoreDb::list_conversations_by_scope`].
+    pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
+        read_list_conversations_by_column(&self.conn, "scope", scope)
+    }
+
+    // -------- Message reads --------
+
+    /// See [`LocalStoreDb::get_message_skeleton`].
+    pub fn get_message_skeleton(&self, message_id: &str) -> DbResult<Option<MessageSkeleton>> {
+        read_message_skeleton(&self.conn, message_id)
+    }
+
+    /// See [`LocalStoreDb::get_message_body`].
+    pub fn get_message_body(&self, message_id: &str) -> DbResult<Option<MessageBody>> {
+        read_message_body(&self.conn, message_id)
+    }
+
+    /// See [`LocalStoreDb::get_message_with_body`].
+    pub fn get_message_with_body(
+        &self,
+        message_id: &str,
+    ) -> DbResult<Option<(MessageSkeleton, Option<MessageBody>)>> {
+        read_message_with_body(&self.conn, message_id)
+    }
+
+    /// See [`LocalStoreDb::get_conversation_messages`].
+    pub fn get_conversation_messages(
+        &self,
+        conversation_id: &str,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> DbResult<Vec<MessageSkeleton>> {
+        read_conversation_messages(&self.conn, conversation_id, before_ms, limit)
+    }
+
+    /// See [`LocalStoreDb::get_timeline`].
+    pub fn get_timeline(
+        &self,
+        conversation_id: &str,
+        before_ms: Option<i64>,
+        limit: usize,
+    ) -> DbResult<Vec<TimelineRow>> {
+        read_timeline(&self.conn, conversation_id, before_ms, limit)
+    }
+
+    // -------- Media search --------
+
+    /// See [`LocalStoreDb::search_media_index`].
+    pub fn search_media_index(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+    ) -> DbResult<Vec<MediaSearchResult>> {
+        read_search_media_index(&self.conn, query, kind)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LocalStoreReaderPool
+// ---------------------------------------------------------------------------
+
+/// Pool of [`LocalStoreReader`] connections used to serve
+/// concurrent read traffic alongside the single writer.
+///
+/// # Concurrency model
+///
+/// * The writer (`LocalStoreDb`, held in `Mutex<LocalStoreDb>`)
+///   takes its lock for the duration of every write transaction.
+/// * The reader pool holds N `LocalStoreReader` handles in a
+///   `Mutex<Vec<LocalStoreReader>>` plus a `Condvar`. A
+///   [`LocalStoreReaderPool::with_reader`] call pops a reader
+///   off the vec (blocking on the condvar if all readers are
+///   in use), runs the supplied closure, and pushes the reader
+///   back on the way out — guaranteed to run even on closure
+///   panic via a drop guard.
+/// * Under WAL mode the readers and writer do **not** block
+///   each other; this pool is what lets the bridge crates run
+///   `search()` and `get_conversation_messages()` in parallel
+///   while an `ingest_messages()` transaction is committing on
+///   the writer side.
+///
+/// # `Send` / `Sync`
+///
+/// `LocalStoreReader` itself is `!Send` because the embedded
+/// `rusqlite::Connection` is `!Send` under the default
+/// (per-connection) mutex regime SQLCipher ships with. The pool
+/// wraps the vec in a `Mutex` and exposes only the
+/// `with_reader(|r| ...)` closure form, so the reader's
+/// `!Send`-ness never escapes the pool — `LocalStoreReaderPool`
+/// itself is `Send + Sync` (because `Mutex<T>: Send` whenever
+/// `T: Send`, and `Condvar` is `Send + Sync`).
+#[derive(Debug)]
+pub struct LocalStoreReaderPool {
+    slots: Mutex<Vec<LocalStoreReader>>,
+    available: Condvar,
+    capacity: usize,
+}
+
+impl LocalStoreReaderPool {
+    /// Open `capacity` read-only connections to the encrypted
+    /// database at `path` and seed the pool with them.
+    ///
+    /// `capacity` must be `>= 1`; a `0` value is silently
+    /// clamped to `1` (and a `warn!` is emitted by the caller in
+    /// `core_impl`).
+    pub fn open(path: &Path, key: &[u8; 32], capacity: usize) -> DbResult<Self> {
+        let capacity = capacity.max(1);
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(LocalStoreReader::open(path, key)?);
+        }
+        Ok(Self {
+            slots: Mutex::new(slots),
+            available: Condvar::new(),
+            capacity,
+        })
+    }
+
+    /// Open `capacity` read-only connections via an explicit URI
+    /// (used by the in-memory `cache=shared` test harness).
+    pub fn open_uri(uri: &str, key: &[u8; 32], capacity: usize) -> DbResult<Self> {
+        let capacity = capacity.max(1);
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(LocalStoreReader::open_uri(uri, key)?);
+        }
+        Ok(Self {
+            slots: Mutex::new(slots),
+            available: Condvar::new(),
+            capacity,
+        })
+    }
+
+    /// Maximum number of concurrent readers the pool was sized
+    /// for at construction.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Check a reader out, run `f` with it, and return it to the
+    /// pool — even if `f` panics.
+    ///
+    /// Blocks if every reader is currently in use, waking on the
+    /// pool's `Condvar` when a checkin happens. The closure
+    /// receives a `&LocalStoreReader`, never the owned value, so
+    /// callers cannot accidentally hold a reader past the
+    /// closure scope.
+    pub fn with_reader<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&LocalStoreReader) -> R,
+    {
+        let reader = self.checkout();
+        // Drop guard ensures the reader is returned to the pool
+        // even if `f` panics. We use `Option::take()` inside the
+        // guard so the explicit checkin on the success path can
+        // disarm the guard before returning the result.
+        struct Guard<'a> {
+            pool: &'a LocalStoreReaderPool,
+            reader: Option<LocalStoreReader>,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if let Some(reader) = self.reader.take() {
+                    self.pool.checkin(reader);
+                }
+            }
+        }
+        let mut guard = Guard {
+            pool: self,
+            reader: Some(reader),
+        };
+        let result = f(guard.reader.as_ref().expect("reader present"));
+        // Explicit checkin on the success path so callers don't
+        // pay the cost of `Drop` running through `Option::take`.
+        if let Some(reader) = guard.reader.take() {
+            self.checkin(reader);
+        }
+        result
+    }
+
+    fn checkout(&self) -> LocalStoreReader {
+        let mut slots = self.slots.lock().expect("reader pool mutex poisoned");
+        while slots.is_empty() {
+            slots = self
+                .available
+                .wait(slots)
+                .expect("reader pool condvar poisoned");
+        }
+        slots.pop().expect("non-empty checked above")
+    }
+
+    fn checkin(&self, reader: LocalStoreReader) {
+        let mut slots = self.slots.lock().expect("reader pool mutex poisoned");
+        slots.push(reader);
+        // Wake one waiter; `notify_one` is sufficient because a
+        // single returned reader can only unblock one waiting
+        // checkout.
+        self.available.notify_one();
+    }
 }
 
 /// Read the current `PRAGMA user_version` for `conn`.
@@ -3993,5 +4509,234 @@ mod tests {
         let ledger = db.load_backup_segment_ledger().unwrap();
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].segment_id, "seg-existing");
+    }
+
+    // -----------------------------------------------------------
+    // Phase B.1: WAL mode + LocalStoreReader / LocalStoreReaderPool
+    // -----------------------------------------------------------
+
+    fn sample_conversation(id: &str, last_activity_ms: i64) -> Conversation {
+        Conversation {
+            conversation_id: id.to_string(),
+            title_cipher: Some(vec![0xAA; 16]),
+            pinned: false,
+            muted: false,
+            last_message_id: None,
+            last_activity_ms,
+            conversation_type: "dm".to_string(),
+            scope: "b2c".to_string(),
+            tenant_id: String::new(),
+            community_id: String::new(),
+            domain_id: String::new(),
+        }
+    }
+
+    /// Helper: a fresh writer + the data directory it was opened
+    /// against, so the matching reader pool can be opened over
+    /// the same directory.
+    fn fresh_writer_with_dir() -> (tempfile::TempDir, std::path::PathBuf, LocalStoreDb) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let db = LocalStoreDb::open(&dir, &test_key()).unwrap();
+        (tmp, dir, db)
+    }
+
+    /// Helper: filesystem path the reader pool should open
+    /// against, matching the `kchat.db` filename the writer's
+    /// `open` materialises inside `data_dir`.
+    fn db_file(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("kchat.db")
+    }
+
+    #[test]
+    fn writer_open_enables_wal_journal_mode_on_disk() {
+        // PRAGMA journal_mode = WAL must be sticky on the on-disk
+        // database header. We probe the mode by re-opening and
+        // querying the pragma.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let key = test_key();
+        {
+            let _db = LocalStoreDb::open(dir, &key).unwrap();
+        }
+        let probe = LocalStoreDb::open(dir, &key).unwrap();
+        let mode: String = probe
+            .connection()
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        // SQLCipher returns the journal mode lowercased.
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn reader_pool_open_with_capacity_n_seeds_n_readers() {
+        // The pool must materialise exactly `capacity` readers
+        // up-front so checkout is O(1) and no reader is opened
+        // lazily on the hot path.
+        let (_tmp, dir, _writer) = fresh_writer_with_dir();
+        let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 3).unwrap();
+        assert_eq!(pool.capacity(), 3);
+        // Internal: every reader is parked in `slots` until the
+        // first checkout — verify by inspecting the lock-guarded
+        // length.
+        assert_eq!(pool.slots.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reader_pool_zero_capacity_is_clamped_to_one() {
+        let (_tmp, dir, _writer) = fresh_writer_with_dir();
+        let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 0).unwrap();
+        assert_eq!(pool.capacity(), 1);
+    }
+
+    #[test]
+    fn reader_observes_writes_committed_via_writer() {
+        // Read-after-write across the writer/reader split. A row
+        // inserted through the writer must be visible to a freshly
+        // checked-out reader without any explicit synchronisation.
+        let (_tmp, dir, writer) = fresh_writer_with_dir();
+        writer
+            .insert_conversation(&sample_conversation("conv-A", 1_000))
+            .unwrap();
+        let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 2).unwrap();
+        let observed = pool.with_reader(|r| r.list_conversations()).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].conversation_id, "conv-A");
+    }
+
+    #[test]
+    fn reader_rejects_writes_via_query_only_pragma() {
+        // `PRAGMA query_only = 1` plus `SQLITE_OPEN_READ_WRITE`
+        // give a logical read-only invariant: WAL `-shm` access
+        // works, but the engine rejects any mutation. A direct
+        // attempt to INSERT through the reader's `&Connection`
+        // must fail at the SQLite engine, not silently succeed.
+        let (_tmp, dir, _writer) = fresh_writer_with_dir();
+        let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 1).unwrap();
+        let outcome: DbResult<()> = pool.with_reader(|r| {
+            r.connection().execute(
+                "INSERT INTO conversation (
+                        conversation_id, title_cipher, pinned, muted,
+                        last_activity_ms, conversation_type, scope
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params!["conv-X", vec![0u8; 16], 0i64, 0i64, 1i64, "dm", "b2c"],
+            )?;
+            Ok(())
+        });
+        let err = outcome.expect_err("read-only connection must reject INSERT");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only") || msg.contains("READONLY"),
+            "expected SQLITE_READONLY-style error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pool_with_reader_returns_reader_after_panic() {
+        // The drop-guard in `with_reader` must return the reader
+        // to the pool even if the closure panics — otherwise a
+        // single panic would permanently leak a slot.
+        let (_tmp, dir, _writer) = fresh_writer_with_dir();
+        let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 1).unwrap();
+        let pool_ref = &pool;
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool_ref.with_reader(|_r| panic!("simulated reader failure"))
+            }));
+        assert!(result.is_err(), "panic must propagate");
+        // The slot must be back in the pool — a subsequent
+        // checkout must succeed without blocking forever.
+        assert_eq!(pool.slots.lock().unwrap().len(), 1);
+        let count = pool.with_reader(|r| r.list_conversations()).unwrap();
+        assert_eq!(count.len(), 0);
+    }
+
+    #[test]
+    fn pool_blocks_on_checkout_when_all_readers_in_use() {
+        // With capacity=1, the second `with_reader` call must
+        // wait on the condvar until the first releases the slot.
+        // We synchronise the two threads with a parking_lot-like
+        // pair so the race is deterministic.
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (_tmp, dir, _writer) = fresh_writer_with_dir();
+        let pool = Arc::new(LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 1).unwrap());
+
+        // Channels: t1_has_slot -> "thread 1 has checked out
+        // the reader"; t2_started -> "thread 2 has been
+        // scheduled".
+        let (t1_has_slot_tx, t1_has_slot_rx) = std::sync::mpsc::channel::<()>();
+        let (t2_done_tx, t2_done_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let pool_t1 = Arc::clone(&pool);
+        let t1 = std::thread::spawn(move || {
+            pool_t1.with_reader(|_r| {
+                t1_has_slot_tx.send(()).unwrap();
+                // Block until the test signals release.
+                release_rx.recv().unwrap();
+            });
+        });
+
+        // Wait for thread 1 to check out the only reader.
+        t1_has_slot_rx.recv().unwrap();
+
+        let pool_t2 = Arc::clone(&pool);
+        let t2 = std::thread::spawn(move || {
+            pool_t2.with_reader(|r| {
+                // Verify the reader is usable.
+                let _ = r.list_conversations().unwrap();
+            });
+            t2_done_tx.send(()).unwrap();
+        });
+
+        // Thread 2 must NOT complete while thread 1 holds the
+        // slot. Give the scheduler a moment, then assert.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            t2_done_rx.try_recv().is_err(),
+            "thread 2 must block on checkout while thread 1 holds the only reader"
+        );
+
+        // Release thread 1; thread 2 should now complete.
+        release_tx.send(()).unwrap();
+        t2_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("thread 2 must wake on checkin");
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn reader_pool_serves_concurrent_reads_alongside_writer() {
+        // The end-to-end win we're after: a writer can commit
+        // a transaction while N readers run SELECTs in parallel,
+        // all observing a consistent snapshot. We're not trying
+        // to measure throughput here — just to verify the
+        // pool's threading model holds together under load.
+        use std::sync::Arc;
+
+        let (_tmp, dir, writer) = fresh_writer_with_dir();
+        for i in 0..8 {
+            writer
+                .insert_conversation(&sample_conversation(
+                    &format!("conv-{i}"),
+                    1_000 + i as i64,
+                ))
+                .unwrap();
+        }
+        let pool = Arc::new(LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 4).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let pool = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                let rows = pool.with_reader(|r| r.list_conversations()).unwrap();
+                assert_eq!(rows.len(), 8);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
