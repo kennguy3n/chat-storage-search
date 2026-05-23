@@ -25,7 +25,7 @@
 //!
 //! References:
 //! * `docs/DESIGN.md §7.4` — Spotlight anchors.
-//! * — desktop integration.
+//! * `docs/ARCHITECTURE.md §11` — desktop integration.
 
 use kchat_core::scheduler::BackgroundScheduler;
 use kchat_core::Error;

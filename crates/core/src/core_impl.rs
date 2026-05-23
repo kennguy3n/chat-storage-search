@@ -1799,9 +1799,9 @@ impl CoreImpl {
         }
     }
 
-    /// Install the read-only dedup-analytics probe (
-    /// batch-5. Wrapped in `Arc` so multiple
-    /// workers can share one probe. See
+    /// Install the read-only dedup-analytics probe.
+    ///
+    /// Wrapped in `Arc` so multiple workers can share one probe. See
     /// `crates/core/src/transport/dedup_analytics.rs` for the
     /// privacy contract — the probe MUST NOT receive plaintext,
     /// derived plaintext (FTS tokens, embeddings), or media

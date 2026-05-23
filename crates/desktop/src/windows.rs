@@ -23,7 +23,7 @@
 //!
 //! References:
 //! * `docs/DESIGN.md §7.4` — Windows Search anchors.
-//! * — desktop integration.
+//! * `docs/ARCHITECTURE.md §11` — desktop integration.
 //! * `docs/ARCHITECTURE.md §11.4` — DirectML EP fallback to CPU.
 
 use kchat_core::scheduler::BackgroundScheduler;

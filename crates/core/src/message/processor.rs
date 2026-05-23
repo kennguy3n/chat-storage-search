@@ -979,8 +979,8 @@ fn encode_delete_event_payload(message_id: &str, scope: &str) -> Vec<u8> {
 /// Encode the CBOR map payload for a `"media_deleted"` journal
 /// entry: `{ "asset_id": <str>, "message_id": <str> }`. Emitted from
 /// `delete_message` when the deleted message had attached media so
-/// the backup-side tombstone taxonomy stays explicit (
-/// `BackupEventType::MediaDeleted`).
+/// the backup-side tombstone taxonomy stays explicit
+/// (`BackupEventType::MediaDeleted`).
 fn encode_media_delete_event_payload(asset_id: &str, message_id: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     // Map of 2 entries.

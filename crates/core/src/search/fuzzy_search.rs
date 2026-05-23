@@ -1,14 +1,15 @@
 //! Fuzzy token indexer.
 //!
-//! `docs/DESIGN.md §3.4` and spec the
+//! `docs/DESIGN.md §3.4` and `docs/ARCHITECTURE.md §3.4` spec the
 //! fuzzy index: a per-row token table (`search_fuzzy`) carrying
 //! script-tagged n-grams (trigrams for alphabetic / abugida / Hangul,
 //! bigrams for logographic CJK). Trigram lookup against the index
 //! gives approximate matching that FTS5 cannot do directly because
 //! FTS5 has no edit-distance lookup.
 //!
-//! This module is a foundation for — the encrypted shard
-//! / cold-bucket fan-out lands later. What lives here today:
+//! This module is the on-device half of the fuzzy index — the
+//! encrypted shard / cold-bucket fan-out lands separately. What
+//! lives here today:
 //!
 //! * [`FuzzyToken`] — one (token, script) pair.
 //! * [`FuzzyTokenizer`] — pure-Rust token generator that uses

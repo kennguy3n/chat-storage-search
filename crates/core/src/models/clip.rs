@@ -74,9 +74,8 @@ mod windows_directml {
     /// [`OnnxProviderReport`] reflects the EP actually
     /// registered, not the original intent.
     ///
-    /// wires the preview-asset → image-tensor encode
-    /// step (downsample to 224×224 RGB, NCHW float32,
-    /// ImageNet-style normalization) — that lives in a
+    /// The image-tensor encode step (downsample to 224×224 RGB,
+    /// NCHW float32, ImageNet-style normalization) lives in a
     /// follow-up alongside the [`crate::models::embeddings`]
     /// inference loop.
     pub fn create_mobileclip_session(

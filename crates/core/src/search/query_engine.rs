@@ -2015,8 +2015,7 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// Multiply each result's `rank_score` by its recency-decay
-    /// factor and content-kind weight (
-    /// `docs/DESIGN.md §7.5`).
+    /// factor and content-kind weight (`docs/DESIGN.md §7.5`).
     ///
     /// The reference timestamp anchoring "now" is the most-recent
     /// `created_at_ms` in the result set. This keeps the function

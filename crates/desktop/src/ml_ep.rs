@@ -1,5 +1,4 @@
-//! Desktop ML execution-provider selection adapter
-//! batch-5
+//! Desktop ML execution-provider selection adapter.
 //!
 //! `docs/ARCHITECTURE.md §11.4` mandates per-platform EP
 //! selection: CoreML on macOS, DirectML on Windows (when a GPU

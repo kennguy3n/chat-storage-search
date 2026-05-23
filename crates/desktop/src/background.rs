@@ -1,8 +1,6 @@
-//! Desktop in-process background scheduler
+//! Desktop in-process background scheduler.
 //!
-//!
-//! The library calls for a desktop scheduler that
-//! runs the recurring kchat loops on a Rust-native worker
+//! Runs the recurring kchat loops on a Rust-native worker
 //! thread when no platform scheduler bridge
 //! (`NSBackgroundActivityScheduler` on macOS, Windows Task
 //! Scheduler on Windows) is wired in. The desktop binary can
