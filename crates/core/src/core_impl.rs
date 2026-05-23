@@ -4840,24 +4840,31 @@ impl KChatCore for CoreImpl {
     }
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
-    // below (`pressure_level`, `freed_bytes`, `evicted_count`).
-    // Deferred fields are filled in via `Span::current().record`
-    // next to the matching `trace.insert_metadata` calls below.
+    // below (`reason`, `pressure_level`, `freed_bytes`,
+    // `evicted_count`). Deferred fields are filled in via
+    // `Span::current().record` next to the matching
+    // `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
         fields(
-            reason = _reason,
+            reason,
             pressure_level = tracing::field::Empty,
             evicted_count = tracing::field::Empty,
             freed_bytes = tracing::field::Empty,
         ),
     )]
-    fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
+    fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult> {
         // Phase 7, Task 8 (2026-05-04 batch): wrap the eviction
         // hot path with [`crate::perf::PerfTrace`]. We capture
         // `pressure_level`, `evicted_count`, and `freed_bytes`
-        // so callers can plot pressure-vs-recovery curves.
+        // so callers can plot pressure-vs-recovery curves. The
+        // `reason` metadata is recorded on both PerfTrace and the
+        // tracing span for parity with the sibling
+        // `run_incremental_backup` / `hydrate_message`
+        // instrumentation — a dashboard consumer can pivot every
+        // hot-path trace by the same `reason` key.
         let mut trace = crate::perf::PerfTrace::new("enforce_storage_budget");
+        trace.insert_metadata("reason", reason);
 
         // Phase-3 foundation: assess pressure and execute an
         // empty plan when no candidates are surfaced. The body is
