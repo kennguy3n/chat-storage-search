@@ -1,7 +1,6 @@
 //! `media` module — chunked-media pipeline.
 //!
-//! left this module as a placeholder. lands
-//! the chunked-media pipeline that splits a plaintext blob into
+//! The chunked-media pipeline splits a plaintext blob into
 //! AEAD-sealed chunks, persists the descriptor side of the asset,
 //! and uploads the ciphertext to the configured backend:
 //!

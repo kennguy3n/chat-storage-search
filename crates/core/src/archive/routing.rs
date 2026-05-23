@@ -62,10 +62,10 @@ fn zkof_archive_manifest_key(manifest_id: &str) -> String {
 }
 
 /// ZKOF / S3 adapter for archive operations. The HTTP client is
-/// stubbed under [`StubZkofArchiveAdapter`] for — every
-/// method returns [`Error::NotImplemented`] so the rest of the
-/// pipeline can be exercised against the dispatch surface without
-/// a real S3 round-trip.
+/// stubbed under [`StubZkofArchiveAdapter`]: every method returns
+/// [`Error::NotImplemented`] so the rest of the pipeline can be
+/// exercised against the dispatch surface without a real S3
+/// round-trip.
 ///
 /// `docs/DESIGN.md §10.2` — segments map to S3 PutObject keyed
 /// on `archive/segments/{segment_id}`, manifests map to
