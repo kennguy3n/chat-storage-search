@@ -57,7 +57,7 @@ use crate::offload::budget::{StorageBudget, StorageBudgetEnforcer};
 use crate::offload::eviction::{
     collect_eviction_candidates, execute_eviction, plan_tiered_eviction,
 };
-use crate::offload::hydration::{HydrationQueue, HydrationRequest};
+use crate::offload::hydration::HydrationRequest;
 use crate::search::fuzzy_search::FuzzyIndexWriter;
 use crate::search::query_engine::{ColdShardSource, QueryEngine};
 use crate::transport::{DeliveryClient, RawDeliveryMessage, TransportClient};
@@ -67,9 +67,11 @@ use crate::{
     SearchQuery, SearchResult, SearchScope, SendMediaResult,
 };
 
-/// Default capacity hint for [`CoreImpl::hydration_queue`]. The
-/// queue grows beyond this on demand — `HydrationQueue::new`
-/// only sizes the backing `Vec`.
+/// Default capacity hint for the
+/// [`crate::offload::hydration::HydrationQueue`] owned by
+/// [`crate::search::coordinator::Coordinator`]. The queue grows
+/// beyond this on demand — `HydrationQueue::new` only sizes the
+/// backing `Vec`.
 const DEFAULT_HYDRATION_QUEUE_CAPACITY: usize = 256;
 
 /// Default number of reader connections in
@@ -160,18 +162,21 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 /// subsystem fields have been split by their actual mutation
 /// shape:
 ///
-///   * **16 bridges that are installed exactly once at boot**
+///   * **15 bridges that are installed exactly once at boot**
 ///     (`text_embedder`, `image_embedder`, `whisper_transcriber`,
 ///     `document_extractor`, `video_keyframe_sampler`,
 ///     `ocr_bridge`, `resource_probe`, `offline_detector`,
 ///     `perf_collector`, `dedup_analytics`,
-///     `conversation_group_resolver`, `spotlight_anchor`,
-///     `windows_search_anchor`, `delivery_client`, `scheduler`,
-///     `ep_benchmark_runner`) live in
-///     [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are lock-free
-///     atomic loads; the corresponding `install_*` /
+///     `spotlight_anchor`, `windows_search_anchor`,
+///     `delivery_client`, `scheduler`, `ep_benchmark_runner`)
+///     live in [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are
+///     lock-free atomic loads; the corresponding `install_*` /
 ///     `set_delivery_client` setters return
-///     [`Error::Storage`] on double-install.
+///     [`Error::Storage`] on double-install. The 16th bridge —
+///     the Phase-8 `conversation_group_resolver` — moved to
+///     [`crate::search::coordinator::Coordinator`] in Phase B.9
+///     (see the `search` field below) and keeps the same
+///     [`OnceLock`] semantics behind a typed accessor surface.
 ///   * **Phase-B.9 backup coordinator** — the atomic backup key
 ///     bundle (`BackupKeys` — `K_backup_root` + hybrid signing
 ///     key + stable device id), the in-memory manifest chain tail
@@ -187,15 +192,18 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 ///     one named operation. The ZKOF archive bundle similarly
 ///     lives in
 ///     [`crate::archive::coordinator::Coordinator`] (Phase B.9).
-///   * **Genuinely-mutable in-flight state** (`hydration_queue`,
-///     `ep_benchmark_cache`) stays in [`Mutex`]`<T>` /
-///     [`Mutex`]`<Option<T>>` because each is mutated mid-flight
-///     (queue enqueue/dequeue, cache update). The archive epoch
-///     manager and ZKOF backend are owned by
+///   * **Genuinely-mutable in-flight state** (`ep_benchmark_cache`)
+///     stays in [`Mutex`]`<T>` because it is mutated mid-flight
+///     (cache update). The Phase-3 hydration priority queue
+///     ([`crate::offload::hydration::HydrationQueue`]) moved to
+///     [`crate::search::coordinator::Coordinator`] in Phase B.9
+///     (see the `search` field below). The archive epoch manager
+///     and ZKOF backend are owned by
 ///     [`crate::archive::coordinator::Coordinator`] (see the
 ///     `archive` field below). `CoreImpl` no longer holds the
-///     backup or archive mutexes directly; install / rotate /
-///     build-router methods delegate to the coordinators.
+///     backup, archive, or search-orchestration mutexes
+///     directly; install / rotate / build-router / enqueue
+///     methods delegate to the coordinators.
 ///   * The DB connections are split into
 ///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
 ///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
@@ -211,9 +219,10 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 ///   1. **Subsystem lookup** — `OnceLock::get()` on the 16
 ///      bridge fields. Lock-free, no ordering constraint with
 ///      the locks below.
-///   2. **In-flight state** — `hydration_queue`,
-///      `archive` (its internal `current_epoch` /
-///      `zkof_archive` mutexes — see
+///   2. **In-flight state** — `search` (its internal
+///      `hydration_queue` mutex — see
+///      `crate::search::coordinator`), `archive` (its internal
+///      `current_epoch` / `zkof_archive` mutexes — see
 ///      `crate::archive::coordinator`), `ep_benchmark_cache`
 ///      (each independent of the others; no method holds two of
 ///      these simultaneously).
@@ -280,11 +289,19 @@ pub struct CoreImpl {
     /// I/O-bound) `fetch_messages` call. Tests that need a
     /// different client construct a fresh [`CoreImpl`].
     delivery_client: OnceLock<Arc<dyn DeliveryClient>>,
-    /// Phase-3 hydration priority queue. `hydrate_message`
-    /// enqueues a request before serving from local storage so
-    /// the orchestration layer can later pop pending fetches in
-    /// priority order (`docs/PROPOSAL.md §5.5`).
-    hydration_queue: Mutex<HydrationQueue>,
+    /// Phase-B.9 search coordinator — owns the Phase-3 hydration
+    /// priority queue
+    /// ([`crate::offload::hydration::HydrationQueue`]) and the Phase-8
+    /// multi-scope search resolver
+    /// ([`crate::search::search_target::ConversationGroupResolver`])
+    /// previously held directly on `CoreImpl` as the
+    /// `hydration_queue` and `conversation_group_resolver`
+    /// fields. The cold-result backfill, prefetch-window enqueue,
+    /// per-message hydration enqueue, and resolver lookup paths
+    /// all delegate to this coordinator. See
+    /// `crate::search::coordinator` for the per-method
+    /// documentation.
+    search: crate::search::coordinator::Coordinator,
     /// Phase-B.9 archive coordinator — owns the epoch-key
     /// lifecycle (`docs/PROPOSAL.md §2.1`) and the ZKOF backend
     /// wiring previously held directly on `CoreImpl` as the
@@ -411,17 +428,9 @@ pub struct CoreImpl {
     /// privacy contract. Held in [`OnceLock`] for lock-free
     /// dashboard / dedup-event reads.
     dedup_analytics: OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
-    /// Phase-8 multi-scope search resolver. Write-once via
-    /// [`CoreImpl::install_conversation_group_resolver`]; the
-    /// query engine treats "not installed" as the default
-    /// [`crate::search::search_target::NoopConversationGroupResolver`]
-    /// (Channel resolves to its singleton id, Starred / Unread
-    /// resolve to the empty set). Held in [`OnceLock`] so
-    /// `search_with_target` resolves the bridge with a lock-free
-    /// atomic load instead of contending on a mutex before each
-    /// reader-pool checkout.
-    conversation_group_resolver:
-        OnceLock<Arc<dyn crate::search::search_target::ConversationGroupResolver>>,
+    // Phase-8 multi-scope search resolver moved to
+    // `crate::search::coordinator::Coordinator` in Phase B.9 — see
+    // the `search` field above for the doc surface.
     /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
     /// Write-once via
     /// [`CoreImpl::install_spotlight_anchor`]. The
@@ -570,7 +579,7 @@ impl CoreImpl {
             db_readers,
             key: Zeroizing::new(key),
             delivery_client: OnceLock::new(),
-            hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
+            search: crate::search::coordinator::Coordinator::new(DEFAULT_HYDRATION_QUEUE_CAPACITY),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
@@ -584,7 +593,6 @@ impl CoreImpl {
             offline_detector: OnceLock::new(),
             perf_collector: OnceLock::new(),
             dedup_analytics: OnceLock::new(),
-            conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: OnceLock::new(),
@@ -621,7 +629,7 @@ impl CoreImpl {
             db_readers,
             key: Zeroizing::new(key),
             delivery_client: OnceLock::new(),
-            hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
+            search: crate::search::coordinator::Coordinator::new(DEFAULT_HYDRATION_QUEUE_CAPACITY),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
@@ -635,7 +643,6 @@ impl CoreImpl {
             offline_detector: OnceLock::new(),
             perf_collector: OnceLock::new(),
             dedup_analytics: OnceLock::new(),
-            conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: OnceLock::new(),
@@ -675,29 +682,20 @@ impl CoreImpl {
     }
 
     /// Number of pending hydration requests in the priority queue.
-    /// Test-only inspector.
+    /// Test-only inspector — delegates to
+    /// [`crate::search::coordinator::Coordinator::queue_len`].
     #[cfg(test)]
     fn hydration_queue_len(&self) -> usize {
-        self.hydration_queue
-            .lock()
-            .expect("hydration queue poisoned")
-            .len()
+        self.search.queue_len()
     }
 
     /// Drain the hydration queue into priority order. Test-only
     /// inspector — production callers should pop with
-    /// [`HydrationQueue::dequeue`] inside a worker loop.
+    /// [`crate::offload::hydration::HydrationQueue::dequeue`] inside a worker loop. Delegates
+    /// to [`crate::search::coordinator::Coordinator::drain_queue`].
     #[cfg(test)]
     fn hydration_queue_drain(&self) -> Vec<HydrationRequest> {
-        let mut queue = self
-            .hydration_queue
-            .lock()
-            .expect("hydration queue poisoned");
-        let mut out = Vec::with_capacity(queue.len());
-        while let Some(r) = queue.dequeue() {
-            out.push(r);
-        }
-        out
+        self.search.drain_queue()
     }
 
     // ----------------------------------------------------------------
@@ -810,20 +808,11 @@ impl CoreImpl {
     /// — a poisoned queue mutex is logged-and-skipped (the
     /// search results still flow back to the caller).
     fn enqueue_cold_results_for_hydration(&self, results: &[SearchResult]) {
-        let cold_iter = results.iter().filter(|r| r.is_cold);
-        let now = now_ms_for_send_media();
-        let mut queue = match self.hydration_queue.lock() {
-            Ok(q) => q,
-            Err(_) => return,
-        };
-        for r in cold_iter {
-            queue.enqueue(crate::offload::hydration::HydrationRequest {
-                message_id: r.message_id,
-                conversation_id: r.conversation_id,
-                reason: HydrationReason::SearchResultTap,
-                requested_at_ms: now,
-            });
-        }
+        self.search.enqueue_cold_results(
+            results,
+            HydrationReason::SearchResultTap,
+            now_ms_for_send_media(),
+        );
     }
 
     /// Run a unified search and immediately enqueue every
@@ -1270,22 +1259,21 @@ impl CoreImpl {
 
     /// Enqueue P3 prefetches for `visible_ids` and the surrounding
     /// adjacent-window. The window size is the slice the caller
-    /// already widened — typical UI values are 5..50. See
-    /// [`HydrationQueue::enqueue_prefetch_window`].
+    /// already widened — typical UI values are 5..50. Delegates
+    /// to
+    /// [`crate::search::coordinator::Coordinator::enqueue_prefetch_window`].
     pub fn enqueue_prefetch_window(
         &self,
         visible_ids: &[Uuid],
         conversation_id: Uuid,
         window_size: usize,
     ) -> Result<()> {
-        let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
-        queue.enqueue_prefetch_window(
+        self.search.enqueue_prefetch_window(
             visible_ids,
             conversation_id,
             window_size,
             now_ms_for_send_media(),
-        );
-        Ok(())
+        )
     }
 
     // ----------------------------------------------------------------
@@ -1964,17 +1952,14 @@ impl CoreImpl {
         &self,
         resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver>,
     ) -> Result<()> {
-        self.conversation_group_resolver.set(resolver).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "conversation_group_resolver",
-            ))
-        })
+        self.search.install_resolver(resolver)
     }
 
     /// Whether [`Self::install_conversation_group_resolver`] has
-    /// been called.
+    /// been called. Delegates to
+    /// [`crate::search::coordinator::Coordinator::has_resolver`].
     pub fn has_conversation_group_resolver(&self) -> bool {
-        self.conversation_group_resolver.get().is_some()
+        self.search.has_resolver()
     }
 
     /// Phase 7, batch-5 — build a media-migration plan that
@@ -2091,16 +2076,15 @@ impl CoreImpl {
     ) -> Result<Vec<crate::SearchResult>> {
         // Resolve the installed `ConversationGroupResolver` via a
         // lock-free atomic load — the resolver is installed once
-        // at boot. The resolver itself does not touch the DB; it
-        // only translates a `SearchTarget` into a conversation-id
-        // set inside `execute_search_with_target`.
-        let resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver> = match self
-            .conversation_group_resolver
-            .get()
-        {
-            Some(r) => Arc::clone(r),
-            None => Arc::new(crate::search::search_target::NoopConversationGroupResolver::new()),
-        };
+        // at boot. Delegates to
+        // [`crate::search::coordinator::Coordinator::resolver_or_default`]
+        // which falls back to the
+        // [`crate::search::search_target::NoopConversationGroupResolver`]
+        // when nothing has been installed yet. The resolver itself
+        // does not touch the DB; it only translates a
+        // `SearchTarget` into a conversation-id set inside
+        // `execute_search_with_target`.
+        let resolver = self.search.resolver_or_default();
         // SELECT-only path — route through the reader pool so we
         // match the other search entry points (`search`,
         // `search_and_prefetch_cold`, `search_with_cold_source`,
@@ -4977,13 +4961,12 @@ impl KChatCore for CoreImpl {
                 if has_evicted_media && priority > HydrationReason::MediaFullScreen {
                     priority = HydrationReason::MediaFullScreen;
                 }
-                let mut queue = self.hydration_queue.lock().map_err(poisoned)?;
-                queue.enqueue(HydrationRequest {
+                self.search.enqueue_request(HydrationRequest {
                     message_id,
                     conversation_id: conv,
                     reason: priority,
                     requested_at_ms: now_ms_for_send_media(),
-                });
+                })?;
             }
 
             // Phase 7, Task 6 (2026-05-04 batch): expose an explicit
@@ -8097,14 +8080,10 @@ mod tests {
             .hydrate_message(mid, "prefetch")
             .expect("hydrate_message");
 
-        let mut queue = core.hydration_queue.lock().unwrap();
-        let mut found = false;
-        while let Some(req) = queue.dequeue() {
-            if req.message_id == mid && req.reason == HydrationReason::MediaFullScreen {
-                found = true;
-                break;
-            }
-        }
+        let drained = core.hydration_queue_drain();
+        let found = drained
+            .iter()
+            .any(|req| req.message_id == mid && req.reason == HydrationReason::MediaFullScreen);
         assert!(found, "expected an escalated MediaFullScreen entry");
     }
 
@@ -8120,20 +8099,16 @@ mod tests {
             .hydrate_message(mid, "prefetch")
             .expect("hydrate_message");
 
-        let mut queue = core.hydration_queue.lock().unwrap();
-        let mut found = false;
-        while let Some(req) = queue.dequeue() {
-            if req.message_id == mid {
-                assert_eq!(
-                    req.reason,
-                    HydrationReason::AdjacentPrefetch,
-                    "non-evicted media must keep the caller-supplied priority"
-                );
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "expected an enqueued hydration request");
+        let drained = core.hydration_queue_drain();
+        let req = drained
+            .iter()
+            .find(|req| req.message_id == mid)
+            .expect("expected an enqueued hydration request");
+        assert_eq!(
+            req.reason,
+            HydrationReason::AdjacentPrefetch,
+            "non-evicted media must keep the caller-supplied priority"
+        );
     }
 
     #[test]

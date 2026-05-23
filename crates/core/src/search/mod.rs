@@ -11,6 +11,7 @@
 //! [`FuzzyGranularity`]: tokenizer::FuzzyGranularity
 
 pub mod cold_shard_source;
+pub(crate) mod coordinator;
 pub mod fuzzy_search;
 pub mod query_engine;
 pub mod search_target;
