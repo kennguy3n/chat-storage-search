@@ -464,8 +464,23 @@ mod tests {
                 // the production code only surfaces the `Display` text.
                 // Re-encode as `StorageError::Custom` so the mock stays
                 // independent of whether the sub-enums implement `Clone`.
+                //
+                // `Error::Storage(inner)` MUST take the inner
+                // `StorageError`'s Display text (not the outer
+                // `Error`'s) to avoid a doubled `"storage: storage: ..."`
+                // prefix on round-trip: `Error::Storage(...).to_string()`
+                // yields `"storage: <inner>"`, which if re-wrapped into
+                // another `Error::Storage(StorageError::Custom(...))`
+                // would re-prefix on the outer Display. Same trap for
+                // `Search` / `Message` / `Model` / `Transport` if the
+                // mock ever needs to replay them.
                 return Err(match err {
                     Error::NotImplemented(s) => Error::NotImplemented(s),
+                    Error::Storage(inner) => Error::Storage(inner.to_string().into()),
+                    Error::Search(inner) => Error::Search(inner.to_string().into()),
+                    Error::Message(inner) => Error::Message(inner.to_string().into()),
+                    Error::Model(inner) => Error::Model(inner.to_string().into()),
+                    Error::Transport(inner) => Error::Transport(inner.to_string().into()),
                     other => Error::Storage(other.to_string().into()),
                 });
             }
