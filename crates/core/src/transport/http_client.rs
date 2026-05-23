@@ -1,21 +1,21 @@
-//! Production HTTP/JSON [`TransportClient`] — Phase 2 (2026-05-04
+//! Production HTTP/JSON [`TransportClient`] — (
 //! final batch), Task 4.
 //!
-//! `docs/PROPOSAL.md §10` and `docs/ARCHITECTURE.md §10` pin the
+//! `docs/DESIGN.md §10` and `docs/ARCHITECTURE.md §10` pin the
 //! REST endpoint shape:
 //!
-//! * `GET  /v1/messages?conversation_id=&cursor=` →
+//! * `GET /v1/messages?conversation_id=&cursor=` →
 //!   [`FetchMessagesResponse`].
-//! * `POST /v1/blobs/init`                       →
+//! * `POST /v1/blobs/init` →
 //!   [`BlobUploadHandle`].
-//! * `PUT  /v1/blobs/{blob_id}/chunks/{idx}`     →
+//! * `PUT /v1/blobs/{blob_id}/chunks/{idx}` →
 //!   [`ChunkReceipt`] (octet-stream body).
-//! * `POST /v1/blobs/{blob_id}/commit`           →
+//! * `POST /v1/blobs/{blob_id}/commit` →
 //!   [`CommitBlobResponse`].
-//! * `GET  /v1/blobs/{blob_id}?range=START-END`  → bytes.
-//! * `GET  /v1/archive/manifests?after=`         → manifests.
-//! * `GET  /v1/archive/segments/{id}`            → bytes.
-//! * `GET  /v1/archive/index-shards?conversation_hash=&bucket=&type=`
+//! * `GET /v1/blobs/{blob_id}?range=START-END` → bytes.
+//! * `GET /v1/archive/manifests?after=` → manifests.
+//! * `GET /v1/archive/segments/{id}` → bytes.
+//! * `GET /v1/archive/index-shards?conversation_hash=&bucket=&type=`
 //!   → bytes.
 //!
 //! Retry policy: 3 attempts at 1 s / 2 s / 4 s backoff for any
@@ -109,7 +109,7 @@ struct EncryptedManifestWire {
 /// (no trailing slash) and an MLS-derived bearer token. Every
 /// request carries `Authorization: Bearer <token>` and
 /// `Content-Type: application/json` (or `application/octet-stream`
-/// for blob bodies). Internal retry uses exponential backoff —
+/// for blob bodies). Internal retry uses exponential backoff
 /// see [`HTTP_TRANSPORT_RETRY_ATTEMPTS`].
 ///
 /// Two `reqwest::blocking::Client` instances are built once at
@@ -117,7 +117,7 @@ struct EncryptedManifestWire {
 /// `client` carries the 30 s control-plane timeout; `upload_client`
 /// carries the 120 s blob-upload timeout. `reqwest::blocking::Client`
 /// internally owns a tokio runtime and connection pool, so building
-/// it per call would spawn a fresh runtime on every chunk upload —
+/// it per call would spawn a fresh runtime on every chunk upload
 /// the field-level cache avoids that.
 #[cfg(feature = "http-transport")]
 #[derive(Clone)]
@@ -193,13 +193,13 @@ impl HttpTransportClient {
     /// at 1 s / 2 s / 4 s exponential backoff.
     ///
     /// Retries on:
-    ///   - Transport-level [`reqwest::Error`]s classified as
-    ///     transient by [`err_is_retryable`]: `is_timeout`,
-    ///     `is_connect`, `is_request`, or `is_body`. The retry set
-    ///     is intentionally kept in sync with the
-    ///     `TransportError::Network` classifier in
-    ///     [`HttpTransportClient::map_err`].
-    ///   - HTTP responses with status `429` or any `5xx`.
+    /// - Transport-level [`reqwest::Error`]s classified as
+    ///   transient by [`err_is_retryable`]: `is_timeout`,
+    ///   `is_connect`, `is_request`, or `is_body`. The retry set
+    ///   is intentionally kept in sync with the
+    ///   `TransportError::Network` classifier in
+    ///   [`HttpTransportClient::map_err`].
+    /// - HTTP responses with status `429` or any `5xx`.
     ///
     /// `reqwest::blocking::Client::send` returns `Ok(Response)` for
     /// every completed HTTP exchange regardless of status, and
@@ -209,7 +209,7 @@ impl HttpTransportClient {
     /// [`reqwest::blocking::Response`] directly rather than relying
     /// on the error variant. The final response (or error) is
     /// returned to the caller after the retry budget is exhausted
-    /// so the existing `if !status.is_success() { … }` branch can
+    /// so the existing `if !status.is_success { … }` branch can
     /// surface the body in the canonical `Error::Transport`.
     fn with_retry(
         attempts: u32,
@@ -238,46 +238,46 @@ impl HttpTransportClient {
         // so callers can route on intent (retryable vs not).
         //
         // Retryable — `TransportError::Network`:
-        //   * `is_timeout()`  — server didn't reply before the client
-        //                       timeout fired. Walks the cause chain;
-        //                       can fire on any `Kind` if the source
-        //                       contains a `TimedOut`.
-        //   * `is_connect()`  — TCP/TLS handshake failure. Walks the
-        //                       cause chain for hyper connect errors;
-        //                       again `Kind`-orthogonal.
-        //   * `is_request()`  — `Kind::Request`: generic
-        //                       request-sending failure (body stream
-        //                       interrupted, HTTP/2 framing issue,
-        //                       etc.).
-        //   * `is_body()`     — `Kind::Body`: connection drop while
-        //                       reading the response body. The server
-        //                       had started replying but the stream
-        //                       was truncated mid-flight; the partial
-        //                       payload is unusable. Retrying the
-        //                       whole request typically recovers.
-        //                       Critical: this Kind is NOT covered by
-        //                       `is_request()`, so without an explicit
-        //                       check these transient mid-body drops
-        //                       would misclassify as non-retryable.
+        // * `is_timeout` — server didn't reply before the client
+        // timeout fired. Walks the cause chain;
+        // can fire on any `Kind` if the source
+        // contains a `TimedOut`.
+        // * `is_connect` — TCP/TLS handshake failure. Walks the
+        // cause chain for hyper connect errors;
+        // again `Kind`-orthogonal.
+        // * `is_request` — `Kind::Request`: generic
+        // request-sending failure (body stream
+        // interrupted, HTTP/2 framing issue,
+        // etc.).
+        // * `is_body` — `Kind::Body`: connection drop while
+        // reading the response body. The server
+        // had started replying but the stream
+        // was truncated mid-flight; the partial
+        // payload is unusable. Retrying the
+        // whole request typically recovers.
+        // Critical: this Kind is NOT covered by
+        // `is_request`, so without an explicit
+        // check these transient mid-body drops
+        // would misclassify as non-retryable.
         //
         // Non-retryable — `TransportError::Server`:
-        //   * `is_builder()`  — `Kind::Builder`: client config issue
-        //                       (handled at construction sites, this
-        //                       branch is a defensive fallthrough).
-        //   * `is_redirect()` — `Kind::Redirect`: redirect policy
-        //                       loop / too-many-hops. Deterministic
-        //                       at the same URL.
-        //   * `is_status()`   — `Kind::Status`: HTTP error status
-        //                       surfaced by `error_for_status()`. The
-        //                       caller path normally invokes
-        //                       `map_status` explicitly, but the
-        //                       fallback is to treat the status
-        //                       itself as the failure signal.
-        //   * `is_decode()`   — `Kind::Decode`: the server replied
-        //                       with a malformed payload. Retrying
-        //                       returns the same broken response.
-        //   * `is_upgrade()`  — `Kind::Upgrade`: HTTP upgrade
-        //                       negotiation failed.
+        // * `is_builder` — `Kind::Builder`: client config issue
+        // (handled at construction sites, this
+        // branch is a defensive fallthrough).
+        // * `is_redirect` — `Kind::Redirect`: redirect policy
+        // loop / too-many-hops. Deterministic
+        // at the same URL.
+        // * `is_status` — `Kind::Status`: HTTP error status
+        // surfaced by `error_for_status`. The
+        // caller path normally invokes
+        // `map_status` explicitly, but the
+        // fallback is to treat the status
+        // itself as the failure signal.
+        // * `is_decode` — `Kind::Decode`: the server replied
+        // with a malformed payload. Retrying
+        // returns the same broken response.
+        // * `is_upgrade` — `Kind::Upgrade`: HTTP upgrade
+        // negotiation failed.
         //
         // Default: any future `reqwest::Kind` value the classifier
         // doesn't recognise falls through to `Server` so the caller
@@ -333,21 +333,21 @@ fn response_status_is_retryable(status: reqwest::StatusCode) -> bool {
 /// (retryable at the caller layer) is also retried at the inner
 /// short-backoff layer (1 s / 2 s / 4 s). The semantics are:
 ///
-/// * `is_timeout()` — server did not reply before our timeout
+/// * `is_timeout` — server did not reply before our timeout
 ///   fired (transient).
-/// * `is_connect()` — TCP / TLS handshake failure (transient).
-/// * `is_request()` — `Kind::Request`: generic request-sending
+/// * `is_connect` — TCP / TLS handshake failure (transient).
+/// * `is_request` — `Kind::Request`: generic request-sending
 ///   failure, e.g. HTTP/2 framing issue or an interrupted body
 ///   upload. Our request bodies are owned byte vectors, so retrying
 ///   is safe; we don't ship streaming bodies through this transport.
-/// * `is_body()` — `Kind::Body`: connection drop while we are reading
+/// * `is_body` — `Kind::Body`: connection drop while we are reading
 ///   the response body. The partial payload is unusable but the
 ///   server is healthy; a quick retry typically recovers the whole
 ///   response.
 ///
 /// Status-code-bearing errors (from `error_for_status`) are not
 /// produced by our call sites, so we deliberately do not classify
-/// on `e.status()`. HTTP retryability is decided separately on the
+/// on `e.status`. HTTP retryability is decided separately on the
 /// `Response` path via [`response_status_is_retryable`].
 ///
 /// Must be kept in sync with [`HttpTransportClient::map_err`]: if

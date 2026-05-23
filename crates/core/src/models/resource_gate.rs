@@ -1,6 +1,6 @@
-//! Resource-gated background processing — Phase 6, Task 6.
+//! Resource-gated background processing.
 //!
-//! `docs/PROPOSAL.md §7.6` calls for ML inference + model
+//! `docs/DESIGN.md §7.6` calls for ML inference + model
 //! downloads to be gated on battery / charging / thermal /
 //! network state so the device stays cool and responsive even
 //! while the search index is catching up.
@@ -189,7 +189,7 @@ impl ResourceGate {
         true
     }
 
-    /// Phase 8 (2026-05-04 batch 6) — whether the cold shard
+    /// whether the cold shard
     /// cache may be warmed in the background.
     ///
     /// Cache warming is a P5 idle task: it pulls encrypted
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn battery_at_threshold_is_inclusive() {
-        // At exactly the threshold the gate should allow work —
+        // At exactly the threshold the gate should allow work
         // the documented contract is "below `min_battery`".
         let g = ResourceGate::default();
         let res = r(0.20, false, ThermalState::Nominal, NetworkType::WiFi);

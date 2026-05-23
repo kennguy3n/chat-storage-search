@@ -1,6 +1,6 @@
-//! `archive` module — Phase 3 personal cold-storage pipeline.
+//! `archive` module — personal cold-storage pipeline.
 //!
-//! Phase 3 of `docs/PHASES.md` deliverables:
+//! Of deliverables:
 //!
 //! * [`event_journal`] — append-only log of every durable mutation
 //!   that should ride into the next archive segment.
@@ -8,7 +8,7 @@
 //!   per-conversation, per-time-bucket archive segments.
 //!
 //! See `docs/ARCHITECTURE.md §8` for the build / replay protocol
-//! and `docs/PROPOSAL.md §6` for the wire-format / key-hierarchy
+//! and `docs/DESIGN.md §6` for the wire-format / key-hierarchy
 //! specification.
 
 pub mod body_payload;

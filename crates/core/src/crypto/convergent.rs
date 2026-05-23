@@ -6,7 +6,7 @@
 //! at `crates/core/tests/pattern_c_interop_vectors.rs` and lock that
 //! contract.
 //!
-//! Pipeline (`docs/PROPOSAL.md §3.14`, `§8.4`):
+//! Pipeline (`docs/DESIGN.md §3.14`, `§8.4`):
 //! 1. Caller computes `BLAKE3(plaintext)` (full object, not per chunk).
 //! 2. [`derive_convergent_dek`] → `HKDF-SHA256(secret = content_hash,
 //!    salt = tenant_id, info = "zkof-convergent-dek-v1")` → 32 bytes.

@@ -1,7 +1,7 @@
 //! Multilingual caption / filename / MIME-type handling.
 //!
-//! `docs/PROPOSAL.md §3.4` (multilingual tokenization) and
-//! `docs/PROPOSAL.md §8.2` (size-class padding) make it explicit
+//! `docs/DESIGN.md §3.4` (multilingual tokenization) and
+//! `docs/DESIGN.md §8.2` (size-class padding) make it explicit
 //! that KChat cannot ASCII-fold or English-bias any user-controlled
 //! string that crosses the wire. Captions, filenames, and MIME
 //! types all flow through media descriptors / `media_search_index`
@@ -50,7 +50,7 @@ const ILLEGAL_FILENAME_CHARS: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>
 
 /// Apply Unicode NFC normalization and collapse whitespace runs.
 ///
-/// `docs/PROPOSAL.md §3.4` calls out NFC as the canonical form for
+/// `docs/DESIGN.md §3.4` calls out NFC as the canonical form for
 /// any UTF-8 string the local store persists; without it, the same
 /// caption typed with composed (`é`, `\u{00E9}`) vs. decomposed
 /// (`e` + combining acute, `e\u{0301}`) characters would tokenize
@@ -87,7 +87,7 @@ pub fn normalize_caption(caption: &str) -> String {
 /// Sanitize a user-supplied filename for safe round-trip through
 /// the local store and any cloud sink.
 ///
-/// `docs/PROPOSAL.md §3.4` (multilingual tokenization) and §8.2
+/// `docs/DESIGN.md §3.4` (multilingual tokenization) and §8.2
 /// (size-class padding) are the authoritative sources. The
 /// pipeline:
 ///

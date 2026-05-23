@@ -1,6 +1,6 @@
 //! Archive backend routing.
 //!
-//! `docs/PROPOSAL.md §10.1` defines two archive backends:
+//! `docs/DESIGN.md §10.1` defines two archive backends:
 //!
 //! * [`crate::config::ArchiveBackend::KChat`] — the default
 //!   PostgreSQL blob service reached via [`TransportClient`]; it
@@ -9,7 +9,7 @@
 //!   `fetch_archive_manifests` for downloads.
 //! * [`crate::config::ArchiveBackend::Zkof`] — the ZK Object Fabric
 //!   variant that maps the same operations onto S3 PutObject /
-//!   GetObject. The Phase-3 wire-up keeps the dispatch logic real
+//!   GetObject. The wire-up keeps the dispatch logic real
 //!   but stubs the actual S3 client; the HTTP implementation lands
 //!   in a follow-up.
 //!
@@ -19,13 +19,13 @@
 //! time is a one-line change.
 //!
 //! ```text
-//! ┌──────────────────┐    ArchiveBackend::KChat    ┌──────────────────┐
-//! │ archive engine   │ ─────────────────────────▶  │ TransportClient  │
-//! │ (segment/        │                              │ (KChat backend)  │
-//! │  manifest)       │ ─────────────────────────▶  ┌──────────────────┐
-//! └──────────────────┘    ArchiveBackend::Zkof    │ ZkofArchiveAdapter│
-//!                                                  │ (S3, stubbed)    │
-//!                                                  └──────────────────┘
+//! ┌──────────────────┐ ArchiveBackend::KChat ┌──────────────────┐
+//! │ archive engine │ ─────────────────────────▶ │ TransportClient │
+//! │ (segment/ │ │ (KChat backend) │
+//! │ manifest) │ ─────────────────────────▶ ┌──────────────────┐
+//! └──────────────────┘ ArchiveBackend::Zkof │ ZkofArchiveAdapter│
+//! │ (S3, stubbed) │
+//! └──────────────────┘
 //! ```
 
 use std::sync::Arc;
@@ -44,7 +44,7 @@ use crate::transport::TransportClient;
 use crate::Error;
 
 /// Object key prefix for archive segment ciphertext: per
-/// `docs/PROPOSAL.md §10.2`, every segment lives at
+/// `docs/DESIGN.md §10.2`, every segment lives at
 /// `archive/segments/{segment_id}` in the ZKOF bucket.
 pub const ZKOF_ARCHIVE_SEGMENT_KEY_PREFIX: &str = "archive/segments/";
 
@@ -62,12 +62,12 @@ fn zkof_archive_manifest_key(manifest_id: &str) -> String {
 }
 
 /// ZKOF / S3 adapter for archive operations. The HTTP client is
-/// stubbed under [`StubZkofArchiveAdapter`] for Phase 3 — every
+/// stubbed under [`StubZkofArchiveAdapter`] for — every
 /// method returns [`Error::NotImplemented`] so the rest of the
 /// pipeline can be exercised against the dispatch surface without
 /// a real S3 round-trip.
 ///
-/// `docs/PROPOSAL.md §10.2` — segments map to S3 PutObject keyed
+/// `docs/DESIGN.md §10.2` — segments map to S3 PutObject keyed
 /// on `archive/segments/{segment_id}`, manifests map to
 /// `archive/manifests/{generation}`.
 pub trait ZkofArchiveAdapter: Send + Sync {
@@ -119,12 +119,12 @@ impl ZkofArchiveAdapter for StubZkofArchiveAdapter {
 /// archive segments dedup on the cloud side without the cloud
 /// ever holding the per-tenant `K_archive_*` keys.
 ///
-/// Object key layout (matches `docs/PROPOSAL.md §10.2`):
+/// Object key layout (matches `docs/DESIGN.md §10.2`):
 ///
 /// ```text
-/// archive/segments/{segment_id}     — segment blob
-///                                     (encode_archive_segment_blob)
-/// archive/manifests/{manifest_id}   — sealed manifest CBOR
+/// archive/segments/{segment_id} — segment blob
+/// (encode_archive_segment_blob)
+/// archive/manifests/{manifest_id} — sealed manifest CBOR
 /// ```
 ///
 /// Both layers (the AEAD seal under `K_archive_segment` /
@@ -310,7 +310,7 @@ pub fn route_archive_download(
 ///
 /// The KChat backend's manifest-upload endpoint is *not* part of
 /// the [`TransportClient`] surface today — only the *fetch* side
-/// (`fetch_archive_manifests`) is wired in Phase 1 / 2. Until the
+/// (`fetch_archive_manifests`) is wired in / 2. Until the
 /// upload endpoint lands the KChat path returns
 /// [`Error::NotImplemented`] with a descriptive label so the
 /// dispatch surface stays honest. The ZKOF path delegates straight
@@ -735,7 +735,7 @@ mod tests {
             S3ZkofArchiveAdapter::new(s3.clone(), fresh_zkof_config(), "tenant-mfst").unwrap();
         let manifest = stub_manifest();
         adapter.upload_manifest(&manifest).expect("upload manifest");
-        // The S3 key must be `archive/manifests/{manifest_id}` —
+        // The S3 key must be `archive/manifests/{manifest_id}`
         // pull it back via list_objects to confirm.
         let keys = s3
             .list_objects(adapter.bucket(), ZKOF_ARCHIVE_MANIFEST_KEY_PREFIX)

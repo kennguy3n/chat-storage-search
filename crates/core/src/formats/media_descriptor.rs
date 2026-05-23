@@ -1,7 +1,7 @@
 //! Media descriptor wire format.
 //!
-//! `docs/PROPOSAL.md §3.2` (the `media_asset` schema sketch) and the
-//! Phase 0 checklist define what the device persists for every media
+//! `docs/DESIGN.md §3.2` (the `media_asset` schema sketch) and the
+//! Checklist define what the device persists for every media
 //! object. The [`MediaDescriptor`] is the CBOR-encoded form of those
 //! columns: it is what the archive segment carries when offloading
 //! a media key, what the manifest carries in `media_references`, and
@@ -21,16 +21,16 @@ use super::serde_bytes_array;
 ///
 /// Field-by-field provenance:
 ///
-/// | Field             | Source                                                  |
+/// | Field | Source |
 /// | ----------------- | ------------------------------------------------------- |
-/// | `asset_id`        | `media_asset.asset_id` (`docs/PROPOSAL.md §3.2`)        |
-/// | `mime_type`       | `media_asset.mime_type`                                 |
-/// | `bytes_total`     | `media_asset.bytes_total`                               |
-/// | `chunk_count`     | `media_asset.chunk_count`                               |
-/// | `merkle_root`     | `media_asset.merkle_root` (32-byte BLAKE3)              |
-/// | `blob_id`         | `media_asset.blob_id` (backend blob identifier; interpretation depends on `storage_sink`) |
+/// | `asset_id` | `media_asset.asset_id` (`docs/DESIGN.md §3.2`) |
+/// | `mime_type` | `media_asset.mime_type` |
+/// | `bytes_total` | `media_asset.bytes_total` |
+/// | `chunk_count` | `media_asset.chunk_count` |
+/// | `merkle_root` | `media_asset.merkle_root` (32-byte BLAKE3) |
+/// | `blob_id` | `media_asset.blob_id` (backend blob identifier; interpretation depends on `storage_sink`) |
 /// | `wrapped_k_asset` | AES-256-KW(`K_local_db` / `K_archive_root` / `K_backup_root`, `K_asset`) |
-/// | `storage_sink`    | Optional `media_asset.storage_sink` tag (see `docs/PROPOSAL.md §5.7`) |
+/// | `storage_sink` | Optional `media_asset.storage_sink` tag (see `docs/DESIGN.md §5.7`) |
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaDescriptor {
     /// Stable identifier for the media asset.
@@ -43,7 +43,7 @@ pub struct MediaDescriptor {
     pub bytes_total: u64,
 
     /// Number of encrypted chunks the asset was split into. Chunk
-    /// sizes follow `docs/PROPOSAL.md §8.1`.
+    /// sizes follow `docs/DESIGN.md §8.1`.
     pub chunk_count: u32,
 
     /// 32-byte BLAKE3 Merkle root over the per-chunk SHA-256 hashes
@@ -59,7 +59,7 @@ pub struct MediaDescriptor {
     /// [`Self::storage_sink`]: a `"kchat_backend"` value means the
     /// blob lives in the KChat blob service, an `"icloud"` value
     /// means it lives in the user's iCloud container, and so on.
-    /// See `docs/PROPOSAL.md §5.7` (tiered media storage).
+    /// See `docs/DESIGN.md §5.7` (tiered media storage).
     pub blob_id: Uuid,
 
     /// `K_asset` wrapped by the appropriate root (one of `K_local_db`,
@@ -73,7 +73,7 @@ pub struct MediaDescriptor {
     /// `None` means the blob lives on the default sink
     /// (`"kchat_backend"`); existing CBOR payloads written before
     /// this field was added decode as `None` thanks to
-    /// `#[serde(default)]`. See `docs/PROPOSAL.md §5.7`.
+    /// `#[serde(default)]`. See `docs/DESIGN.md §5.7`.
     #[serde(default)]
     pub storage_sink: Option<String>,
 }

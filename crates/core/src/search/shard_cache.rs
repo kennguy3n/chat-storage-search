@@ -1,6 +1,6 @@
-//! Phase 8 (2026-05-04 batch 6) — on-device LRU shard cache.
+//! on-device LRU shard cache.
 //!
-//! `docs/PROPOSAL.md §7` and `docs/PHASES.md §Phase 8` call for
+//! `docs/DESIGN.md §7` and call for
 //! avoiding repeated decryption of the same cold index shard
 //! when the user issues two searches in a row that fan out to
 //! the same `(conversation_id, time_bucket)` pair. The cold
@@ -255,7 +255,7 @@ impl Default for ShardCache {
     }
 }
 
-/// Phase 8 (2026-05-04 batch 6) — Task 7: idle-time shard
+/// idle-time shard
 /// cache warming.
 ///
 /// Pre-fetches and decrypts cold shards for the supplied
@@ -269,7 +269,7 @@ impl Default for ShardCache {
 ///
 /// * the resource gate refuses (battery / thermal / metered net),
 /// * `recent` is empty,
-/// * `cache.max_bytes() == 0`.
+/// * `cache.max_bytes == 0`.
 ///
 /// Errors from the cold source are surfaced unchanged so the
 /// caller can decide whether to back off; partial progress made
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn shard_cache_evicts_lru_when_over_budget() {
         // Entry approximate cost: at least the payload (rows),
-        // which dominates `mem::size_of::<FtsRow>()` for non-tiny
+        // which dominates `mem::size_of::<FtsRow>` for non-tiny
         // payloads. Pick a budget that fits exactly two entries.
         let entry_bytes = CachedShard::Text(fake_text_rows(8, 1024)).approximate_bytes();
         let mut cache = ShardCache::new(entry_bytes * 2 + entry_bytes / 2);
@@ -476,7 +476,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — Task 7: warm_shard_cache
+    // warm_shard_cache
     // ---------------------------------------------------------------
 
     use crate::models::resource_gate::{NetworkType, ThermalState};

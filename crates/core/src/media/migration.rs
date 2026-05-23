@@ -1,14 +1,11 @@
-//! Cross-sink media-blob migration — Phase 7, batch-5
-//! (2026-05-04).
+//! Cross-sink media-blob migration.
 //!
-//! `docs/PHASES.md` Phase 7 calls for an iOS↔Android-style media
-//! blob migration: when the user changes their preferred Tier-2
-//! sink (iCloud → Google Drive, Google Drive → ZK Object Fabric,
-//! ZKOF → KChat, etc.) the existing media originals must move
-//! from the old sink to the new one, the local
-//! `media_asset.storage_sink` / `media_asset.blob_id` columns
-//! must update transactionally, and the old blob may optionally
-//! be deleted.
+//! When the user changes their preferred Tier-2 sink (iCloud →
+//! Google Drive, Google Drive → ZK Object Fabric, ZKOF → KChat,
+//! etc.) the existing media originals must move from the old sink
+//! to the new one, the local `media_asset.storage_sink` /
+//! `media_asset.blob_id` columns must update transactionally, and
+//! the old blob may optionally be deleted.
 //!
 //! Workflow:
 //!
@@ -279,7 +276,7 @@ impl MigrationProgress for NoopMigrationProgress {}
 /// Build a migration plan for moving every `media_asset` whose
 /// `storage_sink` is `source_sink` to `target_sink`.
 ///
-/// Returns an empty plan when `source_sink == target_sink` —
+/// Returns an empty plan when `source_sink == target_sink`
 /// the operation is a no-op, not an error.
 pub fn plan_media_migration(
     db: &LocalStoreDb,
@@ -298,7 +295,7 @@ pub fn plan_media_migration(
     for asset in assets {
         let mut root = [0u8; 32];
         if asset.merkle_root.len() != 32 {
-            // Skip rows with a corrupted merkle_root — Phase 7
+            // Skip rows with a corrupted merkle_root
             // contract is "best-effort migration"; the local
             // store schema enforces the 32-byte length on
             // insert so this branch is defensive only.
@@ -384,11 +381,11 @@ fn migrate_one<H: MigrationDbHandle>(
         Err(e) => return MigrationItemOutcome::Failed(format!("get_media_asset: {e:?}")),
     }
     // 1. Read every ciphertext chunk from the source sink and
-    //    feed it into a streaming BLAKE3 hasher. We retain the
-    //    chunk buffers (the target sink needs them as a
-    //    `&[&[u8]]`) but deliberately do not build a single
-    //    concatenated copy — a 1 GiB media asset would otherwise
-    //    need ~2 GiB peak RSS instead of ~1 GiB.
+    // feed it into a streaming BLAKE3 hasher. We retain the
+    // chunk buffers (the target sink needs them as a
+    // `&[&[u8]]`) but deliberately do not build a single
+    // concatenated copy — a 1 GiB media asset would otherwise
+    // need ~2 GiB peak RSS instead of ~1 GiB.
     let mut chunk_buffers: Vec<Vec<u8>> = Vec::with_capacity(item.chunk_count as usize);
     let mut transit_hasher = blake3::Hasher::new();
     let source_ref = MediaBlobReference {
@@ -430,8 +427,8 @@ fn migrate_one<H: MigrationDbHandle>(
     }
 
     // 3. Read the chunks back from the target and stream them
-    //    through a fresh BLAKE3 hasher — same memory rationale
-    //    as step 1; we never build a concatenated copy.
+    // through a fresh BLAKE3 hasher — same memory rationale
+    // as step 1; we never build a concatenated copy.
     let mut roundtrip_hasher = blake3::Hasher::new();
     for chunk_idx in 0..item.chunk_count {
         match target.fetch_media_chunk(&new_ref, chunk_idx) {
@@ -825,11 +822,11 @@ mod tests {
         p.on_run_completed(&MigrationReport::default());
     }
 
-    /// Regression for the "DB lock held during sink I/O" finding —
+    /// Regression for the "DB lock held during sink I/O" finding
     /// the production migration path uses [`LockingDbHandle`] over
     /// `Mutex<LocalStoreDb>` and must release the DB lock during
     /// every chunk-fetch / chunk-upload / roundtrip-verify phase.
-    /// We assert this with a sink that grabs `try_lock()` on the
+    /// We assert this with a sink that grabs `try_lock` on the
     /// shared mutex while it's servicing a chunk fetch — if the
     /// executor were holding the lock, `try_lock` would fail.
     #[test]

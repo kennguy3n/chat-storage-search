@@ -1,12 +1,12 @@
-//! `offload` module — Phase 3 storage-pressure enforcement.
+//! `offload` module — storage-pressure enforcement.
 //!
-//! Phase 3 of `docs/PHASES.md` and `docs/PROPOSAL.md §5.4` lay out
+//! Of and `docs/DESIGN.md §5.4` lay out
 //! how the local store keeps itself within its storage budget:
 //!
 //! * [`budget`] — observe storage usage, compare against a
 //!   declared budget, surface the resulting [`PressureLevel`].
 //! * [`scoring`] — score individual eviction candidates per the
-//!   PROPOSAL §5.4 formula.
+//!   DESIGN.md §5.4 formula.
 //! * [`eviction`] — turn a sorted list of candidates into an
 //!   [`EvictionPlan`] and execute it via state-machine
 //!   transitions on the local store.

@@ -1,19 +1,19 @@
-//! Phase-4 skeleton-first restore pipeline.
+//! skeleton-first restore pipeline.
 //!
 //! Orchestrates the priority-ordered restore strategy described
-//! in `docs/PROPOSAL.md §11` and `docs/PHASES.md` Phase 4. The
+//! in `docs/DESIGN.md §11`. The
 //! pipeline runs the steps sequentially:
 //!
-//! 1. [`RestorePipeline::restore_conversation_list`] —
+//! 1. [`RestorePipeline::restore_conversation_list`]
 //!    extract conversation metadata from the latest manifest.
-//! 2. [`RestorePipeline::restore_timeline_skeletons`] —
+//! 2. [`RestorePipeline::restore_timeline_skeletons`]
 //!    decrypt backup segments, materialise [`SkeletonRow`] rows
 //!    with `body_state = RemoteArchiveOnly`.
-//! 3. [`RestorePipeline::restore_search_index_shards`] —
-//!    placeholder; Phase 4 wires shard segments in a follow-up.
-//! 4. [`RestorePipeline::restore_recent_bodies`] —
+//! 3. [`RestorePipeline::restore_search_index_shards`]
+//!    placeholder; wires shard segments in a follow-up.
+//! 4. [`RestorePipeline::restore_recent_bodies`]
 //!    decrypt bodies for messages within a recency window.
-//! 5. [`RestorePipeline::enable_lazy_media_restore`] —
+//! 5. [`RestorePipeline::enable_lazy_media_restore`]
 //!    flip restore state to `MediaLazyRestoreEnabled`; media
 //!    downloads on demand.
 //!
@@ -86,7 +86,7 @@ pub struct SealedSearchShardEntry<'a> {
     /// Shard frame as carried in the backup manifest.
     pub shard: &'a SearchIndexShard,
     /// The `K_*_index_shard(shard_id)` the shard was sealed
-    /// under. Phase 5 will move this into a sealed
+    /// under. will move this into a sealed
     /// `wrapped_k_shard` field on the manifest entry; the
     /// pipeline does not derive the key itself today.
     pub k_shard: &'a KeyMaterial,
@@ -184,7 +184,7 @@ impl RestorePipeline {
             .collect()
     }
 
-    /// Step 3: search index shards. Phase-4 no-input variant —
+    /// Step 3: search index shards. no-input variant
     /// preserved so the orchestrator's old call sites do not
     /// fail to compile when shard segments are not yet attached
     /// to the manifest. New callers should prefer
@@ -276,8 +276,8 @@ impl RestorePipeline {
                     });
                 }
                 IndexType::Vector | IndexType::Media | IndexType::Bloom => {
-                    // Vector / media shards are wired in Phase 5;
-                    // bloom shards (Phase 8) are consumed by the
+                    // Vector / media shards are wired in ;
+                    // bloom shards are consumed by the
                     // prefetcher rather than restored into a
                     // SQLite table. Count them as 0-row entries so
                     // the orchestrator's progress reporting still

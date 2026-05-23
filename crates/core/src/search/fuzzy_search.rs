@@ -1,13 +1,13 @@
 //! Fuzzy token indexer.
 //!
-//! `docs/PROPOSAL.md §3.4` and `docs/PHASES.md` Phase 5 spec the
+//! `docs/DESIGN.md §3.4` and spec the
 //! fuzzy index: a per-row token table (`search_fuzzy`) carrying
 //! script-tagged n-grams (trigrams for alphabetic / abugida / Hangul,
 //! bigrams for logographic CJK). Trigram lookup against the index
 //! gives approximate matching that FTS5 cannot do directly because
 //! FTS5 has no edit-distance lookup.
 //!
-//! This module is a foundation for Phase 5 — the encrypted shard
+//! This module is a foundation for — the encrypted shard
 //! / cold-bucket fan-out lands later. What lives here today:
 //!
 //! * [`FuzzyToken`] — one (token, script) pair.
@@ -161,7 +161,7 @@ impl<'a> FuzzySearchEngine<'a> {
     /// message's token set covers — a query of three trigrams that
     /// matches two of them on a row scores `0.6667`.
     ///
-    /// Per Phase 5, Task 2 the matcher is *script-aware*: the
+    /// Per the matcher is *script-aware*: the
     /// query is split into per-script token buckets and a row is
     /// only accepted if at least one of its per-script overlap
     /// fractions clears
@@ -218,7 +218,7 @@ impl<'a> FuzzySearchEngine<'a> {
             let mut total_matched: u32 = 0;
             // A row is accepted if ANY per-script fraction clears
             // its threshold. This preserves cross-script fan-out
-            // — a row that hits perfectly on the Latin half of a
+            // a row that hits perfectly on the Latin half of a
             // mixed query still surfaces, just with a lower
             // overall score because the CJK contribution is zero.
             let mut accepted = false;
@@ -404,7 +404,7 @@ mod tests {
     fn empty_text_produces_no_tokens() {
         assert!(FuzzyTokenizer::generate_tokens("").is_empty());
         // Whitespace / punctuation / digits alone produce no tokens
-        // — the entire input becomes a Common run that
+        // the entire input becomes a Common run that
         // `segment_by_script` returns as `(Unknown, …)`.
         assert!(FuzzyTokenizer::generate_tokens("   ").is_empty());
         assert!(FuzzyTokenizer::generate_tokens("!!! 12345").is_empty());
@@ -552,7 +552,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 5, Task 2: per-script overlap thresholding
+    // per-script overlap thresholding
     // -----------------------------------------------------------
 
     #[test]

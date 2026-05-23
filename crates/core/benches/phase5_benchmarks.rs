@@ -1,6 +1,6 @@
-//! Phase-5 cold-shard latency benchmarks.
+//! cold-shard latency benchmarks.
 //!
-//! `docs/PHASES.md §Phase 5` decision gate: "Search across
+//! The decision gate: "Search across
 //! offloaded shards within ≤ 1.5 s p95 over Wi-Fi for a one-month
 //! bucket". This bench suite exercises the production seal /
 //! open / search path end-to-end so the criterion histograms can
@@ -49,8 +49,8 @@ use kchat_core::{Error, SearchQuery, SearchScope};
 const BENCH_KEY: [u8; 32] = [0x55; 32];
 const BUCKET: &str = "2026-04";
 const NEEDLE: &str = "lighthouse";
-/// One month's worth of messages — matches the Phase 5 budget
-/// "one-month bucket" quoted in `PHASES.md`.
+/// One month's worth of messages — matches the budget
+/// "one-month bucket" quoted in ``.
 const SHARD_ROWS: usize = 1_000;
 /// Simulated round-trip transport latency for the
 /// "combined local + cold" path. Treat as p50 Wi-Fi.
@@ -358,7 +358,7 @@ fn bench_combined_local_plus_cold_search(c: &mut Criterion) {
 // phase5_p95_multilingual — text shard across CJK / Arabic /
 // Cyrillic / Latin corpora.
 //
-// Phase 5 (2026-05-04 final batch) — Task 13: device-matrix p95
+// device-matrix p95
 // gate. The bench is sized so each subgroup (`bench_function`)
 // produces an independent histogram, which lets a per-script p95
 // regression be diffed against the

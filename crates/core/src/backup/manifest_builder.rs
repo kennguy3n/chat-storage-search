@@ -1,4 +1,4 @@
-//! Phase-4 backup manifest chain builder.
+//! backup manifest chain builder.
 //!
 //! Mirror of
 //! [`crate::archive::manifest_builder::build_archive_manifest`] for
@@ -20,7 +20,7 @@
 //! `merkle_root` is the BLAKE3 of every segment's plaintext
 //! `merkle_root` concatenated in the order the orchestrator
 //! supplied — the field name is "merkle root" by convention but is
-//! computed as a flat hash, mirroring §6.3 of `docs/PROPOSAL.md`.
+//! computed as a flat hash, mirroring §6.3 of `docs/DESIGN.md`.
 //!
 //! The output is a [`SealedBackupManifest`]: the signed manifest
 //! plus its AEAD ciphertext, ready to upload alongside the
@@ -78,7 +78,7 @@ pub struct BackupManifestBuildRequest<'a> {
     /// Sealed segments to commit under this manifest.
     pub segments: &'a [BuiltBackupSegment],
     /// Search index shards committed under this manifest. Empty
-    /// today — Phase 4 will wire shard-segment encoding in a
+    /// today — will wire shard-segment encoding in a
     /// later task.
     pub search_index_shards: Vec<ManifestShardRef>,
     /// Media object references committed under this manifest.
@@ -174,7 +174,7 @@ pub fn build_backup_manifest(
 
 /// AEAD AAD for a backup manifest seal:
 /// `BACKUP_MANIFEST_MAGIC || manifest_id(16) || generation(8 LE) ||
-///  merkle_root(32) || device_id(UTF-8)`.
+/// merkle_root(32) || device_id(UTF-8)`.
 pub fn build_manifest_aad(
     manifest_id: &Uuid,
     generation: u64,

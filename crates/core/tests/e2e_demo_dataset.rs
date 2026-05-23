@@ -3,7 +3,7 @@
 //! sweep (`crates/core/tests/benchmark_baseline.rs`).
 //!
 //! The dataset shape mirrors the "comprehensive sample" called out
-//! in `docs/PROPOSAL.md §12` — five conversations spanning a
+//! in `docs/DESIGN.md §12` — five conversations spanning a
 //! personal chat, a group chat, a work channel, a multilingual
 //! group, and a media-heavy thread; messages drawn from twelve
 //! scripts (English, Russian, Chinese, Japanese, Arabic, Thai,
@@ -32,7 +32,7 @@ use uuid::Uuid;
 /// Twelve corpora — same shape as
 /// [`crate::tests::large_scale`]'s `CORPORA`. Order matters: the
 /// dataset generators round-robin through the slice so the first
-/// `CORPORA.len()` messages cover every script before any one
+/// `CORPORA.len` messages cover every script before any one
 /// language repeats.
 pub const CORPORA: &[(&str, &str)] = &[
     (

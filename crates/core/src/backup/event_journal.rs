@@ -1,9 +1,9 @@
-//! Phase-4 backup event journal.
+//! backup event journal.
 //!
 //! Mirror of [`crate::archive::event_journal::ArchiveEventJournal`]
 //! that feeds the **backup** segment builder rather than the
 //! per-conversation archive pipeline. The two journals carry the
-//! same event types but are advanced by independent cursors —
+//! same event types but are advanced by independent cursors
 //! the personal archive and the cloud backup are sealed with
 //! different keys (`K_archive_*` vs `K_backup_*`) and shipped on
 //! independent schedules.
@@ -13,8 +13,8 @@
 //! builder). Both tables are defined in
 //! [`crate::local_store::schema::SCHEMA_SQL`].
 //!
-//! See `docs/PROPOSAL.md §6.4` (backup event taxonomy) and
-//! `docs/PHASES.md` Phase 4 for context.
+//! See `docs/DESIGN.md §6.4` (backup event taxonomy) and
+//! for context.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::Error;
 
 /// Type tag for a backup event. Matches the canonical set in
-/// `docs/PROPOSAL.md §6.4`. Adding a variant is a wire-format
+/// `docs/DESIGN.md §6.4`. Adding a variant is a wire-format
 /// change because the segment builder dispatches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,7 +103,7 @@ pub struct BackupEvent {
 /// AUTOINCREMENT `event_seq` the row was assigned.
 pub type BackupEventSeq = i64;
 
-/// Phase-4 backup event journal.
+/// backup event journal.
 ///
 /// Stateless reader / writer over an existing SQLCipher
 /// [`Connection`]. Borrowing the connection rather than owning
@@ -243,7 +243,7 @@ impl BackupEventJournal {
     /// `event_seq`. Idempotent for a given value.
     ///
     /// A non-monotonic update (`new_cursor < current`) is rejected
-    /// — moving the cursor backwards would re-publish events the
+    /// moving the cursor backwards would re-publish events the
     /// segment builder already emitted.
     pub fn advance_cursor(
         &self,
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn read_skips_legacy_event_types_not_in_taxonomy() {
-        // Mirror the pre-Phase-4 wiring that wrote
+        // Mirror the pre-wiring that wrote
         // `"outbox_pending"` / `"outbox_sent"` strings to the
         // journal directly (see `MessagePersister::persist_outbox_entry_inner`).
         // The typed journal must skip them rather than blow up.

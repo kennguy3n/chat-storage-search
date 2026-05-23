@@ -1,6 +1,6 @@
 //! Hybrid Ed25519 + ML-DSA-65 manifest signing.
 //!
-//! `docs/PROPOSAL.md §2.1` defines the device signing key used to
+//! `docs/DESIGN.md §2.1` defines the device signing key used to
 //! sign every backup and archive manifest in the chain. To maintain
 //! security under both classical and post-quantum adversaries we
 //! sign each canonical manifest payload **twice**:
@@ -63,7 +63,7 @@ pub struct HybridSigningKey {
 impl HybridSigningKey {
     /// Construct a hybrid key from already-existing component keys.
     /// The platform layer (Keychain / Keystore / DPAPI) is the
-    /// canonical home for these — see `docs/PROPOSAL.md §2.1`.
+    /// canonical home for these — see `docs/DESIGN.md §2.1`.
     ///
     /// Both ML-DSA components must come from the same FIPS 204
     /// key-gen run; the verifying key is taken on faith here
@@ -194,7 +194,7 @@ impl HybridVerifyingKey {
     }
 
     /// Verify **both** signatures over the same payload. Returns
-    /// `Ok(())` only if both verify; otherwise reports which leg
+    /// `Ok()` only if both verify; otherwise reports which leg
     /// failed via [`HybridSignatureFailure`].
     pub fn verify_payload(
         &self,

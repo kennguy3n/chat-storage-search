@@ -1,7 +1,7 @@
 //! Media chunker: split, AEAD-seal, and verify media plaintext for the
 //! KChat-internal blob path.
 //!
-//! `docs/PROPOSAL.md §8.1` (chunk sizes), `§8.2` (size-class padding),
+//! `docs/DESIGN.md §8.1` (chunk sizes), `§8.2` (size-class padding),
 //! and `§8.3` (per-chunk AAD layout) are the authoritative sources for
 //! the contracts implemented here. This module does *not* cover the ZK
 //! Object Fabric Pattern C path — that lives in
@@ -42,7 +42,7 @@ use crate::Error;
 /// (`client_sdk.DefaultChunkSize` from
 /// `kennguy3n/zk-object-fabric/encryption/client_sdk/sdk.go`) so the
 /// KChat-internal and ZK Object Fabric paths share a chunk granularity
-/// even though their AAD schemes differ. See `docs/PROPOSAL.md §8.1`
+/// even though their AAD schemes differ. See `docs/DESIGN.md §8.1`
 /// and `§8.4`.
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -52,7 +52,7 @@ const SIZE_CLASS_PREFIX_LEN: usize = 8;
 
 /// Size classes (in bytes) used by [`pad_to_size_class`].
 ///
-/// `docs/PROPOSAL.md §8.2` enumerates 4 KB through 256 MB; we extend the
+/// `docs/DESIGN.md §8.2` enumerates 4 KB through 256 MB; we extend the
 /// ladder by 1 KiB on the low end (small text-like attachments / voice
 /// notes) and 1 GiB on the high end (long-form video) so the ladder
 /// covers the full media-blob size range without introducing a
@@ -106,8 +106,8 @@ pub struct ChunkedMedia {
     pub chunk_count: u32,
 }
 
-/// Round `plaintext.len() + 8` up to the next size class from the
-/// table in `docs/PROPOSAL.md §8.2` and return the padded buffer.
+/// Round `plaintext.len + 8` up to the next size class from the
+/// table in `docs/DESIGN.md §8.2` and return the padded buffer.
 ///
 /// Layout: `[8-byte BE original-length][plaintext][zero padding]`.
 /// The 8-byte prefix is what [`unpad_from_size_class`] uses to
@@ -186,7 +186,7 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 
 /// Chunk `plaintext` into `chunk_size`-byte pieces (last may be
 /// shorter), AEAD-seal every chunk under `k_asset` with the per-chunk
-/// AAD from `docs/PROPOSAL.md §8.3`, and return the sealed chunks plus
+/// AAD from `docs/DESIGN.md §8.3`, and return the sealed chunks plus
 /// the BLAKE3 Merkle root over the (padded) plaintext.
 ///
 /// `blob_id` is the 16-byte identifier mixed into the AAD; the caller

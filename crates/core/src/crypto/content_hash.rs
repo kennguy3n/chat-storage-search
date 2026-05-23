@@ -1,7 +1,7 @@
 //! BLAKE3 content hashing.
 //!
 //! BLAKE3 is the canonical content hash for KChat: it feeds Pattern
-//! C convergent DEK derivation (`docs/PROPOSAL.md §3.14`,
+//! C convergent DEK derivation (`docs/DESIGN.md §3.14`,
 //! `§8.4`) and the per-blob Merkle root in the KChat-internal AAD
 //! construction (`§8.3`). One-shot and streaming variants produce
 //! the same digest on equivalent inputs.

@@ -1,7 +1,7 @@
-//! `backup` — Phase 4 backup pipeline.
+//! `backup` — backup pipeline.
 //!
-//! See `docs/PROPOSAL.md §6` (cloud backup) and `docs/PHASES.md`
-//! Phase 4 for the high-level design. The module is structured
+//! See `docs/DESIGN.md §6` (cloud backup) and
+//! For the high-level design. The module is structured
 //! around the same pattern the archive pipeline uses on
 //! [`crate::archive`]:
 //!

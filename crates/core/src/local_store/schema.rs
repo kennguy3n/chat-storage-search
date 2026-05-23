@@ -8,7 +8,7 @@
 //!
 //! The Rust structs in this module are 1:1 with the schema columns,
 //! using the typed enums from [`super::state_machines`] for state
-//! columns. They are **plain data carriers** — Phase 1 layers the
+//! columns. They are **plain data carriers** — layers the
 //! actual `rusqlite::Connection` interactions, prepared statements,
 //! and migrations on top.
 //!
@@ -43,21 +43,21 @@ CREATE TABLE IF NOT EXISTS conversation (
     muted             INTEGER NOT NULL DEFAULT 0,
     last_message_id   TEXT,
     last_activity_ms  INTEGER NOT NULL,
-    -- Phase 8 conversation hierarchy (`docs/PROPOSAL.md §11`).
-    -- `conversation_type` discriminates the conversation shape
-    -- (`'dm'`, `'group'`, `'channel'`); `scope` distinguishes
-    -- the consumer (`'b2c'`) from enterprise (`'b2b'`)
-    -- conversations. The remaining columns are foreign keys
-    -- into the (future) `tenant`, `community`, and `domain`
-    -- tables — empty strings encode "not part of a hierarchy"
-    -- so legacy rows continue to round-trip without migration.
+ -- conversation hierarchy (`docs/DESIGN.md §11`).
+ -- `conversation_type` discriminates the conversation shape
+ -- (`'dm'`, `'group'`, `'channel'`); `scope` distinguishes
+ -- the consumer (`'b2c'`) from enterprise (`'b2b'`)
+ -- conversations. The remaining columns are foreign keys
+ -- into the (future) `tenant`, `community`, and `domain`
+ -- tables — empty strings encode "not part of a hierarchy"
+ -- so legacy rows continue to round-trip without migration.
     conversation_type TEXT NOT NULL DEFAULT 'dm',
     scope             TEXT NOT NULL DEFAULT 'b2c',
     tenant_id         TEXT NOT NULL DEFAULT '',
     community_id      TEXT NOT NULL DEFAULT '',
     domain_id         TEXT NOT NULL DEFAULT ''
 );
--- Phase 8 hierarchy filter indexes. Each one matches one
+-- hierarchy filter indexes. Each one matches one
 -- `SearchTarget` variant in `crate::SearchTarget` so the
 -- query engine's resolve-target step can issue a single
 -- index-scan SELECT per non-`Global` target.
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS media_asset (
     chunk_count       INTEGER NOT NULL,
     merkle_root       BLOB NOT NULL,
     blob_id           TEXT NOT NULL,
-    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- PROPOSAL.md §5.7
+    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- DESIGN.md §5.7
 );
 
 -- Multilingual full-text search
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS media_search_index (
 -- `conversation_id` / `message_id` discriminators; the backup
 -- segment builder dispatches on `event_type` and conversation
 -- id when packing an incremental segment (see
--- `docs/PHASES.md` Phase 4 — backup segments).
+-- — backup segments).
 CREATE TABLE IF NOT EXISTS backup_event_journal (
     event_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type      TEXT NOT NULL,
@@ -171,23 +171,23 @@ CREATE TABLE IF NOT EXISTS archive_segment_map (
     time_bucket          TEXT NOT NULL,     -- e.g. '2026-04'
     segment_type         TEXT NOT NULL,
     blob_id              TEXT NOT NULL,
-    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- PROPOSAL.md §10.1
+    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- DESIGN.md §10.1
     merkle_root          BLOB NOT NULL,
     state                TEXT NOT NULL,     -- not_archived..archive_compacted
-    -- Phase 8: per-tenant archive segments. Empty string for
-    -- legacy / b2c rows. Mirrors `conversation.tenant_id` so
-    -- the future `SearchTarget::Tenant` resolver can scan
-    -- segments for a tenant in a single covering index scan.
+ -- per-tenant archive segments. Empty string for
+ -- legacy / b2c rows. Mirrors `conversation.tenant_id` so
+ -- the future `SearchTarget::Tenant` resolver can scan
+ -- segments for a tenant in a single covering index scan.
     tenant_id            TEXT NOT NULL DEFAULT ''
 );
--- Phase 8 covering index for `SearchTarget::Tenant` resolution.
+-- covering index for `SearchTarget::Tenant` resolution.
 -- The `(tenant_id, time_bucket)` shape matches the cold-shard
 -- prefetch SELECT issued by `crate::search::shard_prefetch`.
 CREATE INDEX IF NOT EXISTS idx_asm_tenant_bucket
     ON archive_segment_map(tenant_id, time_bucket);
 
 -- Per-archive event log feeding the archive segment builder
--- (`docs/PHASES.md` Phase 3). Mirrors `backup_event_journal` but
+--. Mirrors `backup_event_journal` but
 -- carries the archive-side event types (message_received,
 -- message_edited, message_deleted, media_received, …) and a
 -- single-row cursor that the segment builder advances after each
@@ -236,7 +236,7 @@ pub const TABLES: &[&str] = &[
 // Forward-only migrations
 // ---------------------------------------------------------------------------
 
-/// SQL applied by migration `2`. Adds the Phase-5 backup
+/// SQL applied by migration `2`. Adds the backup
 /// orchestration tables (`backup_manifest_chain` and
 /// `backup_segment_ledger`) that promote the previously in-memory
 /// state owned by [`crate::core_impl::CoreImpl`] to durable
@@ -248,7 +248,7 @@ pub const TABLES: &[&str] = &[
 /// (`crate::local_store::db::run_migrations`) finishes — the v1 →
 /// v2 fixture test in `db.rs` pins that invariant.
 pub const MIGRATION_V2_SQL: &str = r#"
--- Phase 5 (2026-05-04 hardening) — backup manifest chain.
+-- backup manifest chain.
 --
 -- A single-row table that records the latest manifest produced
 -- by `KChatCore::run_incremental_backup` / `compact_backup`. The
@@ -258,7 +258,7 @@ pub const MIGRATION_V2_SQL: &str = r#"
 --
 -- `manifest_cbor` is the canonical CBOR encoding (via `ciborium`) of
 -- `kchat_core::formats::manifest::BackupManifest`. Stored as a
--- BLOB so it round-trips losslessly across version upgrades —
+-- BLOB so it round-trips losslessly across version upgrades
 -- the encoder is pinned in `crate::formats::manifest`.
 CREATE TABLE IF NOT EXISTS backup_manifest_chain (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -267,7 +267,7 @@ CREATE TABLE IF NOT EXISTS backup_manifest_chain (
     updated_at_ms   INTEGER NOT NULL
 );
 
--- Phase 5 (2026-05-04 hardening) — backup segment ledger.
+-- backup segment ledger.
 --
 -- One row per sealed `BuiltBackupSegment` the orchestrator
 -- currently knows about. `compact_backup` reads this ledger,
@@ -329,7 +329,7 @@ pub const LATEST_USER_VERSION: i32 = 2;
 
 /// `kind` discriminator for `message_skeleton.kind`.
 ///
-/// `docs/PROPOSAL.md §3.2` enumerates the three top-level message
+/// `docs/DESIGN.md §3.2` enumerates the three top-level message
 /// kinds. Adding a fourth is a wire-format change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -354,7 +354,7 @@ impl MessageKind {
 }
 
 /// Typed value of `archive_segment_map.storage_backend`
-/// (`docs/PROPOSAL.md §10.1`).
+/// (`docs/DESIGN.md §10.1`).
 ///
 /// The SQL column is a free-form `TEXT NOT NULL DEFAULT
 /// 'kchat_backend'`, but every row should be a member of this enum.
@@ -384,7 +384,7 @@ pub enum StorageBackend {
 
 impl StorageBackend {
     /// Canonical snake_case representation persisted to the SQL
-    /// column. The values are pinned by `docs/PROPOSAL.md §10.1`
+    /// column. The values are pinned by `docs/DESIGN.md §10.1`
     /// and the schema column default in [`SCHEMA_SQL`].
     pub fn as_str(self) -> &'static str {
         match self {
@@ -452,7 +452,7 @@ pub struct Conversation {
     pub last_message_id: Option<String>,
     /// Wall-clock millisecond timestamp of the most recent activity.
     pub last_activity_ms: i64,
-    // ----- Phase 8 conversation-hierarchy columns. ----------------------
+    // ----- conversation-hierarchy columns. ----------------------
     //
     // `#[serde(default)]` lets legacy on-wire payloads continue
     // to deserialize: a missing field decodes as the type's
@@ -485,7 +485,7 @@ fn default_scope() -> String {
 }
 
 impl Conversation {
-    /// Build a Phase-0-style conversation row with the legacy
+    /// Build a legacy-style conversation row with the legacy
     /// hierarchy defaults. Existing call sites that don't
     /// know about [`Self::tenant_id`] / [`Self::community_id`]
     /// / [`Self::domain_id`] should keep using this helper so
@@ -563,7 +563,7 @@ pub struct MessageBody {
     /// Foreign key into `message_skeleton`.
     pub message_id: String,
     /// UTF-8 plaintext. May interleave scripts (per
-    /// `docs/PROPOSAL.md §3.3`). `None` for media-only messages.
+    /// `docs/DESIGN.md §3.3`). `None` for media-only messages.
     pub text_content: Option<String>,
     /// BCP-47 detected language, best-effort.
     pub detected_language: Option<String>,
@@ -594,12 +594,12 @@ pub struct MediaAsset {
     /// **ciphertext** chunks.
     pub merkle_root: Vec<u8>,
     /// Backend blob identifier. The interpretation depends on
-    /// [`Self::storage_sink`] (see `docs/PROPOSAL.md §5.7`).
+    /// [`Self::storage_sink`] (see `docs/DESIGN.md §5.7`).
     pub blob_id: String,
     /// Storage sink the media blob lives on (`"kchat_backend"`,
     /// `"icloud"`, `"google_drive"`, `"zk_object_fabric"`).
     /// Defaults to `"kchat_backend"` for legacy rows. See
-    /// `docs/PROPOSAL.md §5.7` (tiered media storage).
+    /// `docs/DESIGN.md §5.7` (tiered media storage).
     pub storage_sink: String,
 }
 
@@ -634,11 +634,11 @@ pub struct ArchiveSegmentMapEntry {
     /// Segment-type tag (`"message_delta"`, `"timeline_skeleton"`, …).
     pub segment_type: String,
     /// Backend blob identifier. The interpretation depends on
-    /// [`Self::storage_backend`] (see `docs/PROPOSAL.md §10.1`).
+    /// [`Self::storage_backend`] (see `docs/DESIGN.md §10.1`).
     pub blob_id: String,
     /// Storage backend the segment lives on (`"kchat_backend"`,
     /// `"zk_object_fabric"`). Defaults to `"kchat_backend"` for
-    /// legacy rows. See `docs/PROPOSAL.md §10.1` (archive backend
+    /// legacy rows. See `docs/DESIGN.md §10.1` (archive backend
     /// routing).
     pub storage_backend: String,
     /// 32-byte BLAKE3 Merkle root over the ciphertext chunks.
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn schema_sql_uses_icu_tokenizer() {
-        // PROPOSAL.md §3.3: ICU is the primary tokenizer. The schema
+        // DESIGN.md §3.3: ICU is the primary tokenizer. The schema
         // string must hard-code it — a build that wants the
         // `unicode61` fallback substitutes the literal in
         // `search::tokenizer::FTS5_TOKENIZE_UNICODE61`.
@@ -946,8 +946,8 @@ mod tests {
 
     #[test]
     fn schema_sql_columns_match_struct_fields_for_archive_segment_map() {
-        // 9 columns post-Phase-8 (`tenant_id` added on
-        // 2026-05-04): segment_id, conversation_id, time_bucket,
+        // 9 columns post-(`tenant_id` added on
+        // segment_id, conversation_id, time_bucket,
         // segment_type, blob_id, storage_backend, merkle_root,
         // state, tenant_id.
         assert_eq!(

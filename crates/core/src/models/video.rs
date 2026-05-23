@@ -1,7 +1,7 @@
-//! On-device video keyframe-sampling seam — Phase 6, Task 3 of
-//! the 2026-05-04 batch.
+//! On-device video keyframe-sampling seam — of
+//! this release.
 //!
-//! `docs/PROPOSAL.md §7.6` describes the video-search pipeline:
+//! `docs/DESIGN.md §7.6` describes the video-search pipeline:
 //! decode a video attachment into a small set of representative
 //! keyframes, embed each via [`crate::models::clip::ImageEmbedder`]
 //! (MobileCLIP-S2), and write the best embedding into
@@ -14,7 +14,7 @@
 //! ffmpeg on Windows / Linux). This module is the object-safe
 //! Rust seam the platform glue plugs into.
 //!
-//! Like every other Phase 6 ML seam (`TextEmbedder`,
+//! Like every other ML seam (`TextEmbedder`,
 //! `ImageEmbedder`, `OcrBridge`, `WhisperTranscriber`,
 //! `DocumentExtractor`), the trait is intentionally stateless
 //! and synchronous so the same instance can be shared across
@@ -51,13 +51,13 @@ pub struct Keyframe {
     pub mime_type: String,
 }
 
-/// Alias matching the Phase 6 task-spec name. Both names are
+/// Alias matching the task-spec name. Both names are
 /// accepted on the public surface so existing callers continue
 /// to compile and new callers can use the spec name verbatim.
 pub use Keyframe as KeyframeData;
 
 /// On-device video keyframe-sampling seam used by media ingest
-/// (`docs/PROPOSAL.md §7.6`, Phase 6).
+/// (`docs/DESIGN.md §7.6`, ).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash a real platform sampler inside
@@ -107,7 +107,7 @@ impl VideoKeyframeSampler for NoopVideoKeyframeSampler {
 /// reproducible set of synthetic keyframes from a BLAKE3 hash
 /// of `(mime_type, video_data)`.
 ///
-/// Used by the Phase 6 unit / integration tests to stand in for
+/// Used by the unit / integration tests to stand in for
 /// a real AVFoundation / MediaCodec / ffmpeg sampler. The
 /// "image" payload of each keyframe is the BLAKE3 hash of
 /// `(input_hash, frame_index)` — small, deterministic, and
@@ -143,7 +143,7 @@ impl VideoKeyframeSampler for MockVideoKeyframeSampler {
         let input_hash = hasher.finalize();
 
         // Emit min(max_frames, 5) frames so the mock matches
-        // the PROPOSAL §7.6 default fan-out without overshooting
+        // the DESIGN.md §7.6 default fan-out without overshooting
         // when the caller asks for a smaller cap.
         let count = max_frames.min(5);
         let span_ms = (video_data.len() as u64).saturating_mul(10).max(40);
@@ -250,10 +250,10 @@ mod tests {
 
     #[test]
     fn video_keyframe_sampler_noop_returns_not_implemented() {
-        // Phase 6, Task 1 (2026-05-04 batch). Same surface as
+        // Same surface as
         // `noop_video_sampler_returns_not_implemented` above but
-        // pinned under the canonical task-spec test name so
-        // grepping across docs and source agrees.
+        // pinned under the canonical test name so grepping across
+        // docs and source agrees.
         let s = NoopVideoKeyframeSampler;
         let err = s.extract_keyframes(b"unused", "video/mp4", 1).unwrap_err();
         assert!(matches!(
@@ -264,10 +264,9 @@ mod tests {
 
     #[test]
     fn mock_keyframe_sampler_returns_configured_frames() {
-        // Phase 6, Task 1 (2026-05-04 batch). Asserts the mock
-        // honours `max_frames`, populates `frame_index`
-        // monotonically from 0, and produces deterministic
-        // bytes per `(input, frame_index)`.
+        // Asserts the mock honours `max_frames`, populates
+        // `frame_index` monotonically from 0, and produces
+        // deterministic bytes per `(input, frame_index)`.
         let s = MockVideoKeyframeSampler;
         let frames = s
             .extract_keyframes(b"sample", "video/mp4", 4)

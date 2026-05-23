@@ -1,5 +1,5 @@
 //! Integration tests for the in-process background scheduler
-//! (Phase 7, batch-5 — 2026-05-04).
+//!.
 //!
 //! These tests exercise the public `BackgroundScheduler` trait
 //! surface end-to-end: schedule a handler, wait for it to fire,

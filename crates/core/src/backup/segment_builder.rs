@@ -1,4 +1,4 @@
-//! Phase-4 backup segment builder.
+//! backup segment builder.
 //!
 //! Mirror of [`crate::archive::segment_builder::ArchiveSegmentBuilder`]
 //! that drains the **backup** event journal and emits AEAD-sealed
@@ -55,7 +55,7 @@ pub struct BackupSegmentBuildRequest {
     /// Discriminant for the encrypted payload — pinned to a
     /// variant of [`SegmentType`] so the segment frame
     /// (`crate::formats::BackupSegmentFrame`) can carry it
-    /// verbatim. See `docs/PROPOSAL.md §6.2`.
+    /// verbatim. See `docs/DESIGN.md §6.2`.
     pub segment_type: SegmentType,
 }
 
@@ -90,7 +90,7 @@ pub struct BackupSegmentPayload {
     pub events: Vec<BackupEvent>,
 }
 
-/// Phase-4 backup segment builder.
+/// backup segment builder.
 ///
 /// Stateless — every public method takes its own inputs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -104,7 +104,7 @@ impl BackupSegmentBuilder {
 
     /// Build a single backup segment.
     ///
-    /// `k_backup_segment` is `K_backup_segment(segment_id)` —
+    /// `k_backup_segment` is `K_backup_segment(segment_id)`
     /// the caller derives it from `K_backup_root` via
     /// [`crate::crypto::key_hierarchy::derive_backup_segment`].
     pub fn build_segment(
@@ -130,13 +130,13 @@ impl BackupSegmentBuilder {
             })
         })?;
 
-        // 2) Compute the integrity root over the CBOR payload —
-        //    *not* the compressed bytes, so segments are
-        //    deterministic across zstd version updates.
+        // 2) Compute the integrity root over the CBOR payload
+        // *not* the compressed bytes, so segments are
+        // deterministic across zstd version updates.
         let merkle_root = content_hash(&cbor);
 
         // 3) zstd-compress the CBOR. `decode_all` on the read
-        //    side is symmetric.
+        // side is symmetric.
         let compressed =
             zstd::stream::encode_all(&cbor[..], ZSTD_COMPRESSION_LEVEL).map_err(|e| {
                 Error::Storage(crate::local_store::StorageError::Zstd {
@@ -146,9 +146,9 @@ impl BackupSegmentBuilder {
             })?;
 
         // 4) Allocate a fresh segment_id and AEAD-seal the
-        //    compressed payload. AAD ties the segment_id and
-        //    merkle_root to the ciphertext so swapping ciphertexts
-        //    between segments fails the open.
+        // compressed payload. AAD ties the segment_id and
+        // merkle_root to the ciphertext so swapping ciphertexts
+        // between segments fails the open.
         let segment_id = Uuid::now_v7();
         let mut nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -211,7 +211,7 @@ pub fn decrypt_backup_segment(
             "backup segment payload magic mismatch".into(),
         ));
     }
-    // Re-verify the Merkle root against the decoded plaintext —
+    // Re-verify the Merkle root against the decoded plaintext
     // catches a malicious sealer that signed an honest AAD over
     // a payload whose merkle_root was tampered with.
     let actual_root = content_hash(&cbor);
@@ -303,7 +303,7 @@ mod tests {
             )
             .unwrap();
         let err = decrypt_backup_segment(&segment, &other_key).unwrap_err();
-        // open() returns Crypto error
+        // open returns Crypto error
         match err {
             Error::Crypto(_) => {}
             other => panic!("expected Crypto error, got {other:?}"),
@@ -344,7 +344,7 @@ mod tests {
             )
             .unwrap();
         // Tampering with the merkle_root forces the AAD to
-        // mismatch on the open() side.
+        // mismatch on the open side.
         segment.merkle_root[0] ^= 0xFF;
         let err = decrypt_backup_segment(&segment, &key).unwrap_err();
         match err {

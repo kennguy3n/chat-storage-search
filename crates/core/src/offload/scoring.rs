@@ -1,4 +1,4 @@
-//! Eviction scoring formula (`docs/PROPOSAL.md §5.4`).
+//! Eviction scoring formula (`docs/DESIGN.md §5.4`).
 //!
 //! Higher score → evict first. Three signals combine into the
 //! single [`compute_eviction_score`] number:
@@ -25,7 +25,7 @@ use crate::offload::budget::PressureLevel;
 
 /// Coarse content classification used by the eviction scorer.
 ///
-/// `docs/PROPOSAL.md §5.4` lists the priority order
+/// `docs/DESIGN.md §5.4` lists the priority order
 /// `video → documents → images → voice → thumbnails → cold text`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,7 +61,7 @@ impl ContentKind {
     /// Whether this content kind is eligible for eviction at the
     /// given [`PressureLevel`].
     ///
-    /// `docs/PROPOSAL.md §5.4` reserves the lowest tiers for
+    /// `docs/DESIGN.md §5.4` reserves the lowest tiers for
     /// severe pressure: image / voice / video / document originals
     /// move under any pressure greater than `None`, but
     /// **thumbnails** are only evictable under `Critical` /
@@ -81,7 +81,7 @@ impl ContentKind {
             ContentKind::Thumbnail => {
                 matches!(pressure, PressureLevel::Critical | PressureLevel::Extreme)
             }
-            // Cold text bodies are the very last resort —
+            // Cold text bodies are the very last resort
             // evicting them costs a search-fts /
             // search-fuzzy reindex on rehydration.
             ContentKind::Text => matches!(pressure, PressureLevel::Extreme),
@@ -90,7 +90,7 @@ impl ContentKind {
 }
 
 /// Weights table mirroring the priority order in
-/// `docs/PROPOSAL.md §5.4`.
+/// `docs/DESIGN.md §5.4`.
 pub const CONTENT_KIND_WEIGHTS: [(ContentKind, f64); 6] = [
     (ContentKind::Video, 1.0),
     (ContentKind::Document, 0.9),
@@ -128,7 +128,7 @@ pub struct EvictionCandidate {
     /// Archive state at the time of scoring. Eviction is only
     /// safe once the candidate is `archive_verified`.
     pub archive_state: ArchiveState,
-    /// `media_asset.storage_sink` — Phase-3 tiered eviction policy
+    /// `media_asset.storage_sink` — tiered eviction policy
     /// (see [`super::eviction::EvictionTier`]) consults this to
     /// decide whether the candidate's original lives on a user
     /// cloud (cloud-offload first) or only on the KChat backend
@@ -208,7 +208,7 @@ mod tests {
         // the bottom of any eviction plan, regardless of how
         // attractive the rest of their signals look. Spec asks for
         // `f64::MIN` (or anything lower); the implementation
-        // returns `f64::NEG_INFINITY` which is strictly smaller —
+        // returns `f64::NEG_INFINITY` which is strictly smaller
         // both satisfy the contract that the planner never picks
         // a pinned row.
         let now = 365 * 24 * 60 * 60 * 1000_i64;

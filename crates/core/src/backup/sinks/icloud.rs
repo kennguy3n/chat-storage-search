@@ -1,4 +1,4 @@
-//! iCloud (CloudKit) backup sink (Phase 4, Task 5).
+//! iCloud (CloudKit) backup sink ().
 //!
 //! Mirrors [`crate::media::sinks::icloud::ICloudMediaBlobSink`]
 //! for the **backup** pipeline: routes sealed segment / manifest
@@ -9,12 +9,12 @@
 //! [`ICloudBackupBridge`] and hands the trait object back to the
 //! core at unlock time.
 //!
-//! CloudKit record-name layout (matches `docs/PROPOSAL.md §6.5`
+//! CloudKit record-name layout (matches `docs/DESIGN.md §6.5`
 //! and the [`super`] module-level note):
 //!
 //! ```text
-//! backups/{manifest_id}             — sealed manifest CBOR bundle
-//! backups/segments/{segment_id}     — sealed segment ciphertext
+//! backups/{manifest_id} — sealed manifest CBOR bundle
+//! backups/segments/{segment_id} — sealed segment ciphertext
 //! ```
 //!
 //! These are the same record names the

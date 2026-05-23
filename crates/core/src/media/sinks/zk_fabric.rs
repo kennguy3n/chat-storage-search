@@ -1,11 +1,11 @@
-//! ZK Object Fabric media blob sink — Phase 3 wiring.
+//! ZK Object Fabric media blob sink — wiring.
 //!
-//! `docs/PROPOSAL.md §5.7` (tiered media storage) routes media
-//! originals to the user-cloud Tier 2; `docs/PROPOSAL.md §10.2`
+//! `docs/DESIGN.md §5.7` (tiered media storage) routes media
+//! originals to the user-cloud Tier 2; `docs/DESIGN.md §10.2`
 //! pins the wire format for the ZKOF backend onto S3 PutObject /
 //! GetObject (with `Range`) / DeleteObject. The chunks coming
 //! into [`MediaBlobSink::upload_media_chunks`] are already
-//! ciphertext under `K_asset` (per `docs/PROPOSAL.md §8`); the
+//! ciphertext under `K_asset` (per `docs/DESIGN.md §8`); the
 //! sink concatenates them in chunk order and uploads them as a
 //! **single** S3 object so the rehydration path can drive byte-
 //! range GETs against deterministic offsets.
@@ -15,7 +15,7 @@
 //! Byte-range computation for chunk fetch is identical to the
 //! KChat-backend transport
 //! ([`crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE`])
-//! — chunk `n` spans
+//! chunk `n` spans
 //! `[n * DEFAULT_CHUNK_CIPHERTEXT_SIZE, (n + 1) * DEFAULT_CHUNK_CIPHERTEXT_SIZE)`.
 //! The S3 endpoint is expected to clamp the trailing range
 //! against the committed object length, matching the KChat
@@ -26,7 +26,7 @@
 //! and key wrapping are the media engine's job. The sink hands
 //! ciphertext bytes to S3 and reads them back verbatim.
 //!
-//! The Phase-3 wire-up keeps the sink behind a small
+//! The wire-up keeps the sink behind a small
 //! [`S3Client`] trait so the rest of the media pipeline can be
 //! exercised against an in-memory fake. The real HTTP / SDK
 //! client lands in a follow-up (the ZKOF crate at
@@ -50,7 +50,7 @@ pub const ZK_OBJECT_FABRIC_SINK_TAG: &str = "zk_object_fabric";
 /// ZKOF tenant credentials and bucket a [`ZkObjectFabricSink`]
 /// uploads against.
 ///
-/// `docs/PROPOSAL.md §10.2` pins the routing contract: every ZKOF
+/// `docs/DESIGN.md §10.2` pins the routing contract: every ZKOF
 /// tenant is keyed on `(endpoint_url, access_key, secret_key,
 /// bucket)`. The sink does not interpret the credentials — it
 /// hands them to the [`S3Client`] implementation which is
@@ -128,7 +128,7 @@ impl ZkFabricSinkConfig {
 
 /// Object-safe S3 surface the ZKOF sink needs.
 ///
-/// Trimmed down to the three operations the Phase-3 wire-up
+/// Trimmed down to the three operations the wire-up
 /// actually issues:
 ///
 /// * `put_object` — `PutObject`. The impl is free to fall back
@@ -186,7 +186,7 @@ pub trait S3Client: Send + Sync + std::fmt::Debug {
 }
 
 /// Stub `S3Client` returning [`Error::NotImplemented`] from every
-/// method. The Phase-3 dispatch surface is exercised against this
+/// method. The dispatch surface is exercised against this
 /// stub so the sink wiring is testable without a real S3 round
 /// trip.
 #[derive(Debug, Default, Clone, Copy)]
@@ -226,10 +226,10 @@ fn asset_key(asset_id: &str) -> String {
 /// in UTF-8:
 ///
 /// ```text
-/// 0      4              36
+/// 0 4 36
 /// ┌──────┬──────────────┬──────────────────────────────────┐
-/// │chunks│ merkle_root  │ asset_id (utf-8)                 │
-/// │  u32 │  [u8; 32]    │ variable                         │
+/// │chunks│ merkle_root │ asset_id (utf-8) │
+/// │ u32 │ [u8; 32] │ variable │
 /// └──────┴──────────────┴──────────────────────────────────┘
 /// ```
 fn encode_metadata(asset_id: &str, chunk_count: u32, merkle_root: [u8; 32]) -> Vec<u8> {
@@ -278,7 +278,7 @@ fn chunk_range(chunk_idx: u32) -> Range<u64> {
 pub struct ZkObjectFabricSink {
     s3: Arc<dyn S3Client>,
     config: ZkFabricSinkConfig,
-    /// Phase 7 (2026-05-04 batch 10 — Task 10) — optional
+    /// optional
     /// dedup-analytics probe. When set, every successful
     /// `upload_media_chunks` records a
     /// [`crate::transport::dedup_analytics::DedupEvent::ObjectUploaded`]
@@ -301,7 +301,7 @@ impl ZkObjectFabricSink {
         })
     }
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 10): builder helper
+    /// builder helper
     /// that attaches a dedup-analytics probe. Returns `self` for
     /// fluent construction.
     pub fn with_dedup_analytics(

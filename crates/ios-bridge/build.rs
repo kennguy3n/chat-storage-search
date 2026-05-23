@@ -6,7 +6,7 @@
 //! `uniffi::include_scaffolding!("kchat")` macro at the bottom
 //! of `src/lib.rs`.
 //!
-//! See `docs/PHASES.md` Phase 1 for the iOS / Swift packaging
+//! See for the iOS / Swift packaging
 //! plan that consumes this scaffolding.
 
 fn main() {

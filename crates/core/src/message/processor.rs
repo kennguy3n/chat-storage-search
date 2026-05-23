@@ -1,6 +1,6 @@
-//! Message processor — Phase 1 skeleton.
+//! Message processor — skeleton.
 //!
-//! `docs/PROPOSAL.md §11` and `docs/PHASES.md` Phase 1 describe the
+//! `docs/DESIGN.md §11` describes the
 //! ingest / outbox pipeline:
 //!
 //! * The library consumes **already-decrypted** MLS application
@@ -11,9 +11,9 @@
 //!   delivery confirms. `OutboxEntry::client_message_id` is a UUID
 //!   v7 so monotonic ordering survives crashes.
 //!
-//! Phase 0's deliverable is the **types and pure validators** here,
+//! 's deliverable is the **types and pure validators** here,
 //! not the database-backed implementation. The database glue lands
-//! when SQLCipher integration arrives in Phase 1.
+//! when SQLCipher integration arrives in
 
 use std::collections::HashSet;
 
@@ -56,9 +56,9 @@ pub enum ProcessorError {
     #[error("duplicate message")]
     DuplicateMessage,
 
-    /// A storage-layer call failed. Phase 1 surfaces specific causes
+    /// A storage-layer call failed. surfaces specific causes
     /// (database busy, AEAD open failure, …) as a stringified
-    /// description; richer typed surfacing arrives later in Phase 1.
+    /// description; richer typed surfacing arrives later in
     #[error("storage: {0}")]
     StorageError(String),
 
@@ -93,7 +93,7 @@ pub struct IngestedMessage {
     pub created_at_ms: i64,
     /// Plaintext text body. `None` for media-only messages.
     pub text_content: Option<String>,
-    /// Zero or more media descriptors (`docs/PROPOSAL.md §3.2`).
+    /// Zero or more media descriptors (`docs/DESIGN.md §3.2`).
     pub media_descriptors: Vec<MediaDescriptor>,
     /// Identifier of the message this is a reply to, if any.
     pub reply_to: Option<Uuid>,
@@ -160,7 +160,7 @@ pub struct OutboxEntry {
 // MessageProcessor
 // ---------------------------------------------------------------------------
 
-/// Pure-Rust validators / helpers used by the Phase 1 message
+/// Pure-Rust validators / helpers used by the message
 /// processor. The DB-backed `MessageProcessor` instance lands when
 /// SQLCipher integration ships; the static helpers here are usable
 /// today and are what the unit tests exercise.
@@ -178,7 +178,7 @@ impl MessageProcessor {
     /// Validate that `msg` has the minimum fields required to be
     /// persisted.
     ///
-    /// Phase 1 layers additional checks (sender membership in the
+    /// Layers additional checks (sender membership in the
     /// MLS group, conversation existence, edit-vs-create
     /// disambiguation) on top of this baseline. The checks here are
     /// the ones that always apply, regardless of MLS context.
@@ -293,7 +293,7 @@ impl<'a> MessagePersister<'a> {
     /// 2. Rejects duplicates (existing `message_skeleton` row keyed
     ///    on `message_id`).
     /// 3. Inserts the skeleton (`body_state = local_plain_available`)
-    ///    and, when `text_content.is_some()`, a `message_body` row.
+    ///    and, when `text_content.is_some`, a `message_body` row.
     /// 4. Inserts an FTS5 row into `search_fts` for text messages so
     ///    the row is searchable as soon as the transaction commits.
     /// 5. Writes a `"message_received"` entry into
@@ -345,7 +345,7 @@ impl<'a> MessagePersister<'a> {
             ));
         };
 
-        // Task 9 (`docs/PROPOSAL.md §5.7`): a message arriving with
+        // Task 9 (`docs/DESIGN.md §5.7`): a message arriving with
         // a `MediaDescriptor` carries the *thumbnail* + the
         // backend-side metadata for the original. The original
         // bytes haven't been pulled yet, so the skeleton lands in
@@ -378,7 +378,7 @@ impl<'a> MessagePersister<'a> {
         // For each descriptor attached to the inbound MLS payload,
         // land a `media_asset` row. Defaults to the
         // `kchat_backend` storage sink when the sender did not set
-        // one — matches `docs/PROPOSAL.md §5.7`'s "default sink"
+        // one — matches `docs/DESIGN.md §5.7`'s "default sink"
         // policy.
         for desc in &msg.media_descriptors {
             let asset = MediaAsset {
@@ -421,7 +421,7 @@ impl<'a> MessagePersister<'a> {
         // Bump the owning conversation's last_message_id /
         // last_activity_ms so list_conversations reflects the
         // freshly-arrived message. A missing conversation row is
-        // not an error here — Phase 1 leaves conversation creation
+        // not an error here — leaves conversation creation
         // to the caller, and pre-existing tests insert a skeleton
         // before its conversation has been registered.
         self.db.update_conversation_last_message(
@@ -446,13 +446,13 @@ impl<'a> MessagePersister<'a> {
         };
         self.db.insert_backup_event(&entry)?;
 
-        // Mirror the backup-side event into the Phase-3 archive
+        // Mirror the backup-side event into the archive
         // event journal so the segment builder will pick this
         // message up on its next drain. The write happens inside
         // the same `SAVEPOINT persist_ingest;` boundary opened by
         // `persist_ingested_message`, so a rollback discards both
         // journals together. The archive payload carries the
-        // full `text_content` so the Phase 5 cold-hit hydration
+        // full `text_content` so the cold-hit hydration
         // path can extract the body — see
         // `crate::archive::body_payload`.
         let archive_payload = crate::archive::body_payload::encode(msg.text_content.as_deref())
@@ -521,7 +521,7 @@ impl<'a> MessagePersister<'a> {
         let skel = MessageSkeleton {
             message_id: mid.clone(),
             conversation_id: conv.clone(),
-            // Phase 1 outbox sender id is the placeholder "self" —
+            // Outbox sender id is the placeholder "self"
             // KChat's identity layer fills the real id in once the
             // device-side identity wiring lands.
             sender_id: "self".into(),
@@ -578,7 +578,7 @@ impl<'a> MessagePersister<'a> {
         // the local store the same way an MLS-ingested one does.
         // The write rides inside `SAVEPOINT persist_outbox;`.
         // The archive payload carries the full `text_content`
-        // (Phase 5 cold-hit hydration) — see
+        // (cold-hit hydration) — see
         // `crate::archive::body_payload`.
         let archive_payload = crate::archive::body_payload::encode(Some(&entry.text_content))
             .map_err(|e| ProcessorError::StorageError(e.to_string()))?;
@@ -602,7 +602,7 @@ impl<'a> MessagePersister<'a> {
     }
 
     /// Mark an outbox entry as having been confirmed by the MLS
-    /// delivery layer. Phase 1 records this as an `"outbox_sent"`
+    /// delivery layer. records this as an `"outbox_sent"`
     /// entry in `backup_event_journal`; later phases lift it into a
     /// dedicated outbox-status column.
     pub fn mark_sent(&self, client_message_id: &str) -> Result<(), ProcessorError> {
@@ -979,7 +979,7 @@ fn encode_delete_event_payload(message_id: &str, scope: &str) -> Vec<u8> {
 /// Encode the CBOR map payload for a `"media_deleted"` journal
 /// entry: `{ "asset_id": <str>, "message_id": <str> }`. Emitted from
 /// `delete_message` when the deleted message had attached media so
-/// the backup-side tombstone taxonomy stays explicit (Phase-4
+/// the backup-side tombstone taxonomy stays explicit (
 /// `BackupEventType::MediaDeleted`).
 fn encode_media_delete_event_payload(asset_id: &str, message_id: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
@@ -2072,7 +2072,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // search_vector cleanup on delete / edit (Phase 6)
+    // search_vector cleanup on delete / edit
     // -----------------------------------------------------------------
 
     fn vector_count(db: &LocalStoreDb, message_id: &str) -> i64 {
@@ -2233,10 +2233,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase 3: archive event journal mirroring (Task 1)
+    // archive event journal mirroring (Task 1)
     //
     // Every persist / edit / delete entry-point must mirror its
-    // backup-side journal write into the Phase-3
+    // backup-side journal write into the
     // `archive_event_journal`. The tests below assert the row count
     // and event_type tag; full payload round-tripping is covered by
     // the archive event journal's own unit tests.
@@ -2297,7 +2297,7 @@ mod tests {
         assert_eq!(archive_event_count(&db, "message_received"), 1);
     }
 
-    /// Phase-5 cold-hit hydration regression
+    /// cold-hit hydration regression
     /// (PR-#33 review feedback): the archive-side payload of a
     /// `message_edited` event must carry the *edited* body
     /// inside the `KCHAT_ARCHIVE_BODY_PAYLOAD_V1` envelope, not

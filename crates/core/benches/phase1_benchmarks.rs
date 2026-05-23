@@ -1,6 +1,6 @@
-//! Phase-1 performance benchmarks for the local store + search.
+//! performance benchmarks for the local store + search.
 //!
-//! `docs/PROPOSAL.md §13` lists the latency budgets for the Phase-1
+//! `docs/DESIGN.md §13` lists the latency budgets for the
 //! local-store hot paths. The targets relevant to this benchmark
 //! suite are:
 //!

@@ -116,8 +116,8 @@ jobs:
   # NOTE: this job runs `cargo check` TWICE per rustup target:
   #   1. Default features only — validates the *production* build shape
   #      on every target. With `--all-features` the `test-support` gate
-  #      from Phase A.4 would be turned on and a cross-target break in
-  #      production-only code paths could slip through.
+  #      would be turned on and a cross-target break in production-only
+  #      code paths could slip through.
   #   2. Production opt-in features (`onnx-runtime,http-transport`) —
   #      validates the optional-feature surface across macOS / Windows /
   #      Linux including the Windows `directml` ort variant gated on
@@ -239,7 +239,7 @@ jobs:
           echo "All required CI jobs succeeded."
 
   # -------------------------------------------------------------------------
-  # Phase 0+ : cross-language interop check via the Go vector generator.
+  # Cross-language interop check via the Go vector generator.
   # Uses a local replace to the zk-object-fabric SDK on CI nodes that have
   # the sibling repo available; on a fresh GitHub Actions runner the
   # generator falls back to the public module path. Disabled by default

@@ -2,7 +2,7 @@
 //! (preferred on Apple Silicon) with ONNX Runtime as the
 //! cross-platform fallback.
 //!
-//! `docs/PROPOSAL.md §7.6` (on-device ML models) and §7.7
+//! `docs/DESIGN.md §7.6` (on-device ML models) and §7.7
 //! (platform ML execution). On Apple Silicon (`macOS` and `iOS`
 //! `aarch64`), `Whisper-base` runs through Apple MLX
 //! ([`mlx-community/whisper-base-mlx`](https://huggingface.co/mlx-community/whisper-base-mlx)),
@@ -15,10 +15,10 @@
 //! [`crate::models::embeddings_onnx`] DirectML → CPU
 //! best-effort pattern.
 //!
-//! This module is the Phase 6 scaffolding. The actual
+//! This module is the scaffolding. The actual
 //! inference loops (audio → mel-spectrogram → encoder/decoder
 //! → token stream → text) are intentionally NOT wired here yet
-//! — they land alongside the MLX bridge crate (`mlx-rs`) and
+//! they land alongside the MLX bridge crate (`mlx-rs`) and
 //! the ONNX whisper inference glue in a follow-up. What lands
 //! now is:
 //!
@@ -36,7 +36,7 @@
 //! * The [`WhisperBackend`] enum the model manager and the
 //!   transcription orchestrator consume.
 //!
-//! Whisper is **not** quantized to INT4 — see PROPOSAL §7.6.
+//! Whisper is **not** quantized to INT4 — see DESIGN.md §7.6.
 //! INT8 ONNX (~140 MB) is the floor for the ONNX path; the
 //! MLX path consumes the upstream `mlx-community` weights as
 //! published.
@@ -48,7 +48,7 @@
 /// Canonical `model_version` tag for the MLX-flavored
 /// `Whisper-base` artifact shipped to Apple Silicon devices.
 ///
-/// `docs/PROPOSAL.md §7.6.1` (cross-pipeline cache versioning
+/// `docs/DESIGN.md §7.6.1` (cross-pipeline cache versioning
 /// pattern). The MLX path is keyed independently from the ONNX
 /// path so that a device that hops between MLX (Apple Silicon)
 /// and ONNX (e.g. an Intel-Mac desktop binary running on the
@@ -69,14 +69,14 @@ pub const WHISPER_BASE_ONNX_MODEL_VERSION: &str = "whisper_base_onnx_int8@v1";
 /// MLX SLM strategy adopted in
 /// [`kennguy3n/slm-chat-demo`](https://github.com/kennguy3n/slm-chat-demo)
 /// and [`kennguy3n/cv-guard`](https://github.com/kennguy3n/cv-guard)
-/// — Whisper joins the same MLX-on-Apple-Silicon track those
+/// Whisper joins the same MLX-on-Apple-Silicon track those
 /// repos established for the SLM stack.
 pub const WHISPER_BASE_MLX_MODEL_REPO: &str = "mlx-community/whisper-base-mlx";
 
 /// Filename of the ONNX-quantized `Whisper-base` artifact
 /// downloaded on every non-Apple-Silicon target.
 ///
-/// `docs/PROPOSAL.md §7.6` — INT8 is the floor for Whisper;
+/// `docs/DESIGN.md §7.6` — INT8 is the floor for Whisper;
 /// INT4 is intentionally NOT supported because the audio
 /// transcription quality regression at INT4 is too large.
 pub const WHISPER_BASE_ONNX_ARTIFACT: &str = "whisper-base.int8.onnx";
@@ -218,7 +218,7 @@ pub fn select_whisper_backend<P: AppleSiliconProbe + ?Sized>(probe: &P) -> Whisp
 /// Hugging Face repo / artifact identifier the model manager
 /// downloads for a given backend.
 ///
-/// `docs/PROPOSAL.md §7.6` — Apple Silicon downloads
+/// `docs/DESIGN.md §7.6` — Apple Silicon downloads
 /// [`WHISPER_BASE_MLX_MODEL_REPO`]; every other target
 /// downloads [`WHISPER_BASE_ONNX_ARTIFACT`]. The split avoids
 /// shipping ~140 MB of ONNX weights to devices that will
@@ -283,7 +283,7 @@ mod non_apple_silicon {
 pub use non_apple_silicon::MlxAppleSiliconProbe;
 
 // ---------------------------------------------------------------------------
-// WhisperTranscriber trait — Phase 6, Task 1 (this batch)
+// WhisperTranscriber trait — (this batch)
 //
 // Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 // can stash an installed transcriber inside
@@ -299,7 +299,7 @@ use crate::Result;
 /// One contiguous timed segment of a Whisper transcription
 /// result.
 ///
-/// `docs/PROPOSAL.md §7.6` — Whisper emits per-segment
+/// `docs/DESIGN.md §7.6` — Whisper emits per-segment
 /// timestamps that the caller can render alongside the audio
 /// timeline. Times are wall-clock-relative milliseconds from
 /// the start of the audio buffer (NOT epoch-relative).
@@ -333,7 +333,7 @@ pub struct TranscriptionResult {
 }
 
 /// On-device Whisper transcription seam used by media ingest
-/// (`docs/PROPOSAL.md §7.6` / §7.7, Phase 6, Task 1 of this
+/// (`docs/DESIGN.md §7.6` / §7.7, of this
 /// batch).
 ///
 /// Implementations MUST be object-safe and `Send + Sync` so the
@@ -352,7 +352,7 @@ pub trait WhisperTranscriber: std::fmt::Debug + Send + Sync {
     fn transcribe(&self, audio_data: &[u8], mime_type: &str) -> Result<TranscriptionResult>;
 }
 
-/// Alias matching the Phase 6 task-spec name. `AudioTranscriber`
+/// Alias matching the task-spec name. `AudioTranscriber`
 /// and [`WhisperTranscriber`] are the same trait — the alias
 /// exists so call sites can use either name interchangeably.
 pub use WhisperTranscriber as AudioTranscriber;
@@ -375,7 +375,7 @@ impl WhisperTranscriber for NoopWhisperTranscriber {
 /// reproducible transcription from a BLAKE3 hash of
 /// `(mime_type, audio_data)`.
 ///
-/// Used by the Phase 6 unit / integration tests to stand in for
+/// Used by the unit / integration tests to stand in for
 /// a real Whisper engine. Same construction as
 /// [`crate::models::embeddings::MockTextEmbedder`]: the hash
 /// seeds the synthetic transcript so identical inputs always
@@ -432,8 +432,8 @@ impl WhisperTranscriber for MockWhisperTranscriber {
 // ---------------------------------------------------------------------------
 // Tests — exercise `select_whisper_backend` exhaustively. The
 // real MLX / ONNX inference loops are not unit-testable without
-// a real MLX runtime + a real .onnx fixture, so they are
-// deferred to the Phase 6 integration test suite.
+// a real MLX runtime + a real.onnx fixture, so they are
+// deferred to the integration test suite.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -461,7 +461,7 @@ mod tests {
         // The MLX and ONNX transcripts MUST be cached under
         // distinct version tags so a transcript produced on
         // one decoder family cannot be served back on the
-        // other after a device hop. See PROPOSAL §7.6.1.
+        // other after a device hop. See DESIGN.md §7.6.1.
         assert_ne!(
             WhisperBackend::Mlx.model_version(),
             WhisperBackend::Onnx.model_version()
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(report.backend, WhisperBackend::Onnx);
     }
 
-    // ----- Phase 6, Task 1: WhisperTranscriber coverage --------------
+    // -----: WhisperTranscriber coverage --------------
 
     #[test]
     fn noop_whisper_transcriber_returns_not_implemented() {
@@ -582,7 +582,7 @@ mod tests {
         assert!(!result.text.is_empty());
     }
 
-    // ----- Phase 6, Task 2 (2026-05-04 batch): AudioTranscriber alias -----
+    // -----: AudioTranscriber alias -----
 
     #[test]
     fn audio_transcriber_noop_returns_not_implemented() {

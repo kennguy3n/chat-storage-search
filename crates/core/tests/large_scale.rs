@@ -1,7 +1,7 @@
-//! Phase 7, Task 7 (2026-05-04 batch) — large-scale integration
+//! large-scale integration
 //! test scaffold.
 //!
-//! `docs/PHASES.md` Phase 7 enumerates "large-scale ingestion,
+//! The failure-test suite enumerates "large-scale ingestion,
 //! search, and backup/restore stress tests" as a gating item
 //! alongside the failure-scenario suite. This file lands the
 //! first three:
@@ -34,7 +34,7 @@
 //! ```
 //!
 //! `docs/PROGRESS.md` tracks the closure of each one against
-//! Phase 7 acceptance.
+//! Acceptance.
 
 use std::collections::BTreeSet;
 
@@ -233,7 +233,7 @@ fn large_scale_storage_budget_under_pressure() {
     seed_conversation(&db, conv, 1);
 
     // Per-asset bytes: 100 KiB. Asset count: 5 000. Total local
-    // bytes under management: 500 MiB. Budget: max 100 MiB —
+    // bytes under management: 500 MiB. Budget: max 100 MiB
     // every asset is older than `MIN_OFFLOAD_AGE_MS` so the
     // candidate pool is the full set.
     let asset_bytes: i64 = 100 * 1024;
@@ -488,10 +488,10 @@ fn large_scale_backup_restore_round_trip() {
 }
 
 // ===========================================================================
-// Phase 7, batch-5 expansions (2026-05-04)
+// expansions
 // ===========================================================================
 
-/// Phase 7, batch-5 — 100 000-message multilingual ingest with
+/// 100 000-message multilingual ingest with
 /// FTS5 + fuzzy + QueryEngine round-trip.
 ///
 /// The test does not run a literal 100 000 inserts every time
@@ -579,7 +579,7 @@ fn large_scale_ingest_and_search_100k_messages() {
     }
 }
 
-/// Phase 7, batch-5 — 10 000 media-asset rows with mixed
+/// 10 000 media-asset rows with mixed
 /// MIME types. Exercises the insert / list / update path for
 /// every kind the hydrator + sink router cares about
 /// (image / video / audio / document) at scale.
@@ -649,7 +649,7 @@ fn large_scale_media_pipeline_10k_assets() {
     }
 }
 
-/// Phase 7, batch-5 — 50k message ingest then archive
+/// 50k message ingest then archive
 /// compaction stress. Mirrors the failure-suite shape of the
 /// segment-builder + compaction path under volume.
 #[test]
@@ -691,7 +691,7 @@ fn large_scale_archive_compaction_stress() {
     assert_eq!(row_count, total_messages as i64);
 }
 
-/// Phase 7, batch-5 — concurrent reader / writer / eviction
+/// concurrent reader / writer / eviction
 /// stress test. Two threads ingest, two threads search, one
 /// thread runs the eviction enforcer; the test asserts none of
 /// them deadlock and the corpus survives.
@@ -760,7 +760,7 @@ fn large_scale_concurrent_operations() {
         .query_row("SELECT COUNT(*) FROM message_skeleton", [], |r| r.get(0))
         .expect("count");
     // Concurrent SQLCipher writers occasionally drop a row when
-    // two `Uuid::now_v7()` calls collide on the same
+    // two `Uuid::now_v7` calls collide on the same
     // nanosecond. The test asserts the corpus is "mostly
     // intact" (≥ 95 %) rather than exact equality so the
     // mutex-contention path is exercised without flaky CI
@@ -775,14 +775,14 @@ fn large_scale_concurrent_operations() {
 }
 
 // ===========================================================================
-// Phase 7 (2026-05-04 final batch) — Task 14: 6 additional #[ignore]
+// 6 additional #[ignore]
 // stress tests covering 200k ingest, concurrent backup-and-search,
 // 10k-segment archive compaction, deep manifest-chain restore,
 // 12-month cross-epoch search, and 5k-asset media migration.
 //
 // All shapes are deliberately bounded so each #[ignore] run completes
 // within minutes; the test names match the gating items in
-// `docs/PROGRESS.md` Phase 7.
+// `docs/PROGRESS.md`
 // ===========================================================================
 
 #[test]
@@ -920,7 +920,7 @@ fn large_scale_archive_compaction_10k_segments() {
 #[test]
 #[ignore = "slow: 50-generation manifest-chain restore. Run with --ignored."]
 fn large_scale_restore_from_50_generation_manifest_chain() {
-    // Build a notional chain of 50 backup-manifest hash links —
+    // Build a notional chain of 50 backup-manifest hash links
     // each generation's hash is derived from the previous via
     // BLAKE3(prev || generation_le_bytes). Asserts the chain
     // walker the existing manifest-chain verifier consumes

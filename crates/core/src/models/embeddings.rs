@@ -1,15 +1,15 @@
 //! XLM-R text-embedding interface and cross-pipeline cache.
 //!
-//! `docs/PROPOSAL.md §7.6` (on-device ML models) and §7.6.1
+//! `docs/DESIGN.md §7.6` (on-device ML models) and §7.6.1
 //! (cross-pipeline embedding cache). Two responsibilities live here:
 //!
 //! 1. The on-device XLM-R ONNX inference seam that semantic search
-//!    uses to embed queries and messages. Phase 6 fills this in.
+//!    uses to embed queries and messages. fills this in.
 //! 2. The [`EmbeddingCache`] trait — the cross-pipeline cache that
 //!    lets the guardrail (`kennguy3n/slm-guardrail`) and the search
 //!    pipeline share one XLM-R inference per message.
 //!
-//! Phase 6 lands the actual ONNX session glue. The cache trait
+//! Lands the actual ONNX session glue. The cache trait
 //! surface and the default `search_vector`-backed implementation
 //! land here as forward-compatible scaffolding so the persistence
 //! layer (`crate::message::processor::MessagePersister` and the
@@ -29,7 +29,7 @@ use crate::Result;
 /// across the chat-storage-search and `kennguy3n/slm-guardrail`
 /// pipelines.
 ///
-/// `docs/PROPOSAL.md §7.6.1`. Embeddings written under this tag
+/// `docs/DESIGN.md §7.6.1`. Embeddings written under this tag
 /// are readable across both pipelines. A future encoder upgrade
 /// (e.g. `xlmr@v2`) MUST bump this constant; the
 /// version-mismatch invariant on [`EmbeddingCache::get`] then
@@ -38,7 +38,7 @@ pub const XLMR_MODEL_VERSION: &str = "xlmr@v1";
 
 /// Output dimensionality of the XLM-R encoder shipped to devices.
 ///
-/// `docs/PROPOSAL.md §7.6.1`. Matches the shared encoder
+/// `docs/DESIGN.md §7.6.1`. Matches the shared encoder
 /// configuration in `kennguy3n/slm-guardrail`. The cache itself
 /// does not enforce this dimension — it only requires the
 /// dequantized blob length to match what was written — but
@@ -48,12 +48,12 @@ pub const XLMR_MODEL_VERSION: &str = "xlmr@v1";
 pub const XLMR_EMBEDDING_DIM: usize = 384;
 
 /// Canonical on-disk filename for the INT8 XLM-R artifact.
-/// Phase 6, Task 5 (2026-05-04 batch).
+///.
 pub const XLMR_INT8_FILENAME: &str = "xlmr-v1-int8.onnx";
 
 /// Canonical on-disk filename for the INT4 (`MatMulNBits`)
-/// XLM-R artifact shipped to tight-storage devices. Phase 6,
-/// Task 5 (2026-05-04 batch).
+/// XLM-R artifact shipped to tight-storage devices.
+/// Task 5.
 pub const XLMR_INT4_FILENAME: &str = "xlmr-v1-int4.onnx";
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ pub const XLMR_INT4_FILENAME: &str = "xlmr-v1-int4.onnx";
 
 /// Cross-pipeline cache for XLM-R (and other) text embeddings.
 ///
-/// `docs/PROPOSAL.md §7.6.1`. A message's embedding is computed at
+/// `docs/DESIGN.md §7.6.1`. A message's embedding is computed at
 /// most once: whichever pipeline (guardrail or search) first
 /// observes the message writes the vector through [`put`], and the
 /// other pipeline reads it back through [`get`] instead of running
@@ -84,11 +84,11 @@ pub const XLMR_INT4_FILENAME: &str = "xlmr-v1-int4.onnx";
 pub trait EmbeddingCache: std::fmt::Debug {
     /// Look up a cached embedding for `(message_id, model_version)`.
     ///
-    /// Returns `Ok(None)` if no row exists for that pair —
+    /// Returns `Ok(None)` if no row exists for that pair
     /// including when a row exists for the same `message_id` under
     /// a different `model_version` (the version-mismatch
     /// invariant). Returns `Ok(Some(v))` if the row is present;
-    /// `v.len()` matches the encoder's output dimensionality.
+    /// `v.len` matches the encoder's output dimensionality.
     fn get(&self, message_id: &str, model_version: &str) -> Result<Option<Vec<f32>>>;
 
     /// Insert or replace the cached embedding for
@@ -110,7 +110,7 @@ pub trait EmbeddingCache: std::fmt::Debug {
 // ---------------------------------------------------------------------------
 
 /// `EmbeddingCache` placeholder for early bring-up before the
-/// local store is open (e.g. Phase 0 / Phase 1 fixtures, or a
+/// local store is open (e.g. fixtures, or a
 /// caller that does not have a SQLCipher connection in hand).
 ///
 /// [`get`](EmbeddingCache::get) always returns `Ok(None)` so
@@ -246,7 +246,7 @@ fn dequantize_int8(blob: &[u8]) -> Vec<f32> {
 
 /// Crate-private accessor for [`dequantize_int8`].
 ///
-/// Phase 6, Task 3: the brute-force semantic-search engine in
+/// the brute-force semantic-search engine in
 /// [`crate::search::semantic_search`] needs to dequantize raw
 /// `search_vector.embedding` blobs without going through the
 /// [`EmbeddingCache::get`] entry point (the engine fetches all
@@ -257,7 +257,7 @@ pub(crate) fn dequantize_int8_for_search(blob: &[u8]) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// INT4 codec — Phase 6, Task 4 (2026-05-04 batch)
+// INT4 codec
 // ---------------------------------------------------------------------------
 //
 // Linear, symmetric INT4 quantization. Each f32 value is mapped
@@ -265,9 +265,9 @@ pub(crate) fn dequantize_int8_for_search(blob: &[u8]) -> Vec<f32> {
 // and packed two values per byte (low nibble = even index, high
 // nibble = odd index). On-disk layout:
 //
-//   bytes  0..4   : little-endian f32 `scale`
-//   bytes  4..6   : little-endian u16 `len`   (number of f32 values)
-//   bytes  6..    : ceil(len / 2) packed bytes
+// bytes 0..4: little-endian f32 `scale`
+// bytes 4..6: little-endian u16 `len` (number of f32 values)
+// bytes 6..: ceil(len / 2) packed bytes
 //
 // `len` is stored explicitly so an odd-length vector
 // (`len = 2 * packed_bytes - 1`) round-trips losslessly back to
@@ -275,8 +275,8 @@ pub(crate) fn dequantize_int8_for_search(blob: &[u8]) -> Vec<f32> {
 // distinct from [`quantize_int8`] / [`dequantize_int8`] so the two
 // codecs cannot accidentally alias on the same byte buffer.
 //
-// References: `docs/PROPOSAL.md §7.6` (per-tier model packaging),
-// `docs/PHASES.md` Phase 6 (storage-budget aware quantization).
+// References: `docs/DESIGN.md §7.6` (per-tier model packaging),
+// (storage-budget aware quantization).
 
 const INT4_HEADER_LEN: usize = 6;
 
@@ -380,13 +380,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// TextEmbedder trait — Phase 6, Task 2
+// TextEmbedder trait
 // ---------------------------------------------------------------------------
 
 /// On-device text-embedding seam used by the semantic-search and
 /// message-ingest pipelines.
 ///
-/// `docs/PROPOSAL.md §7.6 / §7.6.1` and Phase 6, Task 2. The trait
+/// `docs/DESIGN.md §7.6 / §7.6.1` and. The trait
 /// is intentionally tiny so any encoder (XLM-R, a future
 /// multilingual replacement, a deterministic mock, …) can plug in.
 /// Implementations MUST return an L2-normalized vector of length
@@ -429,9 +429,9 @@ impl TextEmbedder for NoopTextEmbedder {
 /// Deterministic test [`TextEmbedder`] that hashes `text` into a
 /// reproducible, L2-normalized vector.
 ///
-/// Used by the Phase 6 unit tests and integration tests to stand
+/// Used by the unit tests and integration tests to stand
 /// in for an actual ONNX-backed XLM-R encoder. The output is
-/// stable across runs and across processes for a given input —
+/// stable across runs and across processes for a given input
 /// that is what lets the semantic-search tests assert "the same
 /// query returns the same nearest neighbor".
 ///
@@ -673,7 +673,7 @@ mod tests {
         ));
     }
 
-    // ----- Phase 6, Task 2: TextEmbedder trait coverage --------------
+    // -----: TextEmbedder trait coverage --------------
 
     #[test]
     fn noop_text_embedder_returns_not_implemented() {
@@ -696,7 +696,7 @@ mod tests {
         let emb = MockTextEmbedder::default();
         let a = emb.embed("hello world").expect("embed a");
         let b = emb.embed("привет мир").expect("embed b");
-        // Two distinct inputs should yield distinct embeddings —
+        // Two distinct inputs should yield distinct embeddings
         // exact equality would mean the hash seeded the same
         // LCG which would be a real bug.
         assert_ne!(a, b);
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(v.len(), XLMR_EMBEDDING_DIM);
     }
 
-    // ----- Phase 6, Task 4 (2026-05-04 batch): INT4 codec ----------------
+    // -----: INT4 codec ----------------
 
     #[test]
     fn int4_encode_decode_round_trip_preserves_cosine_above_threshold() {
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn int4_blob_is_smaller_than_int8_blob() {
         // A correctness guard for the storage-budget claim in
-        // `docs/PROPOSAL.md §7.6`: INT4 packs ~2x denser than
+        // `docs/DESIGN.md §7.6`: INT4 packs ~2x denser than
         // INT8 for the same input vector.
         let v = fixture_embedding(1);
         let i8_blob = quantize_int8(&v);

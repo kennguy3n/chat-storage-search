@@ -1,5 +1,5 @@
-//! Desktop ML execution-provider selection adapter — Phase 7,
-//! batch-5 (2026-05-04).
+//! Desktop ML execution-provider selection adapter
+//! batch-5
 //!
 //! `docs/ARCHITECTURE.md §11.4` mandates per-platform EP
 //! selection: CoreML on macOS, DirectML on Windows (when a GPU
@@ -88,7 +88,7 @@ impl DesktopExecutionProviderSelector {
     }
 }
 
-/// Phase 6 (2026-05-04 batch 10) — Task 3: GPU detection stub.
+/// GPU detection stub.
 ///
 /// On Windows, the production build will probe DirectX / DXGI to
 /// confirm a DirectML-compatible adapter is present. This stub
@@ -105,7 +105,7 @@ pub fn detect_gpu_available_with_override(force: Option<bool>) -> bool {
     force.unwrap_or(false)
 }
 
-/// Phase 6 (2026-05-04 batch 10) — Task 3: build the host-platform
+/// build the host-platform
 /// [`EpFallbackChain`] for desktop.
 ///
 /// Combines [`host_platform`] with [`detect_gpu_available`] to
@@ -130,7 +130,7 @@ pub fn host_fallback_chain() -> EpFallbackChain {
     EpFallbackChain::for_platform(platform, &caps)
 }
 
-/// Phase 6 (2026-05-04 batch 10) — Task 3: convenience entry
+/// convenience entry
 /// point that the desktop ONNX-session creation path calls into.
 ///
 /// Returns the `(host_platform, primary_ep, fallback_chain)`
@@ -145,7 +145,7 @@ pub fn create_desktop_session_config() -> (Platform, ExecutionProvider, EpFallba
     (host_platform(), primary, chain)
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: end-to-end desktop
+/// end-to-end desktop
 /// session helper for the XLM-R text encoder.
 ///
 /// Walks [`host_fallback_chain`] to pick the primary EP, then
@@ -170,7 +170,7 @@ pub fn create_desktop_session(
     kchat_core::models::embeddings_onnx::create_xlmr_session_with_ep(model_path, primary)
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// stub for the
 /// always-on shape when the `onnx-runtime` feature is off.
 #[cfg(not(feature = "onnx-runtime"))]
 pub fn create_desktop_session(_model_path: &std::path::Path) -> kchat_core::Result<()> {

@@ -1,6 +1,6 @@
 //! `local_store` module — encrypted on-device storage surface.
 //!
-//! Phase 1 foundation lands here:
+//! Foundation lands here:
 //!
 //! * [`schema`] — the SQLCipher CREATE TABLE statements
 //!   (`SCHEMA_SQL`) plus the typed Rust row structs that mirror them
@@ -13,7 +13,7 @@
 //!
 //! The actual `rusqlite::Connection` bindings, prepared-statement
 //! cache, migrations, and platform `K_local_db` wrap (Keychain /
-//! Keystore / DPAPI) land later in Phase 1 — see `docs/PHASES.md`.
+//! Keystore / DPAPI) land later in — see.
 
 pub mod db;
 pub mod schema;
@@ -25,7 +25,7 @@ pub mod state_machines;
 /// parsing free-form text. The reader pool distinguishes
 /// [`StorageError::LockPoisoned`] from [`StorageError::Sqlite`], and
 /// tests assert on [`StorageError::SubsystemNotInstalled`] instead
-/// of `msg.to_string().contains("not installed")`.
+/// of `msg.to_string.contains("not installed")`.
 ///
 /// The [`StorageError::DatabaseLocked`] / [`StorageError::DiskFull`]
 /// variants exist for retry-loop callers that want to route on
@@ -39,14 +39,14 @@ pub mod state_machines;
 /// # Construction
 ///
 /// Most variants come from `#[from]` conversions so call sites that
-/// previously did `.map_err(|e| Error::Storage(e.to_string().into()))?`
+/// previously did `.map_err(|e| Error::Storage(e.to_string.into))?`
 /// can use the `?` operator directly once they switch to the typed
 /// form:
 ///
 /// ```ignore
 /// // legacy form (still compiles via `From<String>`)
 /// stmt.execute(params![..])
-///     .map_err(|e| Error::Storage(e.to_string().into()))?;
+///.map_err(|e| Error::Storage(e.to_string.into))?;
 /// // typed form (preferred)
 /// stmt.execute(params![..])?;
 /// ```
@@ -177,7 +177,7 @@ pub enum StorageError {
 
     /// Free-form fallback for sites where the underlying error type
     /// does not (yet) merit a dedicated variant. Existing
-    /// `format!("... : {e}")` patterns map to this variant; new
+    /// `format!("...: {e}")` patterns map to this variant; new
     /// failure modes should prefer a typed variant instead.
     #[error("{0}")]
     Custom(String),
@@ -186,7 +186,7 @@ pub enum StorageError {
 impl StorageError {
     /// Construct a [`StorageError::Custom`] from anything that can be
     /// converted into a [`String`]. Equivalent to
-    /// `StorageError::Custom(msg.into())`; useful at call sites that
+    /// `StorageError::Custom(msg.into)`; useful at call sites that
     /// previously did `Error::Storage(msg)`.
     pub fn msg(msg: impl Into<String>) -> Self {
         StorageError::Custom(msg.into())

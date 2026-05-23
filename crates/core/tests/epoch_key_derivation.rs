@@ -1,13 +1,13 @@
-//! Integration test vectors for the Phase-3 archive epoch key
+//! Integration test vectors for the archive epoch key
 //! hierarchy.
 //!
-//! `docs/PROPOSAL.md §2.1` defines the per-epoch indirection
+//! `docs/DESIGN.md §2.1` defines the per-epoch indirection
 //! between `K_archive_root` and the per-segment / per-manifest
 //! keys: each "epoch" gets its own subkey derived as
 //!
 //! ```text
 //! K_archive_epoch(epoch_id) = HKDF(K_archive_root,
-//!                                  info = "kchat-archive-epoch-v1" || epoch_id)
+//! info = "kchat-archive-epoch-v1" || epoch_id)
 //! ```
 //!
 //! These tests exercise the surface that the orchestration layer
@@ -23,7 +23,7 @@
 //!    "rotate" by deriving a new epoch key, then unwrap epoch A's
 //!    key from the persisted blob and recover the original
 //!    plaintext.
-//! 5. HKDF info-string layout — the PHASES.md / PROPOSAL.md spec
+//! 5. HKDF info-string layout — the DESIGN.md spec
 //!    pins the prefix as `b"kchat-archive-epoch-v1"`.
 
 use kchat_core::crypto::aead::xchacha20_poly1305::{open, seal, NONCE_LEN};
@@ -33,7 +33,7 @@ use kchat_core::crypto::key_hierarchy::{
 };
 
 /// Fixed master key fixture so the integration test is fully
-/// deterministic against the PROPOSAL.md HKDF spec.
+/// deterministic against the DESIGN.md HKDF spec.
 fn master() -> KeyMaterial {
     KeyMaterial::from_bytes([0xAB; 32])
 }
@@ -77,7 +77,7 @@ fn epoch_key_wrap_unwrap_round_trip() {
 
 #[test]
 fn cross_epoch_segment_decrypt() {
-    // Phase 3 key-rotation flow: build a segment under epoch A's
+    // key-rotation flow: build a segment under epoch A's
     // key, persist `wrap_epoch_key(K_archive_root, epoch_A)`,
     // "rotate" to epoch B (i.e. derive a fresh epoch_B key for
     // future segments), then later unwrap epoch A's key from the
@@ -108,7 +108,7 @@ fn cross_epoch_segment_decrypt() {
 
 #[test]
 fn epoch_key_info_string_matches_spec() {
-    // `docs/PROPOSAL.md §2.1` pins the HKDF info prefix as
+    // `docs/DESIGN.md §2.1` pins the HKDF info prefix as
     // `b"kchat-archive-epoch-v1"`. If a future change tries to
     // bump that label, every existing archive on disk would no
     // longer decrypt — so the constant is part of the wire format

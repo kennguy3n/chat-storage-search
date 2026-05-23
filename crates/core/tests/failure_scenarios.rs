@@ -1,6 +1,6 @@
-//! Phase-7 failure-scenario foundation suite (Task 10).
+//! failure-scenario foundation suite (Task 10).
 //!
-//! `docs/PHASES.md` Phase 7 enumerates 8 failure scenarios that
+//! enumerates 8 failure scenarios that
 //! must each have a self-contained reproduction in the test
 //! suite before the milestone closes. This file lands the first
 //! 4 — the chunked-upload, chunked-decrypt, backup-decrypt, and
@@ -607,7 +607,7 @@ fn manifest_chain_break_returns_chain_break_with_expected_and_actual() {
 // Scenario 5 — Device removed from MLS group between backup and restore
 // ===========================================================================
 //
-// Phase 7 / `docs/PHASES.md §Failure test suite`. Models a device
+// / ` test suite`. Models a device
 // that produced a backup chain under its pre-removal Ed25519
 // signing key and was subsequently kicked from the MLS group. On
 // restore the trust anchor is the post-removal group key, so
@@ -711,7 +711,7 @@ fn device_removed_from_mls_group_between_backup_and_restore_surfaces_signature_i
 // Scenario 6 — Search shard missing from the backend
 // ===========================================================================
 //
-// `docs/PHASES.md §Failure test suite`. The query engine must
+// ` test suite`. The query engine must
 // gracefully degrade to local-only results when a cold shard fetch
 // returns a structured 404 / not-found, and must surface a
 // warning flag the orchestration layer can wire to UI telemetry.
@@ -881,7 +881,7 @@ fn search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag() 
 // Scenario 7 — Low-storage condition during restore
 // ===========================================================================
 //
-// `docs/PHASES.md §Failure test suite`. Simulates a disk-full
+// ` test suite`. Simulates a disk-full
 // condition mid-`RestorePipeline::run` by dropping the
 // `restore_state` table after the pipeline has advanced past
 // `ManifestVerified`. The pipeline's next call to
@@ -899,7 +899,7 @@ fn low_storage_condition_during_restore_surfaces_resumable_storage_error() {
     use kchat_core::restore::state_machine;
 
     let db = LocalStoreDb::open_in_memory(&[0xCC; 32]).expect("open in-memory db");
-    // Walk to ManifestVerified — Phase 4 / Task 8 owns this state
+    // Walk to ManifestVerified — owns this state
     // machine but the test only needs the prerequisite.
     for st in [
         RestoreState::IdentityRestored,
@@ -974,7 +974,7 @@ fn low_storage_condition_during_restore_surfaces_resumable_storage_error() {
     assert_eq!(notes.as_deref(), Some("resumed after low-storage failure"));
 }
 
-/// Phase 7 / Task 7 follow-up: end-to-end resume after a
+/// follow-up: end-to-end resume after a
 /// low-storage failure. Drives `RestorePipeline::run` to the
 /// failure point, "frees space" by restoring the dropped state
 /// table, and re-runs the pipeline — asserting it reaches
@@ -999,7 +999,7 @@ fn low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete()
     let backup_root = derive_backup_root(&identity).unwrap();
     let k_seg = derive_backup_segment(&backup_root, &Uuid::now_v7().into_bytes()).unwrap();
 
-    // Phase A: fail mid-restore by dropping the state table —
+    // Phase A: fail mid-restore by dropping the state table
     // the next state-machine write surfaces a structured
     // `Error::Storage` (= "no such table") which is the same
     // shape SQLite returns under `SQLITE_FULL`.
@@ -1057,11 +1057,11 @@ fn low_storage_during_restore_checkpoints_and_resumes_to_full_restore_complete()
 // Scenario 8 — Manifest chain break detected on restore (extended)
 // ===========================================================================
 //
-// `docs/PHASES.md §Failure test suite`. The base coverage lives in
+// ` test suite`. The base coverage lives in
 // `manifest_chain_break_returns_chain_break_with_expected_and_actual`
 // above (chain break at gen 1). This extension stresses the
 // detector at the *deepest* link of a 4-generation chain — gen 3
-// — and verifies the reported `expected` hash equals
+// and verifies the reported `expected` hash equals
 // `compute_manifest_hash(gen2)`, not gen0.
 
 #[test]
@@ -1188,7 +1188,7 @@ fn manifest_chain_break_at_deepest_generation_reports_correct_link() {
 // Scenario 9 — Manifest upload interrupted mid-write
 // ===========================================================================
 //
-// Phase 7 / `docs/PHASES.md §Failure test suite`. Models the
+// / ` test suite`. Models the
 // orchestration-layer failure mode where a backup manifest has
 // already been built and signed locally, but the call to
 // `BackupSink::upload_backup_manifest` fails with a transient
@@ -1196,15 +1196,15 @@ fn manifest_chain_break_at_deepest_generation_reports_correct_link() {
 // through the write. The test asserts that:
 //
 // 1. `upload_backup_manifest` surfaces a structured
-//    `Error::Transport` (not a panic, not a corrupted local
-//    state).
+// `Error::Transport` (not a panic, not a corrupted local
+// state).
 // 2. The failure does not destroy the manifest — the orchestration
-//    layer can re-issue the upload against a healthy sink and
-//    succeed without rebuilding or re-signing the manifest.
+// layer can re-issue the upload against a healthy sink and
+// succeed without rebuilding or re-signing the manifest.
 // 3. `verify_manifest_chain` still accepts the chain after the
-//    retry — the manifest bytes the retry uploads are
-//    byte-for-byte the bytes the failed attempt tried to upload,
-//    so generation 1 still chains correctly under generation 0.
+// retry — the manifest bytes the retry uploads are
+// byte-for-byte the bytes the failed attempt tried to upload,
+// so generation 1 still chains correctly under generation 0.
 
 /// Programmable [`BackupSink`] that fails the first
 /// `upload_backup_manifest` call with `Error::Transport(message)`
@@ -1375,7 +1375,7 @@ fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
 }
 
 // ===========================================================================
-// Phase 7, Task 6 (2026-05-04 batch) — offline + interrupted scenarios.
+// offline + interrupted scenarios.
 // ===========================================================================
 //
 // These tests exercise the `OfflineDetector` wiring on the
@@ -1413,7 +1413,7 @@ fn offline_during_backup_defers_upload_and_succeeds_on_reconnect() {
 
     // First run: device is offline. The wrapper short-circuits
     // before any segment-build / upload work, returns
-    // `BackupResult { deferred: true, .. }`, and the detector's
+    // `BackupResult { deferred: true,.. }`, and the detector's
     // `is_online()` shim reports `false`.
     let detector = Arc::new(ToggleOfflineDetector::new(false));
     core.install_offline_detector(detector.clone())
@@ -1432,7 +1432,7 @@ fn offline_during_backup_defers_upload_and_succeeds_on_reconnect() {
         "deferred run must not segment events",
     );
 
-    // Second run: device reconnects. The same core instance —
+    // Second run: device reconnects. The same core instance
     // no segments were lost because the wrapper never touched
     // the journal. With no events pending the inner pipeline
     // is a no-op (`segments_built = 0`) and `deferred = false`.
@@ -1454,7 +1454,7 @@ fn offline_during_hydration_returns_cold_with_offline_flag() {
 
     // Seed a conversation + a message-skeleton row whose body
     // lives only in the remote archive (no local body row).
-    // `hydrate_message` should report `is_cold = true` and —
+    // `hydrate_message` should report `is_cold = true` and
     // because the detector is offline — `offline = true`.
     let conv_id = uuid::Uuid::now_v7();
     let msg_id = uuid::Uuid::now_v7();
@@ -1520,7 +1520,7 @@ fn offline_during_hydration_returns_cold_with_offline_flag() {
 }
 
 // ===========================================================================
-// Phase 7 (2026-05-04 final batch) — Task 15: 6 additional edge-case
+// 6 additional edge-case
 // tests covering eviction-vs-backup contention, missing epoch keys,
 // search-during-restore partials, expired media auth tokens, archive
 // network partition, and shard-cache corruption detection.

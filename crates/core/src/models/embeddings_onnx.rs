@@ -3,7 +3,7 @@
 //! execution-provider state machine reused by
 //! [`crate::models::clip`] for MobileCLIP-S2.
 //!
-//! `docs/PROPOSAL.md §7.7` and `docs/ARCHITECTURE.md §11.4`. On
+//! `docs/DESIGN.md §7.7` and `docs/ARCHITECTURE.md §11.4`. On
 //! Windows the session is created with the DirectML EP first; if
 //! DirectML initialization fails (no compatible GPU, driver
 //! issues, ONNX Runtime not built with DirectML support, model
@@ -11,7 +11,7 @@
 //! the CPU EP without failing the session-create call. On
 //! non-Windows targets only the CPU EP is attempted.
 //!
-//! This module is the Phase 6 scaffolding: the EP-selection
+//! This module is the scaffolding: the EP-selection
 //! state machine lands now (always compiled, no `ort` dependency)
 //! so it can be exhaustively unit-tested on Linux / macOS CI
 //! without needing a DirectML adapter or even an ONNX Runtime
@@ -92,7 +92,7 @@ pub struct OnnxProviderReport {
 /// feature.
 ///
 /// Implementations MUST be cheap (no allocation, no I/O beyond
-/// what ORT does internally) and MUST NOT panic on failure —
+/// what ORT does internally) and MUST NOT panic on failure
 /// any error path inside the probe is reported as `false`.
 pub trait DirectMlProbe {
     /// Return `true` if DirectML is available on the current
@@ -185,7 +185,7 @@ mod windows_directml {
     /// but registration failed, the report reads
     /// `provider: Cpu, directml_attempted: true`.
     ///
-    /// This is the Phase 6 scaffold: the inference loop
+    /// This is the scaffold: the inference loop
     /// (input-tensor encode → `session.run` → mean-pool →
     /// `Vec<f32>`) is intentionally not wired here yet — that
     /// lands together with the SentencePiece tokenizer in a
@@ -255,7 +255,7 @@ mod posix_cpu {
     ///
     /// Always registers the CPU EP. The cross-platform
     /// inference seam (CoreML EP on Apple, NNAPI EP on Android,
-    /// etc.) lands later in Phase 6 — this scaffold focuses on
+    /// etc.) lands later in — this scaffold focuses on
     /// the Windows DirectML path called out in
     /// `docs/ARCHITECTURE.md §11.4`.
     pub fn create_xlmr_session(
@@ -272,7 +272,7 @@ mod posix_cpu {
 #[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
 pub use posix_cpu::{create_xlmr_session, OrtDirectMlProbe};
 
-/// Phase 6, Task 5 (2026-05-04 batch): INT4 (`MatMulNBits`)
+/// INT4 (`MatMulNBits`)
 /// flavor of [`create_xlmr_session`].
 ///
 /// Same EP-selection state machine and CPU fallback as
@@ -289,7 +289,7 @@ pub fn create_xlmr_session_int4(
     create_xlmr_session(model_path)
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: EP-aware named seam
+/// EP-aware named seam
 /// over [`create_xlmr_session`].
 ///
 /// Production callers walk the [`crate::models::ep_tuning::EpFallbackChain`]
@@ -325,7 +325,7 @@ pub fn create_xlmr_session_with_ep(
     create_xlmr_session(model_path)
 }
 
-/// Phase 6, Task 5 (2026-05-04 batch): INT4 session-creator
+/// INT4 session-creator
 /// stub for builds without the `onnx-runtime` cargo feature.
 #[cfg(not(feature = "onnx-runtime"))]
 pub fn create_xlmr_session_int4(_model_path: &std::path::Path) -> crate::Result<()> {
@@ -334,7 +334,7 @@ pub fn create_xlmr_session_int4(_model_path: &std::path::Path) -> crate::Result<
     ))
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// stub for the
 /// EP-aware seam when the `onnx-runtime` feature is off.
 #[cfg(not(feature = "onnx-runtime"))]
 pub fn create_xlmr_session_with_ep(
@@ -349,7 +349,7 @@ pub fn create_xlmr_session_with_ep(
 // ---------------------------------------------------------------------------
 // OnnxTextEmbedder — long-lived `ort::Session` wrapper.
 //
-// Phase 6, Task 1 (`docs/PROPOSAL.md §7.6 / §7.7`,
+// (`docs/DESIGN.md §7.6 / §7.7`,
 // `docs/ARCHITECTURE.md §11.4`). The struct owns one
 // `ort::Session` for the lifetime of the wrapper so XLM-R
 // inference re-uses the same DirectML / CPU registration across
@@ -364,12 +364,12 @@ pub fn create_xlmr_session_with_ep(
 // `cfg(not(target_os = "windows"))` because:
 //
 // 1. The `ort` crate itself only resolves when the `onnx-runtime`
-//    feature is on — without it the compiler does not see
-//    `ort::Session`.
+// feature is on — without it the compiler does not see
+// `ort::Session`.
 // 2. Without a real XLM-R `.onnx` artifact in the test corpus
-//    `session.run` would fail, so the unit tests cannot exercise
-//    the inference loop directly. The integration tests in the
-//    Phase 6 model-manager suite supply a real model.
+// `session.run` would fail, so the unit tests cannot exercise
+// the inference loop directly. The integration tests in the
+// Model-manager suite supply a real model.
 //
 // What lives outside the feature gate (and is therefore unit-
 // testable on every target) is the error-mapping shim:
@@ -482,7 +482,7 @@ impl OnnxTextEmbedder {
     /// L2-normalize) is intentionally not wired here yet: shipping
     /// it requires a SentencePiece tokenizer artifact that lives
     /// alongside the `.onnx` model in the [`super::model_manager`]
-    /// cache, which is itself a Phase 6 follow-up. Until that
+    /// cache, which is itself a follow-up. Until that
     /// lands, the wrapper returns
     /// [`crate::Error::NotImplemented`] so a caller that has
     /// installed an `OnnxTextEmbedder` learns about the missing
@@ -510,7 +510,7 @@ pub struct OnnxTextEmbedder;
 impl OnnxTextEmbedder {
     /// Always returns
     /// [`crate::Error::NotImplemented`](crate::Error::NotImplemented)
-    /// — the `onnx-runtime` cargo feature is required for the
+    /// the `onnx-runtime` cargo feature is required for the
     /// real session creator.
     pub fn new(_model_path: &std::path::Path) -> crate::Result<Self> {
         Err(crate::Error::NotImplemented(
@@ -529,7 +529,7 @@ impl OnnxTextEmbedder {
 
 // Sanity tests for the always-compiled stub variant — the real
 // inference loop tests live behind `cfg(feature = "onnx-runtime")`
-// in the Phase 6 model-manager integration suite.
+// in the model-manager integration suite.
 #[cfg(all(test, not(feature = "onnx-runtime")))]
 mod stub_tests {
     use super::*;
@@ -552,8 +552,8 @@ mod stub_tests {
 // ---------------------------------------------------------------------------
 // Tests — exercise `select_provider` exhaustively. The actual
 // `ort::Session` creators are not unit-testable without a real
-// ORT install + a real .onnx fixture, so they are deferred to
-// the Phase 6 integration test suite.
+// ORT install + a real.onnx fixture, so they are deferred to
+// the integration test suite.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

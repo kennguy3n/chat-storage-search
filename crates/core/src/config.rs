@@ -1,6 +1,6 @@
 //! Configuration for [`crate::KChatCore`].
 //!
-//! Phase 0 captures only the platform identifier and the on-disk
+//! Captures only the platform identifier and the on-disk
 //! root directory; later phases extend the struct (network policy,
 //! ML model directory, search budget, etc.) without breaking the
 //! existing fields.
@@ -21,30 +21,30 @@ pub enum Platform {
 
 /// Personal-archive storage backend.
 ///
-/// `docs/PROPOSAL.md §10.1` documents the
+/// `docs/DESIGN.md §10.1` documents the
 /// `archive_backend = "kchat" | "zkof"` configuration. The KChat
 /// backend (PostgreSQL blob service) is the default; ZK Object
 /// Fabric (S3 API) is the optional alternative that lands in
-/// Phase 3.
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ArchiveBackend {
     /// KChat backend's `/v1/blobs/*` and `/v1/archive/*` endpoints.
     #[default]
     #[serde(rename = "kchat")]
     KChat,
-    /// ZK Object Fabric (S3 API). See `docs/PROPOSAL.md §10.1`.
+    /// ZK Object Fabric (S3 API). See `docs/DESIGN.md §10.1`.
     #[serde(rename = "zkof")]
     Zkof,
 }
 /// Storage destination for media blobs.
 ///
-/// `docs/PROPOSAL.md §5.7` (tiered media storage). Media originals
+/// `docs/DESIGN.md §5.7` (tiered media storage). Media originals
 /// dominate per-user archive cost at scale; routing them to the
 /// user's own cloud (iCloud, Google Drive, ZKOF) instead of the
 /// KChat backend keeps backend storage to text deltas, indexes,
 /// thumbnails, and key wraps. The variants are intentionally a
-/// superset: `KChatBackend` is the Phase-1 default, the user-cloud
-/// variants land in Phase 3 and may grow inner fields then.
+/// superset: `KChatBackend` is the default, the user-cloud
+/// variants land in and may grow inner fields then.
 ///
 /// The serialized variant tags (`"kchat_backend"`, `"icloud"`,
 /// `"google_drive"`, `"zk_object_fabric"`) are pinned via explicit
@@ -62,7 +62,7 @@ pub enum StorageSink {
     /// KChat backend's blob service.
     #[serde(rename = "kchat_backend")]
     KChatBackend,
-    /// iCloud (CloudKit file storage). Implementation lands in Phase 3.
+    /// iCloud (CloudKit file storage). Implementation lands in
     #[serde(rename = "icloud")]
     ICloud {
         /// CloudKit container path (or platform-specific equivalent)
@@ -70,13 +70,13 @@ pub enum StorageSink {
         container_path: String,
     },
     /// Google Drive (Drive API via platform bridge). Implementation
-    /// lands in Phase 3.
+    /// lands in
     #[serde(rename = "google_drive")]
     GoogleDrive {
         /// Drive folder ID where media blobs are stored.
         folder_id: String,
     },
-    /// ZK Object Fabric (S3 API). Implementation lands in Phase 3.
+    /// ZK Object Fabric (S3 API). Implementation lands in
     #[serde(rename = "zk_object_fabric")]
     ZkObjectFabric {
         /// S3 bucket name media blobs are uploaded to.
@@ -87,23 +87,23 @@ pub enum StorageSink {
 /// Privacy posture toggle for the archive prefetch / orchestration
 /// pipeline.
 ///
-/// `docs/PROPOSAL.md §5.6` proposes optional **dummy request
+/// `docs/DESIGN.md §5.6` proposes optional **dummy request
 /// padding** to break the per-bucket access-pattern fingerprint:
 /// when [`PrivacyLevel::High`] is configured, the orchestration
 /// layer mixes dummy segment-id fetches in with the real ones so an
 /// observer at the transport / backend layer cannot distinguish
 /// "user is reading bucket X" from "user is paginating bucket Y".
 /// The default ([`PrivacyLevel::Standard`]) keeps the prefetch path
-/// cost-optimal and is what every Phase-1 / Phase-2 deployment
+/// cost-optimal and is what every / deployment
 /// already runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PrivacyLevel {
-    /// Phase-1 default. The prefetch issues exactly one fetch per
+    /// default. The prefetch issues exactly one fetch per
     /// real segment id.
     #[default]
     #[serde(rename = "standard")]
     Standard,
-    /// Phase-3 optional. The prefetch interleaves randomly
+    /// optional. The prefetch interleaves randomly
     /// generated dummy segment ids with the real ones; the dummy
     /// fetches return empty / 404 from the backend and are
     /// dropped on the receiving side. Trades transport bandwidth
@@ -123,29 +123,29 @@ pub struct KChatCoreConfig {
     /// Tenant identifier used for ZK Object Fabric Pattern C derivation.
     pub tenant_id: String,
     /// Personal-archive backend. Defaults to
-    /// [`ArchiveBackend::KChat`]. See `docs/PROPOSAL.md §10.1`.
+    /// [`ArchiveBackend::KChat`]. See `docs/DESIGN.md §10.1`.
     pub archive_backend: ArchiveBackend,
     /// Optional storage sink for **media originals**. `None` means
     /// media blobs flow through the default `TransportClient` to
     /// the KChat backend (Tier 0). When set to a user-cloud variant
     /// (Tier 2), the media engine routes originals there; thumbnails
     /// and archive segments still go to Tier 0. See
-    /// `docs/PROPOSAL.md §5.7`.
+    /// `docs/DESIGN.md §5.7`.
     pub media_blob_sink: Option<StorageSink>,
     /// Privacy posture for archive prefetch / orchestration. The
     /// default is [`PrivacyLevel::Standard`]; bumping it to
     /// [`PrivacyLevel::High`] enables dummy-request padding per
-    /// `docs/PROPOSAL.md §5.6`.
+    /// `docs/DESIGN.md §5.6`.
     pub privacy_level: PrivacyLevel,
-    /// Phase 8 (2026-05-04 batch 6) — per-tenant search policy
+    /// per-tenant search policy
     /// overrides keyed by `tenant_id`. The orchestration layer
     /// looks the active tenant up in this map and feeds the
     /// resulting [`TenantSearchPolicy`] into the cold fan-out;
     /// tenants without a registered override fall back to
     /// [`TenantSearchPolicy::default`] (which allows everything
-    /// the legacy Phase-1..Phase-7 search engine allowed).
+    /// the legacy engine allowed).
     pub tenant_search_policies: HashMap<String, TenantSearchPolicy>,
-    /// Phase 8 (2026-05-04 batch 10) — maximum number of cold
+    /// maximum number of cold
     /// shard fetches the orchestration layer is allowed to
     /// issue **in parallel** for a single search. Defaults to
     /// `4`. Setting this to `1` collapses the parallel path
@@ -156,7 +156,7 @@ pub struct KChatCoreConfig {
     /// implementation being `Send + Sync` — the legacy entry
     /// point is preserved unchanged for sources that are not.
     pub max_cold_fetch_concurrency: usize,
-    /// Phase 7 (2026-05-04 batch 10 — Task 9) — when set to
+    /// when set to
     /// `Some((source, target))`, the eviction path automatically
     /// queues a one-off [`crate::scheduler::OneOffTask::MediaMigration`]
     /// after a successful eviction pass. `None` (the default)
@@ -170,16 +170,16 @@ pub struct KChatCoreConfig {
     pub auto_migrate_after_eviction: Option<(String, String)>,
 }
 
-/// Phase 5 (2026-05-04 batch 10) — per-platform p95 latency
+/// per-platform p95 latency
 /// budgets for cold-shard search.
 ///
-/// `docs/PROPOSAL.md §7.5` pins the cold-shard decrypt + search
+/// `docs/DESIGN.md §7.5` pins the cold-shard decrypt + search
 /// p95 budget at 1.5 s and gives a per-device target matrix:
 /// flagship phones get a tighter budget, mid-range Android sees
 /// a looser one, desktops are tighter still. The
 /// [`DeviceMatrixConfig`] surface lets a caller pick the right
 /// budget for the host device when running the on-device
-/// latency gates added in Phase 5 batch 10.
+/// latency gates added in
 ///
 /// Values are nanoseconds — same unit as
 /// [`crate::perf::PerfTrace::duration_ns`] and
@@ -192,8 +192,8 @@ pub struct DeviceMatrixConfig {
     /// `1_000_000_000` (1.0 s).
     pub ios_flagship_p95_ns: u64,
     /// p95 budget for an older iOS device (≤A13). Default:
-    /// `1_500_000_000` (1.5 s) — matches the headline PROPOSAL
-    /// §7.5 budget.
+    /// `1_500_000_000` (1.5 s) — matches the headline
+    /// `docs/DESIGN.md` §7.5 budget.
     pub ios_older_p95_ns: u64,
     /// p95 budget for an Android flagship (Snapdragon 8 Gen-class).
     /// Default: `1_200_000_000` (1.2 s).
@@ -218,9 +218,9 @@ impl Default for DeviceMatrixConfig {
     }
 }
 
-/// Phase 8 (2026-05-04 batch 6) — per-tenant search policy.
+/// per-tenant search policy.
 ///
-/// `docs/PROPOSAL.md §7` introduces multi-scope search: a single
+/// `docs/DESIGN.md §7` introduces multi-scope search: a single
 /// query can target a single conversation, a community, a
 /// domain, an entire tenant, or the global B2C archive. Some
 /// deployments need to **forbid** the wider scopes — a B2B
@@ -245,7 +245,7 @@ pub struct TenantSearchPolicy {
     /// Default: `false` — most B2B deployments keep tenants
     /// disjoint at the bucket level. Setting this to `true`
     /// lets the cold fan-out cross tenant boundaries, which is
-    /// the legacy Phase-5 behaviour.
+    /// the legacy behaviour.
     pub allow_cross_tenant_results: bool,
     /// Maximum number of cold `(conversation_id, time_bucket)`
     /// pairs the fan-out is allowed to fetch for a single
@@ -296,7 +296,7 @@ impl KChatCoreConfig {
     }
 
     /// Override the cold-shard parallel fetch concurrency
-    /// (Phase 8 batch 10). Builder-style mirror of
+    ///. Builder-style mirror of
     /// [`KChatCoreConfig::with_tenant_search_policy`].
     #[must_use]
     pub fn with_max_cold_fetch_concurrency(mut self, n: usize) -> Self {
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn archive_backend_canonical_strings() {
-        // PROPOSAL.md §10.1 documents `archive_backend = "kchat" | "zkof"`.
+        // DESIGN.md §10.1 documents `archive_backend = "kchat" | "zkof"`.
         assert_eq!(
             serde_json::to_string(&ArchiveBackend::KChat).unwrap(),
             "\"kchat\""
@@ -477,7 +477,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — TenantSearchPolicy
+    // TenantSearchPolicy
     // -------------------------------------------------------------------
 
     #[test]
@@ -536,13 +536,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Phase 5 (2026-05-04 batch 10) — DeviceMatrixConfig.
+    // DeviceMatrixConfig.
     // ---------------------------------------------------------------
 
     #[test]
     fn device_matrix_config_default_budgets() {
         let m = DeviceMatrixConfig::default();
-        // Pinned to PROPOSAL.md §7.5 device matrix.
+        // Pinned to DESIGN.md §7.5 device matrix.
         assert_eq!(m.ios_flagship_p95_ns, 1_000_000_000);
         assert_eq!(m.ios_older_p95_ns, 1_500_000_000);
         assert_eq!(m.android_flagship_p95_ns, 1_200_000_000);

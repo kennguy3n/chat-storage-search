@@ -1,20 +1,24 @@
-# KChat Storage & Search — Technical Proposal
+# KChat Storage & Search — Design
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-This document defines the target architecture. See
-[PROGRESS.md](PROGRESS.md) for current implementation status.
+This document is the technical design for the KChat Storage &
+Search library. It covers the privacy boundary, key hierarchy,
+local storage layout, archive and backup formats, the search
+engine, the chunking and encryption specs, the restore pipeline,
+and the public API surface. The companion document
+[ARCHITECTURE.md](ARCHITECTURE.md) provides the system diagrams,
+dependency graph, schema, and sequence flows.
 
 ---
 
-## 0. Scope
+## 0. What the library is
 
-This module is a Rust core library with platform-specific bridges
-that provides E2EE local storage, personal archive, encrypted
-backup, storage offload, rehydration, and multilingual search to
-KChat.
+A Rust core library with platform-specific bridges that provides
+E2EE local storage, personal archive, encrypted backup, storage
+offload, rehydration, and multilingual search to KChat.
 
-### 0.1 In scope
+### 0.1 Components
 
 - **Rust core** crate: schema, crypto, indexing, search, archive,
   backup, offload, restore, transport, scheduler.
@@ -24,7 +28,7 @@ KChat.
 - **Android bridge** via JNI; idiomatic Kotlin façade over the
   generated bindings.
 - **Desktop**: macOS and Windows native consumers of the same Rust
-  crate. Windows must work CPU-only — no GPU assumption.
+  crate. Windows works CPU-only — no GPU assumption.
 - **MLS-plaintext-in / persistence-out integration** with KChat's
   MLS layer: the library consumes already-decrypted MLS application
   messages and produces local rows, indexes, archive events, and
@@ -566,8 +570,8 @@ index shards (recent). Small, latency-sensitive, ciphertext-only.
 
 **Tier 1 — KChat backend, movable**: older search index shards.
 Stored on the KChat backend by default, can age to user cloud
-under storage pressure (Phase 7). Shards remain encrypted; the
-shard fetch path on a search hit is the only consumer.
+under storage pressure. Shards remain encrypted; the shard fetch
+path on a search hit is the only consumer.
 
 **Tier 2 — User cloud (media originals)**: photos, videos,
 documents, voice messages, large attachments. Routed to iCloud,
@@ -593,8 +597,8 @@ fetching an original. Thumbnails always go through the KChat
 [`TransportClient`] (Tier 0); only originals are routed.
 
 **Default policy.** `media_blob_sink = None` means originals flow
-through the default `TransportClient` to the KChat backend (the
-Phase 1 / Phase 2 default). Setting `media_blob_sink` to one of
+through the default `TransportClient` to the KChat backend.
+Setting `media_blob_sink` to one of
 the user-cloud variants in `KChatCoreConfig` redirects originals
 to that sink without touching the thumbnail or archive path.
 
@@ -609,10 +613,10 @@ root) and AEAD open with `K_asset` are unchanged — only the
 
 **Cross-platform migration.** Switching from iOS to Android
 requires migrating iCloud-resident originals to Google Drive (or
-ZKOF as a platform-neutral fallback). Phase 7 carries a
-background migration job that re-uploads originals from the old
-sink to the new one and rewrites `media_asset.storage_sink` and
-the related `MediaDescriptor` field. ZKOF is the recommended
+ZKOF as a platform-neutral fallback). A background migration job
+re-uploads originals from the old sink to the new one and
+rewrites `media_asset.storage_sink` and the related
+`MediaDescriptor` field. ZKOF is the recommended
 neutral target for households that span platforms because it
 removes the per-vendor dependency entirely.
 
@@ -783,8 +787,10 @@ KChat MAY additionally implement:
 GET /v1/archive/index-shards?conversation_hash=...&bucket=2026-04&type=bloom
 ```
 
-Bloom filter shards are a Phase 8 addition. They are tiny (~1-10 KB)
-encrypted bloom filters over the lowercased words in a bucket. The
+Bloom filter shards are an optional, smaller-blast-radius shard
+type layered on top of the text and fuzzy shards. They are tiny
+(~1-10 KB) encrypted bloom filters over the lowercased words in a
+bucket. The
 client fetches bloom shards first to determine which buckets could
 possibly match the query, then fetches full text + fuzzy shards only
 for bloom-positive buckets. This reduces the number of full shard
@@ -921,7 +927,7 @@ is supported for the embedding models (`XLM-R` and `MobileCLIP-S2`).
 INT4 halves the on-disk size with minimal accuracy loss for
 embedding tasks (cosine-similarity correlation against the INT8
 baseline is verified by the multilingual relevance regression
-suite — see PHASES Phase 6). INT4 is the default on devices with
+suite). INT4 is the default on devices with
 tight storage budgets (low-end Android, Windows tablets); INT8
 remains the default on desktop and recent flagship mobile hardware
 where the slightly higher accuracy is preferred and the storage
@@ -1054,7 +1060,7 @@ correlated by the shard listing endpoint.
    result appears instantly; tap downloads encrypted chunks,
    verifies, decrypts, streams.
 
-### 7.10 Multi-scope search architecture (Phase 8)
+### 7.10 Multi-scope search architecture
 
 KChat's organizational model introduces three search scope levels
 beyond the single-conversation filter:
@@ -1093,9 +1099,6 @@ B2B tenant isolation is cryptographic: each tenant derives its own
 `K_b2b_tenant_root(tenant_id)` from `K_user_master`, with
 per-tenant archive and search shard keys. A `TenantSearchPolicy`
 controls whether a tenant's data participates in global search.
-
-
-See PHASES.md Phase 8 for the full checklist and priority order.
 
 ---
 
@@ -1158,8 +1161,12 @@ That means:
 | Cipher                   | XChaCha20-Poly1305 (24-byte nonce, 16-byte Poly1305 tag); AAD = empty                                                                                           | `chacha20poly1305.NewX` in `sdk.go`                     |
 | Frame layout             | `[24-byte nonce][4-byte BE ciphertext length][ciphertext+tag]` per chunk                                                                                        | `chunkHeaderSize` + `nextFrame` in `sdk.go`             |
 
-Cross-language test vectors fix this contract — see Phase 0 in
-[PHASES.md](PHASES.md). Pattern C also drops KChat's per-chunk AAD
+Cross-language test vectors at
+`crates/core/tests/pattern_c_interop_vectors.json` lock this
+contract — they are regenerated from the Go SDK by
+`tests/generate_vectors/main.go` and exercised by
+`pattern_c_interop_vectors` in CI. Pattern C also drops KChat's
+per-chunk AAD
 for ZK Fabric uploads because the Go SDK uses empty AAD; the
 KChat-internal AAD scheme in §8.3 is for KChat's own backend
 blob, archive, and search shard paths, not for Pattern C. The
@@ -1289,7 +1296,7 @@ of the KChat backend's `/v1/blobs/*` endpoints. Each
 | `ZkObjectFabric { … }`  | S3 `PutObject` (multipart for large originals) in the configured bucket | S3 `GetObject` (range)                      | S3 `DeleteObject`                         |
 
 All variants receive identical AEAD-sealed ciphertext (per
-`docs/PROPOSAL.md §8`). The sink is a byte mover — it never
+`docs/DESIGN.md §8`). The sink is a byte mover — it never
 inspects, compresses, or re-keys the chunks. Thumbnails and
 archive segments do not flow through `MediaBlobSink`; they keep
 the existing routing (Tier 0).
@@ -1417,7 +1424,7 @@ is *include cold*, with a small ranking penalty per §7.5.
 | Backup manifest chain corruption                                  | Verify `previous_manifest_hash` chain on every restore; alert on chain break; never silently re-rooted.                                                                                 |
 | Archive segment loss on backend                                   | Whole-object Merkle root verification; re-archive from local if the segment is still on-device; surface the loss to the user when neither side has it.                                  |
 | Platform backup size limits (Android Auto Backup 25 MB)           | Auto Backup carries only recovery envelopes + manifest pointers; full data goes to Large Backup, SAF, or ZK Object Fabric.                                                              |
-| ZK Object Fabric Pattern C interop drift                          | Cross-language test vectors locked in Phase 0; Rust implementation diff-tested against the Go SDK on every release.                                                                     |
+| ZK Object Fabric Pattern C interop drift                          | Cross-language test vectors locked at `crates/core/tests/pattern_c_interop_vectors.json`; Rust implementation diff-tested against the Go SDK on every release.                          |
 | Access-pattern metadata leakage on rehydration                    | Batch-by-bucket prefetch coarsens the signal to per-bucket granularity; optional dummy request padding (`privacy_level = "high"`) further obscures access patterns. See §5.6.          |
 | Archive key compromise exposes full history                       | Epoch-rotated archive keys (`K_archive_epoch`) limit the blast radius to the current epoch + any prior epochs whose wrapped keys the attacker can unwrap. Optional epoch-key deletion provides forward secrecy at the cost of scroll-back depth. See §2.1. |
 | Backend storage cost at scale (media originals)                   | Tiered media storage routes originals to user-paid cloud (iCloud / Google Drive / ZK Object Fabric); KChat backend holds only text, indexes, thumbnails, and manifests. See §5.7.       |

@@ -1,4 +1,4 @@
-//! Android backup sink (Phase 4, Task 5).
+//! Android backup sink.
 //!
 //! Mirrors [`crate::backup::sinks::icloud::ICloudBackupSink`] for
 //! the Android side of the **backup** pipeline. The Rust core
@@ -11,18 +11,18 @@
 //!
 //! ## Why two channels?
 //!
-//! `docs/PROPOSAL.md §6.5` pins Android's backup story to Auto
+//! `docs/DESIGN.md §6.5` pins Android's backup story to Auto
 //! Backup *plus* SAF: Auto Backup is free / quota-managed by
 //! Google but capped at 25 MiB *per package*, while SAF lets the
 //! user choose any document provider (Google Drive, Dropbox,
 //! Nextcloud, …) and is unconstrained in size. The split is:
 //!
 //! ```text
-//! Auto Backup  ── manifest pointers (≤ 25 MiB cumulative)
-//!                  → BackupAgent xml namespace
+//! Auto Backup ── manifest pointers (≤ 25 MiB cumulative)
+//! → BackupAgent xml namespace
 //!
-//! SAF          ── full segment ciphertext, one document URI per
-//!                  segment, listed under a user-picked tree URI
+//! SAF ── full segment ciphertext, one document URI per
+//! segment, listed under a user-picked tree URI
 //! ```
 //!
 //! The bridge is byte-level so the Kotlin side can decide on

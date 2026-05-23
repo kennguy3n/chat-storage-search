@@ -1,17 +1,17 @@
-//! `media` module — Phase 2 chunked-media pipeline.
+//! `media` module — chunked-media pipeline.
 //!
-//! Phase 0 / Phase 1 left this module as a placeholder. Phase 2 lands
+//! left this module as a placeholder. lands
 //! the chunked-media pipeline that splits a plaintext blob into
 //! AEAD-sealed chunks, persists the descriptor side of the asset,
 //! and uploads the ciphertext to the configured backend:
 //!
-//! * [`chunker`] — split, AEAD-seal (`docs/PROPOSAL.md §8.3`),
+//! * [`chunker`] — split, AEAD-seal (`docs/DESIGN.md §8.3`),
 //!   integrity-verify, and size-class pad (`§8.2`).
 //! * [`processor`] — generate `K_asset`, run [`chunker::chunk_and_encrypt`],
 //!   wrap `K_asset` under a hierarchy root, and assemble the
 //!   [`crate::formats::media_descriptor::MediaDescriptor`] the rest
 //!   of the system persists.
-//! * [`thumbnail`] — Phase-2 thumbnail generator: decode → resize →
+//! * [`thumbnail`] — thumbnail generator: decode → resize →
 //!   re-encode as PNG so the timeline can render a low-fidelity
 //!   preview before / instead of the original.
 //! * [`upload`] — drive [`crate::transport::TransportClient`] through
@@ -25,14 +25,14 @@
 //!   the rehydration path doesn't re-pay AEAD work for hot assets.
 //! * [`caption`] — Unicode-NFC normalization and filesystem-safe
 //!   sanitization for multilingual filenames / captions
-//!   (`docs/PROPOSAL.md §3.4`).
+//!   (`docs/DESIGN.md §3.4`).
 //! * [`routing`] — `route_media_upload` / `route_media_download`
 //!   dispatch between the KChat [`crate::transport::TransportClient`]
 //!   and an optional [`sinks::MediaBlobSink`] per
-//!   `docs/PROPOSAL.md §5.7`.
+//!   `docs/DESIGN.md §5.7`.
 //! * [`sinks`] — the [`sinks::MediaBlobSink`] routing seam for
 //!   media-original uploads / downloads (KChat backend, iCloud,
-//!   Google Drive, ZK Object Fabric). See `docs/PROPOSAL.md §5.7`.
+//!   Google Drive, ZK Object Fabric). See `docs/DESIGN.md §5.7`.
 
 pub mod cache;
 pub mod caption;

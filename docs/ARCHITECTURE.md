@@ -3,7 +3,7 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
 This document is the system-architecture companion to
-[PROPOSAL.md](PROPOSAL.md). It contains the diagrams, schema, state
+[DESIGN.md](DESIGN.md). It contains the diagrams, schema, state
 machines, and sequence flows that define how the Rust core and its
 platform bridges fit together. Where the proposal is "what and why",
 this document is "how the pieces connect".
@@ -227,7 +227,7 @@ storage (iCloud / Google Drive / ZK Object Fabric) via the
 archive stores only `media_key_delta` segments (the `K_asset`
 wraps) and thumbnails; originals are fetched from the user's
 configured media sink on tap. Thumbnails and archive segments
-stay on Tier 0; only originals are routed. See PROPOSAL.md §5.7.
+stay on Tier 0; only originals are routed. See DESIGN.md §5.7.
 
 ---
 
@@ -282,7 +282,7 @@ CREATE TABLE media_asset (
     chunk_count       INTEGER NOT NULL,
     merkle_root       BLOB NOT NULL,
     blob_id           TEXT NOT NULL,
-    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- PROPOSAL.md §5.7
+    storage_sink      TEXT NOT NULL DEFAULT 'kchat_backend'  -- DESIGN.md §5.7
 );
 
 -- Multilingual full-text search
@@ -333,7 +333,7 @@ CREATE TABLE archive_segment_map (
     time_bucket          TEXT NOT NULL,     -- e.g. '2026-04'
     segment_type         TEXT NOT NULL,
     blob_id              TEXT NOT NULL,
-    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- PROPOSAL.md §10.1
+    storage_backend      TEXT NOT NULL DEFAULT 'kchat_backend',  -- DESIGN.md §10.1
     merkle_root          BLOB NOT NULL,
     state                TEXT NOT NULL      -- not_archived..archive_compacted
 );
@@ -469,7 +469,7 @@ flowchart TD
     Cold["Cold bucket?<br/>fetch encrypted shard<br/>by coarse bucket"]
     Decrypt["Decrypt shard locally"]
     Merge["Merge candidates by<br/>message_id"]
-    Rerank["Rerank<br/>BM25_WEIGHT × bm25 +<br/>FUZZY_WEIGHT × fuzzy +<br/>SEMANTIC_WEIGHT × cosine ×<br/>recency × content_kind<br/>(see PROPOSAL.md §7.5)"]
+    Rerank["Rerank<br/>BM25_WEIGHT × bm25 +<br/>FUZZY_WEIGHT × fuzzy +<br/>SEMANTIC_WEIGHT × cosine ×<br/>recency × content_kind<br/>(see DESIGN.md §7.5)"]
     Out["Skeleton results<br/>(hydrate on tap)"]
 
     Q --> LD --> NORM --> TOK
@@ -492,7 +492,7 @@ flowchart TD
     Merge --> Rerank --> Out
 ```
 
-The semantic path is the Phase 6 implementation. The query
+The semantic path layers on top of the lexical engines. The query
 string flows through `QueryEngine::execute_search_with_semantic`
 which:
 1. runs the existing FTS5 + fuzzy fan-out;
@@ -513,8 +513,8 @@ which:
 4. weights surviving candidates by the recency × content-kind
    factor and re-sorts.
 
-The Phase-6 batch additionally lands a dedicated reranking
-entry point: `QueryEngine::rerank_with_semantic` takes a result
+There is a dedicated reranking entry point as well:
+`QueryEngine::rerank_with_semantic` takes a result
 set + a query embedding, recomputes cosine similarity for every
 result that has a vector in `search_vector`, updates
 `semantic_score` in place, adds `sim × SEMANTIC_WEIGHT` to
@@ -524,7 +524,7 @@ descending `created_at_ms` then by `message_id`.
 issued during the rerank pass.
 
 The same `media_search_index` table that backs the OCR bridge
-also carries the **Phase-6 batch additions**: the
+carries audio and document MIME results: the
 `WhisperTranscriber` seam writes audio MIME results with
 `kind = "transcript"` (text + language); the
 `DocumentExtractor` seam writes PDF / DOCX page-level extracts
@@ -547,10 +547,10 @@ first observes the message writes the 384-dim vector into the
 `search_vector` row keyed by `(message_id, model_version =
 'xlmr@v1')`, and the other pipeline reads it back from that row
 instead of running its own ONNX inference. See
-[`docs/PROPOSAL.md` §7.6.1](./PROPOSAL.md) for the full contract
+[`docs/DESIGN.md` §7.6.1](./DESIGN.md) for the full contract
 (version-mismatch handling, locality / non-replication rules)
 and [`crate::models::embeddings::EmbeddingCache`] for the trait
-that binds the seam. The Phase-6 integration test
+that binds the seam. The integration test
 `crates/core/tests/phase6_embedding_cache.rs` exercises the
 seam (put/get round-trip with INT8-codec cosine fidelity > 0.999,
 version-mismatch → `None`, two-instance same-connection
@@ -691,7 +691,7 @@ empty row vector to the query engine, and records the failure in
 a side-channel log so the platform layer can render a "search
 results may be incomplete" banner without losing local hits.
 
-### 6.3 Ranking formula (PROPOSAL §7.5)
+### 6.3 Ranking formula (DESIGN.md §7.5)
 
 After the local + cold candidates merge by `message_id`, the
 query engine reranks with the multiplicative formula
@@ -742,7 +742,7 @@ In-module unit tests pin every direction of the formula:
 
 ### 6.4 Script-aware fuzzy matching
 
-`FuzzySearchEngine::search_fuzzy` (Phase 5, Task 2) groups query
+`FuzzySearchEngine::search_fuzzy` groups query
 tokens by `ScriptClass`, joins
 `search_fuzzy(token, script, message_id)` on `(token, script)`,
 and applies a per-script overlap floor via
@@ -913,7 +913,7 @@ sequenceDiagram
     Sys->>Off: "enforceStorageBudget(reason)"
     Off->>DB: "compute storage usage + headroom"
     Off->>DB: "build candidate set<br/>(verified archives, not pinned, not active)"
-    Off->>DB: "score each candidate<br/>(see PROPOSAL.md §5.4)"
+    Off->>DB: "score each candidate<br/>(see DESIGN.md §5.4)"
     loop "until headroom reclaimed"
         Off->>DB: "evict next candidate per priority order"
     end
@@ -1005,7 +1005,7 @@ Prefetch granularity is **per time bucket**: when any segment in a
 `(conversation_id, time_bucket)` is needed, all segments for that
 pair are fetched. This aligns the prefetch unit with the archive
 segment grouping and reduces per-segment access-pattern metadata
-to per-bucket granularity (see PROPOSAL.md §5.6).
+to per-bucket granularity (see DESIGN.md §5.6).
 
 ---
 
@@ -1425,7 +1425,7 @@ surface:
   per-platform p95 dashboards can be assembled from a single
   collector backend.
 
-### 11.11 Phase 7 service seams
+### 11.11 Cross-platform service seams
 
 Four additional object-safe traits add desktop and B2B
 operational support:

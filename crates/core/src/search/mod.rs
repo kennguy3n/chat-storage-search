@@ -1,11 +1,11 @@
 //! `search` module — search engine surface.
 //!
-//! Phase 0 lands the multilingual tokenization spec ([`tokenizer`]):
+//! Lands the multilingual tokenization spec ([`tokenizer`]):
 //! the FTS5 `tokenize = '...'` literal, the ISO-15924 [`ScriptClass`],
 //! the trigram-vs-bigram [`FuzzyGranularity`] mapping, and the
 //! mixed-script `segment_by_script` helper that the fuzzy indexer
 //! uses to tag rows. The actual FTS5 / fuzzy / vector engines land in
-//! Phases 1, 5, and 6 respectively — see `docs/PHASES.md`.
+//! Phases 1, 5, and 6 respectively — see.
 //!
 //! [`ScriptClass`]: tokenizer::ScriptClass
 //! [`FuzzyGranularity`]: tokenizer::FuzzyGranularity
@@ -105,8 +105,8 @@ impl SearchError {
     /// `rusqlite::Error`). Use the bare
     /// `impl From<DbError> for SearchError` (`?`-friendly) for
     /// callers that need the structural [`SearchError::Sqlite`] path
-    /// — for example, a future retry loop pattern-matching on
-    /// `rusqlite::Error::sqlite_error_code()`. The four
+    /// for example, a future retry loop pattern-matching on
+    /// `rusqlite::Error::sqlite_error_code`. The four
     /// `read_list_conversations_by_column` call sites in
     /// `query_engine` are not retry hot-paths, so observability wins
     /// over typed routing for them.

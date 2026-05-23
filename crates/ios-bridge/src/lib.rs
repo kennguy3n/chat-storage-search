@@ -8,7 +8,7 @@
 
 //! iOS UniFFI bridge for `kchat-core`.
 //!
-//! Phase 1 scaffold. The UDL at [`src/kchat.udl`] defines the
+//! The UDL at [`src/kchat.udl`] defines the
 //! cross-language surface; this module supplies the matching Rust
 //! types and method implementations. The
 //! `uniffi::include_scaffolding!("kchat")` macro at the bottom of
@@ -35,7 +35,7 @@
 //!   [`kchat_core::KChatCore`] are exposed; the inherent
 //!   [`kchat_core::CoreImpl::with_transport`] entry point will be
 //!   added once the transport surface is wired through UniFFI in
-//!   Phase 2.
+//!
 
 use std::path::PathBuf;
 use std::sync::{Mutex, Once};
@@ -247,7 +247,7 @@ impl From<ContentKind> for kchat_core::ContentKind {
     }
 }
 
-/// Phase 8 (2026-05-04 batch 6) — Task 8: FFI-shaped mirror of
+/// FFI-shaped mirror of
 /// [`kchat_core::SearchTarget`].
 ///
 /// UDL emits this as a tagged enum. Variants that carry a UUID
@@ -322,7 +322,7 @@ pub struct SearchQuery {
     pub date_from: Option<i64>,
     pub date_to: Option<i64>,
     pub content_kind: Option<ContentKind>,
-    /// Phase 8 (2026-05-04 batch 6) — Task 8: optional
+    /// optional
     /// SearchTarget. `None` preserves the legacy default
     /// (`SearchTarget::Global`), keeping every Swift caller
     /// that constructed a [`SearchQuery`] before this field
@@ -464,7 +464,7 @@ impl From<kchat_core::message::processor::IngestResult> for IngestResult {
 /// FFI-shaped placeholder mirror of
 /// [`kchat_core::DeviceRegistration`]. The full payload (MLS
 /// credential bundle, KeyPackage handle, …) lands when the MLS
-/// layer arrives later in Phase 1 / Phase 2; the empty struct here
+/// layer arrives later in / ; the empty struct here
 /// is enough to pin the FFI shape today.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceRegistration {}
@@ -506,8 +506,8 @@ fn key_from_vec(key: Vec<u8>) -> Result<[u8; 32]> {
 // Tracing subscriber installation
 // ---------------------------------------------------------------------------
 //
-// `kchat-core` emits `tracing` spans / events on every hot path
-// (Phase A.3). Without a process-wide subscriber installed those
+// `kchat-core` emits `tracing` spans / events on every hot path.
+// Without a process-wide subscriber installed those
 // events would be discarded by `tracing`'s no-op default.
 //
 // We use `std::sync::Once` so the subscriber is installed exactly
@@ -686,7 +686,7 @@ impl KChatCore {
 }
 
 // Compile-time check that the unused [`BackupSource`] re-export is
-// still wired so future Phase-4 expansion of the UDL doesn't have
+// still wired so future expansion of the UDL doesn't have
 // to re-import it.
 #[allow(dead_code)]
 fn _backup_source_is_in_scope() -> BackupSource {
@@ -694,7 +694,7 @@ fn _backup_source_is_in_scope() -> BackupSource {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 (2026-05-04 final batch) — Task 11: iCloud bridge wiring.
+// iCloud bridge wiring.
 //
 // `ICloudBlobBridgeImpl` adapts a Swift-side
 // [`ICloudBlobCallback`] trait object into the canonical
@@ -702,7 +702,7 @@ fn _backup_source_is_in_scope() -> BackupSource {
 // core's `ICloudMediaBlobSink` consumes. The Rust side does not
 // itself talk to CloudKit; the callback's `upload_file`,
 // `download_file_range`, and `delete_file` methods are
-// implemented in Swift against `CKContainer.default()`.
+// implemented in Swift against `CKContainer.default`.
 //
 // The `ICloudBlobCallback` shape is stable:
 // adding it to `kchat.udl` as a `callback interface` is the
@@ -718,7 +718,7 @@ use kchat_core::media::sinks::icloud::{
 };
 
 /// Callback contract the Swift side fulfills against
-/// `CKContainer.default().publicCloudDatabase`.
+/// `CKContainer.default.publicCloudDatabase`.
 ///
 /// Mirrors a UniFFI `callback interface ICloudBlobCallback`.
 /// Each method maps 1:1 to the bridge methods on
@@ -951,7 +951,7 @@ mod tests {
         let conv = Uuid::now_v7();
 
         // Seed conversation directly through the wrapped CoreImpl
-        // — `create_conversation` is an inherent method on
+        // `create_conversation` is an inherent method on
         // CoreImpl and not part of the FFI yet.
         {
             let core = bridge.core.lock().unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — Task 8: SearchTarget bridge tests
+    // SearchTarget bridge tests
     // ---------------------------------------------------------------
 
     #[test]

@@ -1,6 +1,6 @@
-//! Windows-specific desktop integration scaffold.
+//! Windows-specific desktop integration.
 //!
-//! Phase 7, Task 6 (2026-05-04 batch). The three seams here are:
+//! The three seams here are:
 //!
 //! * [`WindowsSearchBridge`] — outbound interface to the Windows
 //!   Search indexer. Mirrors [`super::macos::SpotlightBridge`]
@@ -18,12 +18,12 @@
 //!   falls back to CPU EP), and that INT4 is the default tier
 //!   for tight-storage devices.
 //!
-//! All trait seams are object-safe (`Box<dyn ...>`) and
+//! All trait seams are object-safe (`Box<dyn...>`) and
 //! `Send + Sync`.
 //!
 //! References:
-//! * `docs/PROPOSAL.md §7.4` — Windows Search anchors.
-//! * `docs/PHASES.md` Phase 7 — desktop integration.
+//! * `docs/DESIGN.md §7.4` — Windows Search anchors.
+//! * — desktop integration.
 //! * `docs/ARCHITECTURE.md §11.4` — DirectML EP fallback to CPU.
 
 use kchat_core::scheduler::BackgroundScheduler;
@@ -60,9 +60,9 @@ pub trait WindowsSearchBridge: Send + Sync + std::fmt::Debug {
     fn remove_conversation(&self, conversation_id: &str) -> Result<(), Error>;
 }
 
-/// Phase-7 placeholder Windows Search bridge.
+/// placeholder Windows Search bridge.
 ///
-/// Every method silently succeeds (`Ok(())`).
+/// Every method silently succeeds (`Ok()`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWindowsSearchBridge;
 
@@ -96,7 +96,7 @@ impl WindowsSearchBridge for NoopWindowsSearchBridge {
 // WindowsSchedulerBridge — outbound IBackgroundTrigger seam
 // ---------------------------------------------------------------------------
 
-/// Phase-7 placeholder for the Windows
+/// placeholder for the Windows
 /// `IBackgroundTrigger` / Task Scheduler bridge. Every method
 /// returns [`Error::NotImplemented`] so the orchestration layer
 /// can distinguish "no bridge installed" from "scheduler

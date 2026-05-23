@@ -1,11 +1,11 @@
 //! On-device ONNX Runtime session creator for the MobileCLIP-S2
 //! image / video encoder.
 //!
-//! `docs/PROPOSAL.md §7.6` and §7.7. MobileCLIP-S2 is the
+//! `docs/DESIGN.md §7.6` and §7.7. MobileCLIP-S2 is the
 //! image-side encoder that pairs with the XLM-R text encoder for
 //! cross-modal semantic search (a query is text-embedded and
-//! matched against image embeddings via HNSW). Phase 6 lands the
-//! actual inference loop; this module is the Phase 6 scaffold
+//! matched against image embeddings via HNSW). lands the
+//! actual inference loop; this module is the scaffold
 //! for the `ort::Session` creator that mirrors the DirectML →
 //! CPU best-effort pattern in
 //! [`crate::models::embeddings_onnx`] (which also owns the
@@ -32,7 +32,7 @@ use crate::models::embeddings_onnx::OrtSessionResult;
 /// Canonical `model_version` tag for the MobileCLIP-S2
 /// image / video encoder shipped to devices.
 ///
-/// `docs/PROPOSAL.md §7.6.1` (cross-pipeline embedding cache):
+/// `docs/DESIGN.md §7.6.1` (cross-pipeline embedding cache):
 /// any future encoder upgrade (e.g. `mobileclip_s2@v2`) MUST
 /// bump this constant so the version-mismatch invariant on
 /// [`crate::models::embeddings::EmbeddingCache::get`]
@@ -41,7 +41,7 @@ pub const MOBILECLIP_S2_MODEL_VERSION: &str = "mobileclip_s2@v1";
 
 /// Output dimensionality of the MobileCLIP-S2 image encoder.
 ///
-/// `docs/PROPOSAL.md §7.6`. The cache itself does not enforce
+/// `docs/DESIGN.md §7.6`. The cache itself does not enforce
 /// this dimension — it only requires the dequantized blob
 /// length to match what was written — but callers SHOULD assert
 /// against this constant before consuming a cached vector to
@@ -49,14 +49,14 @@ pub const MOBILECLIP_S2_MODEL_VERSION: &str = "mobileclip_s2@v1";
 pub const MOBILECLIP_S2_EMBEDDING_DIM: usize = 512;
 
 /// Canonical on-disk filename for the INT8 MobileCLIP-S2
-/// artifact. Phase 6, Task 5 (2026-05-04 batch). The trailing
+/// artifact.. The trailing
 /// `.onnx` suffix lets `ModelManager::resolve_destination` work
 /// uniformly across encoders.
 pub const MOBILECLIP_S2_INT8_FILENAME: &str = "mobileclip_s2-v1-int8.onnx";
 
 /// Canonical on-disk filename for the INT4 (`MatMulNBits`)
 /// MobileCLIP-S2 artifact shipped to tight-storage devices.
-/// Phase 6, Task 5 (2026-05-04 batch).
+///.
 pub const MOBILECLIP_S2_INT4_FILENAME: &str = "mobileclip_s2-v1-int4.onnx";
 
 #[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
@@ -77,7 +77,7 @@ mod windows_directml {
     /// [`OnnxProviderReport`] reflects the EP actually
     /// registered, not the original intent.
     ///
-    /// Phase 6 wires the preview-asset → image-tensor encode
+    /// wires the preview-asset → image-tensor encode
     /// step (downsample to 224×224 RGB, NCHW float32,
     /// ImageNet-style normalization) — that lives in a
     /// follow-up alongside the [`crate::models::embeddings`]
@@ -128,7 +128,7 @@ mod posix_cpu {
     /// macOS / Linux flavor of the MobileCLIP-S2 session
     /// creator. Always registers the CPU EP. The cross-platform
     /// inference seam (CoreML EP on Apple, NNAPI EP on
-    /// Android) lands later in Phase 6 — this scaffold focuses
+    /// Android) lands later in — this scaffold focuses
     /// on the Windows DirectML path called out in
     /// `docs/ARCHITECTURE.md §11.4`.
     pub fn create_mobileclip_session(
@@ -145,18 +145,18 @@ mod posix_cpu {
 #[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
 pub use posix_cpu::create_mobileclip_session;
 
-/// Phase 6, Task 5 (2026-05-04 batch): INT4 (`MatMulNBits`)
+/// INT4 (`MatMulNBits`)
 /// flavor of [`create_mobileclip_session`].
 ///
 /// The actual `MatMulNBits` graph optimization in `ort` is
 /// applied automatically at session-load time when the `.onnx`
 /// model file already carries `MatMulNBits` nodes (which our
 /// INT4 export pipeline produces). This helper is therefore
-/// structurally identical to [`create_mobileclip_session`] —
+/// structurally identical to [`create_mobileclip_session`]
 /// the EP-selection state machine and CPU fallback are the
 /// same. The function exists as a named seam so future graph-
 /// optimization tweaks (`SessionBuilder::with_optimization_level`
-/// /  `with_intra_threads`) can land without touching the
+/// / `with_intra_threads`) can land without touching the
 /// INT8 path.
 #[cfg(feature = "onnx-runtime")]
 pub fn create_mobileclip_session_int4(
@@ -168,7 +168,7 @@ pub fn create_mobileclip_session_int4(
     create_mobileclip_session(model_path)
 }
 
-/// Phase 6, Task 5 (2026-05-04 batch): INT4 session-creator
+/// INT4 session-creator
 /// stub for builds without the `onnx-runtime` cargo feature.
 ///
 /// Returns [`crate::Error::NotImplemented`] so callers can
@@ -180,7 +180,7 @@ pub fn create_mobileclip_session_int4(_model_path: &std::path::Path) -> crate::R
     ))
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: EP-aware named seam
+/// EP-aware named seam
 /// over [`create_mobileclip_session`].
 ///
 /// Mirrors [`crate::models::embeddings_onnx::create_xlmr_session_with_ep`]:
@@ -200,7 +200,7 @@ pub fn create_mobileclip_session_with_ep(
     create_mobileclip_session(model_path)
 }
 
-/// Phase 6 (2026-05-04 final batch) — Task 3: stub for the
+/// stub for the
 /// EP-aware seam when the `onnx-runtime` feature is off.
 #[cfg(not(feature = "onnx-runtime"))]
 pub fn create_mobileclip_session_with_ep(
@@ -213,13 +213,13 @@ pub fn create_mobileclip_session_with_ep(
 }
 
 // ---------------------------------------------------------------------------
-// ImageEmbedder trait — Phase 6, Task 9
+// ImageEmbedder trait
 // ---------------------------------------------------------------------------
 
 use crate::Result;
 
 /// On-device image-embedding seam used by the media-ingest
-/// pipeline (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
+/// pipeline (`docs/DESIGN.md §7.6`, ).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash it inside `Mutex<Option<Box<dyn ImageEmbedder>>>`.
@@ -256,7 +256,7 @@ impl ImageEmbedder for NoopImageEmbedder {
 /// `(mime_type, image_data)` into a reproducible, L2-normalized
 /// vector.
 ///
-/// Used by the Phase 6 unit tests to stand in for a real
+/// Used by the unit tests to stand in for a real
 /// MobileCLIP-S2 encoder. Same construction as
 /// [`crate::models::embeddings::MockTextEmbedder`]: BLAKE3 of
 /// the input seeds an LCG, and the resulting `dim`-length f32
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn embedding_dim_is_documented_clip_s2() {
-        // Sanity: matches `docs/PROPOSAL.md §7.6` (~40 MB INT4
+        // Sanity: matches `docs/DESIGN.md §7.6` (~40 MB INT4
         // / ~80 MB INT8). 512 is the documented MobileCLIP-S2
         // image-embedding dimension.
         assert_eq!(MOBILECLIP_S2_EMBEDDING_DIM, 512);
@@ -341,7 +341,7 @@ mod tests {
     fn model_version_tag_is_versioned() {
         // The `@vN` suffix is the cache-invalidation lever; bump
         // it whenever the encoder is replaced. See
-        // `docs/PROPOSAL.md §7.6.1`.
+        // `docs/DESIGN.md §7.6.1`.
         assert!(
             MOBILECLIP_S2_MODEL_VERSION.contains('@'),
             "model version tag must include an @vN suffix"
@@ -364,7 +364,7 @@ mod tests {
         }
     }
 
-    // ----- Phase 6, Task 9: ImageEmbedder coverage --------------
+    // -----: ImageEmbedder coverage --------------
 
     #[test]
     fn noop_image_embedder_returns_not_implemented() {

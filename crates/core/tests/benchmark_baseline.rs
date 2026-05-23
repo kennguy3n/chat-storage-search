@@ -394,7 +394,7 @@ impl BenchmarkReport {
 
 /// `chrono` is not a dev-dep on this crate. The committed
 /// snapshot only needs a calendar date, so we derive one from
-/// `SystemTime::now()` arithmetic — accurate to the day, which is
+/// `SystemTime::now` arithmetic — accurate to the day, which is
 /// the only resolution the JSON snapshot records.
 fn today_iso_date() -> String {
     let secs = std::time::SystemTime::now()

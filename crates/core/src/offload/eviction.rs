@@ -1,4 +1,4 @@
-//! Eviction planner & executor (`docs/PROPOSAL.md §5.4`).
+//! Eviction planner & executor (`docs/DESIGN.md §5.4`).
 //!
 //! Given a list of [`EvictionCandidate`]s and a target byte count,
 //! [`plan_eviction`] sorts by score and accumulates candidates
@@ -45,9 +45,9 @@ pub struct EvictionResult {
     pub evicted_count: u32,
 }
 
-/// Tier classification for the Phase-3 tiered eviction policy.
+/// Tier classification for the tiered eviction policy.
 ///
-/// `docs/PROPOSAL.md §5.4` and the PHASES.md "Phase 3 / tiered
+/// `docs/DESIGN.md §5.4` and the "tiered
 /// eviction" entry call for the budget enforcer to spend its byte
 /// budget against the cheaper tier before touching anything that
 /// requires a network rehydration:
@@ -112,7 +112,7 @@ pub struct TieredEvictionPlan {
 
 /// Tiered eviction planner.
 ///
-/// `docs/PROPOSAL.md §5.4` — first satisfy the byte budget out of
+/// `docs/DESIGN.md §5.4` — first satisfy the byte budget out of
 /// candidates whose originals live on a user cloud sink (cheap
 /// to rehydrate). Only if the cloud pass falls short do we fall
 /// through to candidates whose originals live on the KChat
@@ -169,14 +169,14 @@ pub fn plan_eviction(
 ) -> EvictionPlan {
     // Default pressure-level for the legacy single-arg planner is
     // `Extreme` so every content kind remains eligible — keeps the
-    // pre-Phase-3 callers working unchanged.
+    // pre-callers working unchanged.
     plan_eviction_with_pressure(candidates, target_bytes, now_ms, PressureLevel::Extreme)
 }
 
 /// `plan_eviction` variant that filters candidates by the
 /// caller-supplied [`PressureLevel`] before scoring.
 ///
-/// `docs/PROPOSAL.md §5.4` reserves the lowest tiers (thumbnails,
+/// `docs/DESIGN.md §5.4` reserves the lowest tiers (thumbnails,
 /// cold text bodies) for severe pressure. This entry point lets the
 /// orchestration layer pass through the [`PressureLevel`] computed
 /// by [`super::budget::pressure_level`] so the planner only ever
@@ -221,9 +221,9 @@ pub fn plan_eviction_with_pressure(
 ///
 /// For every candidate in `plan.candidates`, this issues an
 /// `UPDATE media_asset SET media_state = 'evicted', bytes_local = 0
-///   WHERE asset_id = ?1`. The string literal must match
+/// WHERE asset_id = ?1`. The string literal must match
 /// [`MediaState::as_str`](crate::local_store::state_machines::MediaState)
-/// — `'evicted'` is the canonical state for assets whose local data
+/// `'evicted'` is the canonical state for assets whose local data
 /// has been reclaimed by the storage budget enforcer.
 ///
 /// Eviction is per-asset (not per-message). `media_asset` is keyed
@@ -263,7 +263,7 @@ pub fn execute_eviction(conn: &Connection, plan: &EvictionPlan) -> Result<Evicti
 }
 
 /// Map a MIME type string to the eviction-priority bucket from
-/// `docs/PROPOSAL.md §5.4`.
+/// `docs/DESIGN.md §5.4`.
 ///
 /// Thumbnails are not directly distinguishable from full images at
 /// the `media_asset` level, so this mapper folds them into
@@ -296,16 +296,16 @@ fn classify_mime_type(mime_type: &str) -> ContentKind {
 ///
 /// Filters applied at the SQL layer:
 ///
-/// * `message_skeleton.archive_state = 'archive_verified'` —
+/// * `message_skeleton.archive_state = 'archive_verified'`
 ///   evicting an asset that has not yet been verified-uploaded
 ///   would lose it permanently.
 /// * `conversation.pinned = 0` — pinned conversations are exempt
-///   from eviction (`docs/PROPOSAL.md §5.4`).
+///   from eviction (`docs/DESIGN.md §5.4`).
 /// * `media_asset.media_state = 'original_local'` — the asset's
 ///   bytes are still on disk; already-evicted / cold rows have no
 ///   bytes to free.
 /// * `message_skeleton.created_at_ms < (now_ms - min_offload_age_ms)`
-///   — leave recently-arrived media alone so the typical
+///   leave recently-arrived media alone so the typical
 ///   "scroll back to last week" pattern stays hot.
 ///
 /// Rows are ordered by the §5.4 priority table:
@@ -992,7 +992,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Phase-3: PressureLevel-gated planning (`§5.4`).
+    // PressureLevel-gated planning (`§5.4`).
     // -------------------------------------------------------------
 
     #[test]
@@ -1137,7 +1137,7 @@ mod tests {
     fn tiered_eviction_respects_pressure_filter_in_each_pass() {
         // Text bodies are only eligible at Extreme pressure. With
         // Warning the cloud pool drops them and the full pool too
-        // — only the video survives.
+        // only the video survives.
         let cands = vec![
             cand_with_sink(ContentKind::Text, 100, 0, "icloud"),
             cand(ContentKind::Video, 1000, 0),

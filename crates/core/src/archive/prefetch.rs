@@ -1,6 +1,6 @@
-//! Phase-3 batch-by-bucket prefetch.
+//! batch-by-bucket prefetch.
 //!
-//! `docs/PROPOSAL.md §5.6` calls for the rehydration engine to
+//! `docs/DESIGN.md §5.6` calls for the rehydration engine to
 //! coarsen its access-pattern metadata by fetching every archive
 //! segment for a `(conversation_id, time_bucket)` key in one
 //! batch instead of issuing one fetch per scroll-back gesture.
@@ -60,7 +60,7 @@ fn ensure_all_kchat_backend(rows: &[(String, String, String)]) -> Result<(), Err
 /// Encrypted archive segment payload, paired with the metadata
 /// the orchestration layer needs to decrypt and merge it.
 ///
-/// Decryption is intentionally **not** the prefetch layer's job —
+/// Decryption is intentionally **not** the prefetch layer's job
 /// that keeps the prefetch surface dumb (no key material in this
 /// hop) and lets the calling code batch decryption against the
 /// current epoch key.
@@ -73,7 +73,7 @@ pub struct PrefetchedSegment {
     /// the segment was uploaded under.
     pub blob_id: String,
     /// `kchat_backend` / `zk_object_fabric` / …
-    /// (`docs/PROPOSAL.md §10.1`).
+    /// (`docs/DESIGN.md §10.1`).
     pub storage_backend: String,
     /// Encrypted segment bytes (CBOR + AEAD, exactly what
     /// `TransportClient::fetch_archive_segment` returned).
@@ -193,7 +193,7 @@ pub fn batch_prefetch_bucket_with_router(
 
 /// Padding-aware variant of [`batch_prefetch_bucket`].
 ///
-/// `docs/PROPOSAL.md §5.6` — when
+/// `docs/DESIGN.md §5.6` — when
 /// [`crate::config::PrivacyLevel::High`] is configured the
 /// orchestration layer mixes dummy segment-id fetches in with the
 /// real ones. The dummy ids are freshly-generated UUIDv4s; the
@@ -216,7 +216,7 @@ pub fn batch_prefetch_bucket_with_padding(
     }
 
     // 1) Pull every real segment-id row up front so we know how
-    //    many dummies to mint.
+    // many dummies to mint.
     let mut stmt = conn
         .prepare(
             "SELECT segment_id, blob_id, storage_backend
@@ -249,15 +249,15 @@ pub fn batch_prefetch_bucket_with_padding(
     ensure_all_kchat_backend(&backend_check)?;
 
     // 2) Compute how many dummies to mint and shuffle them in
-    //    with the real ids.
+    // with the real ids.
     let real_ids: Vec<String> = real_rows.keys().cloned().collect();
     let padding_count = compute_padding_count(real_ids.len());
     let padded = pad_with_dummy_requests(&real_ids, padding_count);
 
     // 3) Issue one fetch per id in the padded order. Dummy
-    //    fetches that error out are silently dropped — the
-    //    backend will 404 on every dummy id and we don't want a
-    //    single 404 to fail the whole batch.
+    // fetches that error out are silently dropped — the
+    // backend will 404 on every dummy id and we don't want a
+    // single 404 to fail the whole batch.
     let mut out = Vec::with_capacity(real_rows.len());
     for id in padded {
         if let Some((blob_id, storage_backend)) = real_rows.get(&id).cloned() {
@@ -551,7 +551,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------
-    // Phase 4 (Task 8): storage_backend-aware routing tests.
+    // (Task 8): storage_backend-aware routing tests.
     // ---------------------------------------------------------
 
     /// In-memory `S3Client` for ZKOF-routed prefetch tests.
@@ -757,7 +757,7 @@ mod tests {
             }
             other => panic!("expected Error::Storage, got {other:?}"),
         }
-        // The transport must NOT have been called for any row —
+        // The transport must NOT have been called for any row
         // the validator runs before the fetch loop, so we don't
         // even start a doomed KChat fetch on the seg-K row.
         assert!(transport.calls().is_empty());

@@ -1,4 +1,4 @@
-//! Phase-4 backup-manifest chain verification.
+//! backup-manifest chain verification.
 //!
 //! Walks an ordered slice of [`BackupManifest`] from generation 0
 //! to the latest and verifies:
@@ -39,7 +39,7 @@ pub enum VerificationError {
     #[error("manifest chain is empty")]
     EmptyChain,
 
-    /// `manifest[generation]` failed hybrid signature verification —
+    /// `manifest[generation]` failed hybrid signature verification
     /// either the Ed25519 leg or the ML-DSA-65 leg (or both) did
     /// not validate against the supplied verifying key.
     #[error("manifest {generation}: signature failed verification")]
@@ -88,7 +88,7 @@ pub enum VerificationError {
 }
 
 /// Walk the manifest chain from `manifests[0]` (genesis) to
-/// `manifests.last()`. Returns `Ok(())` only if every check
+/// `manifests.last`. Returns `Ok()` only if every check
 /// passes — including both the Ed25519 and ML-DSA-65 signature
 /// legs on every generation.
 pub fn verify_manifest_chain(

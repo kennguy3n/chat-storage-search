@@ -1,6 +1,6 @@
 //! Media download / rehydration pipeline.
 //!
-//! `docs/PROPOSAL.md §8` (chunking + AEAD) and `docs/PROPOSAL.md §10.3`
+//! `docs/DESIGN.md §8` (chunking + AEAD) and `docs/DESIGN.md §10.3`
 //! (`fetch_blob_range`) are the authoritative sources for the contract
 //! implemented here. This is the inverse of
 //! [`crate::media::upload::upload_chunked_media`]: the upload path
@@ -18,7 +18,7 @@
 //!   (`MediaState::Evicted → DownloadInProgress → OriginalLocal`).
 //! * [`download_single_chunk`] — single-chunk fetch used by
 //!   range-scrub / scroll-back rehydration where the caller only
-//!   needs one chunk's plaintext (`docs/PROPOSAL.md §8.5`).
+//!   needs one chunk's plaintext (`docs/DESIGN.md §8.5`).
 //!
 //! ## Range layout
 //!
@@ -32,10 +32,10 @@
 //! pipeline left short still fetches correctly with the same range
 //! formula.
 //!
-//! Phase 2 keeps the download pipeline synchronous to match the
-//! Phase-1 [`crate::transport::TransportClient`] surface; the
+//! Keeps the download pipeline synchronous to match the
+//! [`crate::transport::TransportClient`] surface; the
 //! production async client lands together with the upload async flip
-//! in Phase 2+.
+//! in +.
 
 use std::ops::Range;
 
@@ -111,7 +111,7 @@ fn blob_id_to_aad_bytes(blob_id: &str) -> Result<[u8; 16], Error> {
 /// Run the full chunk-fetch + AEAD-open + BLAKE3 verification of a
 /// previously uploaded asset and return the concatenated plaintext.
 ///
-/// `docs/PROPOSAL.md §8` rehydration contract:
+/// `docs/DESIGN.md §8` rehydration contract:
 ///
 /// 1. For `chunk_idx in 0..chunk_count`, call
 ///    [`TransportClient::fetch_blob_range`] for the chunk's byte
@@ -188,7 +188,7 @@ pub fn download_chunked_media(
 /// Fetch and AEAD-open a single chunk of a previously uploaded asset.
 ///
 /// Used by range-scrub / scroll-back rehydration paths that only
-/// need one chunk's plaintext (`docs/PROPOSAL.md §8.5`). Returns the
+/// need one chunk's plaintext (`docs/DESIGN.md §8.5`). Returns the
 /// chunk's plaintext bytes (a slice of the whole-object plaintext).
 ///
 /// **Important:** this single-chunk path verifies the AEAD tag and
@@ -271,15 +271,15 @@ pub struct RehydrationPlan {
     pub from_state: MediaState,
 }
 
-/// Phase 1 of the three-phase rehydration: read the `media_asset`
+/// Of the three-phase rehydration: read the `media_asset`
 /// row, validate the legal pre-state, and pull every field the
 /// download phase needs.
 ///
-/// Implements the metadata-read half of `docs/PROPOSAL.md §5.5` so
+/// Implements the metadata-read half of `docs/DESIGN.md §5.5` so
 /// the long-running download phase can run with the db mutex
 /// **released** — concurrent `send_text` / `search` / `ingest`
 /// callers must not block on a multi-chunk media fetch (Task 2 of
-/// the Phase 3/4 batch).
+/// the /4 batch).
 pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<RehydrationPlan, Error> {
     let row = db
         .get_media_asset(asset_id)
@@ -340,7 +340,7 @@ pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<Rehydrat
     })
 }
 
-/// Phase 2 of the three-phase rehydration: unwrap `K_asset`, drive
+/// Of the three-phase rehydration: unwrap `K_asset`, drive
 /// the chunked download, AEAD-open every chunk, and verify the
 /// whole-object BLAKE3 root.
 ///
@@ -383,13 +383,13 @@ pub fn execute_rehydration_download(
     }
 }
 
-/// Phase 3 of the three-phase rehydration: flip `media_state` from
+/// Of the three-phase rehydration: flip `media_state` from
 /// `from_state → DownloadInProgress → OriginalLocal` and update
 /// `bytes_local`, all under a single
 /// `SAVEPOINT rehydrate_media_state` so a partial failure rolls
 /// back to the pre-call state.
 ///
-/// `from_state` is captured in [`RehydrationPlan`] from phase 1 —
+/// `from_state` is captured in [`RehydrationPlan`] from phase 1
 /// re-reading the row here would race against any concurrent
 /// `update_media_state` writer (e.g. an eviction sweep), and we
 /// want the savepoint scope to fail loudly if that happens rather
@@ -456,8 +456,8 @@ pub fn commit_rehydration(
 /// Rehydrate a previously evicted media asset from cold storage,
 /// driven by the row in `media_asset` for `asset_id`.
 ///
-/// Implements the Phase-3 lazy-rehydrate flow from
-/// `docs/PROPOSAL.md §5.5`. As of Task 2 of the Phase 3/4 batch
+/// Implements the lazy-rehydrate flow from
+/// `docs/DESIGN.md §5.5`. As of Task 2 of the /4 batch
 /// this function is a thin wrapper that composes the three
 /// independently usable phases:
 ///
@@ -917,7 +917,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // rehydrate_media_asset — Phase-3 lazy media rehydration on tap.
+    // rehydrate_media_asset — lazy media rehydration on tap.
     // -----------------------------------------------------------------
 
     use crate::crypto::key_wrap::wrap_key;

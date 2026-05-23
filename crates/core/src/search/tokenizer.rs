@@ -1,12 +1,12 @@
 //! Multilingual tokenization spec.
 //!
-//! `docs/PROPOSAL.md §3.3` and §3.4 lock the tokenization contract:
+//! `docs/DESIGN.md §3.3` and §3.4 lock the tokenization contract:
 //!
 //! * **Primary tokenizer.** SQLite FTS5 with `tokenize = 'icu'`. ICU
 //!   performs script-aware word segmentation (CJK / Thai / Khmer /
 //!   Lao / Myanmar have no whitespace word boundaries), NFKC
 //!   normalization, case folding, and accent folding. ICU is statically
-//!   linked so every Phase-1 build pays the binary-size cost in
+//!   linked so every build pays the binary-size cost in
 //!   exchange for usable multilingual search.
 //! * **Fallback tokenizer.** `tokenize = 'unicode61 remove_diacritics 2'`
 //!   on platforms where ICU cannot be linked. The fallback is
@@ -20,11 +20,11 @@
 //!   merging.
 //!
 //! This module is intentionally a **spec / glue layer** — the actual
-//! ICU bindings land with the SQLCipher integration in Phase 1. What
+//! ICU bindings land with the SQLCipher integration in What
 //! this module provides today:
 //!
 //! * `TokenizerConfig`, `NormalizationMode`, `FallbackMode` — the
-//!   knobs the Phase-1 integration will pass into ICU.
+//!   knobs the integration will pass into ICU.
 //! * `ScriptClass` — the ISO-15924 enumeration the fuzzy index tags
 //!   each row with.
 //! * `FuzzyGranularity` and `fuzzy_granularity` — the per-script
@@ -57,7 +57,7 @@ pub const FTS5_TOKENIZE_UNICODE61: &str = "tokenize = 'unicode61 remove_diacriti
 /// Returns the FTS5 `tokenize = '...'` literal for the **primary**
 /// tokenizer (ICU).
 ///
-/// `docs/PROPOSAL.md §3.3` mandates ICU as the primary tokenizer. Use
+/// `docs/DESIGN.md §3.3` mandates ICU as the primary tokenizer. Use
 /// [`fts5_tokenizer_config_for`] to select the fallback explicitly.
 pub fn fts5_tokenizer_config() -> String {
     fts5_tokenizer_config_for(FallbackMode::Icu)
@@ -65,7 +65,7 @@ pub fn fts5_tokenizer_config() -> String {
 
 /// Returns the FTS5 `tokenize = '...'` literal for the requested mode.
 ///
-/// `docs/PROPOSAL.md §3.3`:
+/// `docs/DESIGN.md §3.3`:
 /// * [`FallbackMode::Icu`] → `tokenize = 'icu'`
 /// * [`FallbackMode::Unicode61`] → `tokenize = 'unicode61 remove_diacritics 2'`
 pub fn fts5_tokenizer_config_for(mode: FallbackMode) -> String {
@@ -81,7 +81,7 @@ pub fn fts5_tokenizer_config_for(mode: FallbackMode) -> String {
 
 /// Unicode normalization mode applied before tokenization.
 ///
-/// `docs/PROPOSAL.md §3.3` requires NFKC normalization so that
+/// `docs/DESIGN.md §3.3` requires NFKC normalization so that
 /// compatibility-equivalent characters (e.g. half-width katakana
 /// `ｱ` ⇔ `ア`, mathematical alphanumerics, ligatures) collapse into
 /// a canonical form before tokens are emitted.
@@ -89,7 +89,7 @@ pub fn fts5_tokenizer_config_for(mode: FallbackMode) -> String {
 #[serde(rename_all = "snake_case")]
 pub enum NormalizationMode {
     /// NFKC — compatibility decomposition, then canonical composition.
-    /// **Default and only supported mode in Phase 1.**
+    /// **Default and only supported mode in **
     Nfkc,
     /// No normalization. Available so test harnesses can isolate the
     /// tokenizer's behavior from the normalizer's.
@@ -98,7 +98,7 @@ pub enum NormalizationMode {
 
 /// Which FTS5 tokenizer is in use.
 ///
-/// `docs/PROPOSAL.md §3.3` defines ICU as primary and `unicode61` as
+/// `docs/DESIGN.md §3.3` defines ICU as primary and `unicode61` as
 /// the fallback for platforms where ICU cannot be linked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,8 +112,8 @@ pub enum FallbackMode {
 
 /// ICU tokenizer configuration knobs.
 ///
-/// The Phase-1 SQLCipher integration projects this struct into the
-/// FTS5 tokenizer's `tokenize = 'icu', ...` arguments and into the
+/// The SQLCipher integration projects this struct into the
+/// FTS5 tokenizer's `tokenize = 'icu',...` arguments and into the
 /// non-FTS fuzzy / vector pipelines that share the same normalization
 /// pre-pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,9 +139,9 @@ pub struct TokenizerConfig {
     /// accent-stripped queries.
     pub fold_accents: bool,
 
-    /// Which FTS5 tokenizer this configuration targets. Phase 1
+    /// Which FTS5 tokenizer this configuration targets.
     /// always picks [`FallbackMode::Icu`]; the fallback is documented
-    /// here so a Phase-1+ build that opts out of ICU has a
+    /// here so a build that opts out of ICU has a
     /// well-defined config to point at.
     pub fallback: FallbackMode,
 }
@@ -167,7 +167,7 @@ impl Default for TokenizerConfig {
 /// The variants here are exactly the scripts the multilingual fuzzy
 /// index distinguishes. Adding more scripts is a forward-compatible
 /// change because every fuzzy row carries the script tag as a column
-/// (`docs/PROPOSAL.md §3.2`).
+/// (`docs/DESIGN.md §3.2`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ScriptClass {
@@ -217,7 +217,7 @@ impl ScriptClass {
     /// per-row tag inside encrypted fuzzy shards. The inverse is
     /// [`Self::from_iso_15924`].
     ///
-    /// `docs/PROPOSAL.md §3.2`.
+    /// `docs/DESIGN.md §3.2`.
     #[must_use]
     pub fn to_iso_15924(self) -> &'static str {
         match self {
@@ -268,7 +268,7 @@ impl ScriptClass {
 
 /// Granularity of fuzzy tokens for a script class.
 ///
-/// `docs/PROPOSAL.md §3.4`:
+/// `docs/DESIGN.md §3.4`:
 ///
 /// * **Trigram** for scripts where words are typically ≥ 3 characters
 ///   (Latin, Cyrillic, Greek, Arabic, Hebrew, Devanagari, Bengali,
@@ -287,9 +287,9 @@ pub enum FuzzyGranularity {
 }
 
 /// Minimum per-script fuzzy overlap fraction required for a row
-/// to be accepted as a fuzzy match (Phase 5, Task 2).
+/// to be accepted as a fuzzy match.
 ///
-/// `docs/PROPOSAL.md §3.4` makes the granularity decision purely
+/// `docs/DESIGN.md §3.4` makes the granularity decision purely
 /// a function of the script — bigrams for logographic CJK,
 /// trigrams elsewhere — but says nothing about thresholding. The
 /// rationale for tighter CJK gating:
@@ -297,7 +297,7 @@ pub enum FuzzyGranularity {
 /// * A bigram is a stronger signal than a trigram (fewer rare
 ///   bigrams in CJK, so a single overlap is highly informative).
 ///   Loose thresholding would surface unrelated rows.
-/// * A trigram in Latin / Cyrillic / ... is a weaker signal but a
+/// * A trigram in Latin / Cyrillic /... is a weaker signal but a
 ///   typo of a common 5-7 character word still preserves several
 ///   trigrams; loose thresholding lets `meetng` find `meeting`.
 ///
@@ -319,7 +319,7 @@ pub fn fuzzy_min_overlap(script: ScriptClass) -> f64 {
 }
 
 /// Map a [`ScriptClass`] to its [`FuzzyGranularity`] per
-/// `docs/PROPOSAL.md §3.4`.
+/// `docs/DESIGN.md §3.4`.
 ///
 /// The decision is purely a function of the script — it does not
 /// depend on the user's query, the current locale, or the FTS5
@@ -351,11 +351,11 @@ pub fn fuzzy_granularity(script: ScriptClass) -> FuzzyGranularity {
 /// Classify a single Unicode codepoint into a [`ScriptClass`].
 ///
 /// Uses Unicode block ranges (not the full ICU script-property
-/// database). The Phase-1 fuzzy indexer that ships with ICU bindings
+/// database). The fuzzy indexer that ships with ICU bindings
 /// will additionally consult ICU's per-codepoint script property to
 /// catch the long tail (e.g. CJK extensions G–H, supplementary
 /// historical blocks); the table here intentionally covers only the
-/// blocks that matter for the `docs/PROPOSAL.md §3.4` fuzzy split.
+/// blocks that matter for the `docs/DESIGN.md §3.4` fuzzy split.
 pub fn detect_script(c: char) -> ScriptClass {
     let cp = c as u32;
     match cp {
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn segment_by_script_mixed_latin_cjk_hira() {
-        // The canonical PROPOSAL.md §3.3 example.
+        // The canonical DESIGN.md §3.3 example.
         let runs = segment_by_script("Meeting at 3pm 会議室で");
         assert_eq!(
             runs,
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn fuzzy_granularity_hangul_is_trigram() {
-        // PROPOSAL.md §3.4: Hangul "when treated graphemically".
+        // DESIGN.md §3.4: Hangul "when treated graphemically".
         assert_eq!(
             fuzzy_granularity(ScriptClass::Hang),
             FuzzyGranularity::Trigram

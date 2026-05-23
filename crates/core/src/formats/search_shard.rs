@@ -1,6 +1,6 @@
 //! Encrypted search index shard wire format.
 //!
-//! Mirrors the JSON sketch in `docs/PROPOSAL.md §7.8` but written as
+//! Mirrors the JSON sketch in `docs/DESIGN.md §7.8` but written as
 //! CBOR for on-disk / on-wire use. Conversion to / from the §7.8 JSON
 //! shape is straightforward: the byte fields (`conversation_id_hash`,
 //! `nonce`, `aad_hash`, `ciphertext`, `ciphertext_sha256`) are
@@ -28,7 +28,7 @@ pub const SHARD_ENCRYPTION: &str = "xchacha20-poly1305";
 
 /// Discriminant for the kinds of search index a shard can carry.
 ///
-/// Phase 8 (2026-05-04 batch) adds [`IndexType::Bloom`]: a
+/// Adds [`IndexType::Bloom`]: a
 /// per-`(conversation_id, time_bucket)` bloom filter built from
 /// the lowercase word set of every `search_fts` row. Bloom shards
 /// are fetched first by the prefetcher (see
@@ -38,7 +38,7 @@ pub const SHARD_ENCRYPTION: &str = "xchacha20-poly1305";
 #[serde(rename_all = "lowercase")]
 pub enum IndexType {
     /// Per-bucket bloom filter over `search_fts` words.
-    /// Phase 8 — fetched first so the prefetcher can skip buckets
+    /// fetched first so the prefetcher can skip buckets
     /// that cannot contain any query token.
     Bloom,
     /// FTS5 (or fallback `unicode61`) full-text index.
@@ -69,7 +69,7 @@ impl IndexType {
 /// Encrypted search index shard frame.
 ///
 /// `conversation_id_hash` is the BLAKE3-keyed-hash of the conversation
-/// id (per `docs/PROPOSAL.md §7.8`); the field is `Vec<u8>` (rather
+/// id (per `docs/DESIGN.md §7.8`); the field is `Vec<u8>` (rather
 /// than a fixed-size array) because the keyed hash output length is a
 /// configuration knob the search layer owns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

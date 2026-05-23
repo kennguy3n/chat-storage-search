@@ -1,7 +1,7 @@
-//! End-to-end integration test for the Phase-3 storage budget
+//! End-to-end integration test for the storage budget
 //! enforcement pipeline.
 //!
-//! `docs/PROPOSAL.md §5.4` and the PHASES.md "Phase 3 / tiered
+//! `docs/DESIGN.md §5.4` and the "tiered
 //! eviction" entry tie the budget enforcer, the eviction priority
 //! order, and the tiered (cloud-offload-first) policy together
 //! into one pipeline:
@@ -140,9 +140,9 @@ fn insert_media_message(
 
 /// Tight budget that keeps the math easy:
 ///
-/// * `max_bytes`         = 100 KiB
-/// * `warning_threshold` =  50 % →  50 KiB
-/// * `critical_threshold`=  75 % →  75 KiB
+/// * `max_bytes` = 100 KiB
+/// * `warning_threshold` = 50 % → 50 KiB
+/// * `critical_threshold`= 75 % → 75 KiB
 fn tight_budget() -> StorageBudget {
     StorageBudget {
         max_bytes: 100 * 1024,

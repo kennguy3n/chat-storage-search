@@ -1,6 +1,6 @@
 //! SQLCipher-backed local store database connection.
 //!
-//! `docs/PROPOSAL.md §7` and `docs/ARCHITECTURE.md §4` describe the
+//! `docs/DESIGN.md §7` and `docs/ARCHITECTURE.md §4` describe the
 //! on-device persistence layer:
 //!
 //! * The database file lives at `{data_dir}/kchat.db`.
@@ -10,7 +10,7 @@
 //! * The 32-byte `K_local_db` from
 //!   [`crate::crypto::key_hierarchy`] is set with `PRAGMA key`. The
 //!   platform-specific wrap of `K_local_db` (Keychain / Keystore /
-//!   DPAPI) is layered above this struct and lands later in Phase 1.
+//!   DPAPI) is layered above this struct and lands later in
 //! * Schema bring-up runs [`super::schema::SCHEMA_SQL`]. If the build
 //!   does not ship the FTS5 ICU tokenizer the schema is rewritten to
 //!   the [`unicode61` fallback](crate::search::tokenizer::FTS5_TOKENIZE_UNICODE61)
@@ -56,7 +56,7 @@ pub enum DbError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A precondition checked inside a transaction did not hold —
+    /// A precondition checked inside a transaction did not hold
     /// e.g. a monotonic-cursor advance was passed a smaller value
     /// than the persisted one. Used by
     /// [`LocalStoreDb::atomic_append_segment_and_manifest`] to
@@ -75,7 +75,7 @@ pub type DbResult<T> = std::result::Result<T, DbError>;
 /// Returns a copy of [`SCHEMA_SQL`] with the FTS5 `tokenize = 'icu'`
 /// clause rewritten to the documented `unicode61` fallback.
 ///
-/// `docs/PROPOSAL.md §3.3`: ICU is the primary tokenizer. If the
+/// `docs/DESIGN.md §3.3`: ICU is the primary tokenizer. If the
 /// SQLCipher build does not link against ICU (e.g. the
 /// `bundled-sqlcipher-vendored-openssl` configuration this crate
 /// uses by default), the FTS5 virtual table cannot be created with
@@ -94,7 +94,7 @@ pub fn create_schema_with_unicode61_fallback() -> String {
 /// Decode a `conversation` table row into a [`Conversation`].
 /// Centralised so every read path (single-row fetch, full
 /// list, hierarchy filter) sees the same column ordering and
-/// the Phase-8 hierarchy fields are always populated.
+/// the hierarchy fields are always populated.
 fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         conversation_id: row.get(0)?,
@@ -133,13 +133,13 @@ fn fts5_icu_available(conn: &Connection) -> bool {
 ///
 /// The CREATE-VIRTUAL-TABLE probe used at writer-open time is not
 /// usable here for two reasons:
-///   1. `LocalStoreReader` opens with `PRAGMA query_only = 1`,
-///      which makes the SQLite engine reject *any* mutating
-///      statement — including `CREATE` for `temp.` tables.
-///   2. The reader does not run migrations, so a fresh sniff
-///      against the loaded `icu` extension would not match the
-///      stored schema if the writer was opened on a build with
-///      different tokenizer availability.
+/// 1. `LocalStoreReader` opens with `PRAGMA query_only = 1`,
+///    which makes the SQLite engine reject *any* mutating
+///    statement — including `CREATE` for `temp.` tables.
+/// 2. The reader does not run migrations, so a fresh sniff
+///    against the loaded `icu` extension would not match the
+///    stored schema if the writer was opened on a build with
+///    different tokenizer availability.
 ///
 /// Instead, sniff the persisted `search_fts` `CREATE VIRTUAL
 /// TABLE` SQL from `sqlite_master` and check whether the writer
@@ -243,7 +243,7 @@ impl LocalStoreDb {
     /// in-memory SQLCipher handle holds nothing persistent, so a
     /// production caller that reached it would silently lose
     /// every write across process restarts; closing the symbol
-    /// off at the linker layer prevents that class of misuse —
+    /// off at the linker layer prevents that class of misuse
     /// the same rationale as
     /// [`crate::core_impl::CoreImpl::new_in_memory`]. See the
     /// `test-support` feature comment in
@@ -347,7 +347,7 @@ impl LocalStoreDb {
     // Conversation
     // ---------------------------------------------------------------
 
-    /// Insert a row into `conversation`. Phase-8 hierarchy
+    /// Insert a row into `conversation`. hierarchy
     /// columns ([`Conversation::conversation_type`], `scope`,
     /// `tenant_id`, `community_id`, `domain_id`) are always
     /// written so `SELECT *` round-trips the full struct.
@@ -437,7 +437,7 @@ impl LocalStoreDb {
     }
 
     /// List every conversation that belongs to `community_id`.
-    /// Phase 8 helper for [`crate::SearchTarget::Community`]
+    /// Helper for [`crate::SearchTarget::Community`]
     /// resolution; the WHERE clause matches the
     /// `idx_conv_community` index added to
     /// [`crate::local_store::schema::SCHEMA_SQL`].
@@ -453,18 +453,18 @@ impl LocalStoreDb {
     }
 
     /// List every conversation that belongs to `domain_id`.
-    /// Phase 8 helper for [`crate::SearchTarget::Domain`].
+    /// Helper for [`crate::SearchTarget::Domain`].
     pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
         read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Domain, domain_id)
     }
 
     /// List every conversation that belongs to `tenant_id`.
-    /// Phase 8 helper for [`crate::SearchTarget::Tenant`].
+    /// Helper for [`crate::SearchTarget::Tenant`].
     pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
         read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Tenant, tenant_id)
     }
 
-    /// List every conversation with the given `scope`. Phase 8
+    /// List every conversation with the given `scope`.
     /// helper for [`crate::SearchTarget::B2cAll`].
     pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
         read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Scope, scope)
@@ -515,7 +515,7 @@ impl LocalStoreDb {
     /// timeline ordering columns (`created_at_ms`, the row's
     /// position in `message_skeleton`).
     ///
-    /// `docs/PROPOSAL.md §5.5` calls out that a cold message must be
+    /// `docs/DESIGN.md §5.5` calls out that a cold message must be
     /// "filled in" without a scroll-jump on the renderer — the row
     /// is already drawn as a skeleton and the body arrives later
     /// from the archive. The full sequence runs inside a single
@@ -536,7 +536,7 @@ impl LocalStoreDb {
     /// 3. Refresh the `search_fts` row. The previous row (if any) is
     ///    dropped first so we never accumulate stale duplicates.
     ///
-    /// `created_at_ms` is **never** touched by this method —
+    /// `created_at_ms` is **never** touched by this method
     /// `INSERT OR REPLACE` would reset the column on the FTS side,
     /// so the implementation deliberately reads the existing
     /// timestamp out of `message_skeleton` and re-inserts it
@@ -551,10 +551,10 @@ impl LocalStoreDb {
         new_body_state: BodyState,
     ) -> DbResult<()> {
         // 0) Pre-fetch the skeleton row so we have the
-        //    conversation_id / sender_id / created_at_ms triple
-        //    needed by the `search_fts` upsert. A missing skeleton
-        //    is an error — rehydration of an unknown message would
-        //    silently succeed otherwise.
+        // conversation_id / sender_id / created_at_ms triple
+        // needed by the `search_fts` upsert. A missing skeleton
+        // is an error — rehydration of an unknown message would
+        // silently succeed otherwise.
         let row = self.conn.query_row(
             "SELECT conversation_id, sender_id, created_at_ms
                FROM message_skeleton
@@ -583,10 +583,10 @@ impl LocalStoreDb {
             .map_err(DbError::from)?;
         let result: DbResult<()> = (|| {
             // 1) UPSERT message_body. We can't use
-            //    `INSERT OR REPLACE` because that would clear
-            //    `detected_language` / `rich_meta` on rows that
-            //    already have them set. The `ON CONFLICT DO UPDATE`
-            //    form preserves those columns.
+            // `INSERT OR REPLACE` because that would clear
+            // `detected_language` / `rich_meta` on rows that
+            // already have them set. The `ON CONFLICT DO UPDATE`
+            // form preserves those columns.
             self.conn.execute(
                 "INSERT INTO message_body
                      (message_id, text_content, detected_language, rich_meta)
@@ -687,7 +687,7 @@ impl LocalStoreDb {
     /// `archive_segment_map` row. Returns the number of rows
     /// actually updated (0 when no segment matches).
     ///
-    /// `docs/PROPOSAL.md §10.1` calls this out as the single point
+    /// `docs/DESIGN.md §10.1` calls this out as the single point
     /// the orchestration layer flips a segment from the KChat
     /// backend to ZK Object Fabric — the manifest builder records
     /// the change in the next manifest, and the prefetch path
@@ -708,7 +708,7 @@ impl LocalStoreDb {
     /// **without overwriting** any pre-existing local skeleton for
     /// `message_id`.
     ///
-    /// `docs/PROPOSAL.md §5.1` (skeleton-first rendering) — when
+    /// `docs/DESIGN.md §5.1` (skeleton-first rendering) — when
     /// the orchestration layer rehydrates a scroll-back bucket it
     /// merges the skeletons it pulls from the archive into the
     /// local store. Existing local rows always win because they
@@ -749,7 +749,7 @@ impl LocalStoreDb {
 
     /// Insert a row into `media_asset`.
     ///
-    /// `docs/PROPOSAL.md §3.2` (`media_asset` columns) and §5.7
+    /// `docs/DESIGN.md §3.2` (`media_asset` columns) and §5.7
     /// (tiered media storage) define the row's shape. The caller is
     /// responsible for funneling the
     /// [`crate::media::processor::MediaProcessResult::descriptor`]
@@ -823,7 +823,7 @@ impl LocalStoreDb {
     ///
     /// Mirrors [`Self::get_media_asset`] but keys on the owning
     /// `message_id` rather than the `asset_id`. The hydration path
-    /// (`docs/PROPOSAL.md §5.2` — lazy media rehydration on tap)
+    /// (`docs/DESIGN.md §5.2` — lazy media rehydration on tap)
     /// pulls the asset row through this helper so the caller can
     /// inspect [`MediaState`] before deciding whether to fetch the
     /// blob.
@@ -886,7 +886,7 @@ impl LocalStoreDb {
         Ok(out)
     }
 
-    /// Phase 7, batch-5 — list every `media_asset` row whose
+    /// list every `media_asset` row whose
     /// `storage_sink` matches the supplied tag, ordered by
     /// `asset_id` for deterministic iteration. Used by the
     /// cross-sink media migration planner
@@ -938,7 +938,7 @@ impl LocalStoreDb {
         Ok(out)
     }
 
-    /// Phase 7, batch-5 — update `media_asset.storage_sink` and
+    /// update `media_asset.storage_sink` and
     /// `media_asset.blob_id` for `asset_id`. Returns the number
     /// of rows updated (0 when no asset matches). Used by the
     /// migration executor after a successful cross-sink upload.
@@ -976,7 +976,7 @@ impl LocalStoreDb {
     }
 
     // ----------------------------------------------------------------
-    // media_search_index helpers — Phase 6, Task 4
+    // media_search_index helpers
     // ----------------------------------------------------------------
 
     /// Insert one row into the `media_search_index` table.
@@ -989,7 +989,7 @@ impl LocalStoreDb {
     ///
     /// The PK is `(asset_id, kind, text)`, so re-inserting the
     /// same recognized text for the same asset is a no-op
-    /// (`INSERT OR IGNORE`). The OCR fan-out is best-effort —
+    /// (`INSERT OR IGNORE`). The OCR fan-out is best-effort
     /// duplicate hits across re-runs should not error.
     pub fn insert_media_search_index(
         &self,
@@ -1023,7 +1023,7 @@ impl LocalStoreDb {
     ///
     /// Returns rows in unspecified order — the caller is
     /// expected to merge media hits into the master ranking
-    /// pipeline (`docs/PROPOSAL.md §7.5` ranking formula),
+    /// pipeline (`docs/DESIGN.md §7.5` ranking formula),
     /// which applies its own ordering.
     pub fn search_media_index(
         &self,
@@ -1083,7 +1083,7 @@ impl LocalStoreDb {
         Ok(())
     }
 
-    /// Remove the `search_fts` row for `message_id`. Idempotent —
+    /// Remove the `search_fts` row for `message_id`. Idempotent
     /// a missing row is not an error.
     pub fn delete_fts_row(&self, message_id: &str) -> DbResult<()> {
         self.conn.execute(
@@ -1093,10 +1093,10 @@ impl LocalStoreDb {
         Ok(())
     }
 
-    /// Remove the `search_vector` row for `message_id`. Idempotent —
+    /// Remove the `search_vector` row for `message_id`. Idempotent
     /// a missing row is not an error.
     ///
-    /// The Phase 6 ingest path writes embeddings to `search_vector`
+    /// The ingest path writes embeddings to `search_vector`
     /// via the cross-pipeline embedding cache. Per-message delete
     /// and edit paths must invoke this helper alongside
     /// [`Self::delete_fts_row`] to keep semantic search consistent
@@ -1339,7 +1339,7 @@ impl LocalStoreDb {
 }
 
 // ---------------------------------------------------------------------------
-// MediaSearchResult — Phase 6, Task 4
+// MediaSearchResult
 // ---------------------------------------------------------------------------
 
 /// One row returned by [`LocalStoreDb::search_media_index`].
@@ -1465,7 +1465,7 @@ pub fn update_archive_state(
 }
 
 // ---------------------------------------------------------------------------
-// Backup orchestration state (Phase 5 hardening — Task 2)
+// Backup orchestration state (hardening — Task 2)
 // ---------------------------------------------------------------------------
 
 /// One row of the `backup_segment_ledger` table.
@@ -1480,7 +1480,7 @@ pub fn update_archive_state(
 pub struct BackupSegmentLedgerRow {
     /// Sealed segment id (UUID v7).
     pub segment_id: String,
-    /// Mirror of `SegmentType` ("events", "message_delta", ...).
+    /// Mirror of `SegmentType` ("events", "message_delta",...).
     pub segment_type: String,
     /// 24-byte XChaCha20-Poly1305 nonce.
     pub nonce: Vec<u8>,
@@ -1837,7 +1837,7 @@ fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
     conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
     // Enable Write-Ahead Logging so the reader pool can run
     // SELECTs concurrently with the writer's INSERT/UPDATE/DELETE
-    // — see the doc comment above for the rationale. For
+    // see the doc comment above for the rationale. For
     // `:memory:` databases SQLite returns the actual mode (which
     // is `MEMORY`) without raising an error, so this is safe to
     // run unconditionally.
@@ -1856,20 +1856,20 @@ fn init_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<bool> {
 /// Run the post-open setup for a **read-only** reader connection.
 ///
 /// Differs from [`init_connection`] in three ways:
-///   1. No `PRAGMA journal_mode = WAL` — the writer's open
-///      already sticky-set WAL into the database header; a
-///      reader that re-issues the pragma would observe `wal`
-///      and return the same value, so the call is omitted to
-///      keep reader bring-up lean.
-///   2. No [`run_migrations`] call — the writer is the only path
-///      that ever creates or alters tables. A reader that finds
-///      the schema at an older version logs nothing and proceeds:
-///      the writer will have run the migrations first, so by the
-///      time the reader pool is initialised the schema is always
-///      current.
-///   3. The sanity-check `SELECT` still runs so an incorrect key
-///      surfaces synchronously, before the connection joins the
-///      pool.
+/// 1. No `PRAGMA journal_mode = WAL` — the writer's open
+///    already sticky-set WAL into the database header; a
+///    reader that re-issues the pragma would observe `wal`
+///    and return the same value, so the call is omitted to
+///    keep reader bring-up lean.
+/// 2. No [`run_migrations`] call — the writer is the only path
+///    that ever creates or alters tables. A reader that finds
+///    the schema at an older version logs nothing and proceeds:
+///    the writer will have run the migrations first, so by the
+///    time the reader pool is initialised the schema is always
+///    current.
+/// 3. The sanity-check `SELECT` still runs so an incorrect key
+///    surfaces synchronously, before the connection joins the
+///    pool.
 ///
 /// **`PRAGMA query_only` is what enforces read-only**: the
 /// reader is opened with `SQLITE_OPEN_READ_WRITE`, not
@@ -1906,10 +1906,10 @@ fn init_reader_connection(conn: &Connection, key: &[u8; 32]) -> DbResult<()> {
 // Read-only free functions
 // ---------------------------------------------------------------------------
 //
-// Phase B.1 split: every read-only query that is exposed on both
+// split: every read-only query that is exposed on both
 // the writer ([`LocalStoreDb`]) and the reader pool
 // ([`LocalStoreReader`] / [`LocalStoreReaderPool`]) has its body
-// extracted into a `pub(crate) fn read_xxx(conn: &Connection, ...)`
+// extracted into a `pub(crate) fn read_xxx(conn: &Connection,...)`
 // here, so there is exactly one canonical query body per logical
 // read. The methods on `LocalStoreDb` and `LocalStoreReader` are
 // one-line delegates over `&self.conn`, which is also the public
@@ -2348,7 +2348,7 @@ pub(crate) fn read_search_media_index(
 ///
 /// The method surface is intentionally a strict subset of
 /// [`LocalStoreDb`]: every method delegates to the same
-/// `read_xxx(conn, ...)` free function that the corresponding
+/// `read_xxx(conn,...)` free function that the corresponding
 /// writer-side method calls, so there is exactly one query body
 /// per logical read.
 ///
@@ -2374,7 +2374,7 @@ pub struct LocalStoreReader {
 impl LocalStoreReader {
     /// Open a new logically read-only connection to the
     /// encrypted database at `path`. The schema is *not* re-run
-    /// — the writer is the only path that may alter the on-disk
+    /// the writer is the only path that may alter the on-disk
     /// shape.
     ///
     /// **OS-level open flags**: the connection is opened with
@@ -2437,7 +2437,7 @@ impl LocalStoreReader {
     /// tokenizer wired up, `false` when it falls back to the
     /// `unicode61` tokenizer. The flag is sniffed once at open
     /// time and never changes for the lifetime of the connection
-    /// — schema changes go through the writer and would require
+    /// schema changes go through the writer and would require
     /// re-opening the pool to take effect.
     pub fn icu_available(&self) -> bool {
         self.icu_available
@@ -2569,8 +2569,8 @@ impl LocalStoreReader {
 ///   panic via a drop guard.
 /// * Under WAL mode the readers and writer do **not** block
 ///   each other; this pool is what lets the bridge crates run
-///   `search()` and `get_conversation_messages()` in parallel
-///   while an `ingest_messages()` transaction is committing on
+///   `search` and `get_conversation_messages` in parallel
+///   while an `ingest_messages` transaction is committing on
 ///   the writer side.
 ///
 /// # `Send` / `Sync`
@@ -2579,7 +2579,7 @@ impl LocalStoreReader {
 /// `rusqlite::Connection` is `!Send` under the default
 /// (per-connection) mutex regime SQLCipher ships with. The pool
 /// wraps the vec in a `Mutex` and exposes only the
-/// `with_reader(|r| ...)` closure form, so the reader's
+/// `with_reader(|r|...)` closure form, so the reader's
 /// `!Send`-ness never escapes the pool — `LocalStoreReaderPool`
 /// itself is `Send + Sync` (because `Mutex<T>: Send` whenever
 /// `T: Send`, and `Condvar` is `Send + Sync`).
@@ -2645,7 +2645,7 @@ impl LocalStoreReaderPool {
     {
         let reader = self.checkout();
         // Drop guard ensures the reader is returned to the pool
-        // even if `f` panics. We use `Option::take()` inside the
+        // even if `f` panics. We use `Option::take` inside the
         // guard so the explicit checkin on the success path can
         // disarm the guard before returning the result.
         struct Guard<'a> {
@@ -3036,7 +3036,7 @@ mod tests {
         // Mimic `run_migrations` for a single broken migration so
         // the assertion targets the savepoint/rollback logic in
         // isolation. The real `run_migrations` has the same shape
-        // — see the inner match in `run_migrations` above. We use
+        // see the inner match in `run_migrations` above. We use
         // an outright syntax error (SQLite is lenient about column
         // *types* but will reject malformed DDL).
         let bad = "CREATE TABLE __not_a_table (id INTEGER); THIS IS NOT VALID SQL;";
@@ -3427,7 +3427,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase-3: rehydrate_message_body — `docs/PROPOSAL.md §5.5`.
+    // rehydrate_message_body — `docs/DESIGN.md §5.5`.
     // -----------------------------------------------------------------
 
     fn fts_row_text(db: &LocalStoreDb, message_id: &str) -> Option<String> {
@@ -3534,7 +3534,7 @@ mod tests {
         let body = db.get_message_body("m3").unwrap().unwrap();
         assert_eq!(body.text_content.as_deref(), Some("rehydrated"));
         // Existing detected_language / rich_meta survive the upsert
-        // — the rehydration path only refreshes text_content.
+        // the rehydration path only refreshes text_content.
         assert_eq!(body.detected_language.as_deref(), Some("es"));
         assert_eq!(body.rich_meta, Some(vec![1u8, 2, 3]));
     }
@@ -4003,10 +4003,10 @@ mod tests {
         // Stage matching FTS5 + fuzzy + vector + media rows so the
         // cascade really has something to delete in every dependent
         // table. The media tables are exercised here even though
-        // Phase-1 code paths do not yet insert into them, because the
+        // code paths do not yet insert into them, because the
         // FK constraints between media_search_index → media_asset →
         // message_skeleton would block a future delete the moment
-        // Phase-2 media support lands.
+        // media support lands.
         for (mid, conv, text) in [
             ("m-d-1", "c-doomed", "alpha"),
             ("m-d-2", "c-doomed", "beta"),
@@ -4297,7 +4297,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // upsert_skeleton_from_archive (Task 4 — `docs/PROPOSAL.md §5.1`)
+    // upsert_skeleton_from_archive (Task 4 — `docs/DESIGN.md §5.1`)
     // ----------------------------------------------------------------
 
     fn archive_skeleton(mid: &str, conv: &str) -> MessageSkeleton {
@@ -4362,7 +4362,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // get_media_asset_by_message (Task 5 — `docs/PROPOSAL.md §5.2`)
+    // get_media_asset_by_message (Task 5 — `docs/DESIGN.md §5.2`)
     // ----------------------------------------------------------------
 
     #[test]
@@ -4405,7 +4405,7 @@ mod tests {
 
     // ----------------------------------------------------------------
     // list_media_assets_by_message — multi-asset media support for
-    // `MessagePersister::delete_inner_tx` (Phase 4 backup taxonomy).
+    // `MessagePersister::delete_inner_tx` (backup taxonomy).
     // ----------------------------------------------------------------
 
     #[test]
@@ -4454,7 +4454,7 @@ mod tests {
             .is_empty());
     }
 
-    // ----- Phase 6, Task 4: media_search_index helpers --------------
+    // -----: media_search_index helpers --------------
 
     fn seed_media_asset_for_index(db: &LocalStoreDb, mid: &str, conv: &str, asset_id: &str) {
         seed_skeleton_with_body(db, mid, conv, "ignored");
@@ -4711,7 +4711,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase B.1: WAL mode + LocalStoreReader / LocalStoreReaderPool
+    // WAL mode + LocalStoreReader / LocalStoreReaderPool
     // -----------------------------------------------------------
 
     fn sample_conversation(id: &str, last_activity_ms: i64) -> Conversation {

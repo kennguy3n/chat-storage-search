@@ -1,7 +1,7 @@
-//! `ConversationGroupResolver` trait — Phase 8, batch-5
-//! (2026-05-04).
+//! `ConversationGroupResolver` trait
 //!
-//! `docs/PROPOSAL.md §12` and `docs/PHASES.md` Phase 8 call for
+//!
+//! `docs/DESIGN.md §12` calls for
 //! a multi-scope search: a single search query may apply to
 //! every conversation, one conversation, an explicit group, a
 //! channel, every starred conversation, or every conversation

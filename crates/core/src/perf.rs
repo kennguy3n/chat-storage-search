@@ -1,9 +1,7 @@
-//! Lightweight performance-tracing helpers — Phase 7, Task 8 of
-//! the 2026-05-04 batch.
+//! Lightweight performance-tracing helpers.
 //!
-//! `docs/PHASES.md` Phase 7 calls for "performance profiling and
-//! optimization" as a gating item. This module lands the
-//! Rust-side scaffold:
+//! Cross-platform performance profiling and optimization data is
+//! gathered through this module's Rust-side scaffold:
 //!
 //! * [`PerfTrace`] — one start/end span with a free-form
 //!   metadata bag (typically things like `messages = "10000"`,
@@ -126,7 +124,7 @@ pub trait PerfCollector: std::fmt::Debug + Send + Sync {
 
 /// [`PerfCollector`] that discards every trace.
 ///
-/// The default behavior when no collector is installed —
+/// The default behavior when no collector is installed
 /// instrumentation paths that pass traces into a noop collector
 /// pay only the `record` call cost.
 #[derive(Debug, Default, Clone, Copy)]
@@ -141,7 +139,7 @@ impl PerfCollector for NoopPerfCollector {
 /// [`PerfCollector`] that buffers every trace in a
 /// `Mutex<Vec<PerfTrace>>`.
 ///
-/// Used by the Phase 7 unit / integration tests to assert
+/// Used by the unit / integration tests to assert
 /// against the recorded sequence. Production callers SHOULD
 /// install a collector that streams traces into the platform's
 /// real telemetry sink instead of leaking memory.
@@ -180,13 +178,13 @@ impl PerfCollector for InMemoryPerfCollector {
     }
 }
 
-/// Phase 7 (2026-05-04 batch 10) — aggregated summary over a
+/// aggregated summary over a
 /// set of [`PerfTrace`]s for a single operation.
 ///
 /// Percentiles are computed via the nearest-rank method with a
 /// 1-based index — for `count = 100` traces, `p95_ns` is the
 /// 95th-smallest duration. This matches the convention used
-/// downstream in `docs/PROPOSAL.md §7.5` and the criterion
+/// downstream in `docs/DESIGN.md §7.5` and the criterion
 /// benchmarks under `crates/core/benches/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerfSummary {
@@ -207,7 +205,7 @@ pub struct PerfSummary {
     pub total_ns: u64,
 }
 
-/// Phase 7 (2026-05-04 batch 10) — per-operation p95 budget.
+/// per-operation p95 budget.
 ///
 /// Plug into [`check_budgets`] alongside a `Vec<PerfSummary>`
 /// to detect operations whose measured p95 exceeds the

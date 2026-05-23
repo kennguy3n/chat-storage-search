@@ -1,8 +1,8 @@
 //! Unified query engine combining FTS5, fuzzy search, and structured
 //! filters.
 //!
-//! `docs/PROPOSAL.md §12` defines the [`SearchQuery`] /
-//! [`SearchScope`] / [`SearchResult`] surface. Phase 1 lands the
+//! `docs/DESIGN.md §12` defines the [`SearchQuery`] /
+//! [`SearchScope`] / [`SearchResult`] surface. lands the
 //! local-store half: the engine reads from `search_fts` for free-text
 //! queries, fans the same query out to the script-aware fuzzy index
 //! ([`FuzzySearchEngine`]) for typo / partial / cross-script matches,
@@ -15,7 +15,7 @@
 //! the FTS5 + fuzzy hits with the structured filters and returns the
 //! union ordered by `rank_score` (highest-relevance first).
 //!
-//! Ranking weights follow `docs/PROPOSAL.md §7.5`: BM25 is weighted
+//! Ranking weights follow `docs/DESIGN.md §7.5`: BM25 is weighted
 //! at `2.0` and fuzzy-token-overlap at `1.0`, so a fuzzy-only hit
 //! always ranks below an FTS hit on the same query — and a row that
 //! matches both engines accumulates both contributions.
@@ -24,9 +24,9 @@
 //! `message_skeleton.body_state = 'remote_archive_only'` with
 //! `SearchResult::is_cold = true` so the orchestration layer can
 //! enqueue them into the [`crate::offload::HydrationQueue`] at
-//! priority `SearchResultTap` (Phase 5, Task 7).
+//! priority `SearchResultTap`.
 //!
-//! The cold-bucket fan-out (Phase 5, Task 1) is wired through the
+//! The cold-bucket fan-out is wired through the
 //! [`ColdShardSource`] trait — see
 //! [`QueryEngine::execute_search_with_cold_source`]. The
 //! orchestration layer ([`crate::core_impl::CoreImpl`]) implements
@@ -70,24 +70,24 @@ use crate::{ContentKind, Error, SearchQuery, SearchResult, SearchScope, SearchTa
 use rusqlite::Connection;
 
 /// BM25 contribution weight in the merged rank score
-/// (`docs/PROPOSAL.md §7.5`).
+/// (`docs/DESIGN.md §7.5`).
 pub(crate) const BM25_WEIGHT: f64 = 2.0;
 
 /// Fuzzy-token-overlap contribution weight in the merged rank score
-/// (`docs/PROPOSAL.md §7.5`).
+/// (`docs/DESIGN.md §7.5`).
 pub(crate) const FUZZY_WEIGHT: f64 = 1.0;
 
 /// Semantic / cosine-similarity contribution weight in the merged
-/// rank score (`docs/PROPOSAL.md §7.5`). Sits between BM25 (`2.0`)
+/// rank score (`docs/DESIGN.md §7.5`). Sits between BM25 (`2.0`)
 /// and fuzzy (`1.0`) so the on-device reranker leans on
 /// surface-form matches when both signals are available, but
 /// still surfaces semantic-only hits when FTS misses.
 ///
-/// Phase 6, Task 8.
+///.
 pub(crate) const SEMANTIC_WEIGHT: f64 = 1.5;
 
 /// Recency-decay weight in the merged rank score
-/// (`docs/PROPOSAL.md §7.5` — `recency_boost`).
+/// (`docs/DESIGN.md §7.5` — `recency_boost`).
 pub(crate) const RECENCY_WEIGHT: f64 = 0.5;
 
 /// Half-life of the recency-decay function in days. Mirrors
@@ -96,7 +96,7 @@ pub(crate) const RECENCY_WEIGHT: f64 = 0.5;
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 
 /// Multiplicative content-kind weight applied to the merged rank
-/// (`docs/PROPOSAL.md §7.5`). Text bodies are fully searchable; the
+/// (`docs/DESIGN.md §7.5`). Text bodies are fully searchable; the
 /// thumbnails / OCR rows that back media messages are coarser, so
 /// media gets a lighter weight.
 pub(crate) const TEXT_KIND_WEIGHT: f64 = 1.0;
@@ -107,7 +107,7 @@ pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
 /// content-kind weight used by the ranker. The canonical
 /// vocabulary is whatever
 /// [`crate::local_store::schema::MessageKind::as_str`] writes
-/// — today `"text"`, `"media"`, or `"system"`. Unknown / missing
+/// today `"text"`, `"media"`, or `"system"`. Unknown / missing
 /// kinds default to [`TEXT_KIND_WEIGHT`] so cold-only rows that
 /// appear before the local skeleton lands still rank sensibly.
 ///
@@ -116,7 +116,7 @@ pub(crate) const MEDIA_KIND_WEIGHT: f64 = 0.8;
 /// (FTS / fuzzy lane) and
 /// [`QueryEngine::execute_search_with_semantic`] (semantic-only
 /// lane) call it so the two paths cannot drift on this mapping
-/// — the bug fixed in 187c666 was exactly that drift, where the
+/// the bug fixed in 187c666 was exactly that drift, where the
 /// semantic-only branch matched on `MediaDescriptor.kind`
 /// vocabulary (`"image" | "video" | "audio" | "file"`) instead
 /// of `MessageKind` vocabulary, silently demoting media hits to
@@ -160,7 +160,7 @@ pub trait ColdShardSource {
 
     /// Fetch and decrypt the text-index shard for the given
     /// `(conversation_id, time_bucket)`. Implementations should
-    /// return `Ok(Vec::new())` when no shard exists for the
+    /// return `Ok(Vec::new)` when no shard exists for the
     /// pair — that is a legitimate "no results" signal, not an
     /// error.
     fn fetch_text_rows(
@@ -179,7 +179,7 @@ pub trait ColdShardSource {
         time_bucket: &str,
     ) -> Result<Vec<FuzzyRow>, Error>;
 
-    /// Phase 8 (2026-05-04 batch 6) — fetch and decrypt the
+    /// fetch and decrypt the
     /// bloom-filter shard for `(conversation_id, time_bucket)`.
     ///
     /// The bloom shard is consulted by the cold fan-out *before*
@@ -210,11 +210,11 @@ pub trait ColdShardSource {
     }
 }
 
-/// Phase 8 (2026-05-04 batch 6) — does the YYYY-MM `time_bucket`
+/// does the YYYY-MM `time_bucket`
 /// string overlap the optional `[date_from, date_to]` window?
 ///
 /// The bucket grammar matches what the personal-archive segment
-/// builder writes (`docs/PROPOSAL.md §5.2`): `YYYY-MM` for monthly
+/// builder writes (`docs/DESIGN.md §5.2`): `YYYY-MM` for monthly
 /// buckets. The function parses the bucket into a half-open
 /// `[start_ms, end_ms)` range covering the entire month and
 /// returns `true` whenever the bucket and `[date_from, date_to]`
@@ -273,7 +273,7 @@ fn parse_bucket_range_ms(bucket: &str) -> Option<(i64, i64)> {
     Some((start_ms, end_ms_exclusive))
 }
 
-/// Phase 8 (2026-05-04 batch 6) — wrap
+/// wrap
 /// [`ColdShardSource::fetch_text_rows`] with a [`ShardCache`]
 /// lookup / populate cycle. On a cache hit no transport call is
 /// made; on a miss the rows are fetched, decrypted, and inserted
@@ -364,7 +364,7 @@ fn cold_source_fetch_bloom_with_cache(
         // `None`, so an `Err` here is observationally identical
         // to "no shard available". Returning `Ok(None)` keeps the
         // function self-contained against any future caller that
-        // might `?`-propagate or `.unwrap()` the result.
+        // might `?`-propagate or `.unwrap` the result.
         Err(_) => return Ok(None),
     };
     if let Some(filter) = &result {
@@ -377,7 +377,7 @@ fn cold_source_fetch_bloom_with_cache(
     Ok(result)
 }
 
-/// Phase 8 (2026-05-04 batch 10) — Task 1: prefetched payload
+/// prefetched payload
 /// for one cold bucket.
 ///
 /// The parallel fetch path materializes one
@@ -409,7 +409,7 @@ struct BucketPrefetch {
     fuzzy: Result<Vec<FuzzyRow>, Error>,
 }
 
-/// Phase 8 (2026-05-04 batch 10) — Task 1: parallel-fetch the
+/// parallel-fetch the
 /// `(bloom, text, fuzzy)` shard triple for every supplied
 /// `(conversation_id, time_bucket)` pair.
 ///
@@ -556,8 +556,8 @@ impl<'a> QueryEngine<'a> {
     /// Construct a new engine bound to the given connection.
     ///
     /// `icu_available` selects the FTS5 tokenizer path the engine
-    /// will assume. Pass `db.icu_available()` for a writer
-    /// connection or `reader.icu_available()` for a pool reader.
+    /// will assume. Pass `db.icu_available` for a writer
+    /// connection or `reader.icu_available` for a pool reader.
     pub fn new(conn: &'a Connection, icu_available: bool) -> Self {
         Self {
             conn,
@@ -596,7 +596,7 @@ impl<'a> QueryEngine<'a> {
         Ok(out)
     }
 
-    /// Phase 8, batch-5 — run a unified search scoped to the
+    /// run a unified search scoped to the
     /// supplied [`SearchTarget`]. Equivalent to setting
     /// `query.target = target` and calling
     /// [`Self::execute_search`], but works for the new variants
@@ -641,24 +641,24 @@ impl<'a> QueryEngine<'a> {
     /// Run a unified search and fan out to the personal archive
     /// via `cold_source` when [`SearchScope::IncludeCold`] is set.
     ///
-    /// This is the Phase 5, Task 1 entry point: cold buckets are
+    /// This is the entry point: cold buckets are
     /// resolved by [`ColdShardSource::cold_buckets`], shards are
     /// fetched + decrypted by the source, and the in-process
     /// FTS-like + fuzzy fan-out is merged into the local result
     /// set with `is_cold = true`.
     ///
     /// Behaviour summary:
-    /// * [`SearchScope::LocalOnly`] never invokes the cold source —
+    /// * [`SearchScope::LocalOnly`] never invokes the cold source
     ///   this is the offline-only contract from
-    ///   `docs/PROPOSAL.md §12`.
+    ///   `docs/DESIGN.md §12`.
     /// * Empty query strings short-circuit to the structured-only
     ///   path; cold fan-out only runs on free-text queries.
     /// * Non-text `query.content_kind` values short-circuit to
-    ///   the local result set. Phase 5 only ships text + fuzzy
+    ///   the local result set. only ships text + fuzzy
     ///   cold shards, so a media-only query has no cold
     ///   contribution to merge; consulting the cold source would
     ///   leak text-shard hits through the kind filter.
-    /// * Errors from the cold source bubble out of this call —
+    /// * Errors from the cold source bubble out of this call
     ///   callers that want graceful degradation should pass an
     ///   adapter that swallows transient transport failures.
     pub fn execute_search_with_cold_source(
@@ -689,7 +689,7 @@ impl<'a> QueryEngine<'a> {
         )
     }
 
-    /// Phase 8 (2026-05-04 batch 6) — full cold fan-out entry
+    /// full cold fan-out entry
     /// point that threads a per-tenant
     /// [`TenantSearchPolicy`] and an optional on-device
     /// [`ShardCache`] through the bucket loop.
@@ -710,7 +710,7 @@ impl<'a> QueryEngine<'a> {
     ///   independent cross-tenant block. The field is preserved
     ///   for forward compatibility with the per-bucket
     ///   tenant-stamp scheme described in
-    ///   `docs/PROPOSAL.md §7.7`.
+    ///   `docs/DESIGN.md §7.7`.
     /// * `shard_cache`, when supplied, is consulted before each
     ///   transport fetch and populated after each successful
     ///   decrypt. The cache is keyed by
@@ -727,7 +727,7 @@ impl<'a> QueryEngine<'a> {
         // Local results first. mark_cold_results runs inside
         // execute_search_with_limit when scope is IncludeCold so
         // any local row whose body is offloaded already carries
-        // is_cold = true. `e.into()` here routes through the
+        // is_cold = true. `e.into` here routes through the
         // `From<DbError> for SearchError` impl in `search/mod.rs`,
         // which preserves `DbError::Rusqlite` as the typed
         // `SearchError::Sqlite` variant (so future retry / routing
@@ -751,7 +751,7 @@ impl<'a> QueryEngine<'a> {
             return Ok(local);
         }
 
-        // Phase 5 only ships text + fuzzy cold shards. When the
+        // Only ships text + fuzzy cold shards. When the
         // caller has explicitly narrowed the search to a non-text
         // content kind (Image / Video / Audio / Document), the
         // cold path has nothing to contribute — and worse,
@@ -766,10 +766,10 @@ impl<'a> QueryEngine<'a> {
             }
         }
 
-        // Phase 8 (2026-05-04 batch 6) — TenantSearchPolicy
+        // TenantSearchPolicy
         // enforcement #1: block Global queries when the active
         // policy disallows them. We check this *before* paying
-        // for `cold_buckets()` so a forbidden Global search is
+        // for `cold_buckets` so a forbidden Global search is
         // cheap.
         //
         // `allow_cross_tenant_results` is enforced upstream of
@@ -778,7 +778,7 @@ impl<'a> QueryEngine<'a> {
         // `target_set` filter below, so a `Tenant(t)` query
         // cannot pull in other tenants' buckets even when the
         // policy is left at its default. The field is therefore
-        // documentation / future-use only inside this engine —
+        // documentation / future-use only inside this engine
         // see the rustdoc on
         // [`TenantSearchPolicy::allow_cross_tenant_results`].
         let effective_target = query.effective_target();
@@ -795,7 +795,7 @@ impl<'a> QueryEngine<'a> {
         // If a conversation_filter is set, skip every bucket whose
         // conversation_id does not match.
         let conv_filter = query.conversation_filter.map(|c| c.to_string());
-        // Phase 8, batch-5 — also respect the SearchTarget scope:
+        // also respect the SearchTarget scope:
         // when the query carries an explicit non-Global target,
         // skip every cold bucket whose conversation_id is outside
         // the resolved target set. This keeps the cold fan-out
@@ -805,31 +805,31 @@ impl<'a> QueryEngine<'a> {
         // documented contract — see the `Ok(None)` rustdoc on that
         // helper):
         //
-        //   * `Ok(None)`               → `SearchTarget::Global`. No
-        //                                additional restriction; every
-        //                                cold bucket is in scope.
-        //   * `Ok(Some(non_empty))`    → restrict to those buckets.
-        //   * `Ok(Some(empty))`        → **fail-closed**: the target
-        //                                resolved to zero conversations
-        //                                (e.g. `Starred` / `Unread`
-        //                                with the default
-        //                                `NoopConversationGroupResolver`,
-        //                                or a `Conversation(uuid)` that
-        //                                does not exist). Drop every
-        //                                cold bucket so the cold pass
-        //                                stays consistent with the
-        //                                local pass — `push_target_filter`
-        //                                emits `1=0` for an empty
-        //                                resolution, so the local
-        //                                pass returns zero rows; the
-        //                                cold pass mirrors that.
-        //   * `Err(_)`                 → transient resolver error. Fall
-        //                                back to "no extra restriction"
-        //                                (`None`) so a flaky resolver
-        //                                cannot mask cold hits the
-        //                                conversation_filter or the
-        //                                local pass would otherwise
-        //                                surface.
+        // * `Ok(None)` → `SearchTarget::Global`. No
+        // additional restriction; every
+        // cold bucket is in scope.
+        // * `Ok(Some(non_empty))` → restrict to those buckets.
+        // * `Ok(Some(empty))` → **fail-closed**: the target
+        // resolved to zero conversations
+        // (e.g. `Starred` / `Unread`
+        // with the default
+        // `NoopConversationGroupResolver`,
+        // or a `Conversation(uuid)` that
+        // does not exist). Drop every
+        // cold bucket so the cold pass
+        // stays consistent with the
+        // local pass — `push_target_filter`
+        // emits `1=0` for an empty
+        // resolution, so the local
+        // pass returns zero rows; the
+        // cold pass mirrors that.
+        // * `Err(_)` → transient resolver error. Fall
+        // back to "no extra restriction"
+        // (`None`) so a flaky resolver
+        // cannot mask cold hits the
+        // conversation_filter or the
+        // local pass would otherwise
+        // surface.
         // The explicit `Ok(opt) => opt` / `Err(_) => None` arms here
         // exactly mirror the semantics in the comment above. We keep
         // the match form rather than `Result::unwrap_or_default` so
@@ -848,12 +848,12 @@ impl<'a> QueryEngine<'a> {
                     .as_ref()
                     .is_none_or(|set| set.contains(c.as_str()))
             })
-            // Phase 8 (2026-05-04 batch 6) — Task 1: bucket-level
-            // date pruning. Drop any bucket whose YYYY-MM range
-            // falls entirely outside the query's date window
-            // before paying for a transport round-trip. This is a
-            // pure no-op when neither `date_from` nor `date_to` is
-            // set.
+ // bucket-level
+ // date pruning. Drop any bucket whose YYYY-MM range
+ // falls entirely outside the query's date window
+ // before paying for a transport round-trip. This is a
+ // pure no-op when neither `date_from` nor `date_to` is
+ // set.
             .filter(|(_, bucket)| {
                 bucket_overlaps_date_range(bucket.as_str(), query.date_from, query.date_to)
             })
@@ -892,7 +892,7 @@ impl<'a> QueryEngine<'a> {
         let q_tokens = FuzzyTokenizer::generate_tokens(trimmed);
         // Group fuzzy tokens by script so the cold path applies
         // the same per-script overlap threshold as
-        // [`FuzzySearchEngine::search_fuzzy`] (Phase 5, Task 2).
+        // [`FuzzySearchEngine::search_fuzzy`].
         let mut q_by_script: HashMap<ScriptClass, HashSet<String>> = HashMap::new();
         for t in &q_tokens {
             q_by_script
@@ -903,7 +903,7 @@ impl<'a> QueryEngine<'a> {
         let q_count_fuzzy: f64 = q_by_script.values().map(|s| s.len()).sum::<usize>() as f64;
 
         for (conv, bucket) in buckets {
-            // Phase 8 (2026-05-04 batch 6) — Task 2: bloom-filter
+            // bloom-filter
             // pre-check. Consult the bloom shard for this bucket
             // and skip the bucket entirely when it rejects every
             // query token. Empty `q_words` (e.g. a query that
@@ -959,7 +959,7 @@ impl<'a> QueryEngine<'a> {
         Ok(out)
     }
 
-    /// Phase 8 (2026-05-04 batch 10) — Task 1: parallel-fetch
+    /// parallel-fetch
     /// twin of
     /// [`Self::execute_search_with_cold_source_full`].
     ///
@@ -969,7 +969,7 @@ impl<'a> QueryEngine<'a> {
     /// of at most `concurrency` threads. The merge step itself
     /// stays single-threaded — the parallelism is in the
     /// (transport-bound) shard fetch / decrypt path, which
-    /// `docs/PROPOSAL.md §7.5` calls out as the hot critical
+    /// `docs/DESIGN.md §7.5` calls out as the hot critical
     /// section in the multi-bucket fan-out. Setting
     /// `concurrency = 1` collapses the path back to the
     /// sequential loop while still threading the same code path.
@@ -996,7 +996,7 @@ impl<'a> QueryEngine<'a> {
         // `LocalOnly` short-circuit, same `allow_global_search`
         // gate, same target_set / date pruning / policy cap)
         // and limits the parallel-specific code to the
-        // fetch + merge fan-out. `e.into()` preserves the typed
+        // fetch + merge fan-out. `e.into` preserves the typed
         // `SearchError::Sqlite` path for rusqlite-driven failures
         // (same rationale as the sequential cold-source method).
         let local = self
@@ -1133,7 +1133,7 @@ impl<'a> QueryEngine<'a> {
         Ok(out)
     }
 
-    /// Phase 8 (2026-05-04 batch 10) — Task 2: streaming
+    /// streaming
     /// search variant.
     ///
     /// Drives the same bucket fan-out as
@@ -1160,7 +1160,7 @@ impl<'a> QueryEngine<'a> {
         limit: usize,
         mut emit: F,
     ) -> Result<Vec<SearchResult>, Error> {
-        // `e.into()` preserves the typed `SearchError::Sqlite`
+        // `e.into` preserves the typed `SearchError::Sqlite`
         // path for rusqlite-driven failures, matching the
         // sequential / parallel cold-source paths above.
         let local = self
@@ -1192,7 +1192,7 @@ impl<'a> QueryEngine<'a> {
         // `SearchComplete` emissions below. To honor the
         // documented "SearchComplete is emitted exactly once"
         // contract on `crate::SearchEvent`, treat a
-        // `cold_buckets()` failure as a fail-open: emit
+        // `cold_buckets` failure as a fail-open: emit
         // `SearchComplete` carrying the local results so the
         // listener has a terminal signal, then propagate the
         // underlying error to the synchronous return value.
@@ -1365,7 +1365,7 @@ impl<'a> QueryEngine<'a> {
 
     /// Cold-path variant of [`Self::apply_recency_and_kind_weight`]
     /// that skips the `message_skeleton` lookup. Re-weights only
-    /// the rows whose `message_id` is **not** in `local_ids` —
+    /// the rows whose `message_id` is **not** in `local_ids`
     /// those rows came exclusively from the cold path and have
     /// not had Task 3 applied yet. Rows that exist in both local
     /// and cold (i.e. their ID is in `local_ids`) had recency ×
@@ -1386,7 +1386,7 @@ impl<'a> QueryEngine<'a> {
             let recency_score = (-lambda * age_days).exp();
             let recency_factor = (1.0 - RECENCY_WEIGHT) + RECENCY_WEIGHT * recency_score;
             // Cold-only rows are decrypted text shards by
-            // construction (Phase 5 only ships text + fuzzy cold
+            // construction (only ships text + fuzzy cold
             // paths), so we pin the kind weight to
             // `TEXT_KIND_WEIGHT`.
             r.rank_score *= recency_factor * TEXT_KIND_WEIGHT;
@@ -1437,7 +1437,7 @@ impl<'a> QueryEngine<'a> {
     }
 
     // ----------------------------------------------------------------
-    // Semantic reranking (Phase 6, Task 8)
+    // Semantic reranking
     // ----------------------------------------------------------------
 
     /// Run a unified search and merge in cosine-similarity hits
@@ -1460,7 +1460,7 @@ impl<'a> QueryEngine<'a> {
     ///   to the result set with `rank_score =
     ///   cosine * SEMANTIC_WEIGHT * recency_factor *
     ///   kind_weight`. The recency anchor is the maximum
-    ///   `created_at_ms` across the combined candidate set —
+    ///   `created_at_ms` across the combined candidate set
     ///   FTS / fuzzy hits in `local` plus the semantic-only
     ///   skeletons — so the half-life decay is honoured. (An
     ///   earlier bug computed the anchor from a single-element
@@ -1554,7 +1554,7 @@ impl<'a> QueryEngine<'a> {
         // filtered by `execute_search_with_limit`; this guards
         // the *semantic-only* path so a query like
         // `{ sender_filter: Some("alice"),
-        //    date_from: Some(yesterday) }` cannot leak hits
+        // date_from: Some(yesterday) }` cannot leak hits
         // from other senders or outside the date window.
         // `allowed_skeleton_ids` returns `None` when no
         // structured filter is set — keep the candidate set
@@ -1572,7 +1572,7 @@ impl<'a> QueryEngine<'a> {
             HashMap::new()
         };
 
-        // Anchor `now_ms` against the combined candidate set —
+        // Anchor `now_ms` against the combined candidate set
         // FTS / fuzzy hits already in `local` plus any
         // semantic-only hit the bulk fetch resolved. This matches
         // `apply_cold_recency_weight`'s pattern. Anchoring on a
@@ -1596,7 +1596,7 @@ impl<'a> QueryEngine<'a> {
                 // `execute_search_with_limit`; just stack the
                 // semantic contribution on top.
                 local[idx].rank_score += semantic_contribution;
-                // Phase 6, Task 4 (2026-05-04 batch): expose the
+                // expose the
                 // raw cosine similarity so the reranker
                 // (`rerank_with_semantic`) and downstream
                 // consumers can reason about the semantic
@@ -1667,9 +1667,9 @@ impl<'a> QueryEngine<'a> {
     /// Re-score an existing [`SearchResult`] set against the
     /// supplied query embedding, using the same brute-force
     /// cosine-similarity engine that powers
-    /// [`Self::execute_search_with_semantic`]. Phase 6, Task 4
-    /// (2026-05-04 batch) — the "on-device reranking" item from
-    /// `docs/PHASES.md` Phase 6.
+    /// [`Self::execute_search_with_semantic`].
+    /// the "on-device reranking" item from
+    ///.
     ///
     /// The pass is purely local: it reads from `search_vector`
     /// and never fans to the cold archive, regardless of
@@ -1708,7 +1708,7 @@ impl<'a> QueryEngine<'a> {
         }
         let mv = model_version.unwrap_or(crate::models::embeddings::XLMR_MODEL_VERSION);
 
-        // Phase 6, Task 4: respect SearchScope::LocalOnly by
+        // respect SearchScope::LocalOnly by
         // never fanning beyond `search_vector`. The brute-force
         // sweep below only reads local SQLite rows, so this is
         // satisfied unconditionally — the scope match is kept
@@ -1718,8 +1718,7 @@ impl<'a> QueryEngine<'a> {
             SearchScope::LocalOnly | SearchScope::IncludeCold => {}
         }
 
-        // Phase 6, Task 4 (2026-05-04 batch — Devin Review
-        // follow-up): use a parameterized `IN (...)` clause keyed
+        // Use a parameterized `IN (...)` clause keyed
         // by `message_id` so the lookup is O(k · log N) against
         // the `(message_id, model_version)` primary-key index
         // instead of an O(N) sweep across every embedding for
@@ -1929,9 +1928,9 @@ impl<'a> QueryEngine<'a> {
             }
             let mid_uuid = Uuid::parse_str(&h.message_id).unwrap_or(Uuid::nil());
             let cid_uuid = Uuid::parse_str(&h.conversation_id).unwrap_or(Uuid::nil());
-            // FTS5's bm25() returns negative values — more negative is
+            // FTS5's bm25 returns negative values — more negative is
             // more relevant. Flip the sign and weight per
-            // `docs/PROPOSAL.md §7.5`.
+            // `docs/DESIGN.md §7.5`.
             by_id.insert(
                 h.message_id.clone(),
                 SearchResult {
@@ -1981,7 +1980,7 @@ impl<'a> QueryEngine<'a> {
                         sender_id: info.sender_id.clone(),
                         created_at_ms: info.created_at_ms,
                         // Fuzzy rows do not produce highlighted
-                        // snippets — those come from FTS5's snippet().
+                        // snippets — those come from FTS5's snippet.
                         snippet: None,
                         rank_score: f.score * FUZZY_WEIGHT,
                         is_cold: false,
@@ -1996,7 +1995,7 @@ impl<'a> QueryEngine<'a> {
 
         let mut out: Vec<SearchResult> = by_id.into_values().collect();
 
-        // Apply the Phase 5, Task 3 ranking-formula extensions:
+        // Apply the ranking-formula extensions:
         // recency decay + per-kind weight. The base BM25 + fuzzy
         // contributions are already accumulated in `rank_score`
         // above; this pass folds in the multiplicative factors
@@ -2017,8 +2016,8 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// Multiply each result's `rank_score` by its recency-decay
-    /// factor and content-kind weight (Phase 5, Task 3 —
-    /// `docs/PROPOSAL.md §7.5`).
+    /// factor and content-kind weight (
+    /// `docs/DESIGN.md §7.5`).
     ///
     /// The reference timestamp anchoring "now" is the most-recent
     /// `created_at_ms` in the result set. This keeps the function
@@ -2217,7 +2216,7 @@ fn push_structured_filters(query: &SearchQuery, clauses: &mut Vec<String>, binds
     }
 }
 
-/// Phase 8 — resolve a [`SearchTarget`] into a concrete set of
+/// resolve a [`SearchTarget`] into a concrete set of
 /// conversation ids the query engine should scope to. Returns
 /// `Ok(None)` for [`SearchTarget::Global`] (no filter); every
 /// other variant returns `Ok(Some(set))`. An empty set is a
@@ -2234,7 +2233,7 @@ pub fn resolve_target_to_conversation_set(
     )
 }
 
-/// Phase 8, batch-5 — resolution variant that consults a
+/// resolution variant that consults a
 /// [`crate::search::search_target::ConversationGroupResolver`]
 /// for the new variants
 /// (`ConversationGroup` / `Channel` / `Starred` / `Unread`).
@@ -2313,7 +2312,7 @@ pub fn resolve_target_to_conversation_set_with_resolver(
 /// Result alias used by [`resolve_target_to_conversation_set`].
 type SearchResultSet<T> = std::result::Result<T, Error>;
 
-/// Phase 8 — append a `conversation_id IN (…)` filter clause for
+/// append a `conversation_id IN (…)` filter clause for
 /// the supplied [`SearchTarget`]. No-op for [`SearchTarget::Global`]
 /// (no filter wanted). For every other variant — including
 /// [`SearchTarget::Conversation`] — the target is resolved into a
@@ -2412,7 +2411,7 @@ fn date_filter_matches(query: &SearchQuery, created_at_ms: i64) -> bool {
 /// already local, so the row must not enter the cold-only
 /// re-weighting path nor be enqueued for hydration. Otherwise we
 /// synthesize a fresh row with `is_cold = true`.
-/// Phase 8 (2026-05-04 batch 10) — Task 1: shared merge helper
+/// shared merge helper
 /// for one bucket's `(fts_rows, fuzzy_rows)` payload.
 ///
 /// Both the sequential and parallel cold fan-out paths funnel
@@ -2573,7 +2572,7 @@ fn content_kind_to_sql(kind: ContentKind) -> Option<&'static str> {
     match kind {
         ContentKind::Text => Some("text"),
         // Image / Video / Audio / Document all live under the
-        // `media` skeleton kind in Phase 1. Phase 2 will refine
+        // `media` skeleton kind in will refine
         // this once the media-search index is wired up; today we
         // map all four to "media".
         ContentKind::Image | ContentKind::Video | ContentKind::Audio | ContentKind::Document => {
@@ -2828,7 +2827,7 @@ mod tests {
 
     #[test]
     fn search_local_only_does_not_attempt_cold_fetch() {
-        // Phase 1 invariant: LocalOnly returns purely local rows
+        // Invariant: LocalOnly returns purely local rows
         // (is_cold = false) without touching any archive code.
         let db = populated_db();
         let engine = QueryEngine::new(db.connection(), db.icu_available());
@@ -2842,8 +2841,8 @@ mod tests {
 
     #[test]
     fn search_include_cold_returns_local_for_now() {
-        // Phase 1 invariant: IncludeCold is a forward-compat marker;
-        // no archive fan-out lands until Phase 3 / Phase 5.
+        // Invariant: IncludeCold is a forward-compat marker;
+        // no archive fan-out lands until /
         let db = populated_db();
         let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
@@ -3179,7 +3178,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Cold-bucket fan-out via ColdShardSource (Phase 5, Task 1)
+    // Cold-bucket fan-out via ColdShardSource
     // -------------------------------------------------------------------
 
     use std::cell::Cell;
@@ -3479,7 +3478,7 @@ mod tests {
 
     // -------------------------------------------------------------------
     // Ranking formula: recency decay + content-kind weight
-    // (Phase 5, Task 3 — `docs/PROPOSAL.md §7.5`)
+    // ( — `docs/DESIGN.md §7.5`)
     // -------------------------------------------------------------------
 
     #[test]
@@ -3640,7 +3639,7 @@ mod tests {
         );
     }
 
-    // ----- Phase 6, Task 8: semantic reranking ----------------------
+    // -----: semantic reranking ----------------------
 
     use crate::models::embeddings::{
         EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, NoopTextEmbedder, TextEmbedder,
@@ -3649,7 +3648,7 @@ mod tests {
 
     #[test]
     fn semantic_weight_constant_matches_proposal() {
-        // PROPOSAL §7.5 ranking formula constants. Kept as
+        // DESIGN.md §7.5 ranking formula constants. Kept as
         // runtime asserts (rather than `const { … }` blocks) so a
         // future tweak to the constants surfaces as a normal
         // test failure with a useful diff.
@@ -3868,16 +3867,16 @@ mod tests {
             .expect("90-day-old semantic-only hit should surface");
 
         // Numeric envelope:
-        //   cosine ≈ 1.0 (round-trips via the INT8 codec at
-        //     >0.999 fidelity).
-        //   SEMANTIC_WEIGHT = 1.5
-        //   kind_weight = 1.0 (text)
-        //   For the anchor row, age = 0, so recency_factor = 1.0
-        //     and rank_score ≈ 1.5.
-        //   For the 90-day row, age_days = 90,
-        //     recency_score = exp(-90 * ln(2) / 30) = 1/8 = 0.125,
-        //     recency_factor = 0.5 + 0.5 * 0.125 = 0.5625,
-        //     rank_score ≈ 1.5 * 0.5625 ≈ 0.844.
+        // cosine ≈ 1.0 (round-trips via the INT8 codec at
+        // >0.999 fidelity).
+        // SEMANTIC_WEIGHT = 1.5
+        // kind_weight = 1.0 (text)
+        // For the anchor row, age = 0, so recency_factor = 1.0
+        // and rank_score ≈ 1.5.
+        // For the 90-day row, age_days = 90,
+        // recency_score = exp(-90 * ln(2) / 30) = 1/8 = 0.125,
+        // recency_factor = 0.5 + 0.5 * 0.125 = 0.5625,
+        // rank_score ≈ 1.5 * 0.5625 ≈ 0.844.
         let undecayed = SEMANTIC_WEIGHT;
         assert!(
             (recent_score - undecayed).abs() < 0.05,
@@ -4028,7 +4027,7 @@ mod tests {
     /// Build two skeleton-only messages and plant identical mock
     /// embeddings for both so semantic search returns both with
     /// cosine ≈ 1.0. Returns `(allowed_uuid, blocked_uuid)`
-    /// — the caller pairs them with a filter to assert the
+    /// the caller pairs them with a filter to assert the
     /// blocked one is dropped.
     fn seed_two_semantic_only_hits(
         db: &LocalStoreDb,
@@ -4231,7 +4230,7 @@ mod tests {
         // `execute_search_with_semantic` previously matched on
         // `"image" | "video" | "audio" | "file"` — vocabulary
         // borrowed from `MediaDescriptor.kind`, not the canonical
-        // `MessageKind::as_str()` strings actually written into
+        // `MessageKind::as_str` strings actually written into
         // `message_skeleton.kind` ("text" | "media" | "system").
         // Media-typed semantic-only hits silently fell through
         // the `_` arm and got `TEXT_KIND_WEIGHT (= 1.0)` instead
@@ -4243,8 +4242,8 @@ mod tests {
         // `kind = "media"`, plants identical mock embeddings,
         // and asserts:
         //
-        //   * text  rank_score ≈ SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT  = 1.50
-        //   * media rank_score ≈ SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT = 1.20
+        // * text rank_score ≈ SEMANTIC_WEIGHT * TEXT_KIND_WEIGHT = 1.50
+        // * media rank_score ≈ SEMANTIC_WEIGHT * MEDIA_KIND_WEIGHT = 1.20
         //
         // The buggy code produced 1.50 for both. Tolerances
         // absorb INT8-quant cosine fidelity (> 0.999).
@@ -4311,7 +4310,7 @@ mod tests {
     fn kind_str_to_weight_canonical_mapping() {
         // The helper is the single source of truth for the
         // skeleton-kind → ranker-weight mapping. Pin the
-        // canonical `MessageKind::as_str()` vocabulary —
+        // canonical `MessageKind::as_str` vocabulary
         // anything else collapses to TEXT_KIND_WEIGHT so cold
         // / unknown rows stay visible.
         assert_eq!(kind_str_to_weight("text"), TEXT_KIND_WEIGHT);
@@ -4330,7 +4329,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 6, Task 4 (2026-05-04 batch) — `semantic_score`
+    // `semantic_score`
     // population + `rerank_with_semantic` coverage.
     // -----------------------------------------------------------
 
@@ -4546,7 +4545,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8 — SearchTarget integration tests
+// SearchTarget integration tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -4696,7 +4695,7 @@ mod phase8_target_tests {
 
     #[test]
     fn search_with_conversation_target_only_filters_to_that_conversation() {
-        // Phase 8 contract: setting `target = SearchTarget::Conversation(c)`
+        // contract: setting `target = SearchTarget::Conversation(c)`
         // *without* the legacy `conversation_filter` field must scope the
         // search to that single conversation. Regression for the case
         // where `push_target_filter` previously skipped the
@@ -4793,7 +4792,7 @@ mod phase8_target_tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — Tasks 1, 2, 5
+    // Tasks 1, 2, 5
     // -------------------------------------------------------------------
 
     fn ms_for(year: i32, month: u32, day: u32) -> i64 {
@@ -4957,9 +4956,9 @@ mod phase8_target_tests {
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new()
             .with_text(&conv, "2026-04", vec![cold_text_row(&conv, &mid, "lighthouse beacon")])
-            // The bloom shard advertises words that have nothing
-            // to do with the query; pre-check must reject the
-            // bucket before we call fetch_text_rows.
+ // The bloom shard advertises words that have nothing
+ // to do with the query; pre-check must reject the
+ // bucket before we call fetch_text_rows.
             .with_bloom(&conv, "2026-04", &["alpha", "beta", "gamma"]);
         let q = SearchQuery {
             query_string: "lighthouse".into(),
@@ -5056,11 +5055,11 @@ mod phase8_target_tests {
 
     #[test]
     fn cold_source_fetch_bloom_with_cache_swallows_transport_errors() {
-        // Function-level regression for the Phase 8 batch 6
+        // Function-level regression for the batch 6
         // contract on `cold_source_fetch_bloom_with_cache`:
         // even when the underlying `ColdShardSource::fetch_bloom_shard`
         // returns `Err(_)`, the helper must yield `Ok(None)` so
-        // any future caller that `?`-propagates or `.unwrap()`s
+        // any future caller that `?`-propagates or `.unwrap`s
         // the result still gets the documented graceful-degradation
         // behaviour. Pairs with `bloom_precheck_falls_through_on_transport_error`,
         // which exercises the same code path through the public
@@ -5279,7 +5278,7 @@ mod phase8_target_tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 10) — Task 1 parallel-fetch tests.
+    // parallel-fetch tests.
     // -----------------------------------------------------------------
 
     /// `Send + Sync` cold source for the parallel-fetch tests.
@@ -5579,7 +5578,7 @@ mod phase8_target_tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 10) — Task 2 streaming-search tests.
+    // streaming-search tests.
     // -----------------------------------------------------------------
 
     #[test]
@@ -5738,10 +5737,9 @@ mod phase8_target_tests {
         ));
     }
 
-    /// Regression for the Devin Review finding that
-    /// `execute_search_streaming` could violate the
+    /// Regression: `execute_search_streaming` could violate the
     /// "SearchComplete is emitted exactly once" contract: when
-    /// `cold_source.cold_buckets()` returned an `Err`, the
+    /// `cold_source.cold_buckets` returned an `Err`, the
     /// previous code propagated the error via `?` *after*
     /// `LocalResults` had already been emitted, leaving
     /// callback listeners with no terminal event. The fix emits

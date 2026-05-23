@@ -1,6 +1,6 @@
 //! Storage budget enforcement.
 //!
-//! `docs/PROPOSAL.md §5.4` and `docs/ARCHITECTURE.md §8.2` describe
+//! `docs/DESIGN.md §5.4` and `docs/ARCHITECTURE.md §8.2` describe
 //! the storage-budget assessment loop that the offload pipeline
 //! calls on app launch / on demand. This module turns the
 //! quantitative side of that loop into pure functions that can be
@@ -31,7 +31,7 @@ use crate::Error;
 /// * `usage <= warning_threshold_pct%` → [`PressureLevel::None`]
 /// * `usage <= critical_threshold_pct%` → [`PressureLevel::Warning`]
 /// * `usage <= 100%` → [`PressureLevel::Critical`]
-/// * `usage  > 100%` → [`PressureLevel::Extreme`]
+/// * `usage > 100%` → [`PressureLevel::Extreme`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBudget {
     /// Hard ceiling for total local storage, in bytes.
@@ -73,7 +73,7 @@ impl StorageBudget {
 /// `total_bytes` is the sum of the class-specific buckets and is
 /// what the assessor compares against the budget. Individual
 /// buckets are exposed so the eviction pipeline can pick the
-/// right candidate set per pressure level (see PROPOSAL §5.4).
+/// right candidate set per pressure level (see DESIGN.md §5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StorageUsage {
     /// Sum of every bucket below.
@@ -85,7 +85,7 @@ pub struct StorageUsage {
     /// `search_fts` + `search_fuzzy` + `search_vector` +
     /// `media_search_index`.
     pub index_bytes: u64,
-    /// Process-side caches not stored in SQLite (Phase 5+ wires a
+    /// Process-side caches not stored in SQLite (+ wires a
     /// non-zero number once the on-disk media cache lands; for
     /// now reported as 0).
     pub cache_bytes: u64,
@@ -159,8 +159,8 @@ impl PressureLevel {
 /// Stateless storage budget enforcer.
 ///
 /// Holds no internal cache — every call re-queries the database.
-/// Phase 4+ may layer a debounced cache on top once the
-/// orchestration layer is in place.
+/// + may layer a debounced cache on top once the
+///   orchestration layer is in place.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StorageBudgetEnforcer;
 
@@ -228,7 +228,7 @@ pub fn pressure_level(usage: &StorageUsage, budget: &StorageBudget) -> PressureL
 ///
 /// Uses heuristic sums of `LENGTH(...)` over the SQL columns each
 /// bucket owns. Exact disk usage (which would include SQLite's
-/// page overhead) is not what the offload pipeline cares about —
+/// page overhead) is not what the offload pipeline cares about
 /// the budget enforcement loop only needs a reasonable proxy that
 /// updates as content arrives / departs.
 pub fn collect_storage_usage(conn: &Connection) -> Result<StorageUsage, Error> {

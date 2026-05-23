@@ -1,4 +1,4 @@
-//! Phase-3 archive segment builder.
+//! archive segment builder.
 //!
 //! Pulls events out of [`crate::archive::event_journal`], groups
 //! them by `(conversation_id, time_bucket)`, encodes the group as
@@ -8,7 +8,7 @@
 //! [`BuiltSegment`].
 //!
 //! The builder does **not** own the connection, the event journal,
-//! or the manifest writer. The orchestration layer (Phase 3, Task
+//! or the manifest writer. The orchestration layer ( Task
 //! 10 wires it on `CoreImpl`) drives it explicitly:
 //!
 //! 1. `journal.read_unsegmented(...)` → `Vec<ArchiveEvent>`,
@@ -62,10 +62,10 @@ pub struct SegmentBuildRequest {
     /// archive-segment-type variant (i.e.
     /// [`SegmentType::is_archive_segment`] returns true). Defaults
     /// to [`SegmentType::MessageDelta`] for backwards compatibility
-    /// with the Phase 3 / Task 6 builder which only emitted
+    /// with the / Task 6 builder which only emitted
     /// delta-style segments.
     ///
-    /// Phase 3, Task 6 (this file) extends the builder with two
+    /// (this file) extends the builder with two
     /// additional payload shapes that share the same CBOR / zstd
     /// / XChaCha20-Poly1305 pipeline:
     ///
@@ -236,7 +236,7 @@ pub struct BuiltSegment {
 ///
 /// The orchestration layer only needs to know the on-the-wire
 /// shape to round-trip during restore; the field names line up
-/// with `ARCHIVE_EVENTS` from `docs/PROPOSAL.md §6.4`.
+/// with `ARCHIVE_EVENTS` from `docs/DESIGN.md §6.4`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveSegmentPayload {
     /// Magic bytes (always [`ARCHIVE_SEGMENT_PAYLOAD_MAGIC`]).
@@ -250,7 +250,7 @@ pub struct ArchiveSegmentPayload {
     pub events: Vec<ArchiveEvent>,
 }
 
-/// Phase-3 archive segment builder.
+/// archive segment builder.
 ///
 /// Stateless — every public method takes its own inputs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -291,7 +291,7 @@ impl ArchiveSegmentBuilder {
 
     /// Build a single archive segment.
     ///
-    /// `k_archive_segment` is `K_archive_segment(segment_id)` —
+    /// `k_archive_segment` is `K_archive_segment(segment_id)`
     /// the caller derives it from the active epoch key (Task 6).
     pub fn build_segment(
         &self,
@@ -305,7 +305,7 @@ impl ArchiveSegmentBuilder {
         }
         // Reject backup-only variants up front — the
         // archive segment frame can only carry the seven
-        // archive payload variants from `docs/PROPOSAL.md §5.1`.
+        // archive payload variants from `docs/DESIGN.md §5.1`.
         if !request.segment_type.is_archive_segment() {
             return Err(Error::Storage(
                 format!(
@@ -330,13 +330,13 @@ impl ArchiveSegmentBuilder {
             })
         })?;
 
-        // 2) Compute the integrity root over the CBOR payload —
-        //    *not* the compressed bytes, so segments are
-        //    deterministic across zstd version updates.
+        // 2) Compute the integrity root over the CBOR payload
+        // *not* the compressed bytes, so segments are
+        // deterministic across zstd version updates.
         let merkle_root = content_hash(&cbor);
 
         // 3) zstd-compress the CBOR. `decode_all` on the read side
-        //    is symmetric.
+        // is symmetric.
         let compressed =
             zstd::stream::encode_all(&cbor[..], ZSTD_COMPRESSION_LEVEL).map_err(|e| {
                 Error::Storage(crate::local_store::StorageError::Zstd {
@@ -346,9 +346,9 @@ impl ArchiveSegmentBuilder {
             })?;
 
         // 4) Allocate a fresh segment_id and AEAD-seal the
-        //    compressed payload. AAD ties the segment_id and
-        //    merkle_root to the ciphertext so swapping ciphertexts
-        //    between segments fails the open.
+        // compressed payload. AAD ties the segment_id and
+        // merkle_root to the ciphertext so swapping ciphertexts
+        // between segments fails the open.
         let segment_id = Uuid::now_v7();
         let mut nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -387,7 +387,7 @@ pub fn default_time_bucket_for_ms(created_at_ms: i64) -> String {
         return "unknown".into();
     }
     // Hand-roll YYYY-MM from epoch seconds without pulling chrono
-    // — chrono isn't a dependency of `kchat-core` today and this
+    // chrono isn't a dependency of `kchat-core` today and this
     // is a coarse bucketing heuristic, not a calendar engine.
     // We treat all months as 30 days and all years as 365 days,
     // which is fine for archive bucketing: as long as the function
@@ -630,7 +630,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 3, Task 6 — TimelineSkeleton + Checkpoint variants
+    // TimelineSkeleton + Checkpoint variants
     // -----------------------------------------------------------
 
     #[test]
@@ -679,9 +679,9 @@ mod tests {
     #[test]
     fn segment_type_is_preserved_through_cbor_round_trip() {
         // Each archive variant must round-trip its discriminant
-        // through the build → decrypt cycle. Phase 3 batch-5
-        // (2026-05-04) extends this to all seven archive
-        // payload variants from `docs/PROPOSAL.md §5.1`.
+        // through the build → decrypt cycle. batch-5
+        // extends this to all seven archive
+        // payload variants from `docs/DESIGN.md §5.1`.
         let conv = Uuid::now_v7();
         for variant in [
             SegmentType::MessageDelta,
@@ -712,7 +712,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 3 batch-5 — media_key_delta / search_text_index /
+    // Batch-5 — media_key_delta / search_text_index /
     // search_vector_index / media_index round-trips
     // -----------------------------------------------------------
 

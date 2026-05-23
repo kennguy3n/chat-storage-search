@@ -2,7 +2,7 @@
 //!
 //! Drives a [`crate::transport::TransportClient`] through the
 //! `init → chunk(s) → commit` sequence specified in
-//! `docs/PROPOSAL.md §10.1` / `§10.2` and `docs/ARCHITECTURE.md
+//! `docs/DESIGN.md §10.1` / `§10.2` and `docs/ARCHITECTURE.md
 //! §10.1` (`POST /v1/blobs/init`, `PUT chunks/{idx}`, `POST commit`).
 //!
 //! The pipeline operates on the [`crate::media::chunker::SealedChunk`]
@@ -17,12 +17,12 @@
 //! * [`resume_upload`] — resumes after a partial transfer; consults
 //!   [`UploadState::completed_chunks`] to skip chunks the server has
 //!   already received and only re-pushes the pending ones. The
-//!   commit step is idempotent on retry per `docs/PHASES.md` Phase 2
+//!   commit step is idempotent on retry per
 //!   ("idempotent commit on retry") so resuming after a successful
 //!   commit is a no-op.
 //!
-//! Phase 2 keeps the upload pipeline synchronous to match the
-//! Phase-1 [`crate::transport::TransportClient`] surface; Phase 2+
+//! Keeps the upload pipeline synchronous to match the
+//! [`crate::transport::TransportClient`] surface; +
 //! flips both to `async fn` together once the production HTTP /
 //! gRPC / MLS-blob client lands.
 
@@ -36,7 +36,7 @@ use crate::Error;
 /// `completed_chunks[i] == true` means chunk `i` has already been
 /// uploaded to the server and acknowledged with a
 /// [`crate::transport::ChunkReceipt`]. The vector length must match
-/// `sealed_chunks.len()` for [`resume_upload`].
+/// `sealed_chunks.len` for [`resume_upload`].
 ///
 /// `merkle_root` is the BLAKE3 root the client committed to when it
 /// first called [`crate::transport::TransportClient::init_blob_upload`];

@@ -1,6 +1,6 @@
-//! Phase 5, Task 4 — mixed-language query fan-out integration tests.
+//! mixed-language query fan-out integration tests.
 //!
-//! `docs/PROPOSAL.md §3 / §7` requires search to handle queries
+//! `docs/DESIGN.md §3 / §7` requires search to handle queries
 //! that interleave multiple scripts in a single string. The
 //! tokenizer's [`segment_by_script`] (already used for indexing)
 //! drives the fuzzy half; FTS5 with the ICU tokenizer handles the

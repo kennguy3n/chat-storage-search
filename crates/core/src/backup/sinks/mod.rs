@@ -1,4 +1,4 @@
-//! Backup sink routing seam (Phase 4, Task 4).
+//! Backup sink routing seam.
 //!
 //! Mirrors [`crate::media::sinks`] for the **backup** pipeline:
 //! `BackupSink` owns the upload / fetch / list calls the backup
@@ -14,7 +14,7 @@
 //! produce the AEAD-sealed bytes; the sink moves them to and from
 //! the backend verbatim.
 //!
-//! Object key layout (per `docs/PROPOSAL.md §6.5` and Task 4):
+//! Object key layout (per `docs/DESIGN.md §6.5` and Task 4):
 //!
 //! * `backups/{manifest_id}` — sealed manifest bundle (CBOR
 //!   encoding of [`crate::backup::manifest_builder::SealedBackupManifest`]).

@@ -1,4 +1,4 @@
-//! ZK Object Fabric backup sink (Phase 4, Task 4).
+//! ZK Object Fabric backup sink.
 //!
 //! Mirrors [`crate::media::sinks::zk_fabric::ZkObjectFabricSink`]
 //! for the **backup** pipeline. Routes sealed segment ciphertext
@@ -17,12 +17,12 @@
 //! reference and vice versa, exercised by
 //! [`crates/core/tests/pattern_c_interop_vectors.rs`].
 //!
-//! S3 key layout (matches `docs/PROPOSAL.md §6.5`):
+//! S3 key layout (matches `docs/DESIGN.md §6.5`):
 //!
 //! ```text
-//! backups/{manifest_id}             — sealed manifest (CBOR
-//!                                     of SealedBackupManifest)
-//! backups/segments/{segment_id}     — sealed segment ciphertext
+//! backups/{manifest_id} — sealed manifest (CBOR
+//! of SealedBackupManifest)
+//! backups/segments/{segment_id} — sealed segment ciphertext
 //! ```
 //!
 //! Both layers (the AEAD seal in
@@ -80,7 +80,7 @@ pub struct ZkofBackupSink {
     s3: Arc<dyn S3Client>,
     config: ZkFabricSinkConfig,
     tenant_id: String,
-    /// Phase 7 (2026-05-04 batch 10 — Task 10) — optional
+    /// optional
     /// dedup-analytics probe. When set, every successful
     /// `upload_backup_segment` / `upload_backup_manifest` records
     /// a [`DedupEvent::ObjectUploaded`] into the probe. The flag
@@ -115,7 +115,7 @@ impl ZkofBackupSink {
         })
     }
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 10): builder helper
+    /// builder helper
     /// that attaches a dedup-analytics probe. Returns `self` for
     /// fluent construction. When set, every successful upload
     /// records a [`crate::transport::dedup_analytics::DedupEvent::ObjectUploaded`]
@@ -170,13 +170,13 @@ impl BackupSink for ZkofBackupSink {
         let size_bytes = ciphertext.len() as u64;
         self.s3
             .put_object(&self.config.bucket, &segment_key(segment_id), &sealed)?;
-        // Phase 7 (2026-05-04 batch 10 — Task 10): record the
+        // record the
         // upload into the dedup-analytics probe if installed. We
         // cannot tell from the S3 PutObject response whether the
         // convergent ciphertext already existed (there is no
         // `If-None-Match` semantics in the legacy `put_object`
         // surface), so we conservatively report `was_deduped=false`
-        // — production deployments swap in an S3 client that
+        // production deployments swap in an S3 client that
         // checks `HEAD` first and reports the cache hit.
         if let Some(probe) = self.dedup_analytics.as_ref() {
             let _ = probe.record_event(
@@ -219,7 +219,7 @@ impl BackupSink for ZkofBackupSink {
         // bytes. The orchestrator (which holds the manifest
         // ledger row carrying the plaintext hash) finishes the
         // open via [`ZkofBackupSink::pattern_c_open`] before
-        // decoding the CBOR. Phase 5 will fold the hash into
+        // decoding the CBOR. will fold the hash into
         // sink-side metadata so this method returns plaintext
         // directly.
         Ok(bytes)

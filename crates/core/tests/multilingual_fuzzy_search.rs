@@ -1,6 +1,6 @@
-//! Phase 1 combined FTS5 + fuzzy multilingual integration tests.
+//! Combined FTS5 + fuzzy multilingual integration tests.
 //!
-//! `docs/PHASES.md §Phase 1` decision gate: "Text messages can be
+//! The decision gate: "Text messages can be
 //! stored, searched (multilingual)". The companion
 //! `multilingual_search.rs` covers the FTS5 / structured-filter half
 //! of that gate; this file exercises the **combined** FTS5 + fuzzy
@@ -11,7 +11,7 @@
 //! [`MessagePersister`] (which now indexes both `search_fts` and
 //! `search_fuzzy`) and then queried through [`QueryEngine`] (which
 //! merges FTS5 hits + fuzzy hits, dedups by `message_id`, and ranks
-//! exact > fuzzy per `docs/PROPOSAL.md §7.5`).
+//! exact > fuzzy per `docs/DESIGN.md §7.5`).
 //!
 //! ICU-only tests (CJK / Thai FTS word search) are gated on the same
 //! [`LocalStoreDb::icu_available`] probe used by `multilingual_search.rs`
@@ -272,7 +272,7 @@ fn arabic_fuzzy_partial_match() {
 fn cross_engine_dedup_returns_single_result() {
     // A clean exact word — the FTS index hits this row and the
     // fuzzy index hits it too. The merged engine must return it
-    // exactly once (PROPOSAL.md §7.5 dedupes by message_id).
+    // exactly once (DESIGN.md §7.5 dedupes by message_id).
     let f = build_fixture();
     let ids = search_ids(&f, "lighthouse");
 
@@ -316,8 +316,8 @@ fn exact_match_outranks_fuzzy_only_match() {
 #[test]
 fn structured_filters_narrow_fuzzy_results() {
     // Two messages contain "lighthouse"-ish content:
-    //   - latin_lighthouse: alice / conv_a
-    //   - structured_decoy: alice / conv_b
+    // - latin_lighthouse: alice / conv_a
+    // - structured_decoy: alice / conv_b
     // Constrain to conv_a — only the first must come back.
     let f = build_fixture();
     let q = SearchQuery {

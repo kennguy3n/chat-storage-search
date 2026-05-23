@@ -1,8 +1,8 @@
 //! `WindowsSearchAnchor` trait + `NoopWindowsSearchAnchor`
 //! implementation for Windows Search protocol-handler
-//! integration (Phase 7, batch-5 — 2026-05-04).
+//! integration.
 //!
-//! `docs/PROPOSAL.md §7.4` calls for the Windows Search protocol
+//! `docs/DESIGN.md §7.4` calls for the Windows Search protocol
 //! handler equivalent of macOS Spotlight: the system-wide search
 //! bar surfaces kchat messages by URL anchor without dragging
 //! plaintext into the system search index.
@@ -14,7 +14,7 @@
 
 use kchat_core::Error;
 
-/// Phase 7 (2026-05-04 batch 10) — Task 6: one Windows Search
+/// one Windows Search
 /// item. Mirrors [`crate::spotlight::SpotlightItem`] field-for-
 /// field so a single ingest path can fan out to either bridge
 /// without per-platform branching.
@@ -55,7 +55,7 @@ pub trait WindowsSearchAnchor: Send + Sync + std::fmt::Debug {
     /// noop returns the message id verbatim.
     fn search_anchor(&self, message_id: &str) -> Result<String, Error>;
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 6: bulk indexing.
+    /// bulk indexing.
     ///
     /// Index every [`WindowsSearchItem`] in `items` in a single
     /// platform call. Default implementation walks the slice
@@ -68,7 +68,7 @@ pub trait WindowsSearchAnchor: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 6: bulk deindex.
+    /// bulk deindex.
     ///
     /// Remove every Windows Search entry whose unique id is in
     /// `ids`. Idempotent — missing ids are allowed. Default
@@ -80,7 +80,7 @@ pub trait WindowsSearchAnchor: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 6: nuke every
+    /// nuke every
     /// kchat-owned Windows Search entry. Default impl returns
     /// [`Error::NotImplemented`]; the production bridge issues
     /// the matching `ICrawlScopeManager` call.
@@ -117,7 +117,7 @@ impl WindowsSearchAnchor for NoopWindowsSearchAnchor {
 
     // Override the default trait bodies so the noop stays
     // panic-free even when the underlying `index_message` returns
-    // `NotImplemented`. Phase 7 batch 10 — Task 6.
+    // `NotImplemented`.
     fn index_items(&self, _items: &[WindowsSearchItem]) -> Result<(), Error> {
         Ok(())
     }
@@ -159,7 +159,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 6 bulk Windows Search.
+    // bulk Windows Search.
     // -----------------------------------------------------------
 
     #[derive(Debug, Default)]

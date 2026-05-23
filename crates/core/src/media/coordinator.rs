@@ -1,43 +1,43 @@
-//! Phase-B.9 media coordinator.
+//! media coordinator.
 //!
 //! Owns the on-device media-model bridge state previously held
 //! directly on [`crate::core_impl::CoreImpl`]:
 //!
-//!   * `image_embedder` — Phase-6 on-device image-embedding
-//!     seam ([`crate::models::clip::ImageEmbedder`], typically a
-//!     MobileCLIP-S2 ONNX session). Read by
-//!     [`crate::core_impl::CoreImpl::maybe_embed_image_message`]
-//!     and the video-keyframe path inside
-//!     [`crate::core_impl::CoreImpl::maybe_embed_video_keyframes`]
-//!     to write image / keyframe embeddings into the
-//!     `search_vector` table on media ingest.
-//!   * `ocr_bridge` — Phase-6 platform OCR seam
-//!     ([`crate::models::ocr::OcrBridge`]). Today only the
-//!     install / `has_ocr_bridge` surface is wired so the bridge
-//!     can be registered from the platform layer; production
-//!     callers will be added when the media-caption pipeline
-//!     (`docs/PROPOSAL.md §7.6`) lights up, at which point an
-//!     `ocr_bridge()` lookup accessor can be added alongside its
-//!     first caller — no scaffolded accessor is shipped here.
-//!   * `whisper_transcriber` — Phase-6 on-device Whisper
-//!     transcription seam
-//!     ([`crate::models::whisper::WhisperTranscriber`]). Read by
-//!     [`crate::core_impl::CoreImpl::maybe_transcribe_audio_message`]
-//!     to write per-message transcripts into the
-//!     `media_search_index`.
-//!   * `document_extractor` — Phase-6 on-device document
-//!     text-extraction seam
-//!     ([`crate::models::document::DocumentExtractor`]). Read by
-//!     [`crate::core_impl::CoreImpl::maybe_extract_document_pages`]
-//!     to write per-page caption rows into the
-//!     `media_search_index` for PDF / DOCX uploads.
-//!   * `video_keyframe_sampler` — Phase-6 on-device video
-//!     keyframe-sampling seam
-//!     ([`crate::models::video::VideoKeyframeSampler`]). Read by
-//!     [`crate::core_impl::CoreImpl::maybe_embed_video_keyframes`]
-//!     together with `image_embedder` to drive the
-//!     video-keyframe → MobileCLIP-S2 → `search_vector`
-//!     pipeline.
+//! * `image_embedder` — on-device image-embedding
+//!   seam ([`crate::models::clip::ImageEmbedder`], typically a
+//!   MobileCLIP-S2 ONNX session). Read by
+//!   [`crate::core_impl::CoreImpl::maybe_embed_image_message`]
+//!   and the video-keyframe path inside
+//!   [`crate::core_impl::CoreImpl::maybe_embed_video_keyframes`]
+//!   to write image / keyframe embeddings into the
+//!   `search_vector` table on media ingest.
+//! * `ocr_bridge` — platform OCR seam
+//!   ([`crate::models::ocr::OcrBridge`]). Today only the
+//!   install / `has_ocr_bridge` surface is wired so the bridge
+//!   can be registered from the platform layer; production
+//!   callers will be added when the media-caption pipeline
+//!   (`docs/DESIGN.md §7.6`) lights up, at which point an
+//!   `ocr_bridge` lookup accessor can be added alongside its
+//!   first caller — no scaffolded accessor is shipped here.
+//! * `whisper_transcriber` — on-device Whisper
+//!   transcription seam
+//!   ([`crate::models::whisper::WhisperTranscriber`]). Read by
+//!   [`crate::core_impl::CoreImpl::maybe_transcribe_audio_message`]
+//!   to write per-message transcripts into the
+//!   `media_search_index`.
+//! * `document_extractor` — on-device document
+//!   text-extraction seam
+//!   ([`crate::models::document::DocumentExtractor`]). Read by
+//!   [`crate::core_impl::CoreImpl::maybe_extract_document_pages`]
+//!   to write per-page caption rows into the
+//!   `media_search_index` for PDF / DOCX uploads.
+//! * `video_keyframe_sampler` — on-device video
+//!   keyframe-sampling seam
+//!   ([`crate::models::video::VideoKeyframeSampler`]). Read by
+//!   [`crate::core_impl::CoreImpl::maybe_embed_video_keyframes`]
+//!   together with `image_embedder` to drive the
+//!   video-keyframe → MobileCLIP-S2 → `search_vector`
+//!   pipeline.
 //!
 //! Each bridge is held in an [`OnceLock`]`<`[`Arc`]`<dyn T>>`
 //! so hot-path reads on media ingest are **lock-free atomic
@@ -71,7 +71,7 @@
 //! coordinator would either require giving the coordinator
 //! back-references to half of `CoreImpl`'s remaining state or
 //! re-routing the calls through ad-hoc closure trampolines, in
-//! direct conflict with the Phase-B.9 goal of reducing
+//! direct conflict with the goal of reducing
 //! cross-coordinator coupling. The coordinator therefore owns
 //! state only; the orchestrator methods stay on
 //! [`crate::core_impl::CoreImpl`] and call the coordinator
@@ -96,32 +96,32 @@ use crate::models::whisper::WhisperTranscriber;
 /// rationale; the per-method docs below explain the accessor
 /// contract.
 pub(crate) struct Coordinator {
-    /// Phase-6 on-device image-embedding seam (MobileCLIP-S2).
+    /// on-device image-embedding seam (MobileCLIP-S2).
     /// Write-once via [`Self::install_image_embedder`]. Reads on
     /// the media-ingest hot path are lock-free atomic loads via
     /// [`Self::image_embedder`].
     image_embedder: OnceLock<Arc<dyn ImageEmbedder>>,
 
-    /// Phase-6 platform OCR bridge. Write-once via
+    /// platform OCR bridge. Write-once via
     /// [`Self::install_ocr_bridge`]. Install / `has_*` only
     /// today — no production caller invokes
     /// [`OcrBridge::recognize_text`] yet, so no lookup accessor
     /// is shipped (it would be dead scaffolding).
     ocr_bridge: OnceLock<Arc<dyn OcrBridge>>,
 
-    /// Phase-6 on-device Whisper transcription seam.
+    /// on-device Whisper transcription seam.
     /// Write-once via [`Self::install_whisper_transcriber`].
     /// Lock-free atomic-load reads via
     /// [`Self::whisper_transcriber`].
     whisper_transcriber: OnceLock<Arc<dyn WhisperTranscriber>>,
 
-    /// Phase-6 on-device document text-extraction seam.
+    /// on-device document text-extraction seam.
     /// Write-once via [`Self::install_document_extractor`].
     /// Lock-free atomic-load reads via
     /// [`Self::document_extractor`].
     document_extractor: OnceLock<Arc<dyn DocumentExtractor>>,
 
-    /// Phase-6 on-device video keyframe-sampling seam.
+    /// on-device video keyframe-sampling seam.
     /// Write-once via [`Self::install_video_keyframe_sampler`].
     /// Lock-free atomic-load reads via
     /// [`Self::video_keyframe_sampler`].
@@ -149,7 +149,7 @@ impl Coordinator {
     // ----------------------------------------------------------------
 
     /// Install the on-device image-embedding bridge used by
-    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
+    /// media ingest (`docs/DESIGN.md §7.6`, ).
     /// When set, MobileCLIP-S2 embeddings are written to
     /// `search_vector` for image-typed media on ingest.
     /// Write-once: returns
@@ -167,7 +167,7 @@ impl Coordinator {
     }
 
     /// Lock-free atomic load of the installed image embedder.
-    /// Returns `None` when no bridge has been installed yet —
+    /// Returns `None` when no bridge has been installed yet
     /// the caller treats that as "skip MobileCLIP-S2 embedding
     /// for this message" (the `maybe_*` orchestrator methods
     /// log at `debug!` and return early).
@@ -180,7 +180,7 @@ impl Coordinator {
     // ----------------------------------------------------------------
 
     /// Install the platform OCR bridge used by media ingest
-    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Write-once.
+    /// (`docs/DESIGN.md §7.6`, ). Write-once.
     pub(crate) fn install_ocr_bridge(&self, bridge: Arc<dyn OcrBridge>) -> Result<()> {
         self.ocr_bridge
             .set(bridge)
@@ -195,7 +195,7 @@ impl Coordinator {
     // No lock-free lookup accessor is exposed for `ocr_bridge`
     // yet — see the field-level doc comment and the
     // module-level doc for the rationale. When the media-caption
-    // pipeline lands, add an `ocr_bridge()` accessor here
+    // pipeline lands, add an `ocr_bridge` accessor here
     // alongside its first production caller.
 
     // ----------------------------------------------------------------
@@ -438,7 +438,7 @@ mod tests {
         assert!(!c.has_ocr_bridge());
         assert!(!c.has_document_extractor());
         assert!(!c.has_video_keyframe_sampler());
-        // And installing a sibling bridge does NOT reject —
+        // And installing a sibling bridge does NOT reject
         // the OnceLocks are per-bridge.
         c.install_document_extractor(Arc::new(FakeDocExtractor))
             .expect("install doc extractor");

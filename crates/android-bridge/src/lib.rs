@@ -1,6 +1,6 @@
 //! Android JNI bridge for `kchat-core`.
 //!
-//! Phase 1 scaffold. Defines the JNI entry points consumed by the
+//! Defines the JNI entry points consumed by the
 //! Kotlin `com.kchat.core.KChatBridge` companion object plus a
 //! pure-Rust [`bridge`] module that drives the same code path
 //! without a `JNIEnv`. Tests exercise the [`bridge`] module so the
@@ -24,20 +24,20 @@
 //!   swap returned a non-null value, so a double-destroy from the
 //!   Kotlin side cannot double-free the handle. The slot box
 //!   itself is freed by `destroy` exactly once; Kotlin remains
-//!   responsible for serializing `close()` calls.
+//!   responsible for serializing `close` calls.
 //! * Errors cross the JNI boundary as Java exceptions thrown from
 //!   the Rust side. The classes match the Kotlin façade
 //!   (`com.kchat.core.KChatException`); the Kotlin façade
 //!   re-wraps them in idiomatic exceptions. Callers in Kotlin do
 //!   not need to inspect Rust strings.
-//! * Most Phase-1 wiring marshals values through JSON because the
+//! * Most wiring marshals values through JSON because the
 //!   schema-shape (UUIDs, optionals) is straightforward and the
 //!   alternative — a per-field JNI dance — is much more code for
 //!   no measurable runtime benefit at the message rates the app
 //!   sees today. The MessageView / SearchResult batches reuse the
 //!   serde representations defined in `kchat-core`.
 //!
-//! Phase 2 will tighten the marshalling for hot paths (e.g.
+//! Will tighten the marshalling for hot paths (e.g.
 //! pre-encoded `byte[]` skeleton blobs) once benchmarks make the
 //! case.
 
@@ -57,8 +57,8 @@ use uuid::Uuid;
 // Tracing subscriber installation
 // ---------------------------------------------------------------------------
 //
-// `kchat-core` emits `tracing` spans / events on every hot path
-// (Phase A.3). Without a process-wide subscriber installed those
+// `kchat-core` emits `tracing` spans / events on every hot path.
+// Without a process-wide subscriber installed those
 // events would be discarded by `tracing`'s no-op default.
 //
 // The Android bridge installs the subscriber once on the first
@@ -158,7 +158,7 @@ pub enum BridgeError {
 impl From<kchat_core::Error> for BridgeError {
     fn from(e: kchat_core::Error) -> Self {
         // Destructure the inner value rather than calling
-        // `e.to_string()` on the whole variant — each
+        // `e.to_string` on the whole variant — each
         // `kchat_core::Error::*` Display impl already prefixes
         // the category (e.g. `"transport: foo"`), so reusing it
         // here would produce a doubled prefix
@@ -306,7 +306,7 @@ impl KChatBridgeHandle {
         Ok(serde_json::to_string(&hits)?)
     }
 
-    /// Phase 8 (2026-05-04 batch 6) — Task 8: Android `searchWithTarget`
+    /// Android `searchWithTarget`
     /// JNI entry point.
     ///
     /// Equivalent to
@@ -520,12 +520,12 @@ mod jni_bindings {
         // SAFETY: the `jlong` was minted by `initialize` as
         // `Box::into_raw(Box::new(AtomicPtr::new(inner)))` and is
         // freed exactly once by `destroy` (Kotlin serializes
-        // `close()`). Holding `&*slot` until the end of the call
+        // `close`). Holding `&*slot` until the end of the call
         // is sound as long as `destroy` has not yet started
         // freeing the slot box — which is the same contract that
         // governs the pre-A.5 raw `*const KChatBridgeHandle` cast.
         let slot = unsafe { &*(ptr as *const AtomicPtr<KChatBridgeHandle>) };
-        // Phase A.5: read the inner handle with `Acquire` so we
+        // read the inner handle with `Acquire` so we
         // observe the latest swap-to-null from a concurrent
         // `destroy` on another thread. A null load tells us the
         // handle has been torn down; the caller can no longer
@@ -591,7 +591,7 @@ mod jni_bindings {
         };
         match KChatBridgeHandle::initialize(&data_dir, &platform, &tenant_id, &key_bytes) {
             Ok(handle) => {
-                // Phase A.5: mint a two-layer allocation — the
+                // mint a two-layer allocation — the
                 // inner `Box::into_raw` produces the
                 // `*mut KChatBridgeHandle` we want to drop
                 // independently on `destroy`, and the outer
@@ -617,10 +617,10 @@ mod jni_bindings {
     ///
     /// Drops the bridge handle previously returned by
     /// `initialize`. Always paired with the Kotlin
-    /// `KChatBridge.close()` to avoid leaking the SQLCipher
+    /// `KChatBridge.close` to avoid leaking the SQLCipher
     /// connection.
     ///
-    /// Phase A.5: the slot is a
+    /// the slot is a
     /// [`Box<AtomicPtr<KChatBridgeHandle>>`]; `destroy` atomically
     /// swaps the inner pointer to null with
     /// [`Ordering::AcqRel`] before dropping it. If the swap
@@ -651,7 +651,7 @@ mod jni_bindings {
         // `AtomicPtr` wrapper after we've taken the inner out.
         let slot_box: Box<AtomicPtr<KChatBridgeHandle>> =
             unsafe { Box::from_raw(ptr as *mut AtomicPtr<KChatBridgeHandle>) };
-        // Phase A.5: atomic swap-to-null. `AcqRel` pairs with the
+        // atomic swap-to-null. `AcqRel` pairs with the
         // `Acquire` load in `handle_from_ptr` so any in-flight
         // JNI call either observes the inner pointer (sees a
         // live handle, completes its read) or observes null
@@ -905,7 +905,7 @@ mod jni_bindings {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 (2026-05-04 final batch) — Task 12: Google Drive bridge
+// Google Drive bridge
 // wiring.
 //
 // `GoogleDriveBridgeImpl` adapts an Android-side
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn android_bridge_search_with_global_target_default() {
-        // Phase 8 (2026-05-04 batch 6) — Task 8: when
+        // when
         // target_json is None, the search defaults to the
         // SearchTarget::Global behaviour preserved by SearchQuery's
         // serde default.
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn android_bridge_search_with_conversation_target() {
-        // Phase 8 (2026-05-04 batch 6) — Task 8: a Conversation
+        // a Conversation
         // target restricts hits to that conversation even when
         // the query string would have matched messages in other
         // conversations.
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn android_bridge_search_with_community_target() {
-        // Phase 8 (2026-05-04 batch 6) — Task 8: a Community
+        // a Community
         // target with no matching conversations short-circuits
         // to zero hits (the engine resolves the empty
         // target_set).
@@ -1388,8 +1388,8 @@ mod tests {
         assert_eq!(views[0].message_id, m2);
     }
 
-    /// Verify the Phase-1 JNI entry-point symbols exist with the
-    /// signatures the Kotlin façade expects. Compile-time check —
+    /// Verify the JNI entry-point symbols exist with the
+    /// signatures the Kotlin façade expects. Compile-time check
     /// taking a function pointer would force the symbol resolution
     /// at test build time, but the JNI symbols are gated behind
     /// `#[cfg(not(test))]` so we instead reference the bridge
@@ -1425,7 +1425,7 @@ mod tests {
         // failure — the real cursor pass-through is exercised by
         // the core_impl tests. This test pins the bridge contract:
         // if a transport is not configured, surface
-        // `BridgeError::Core { category: "transport", .. }`.
+        // `BridgeError::Core { category: "transport",.. }`.
         let bridge = fresh_bridge();
         let conv = Uuid::now_v7();
         bridge.create_conversation(conv, None, 1).unwrap();

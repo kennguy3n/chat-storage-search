@@ -1,19 +1,17 @@
-//! Offline-detection seam — Phase 7, Task 6 of the 2026-05-04
-//! batch.
+//! Offline-detection seam.
 //!
-//! `docs/PHASES.md` Phase 7 enumerates "edge-case handling
-//! (offline, interrupted, partial, corrupted, missing)" as a
-//! gating item. This module lands the offline-detection seam:
-//! a `Send + Sync` trait the orchestration layer queries before
-//! making outbound network calls (incremental backup, archive
-//! fetch on hydration). Implementations are supplied by the
-//! platform glue (Reachability on iOS, ConnectivityManager on
+//! Edge-case handling for offline, interrupted, partial,
+//! corrupted, and missing network conditions is gated on this
+//! seam: a `Send + Sync` trait the orchestration layer queries
+//! before making outbound network calls (incremental backup,
+//! archive fetch on hydration). Implementations are supplied by
+//! the platform glue (Reachability on iOS, ConnectivityManager on
 //! Android, NCSI on Windows, NetworkManager on Linux).
 //!
 //! The detector is intentionally fail-open: when no detector is
 //! installed, [`crate::core_impl::CoreImpl::is_online`] returns
-//! `true` so the existing Phase 1–5 code paths keep their
-//! "always assume online" behavior. Only when a detector is
+//! `true` so the always-online code paths keep their
+//! pre-platform-detector behavior. Only when a detector is
 //! installed do the offline branches in
 //! [`crate::core_impl::CoreImpl::run_incremental_backup`] and
 //! [`crate::core_impl::CoreImpl::hydrate_message`] kick in.

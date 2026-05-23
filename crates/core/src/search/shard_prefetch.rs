@@ -1,15 +1,15 @@
-//! Batch encrypted-shard prefetch (Phase 5, Task 8).
+//! Batch encrypted-shard prefetch.
 //!
-//! `docs/PHASES.md` Phase 5 calls out that "when fetching
-//! encrypted index shards, fetch all shard types for the target
-//! `(conversation_hash, bucket)` in one batch to coarsen the
-//! metadata signal". A naive implementation that fetches text /
+//! When fetching encrypted index shards, the design coarsens the
+//! metadata signal by fetching all shard types for the target
+//! `(conversation_hash, bucket)` in one batch. A naive
+//! implementation that fetches text /
 //! fuzzy / vector / media shards in four separate transport
 //! round-trips leaks four distinct event timestamps to the
 //! backend; a backend correlator can then infer the user is
 //! actively searching the same `(conversation, bucket)` and
 //! recover the access-pattern fingerprint privacy goal of
-//! `docs/PROPOSAL.md §5.6`.
+//! `docs/DESIGN.md §5.6`.
 //!
 //! This module owns the **batching policy**:
 //!
@@ -40,7 +40,7 @@ use crate::{Error, SearchTarget};
 /// [`batch_prefetch_shards`]. Stable so the test suite can pin
 /// the expected wire ordering, and so any caller that wants to
 /// drop into [`IndexType::all`] for a parallel join sees a
-/// predictable layout. Phase 8 prepends [`IndexType::Bloom`]:
+/// predictable layout. prepends [`IndexType::Bloom`]:
 /// the bloom filter shard is fetched first so the prefetcher
 /// can short-circuit buckets whose filter rejects every query
 /// token before paying for the larger Text / Fuzzy / Vector /
@@ -148,7 +148,7 @@ pub fn batch_prefetch_shards_with_padding(
     )
 }
 
-/// Phase 8 (2026-05-04 batch 6) — scope-proportional dummy
+/// scope-proportional dummy
 /// padding multiplier.
 ///
 /// Wider search scopes leak more access-pattern signal per
@@ -157,13 +157,13 @@ pub fn batch_prefetch_shards_with_padding(
 /// ratio constant across scopes, the multiplier scales linearly
 /// in the number of conversations the scope can implicate:
 ///
-/// | Scope                                    | Multiplier |
+/// | Scope | Multiplier |
 /// |------------------------------------------|------------|
-/// | `Conversation`, `ConversationGroup`,     |            |
-/// |   `Channel`, `Starred`, `Unread`         | 1          |
-/// | `Community`, `Domain`                    | 2          |
-/// | `Tenant`, `B2cAll`                       | 3          |
-/// | `Global`                                 | 4          |
+/// | `Conversation`, `ConversationGroup`, | |
+/// | `Channel`, `Starred`, `Unread` | 1 |
+/// | `Community`, `Domain` | 2 |
+/// | `Tenant`, `B2cAll` | 3 |
+/// | `Global` | 4 |
 ///
 /// The multiplier is applied on top of the base padding count
 /// from [`compute_padding_count`]; see
@@ -181,7 +181,7 @@ pub fn compute_scope_padding_multiplier(target: &SearchTarget) -> usize {
     }
 }
 
-/// Phase 8 (2026-05-04 batch 6) —
+///
 /// [`batch_prefetch_shards_with_padding`] variant that scales
 /// the dummy-request count by
 /// [`compute_scope_padding_multiplier`] for the supplied
@@ -422,12 +422,12 @@ mod tests {
         let cfg = fresh_config(PrivacyLevel::High);
         let out =
             batch_prefetch_shards_with_padding(&t, "hash", "2026-04", &cfg).expect("prefetch");
-        // Real shards returned exactly as if padding was off —
+        // Real shards returned exactly as if padding was off
         // dummies are observable on the transport, not in the
         // returned Vec.
         assert_eq!(out.len(), 1);
-        // PREFETCH_ORDER.len() real-target calls +
-        // (compute_padding_count(1) * PREFETCH_ORDER.len())
+        // PREFETCH_ORDER.len real-target calls +
+        // (compute_padding_count(1) * PREFETCH_ORDER.len)
         // dummy calls.
         let n = PREFETCH_ORDER.len();
         let expected = n + compute_padding_count(1) * n;
@@ -509,7 +509,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — Task 6: scope-proportional padding
+    // scope-proportional padding
     // -------------------------------------------------------------------
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         // Tighter check: the multiplier difference between
         // Conversation (1×) and Global (4×) means the dummy
         // count quadruples; the real-target call burst stays at
-        // PREFETCH_ORDER.len() in both cases.
+        // PREFETCH_ORDER.len in both cases.
         let n = PREFETCH_ORDER.len();
         let base = compute_padding_count(1);
         assert_eq!(conv_calls, n + base * n);

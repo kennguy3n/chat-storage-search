@@ -7,7 +7,7 @@
 //!   x86_64). 12-byte nonce, 16-byte GCM tag.
 //!
 //! [`build_kchat_chunk_aad`] constructs the per-chunk Additional
-//! Authenticated Data described in `docs/PROPOSAL.md §8.3`. Pattern
+//! Authenticated Data described in `docs/DESIGN.md §8.3`. Pattern
 //! C (ZK Object Fabric) does *not* use this AAD — see
 //! [`crate::crypto::convergent`] for that codepath.
 
@@ -24,7 +24,7 @@ use super::{CryptoError, CryptoResult};
 pub const KCHAT_BLOB_CHUNK_AAD_MAGIC: &[u8] = b"KCHAT_BLOB_CHUNK_V1";
 
 /// Object class encoded in [`build_kchat_chunk_aad`]. Numeric values
-/// are the canonical varint payloads from `docs/PROPOSAL.md §8.3`.
+/// are the canonical varint payloads from `docs/DESIGN.md §8.3`.
 ///
 /// Re-used by [`crate::transport::TransportClient`] (the upload /
 /// blob-fetch surface uses the same class enum so the wire-level
@@ -36,11 +36,11 @@ pub const KCHAT_BLOB_CHUNK_AAD_MAGIC: &[u8] = b"KCHAT_BLOB_CHUNK_V1";
 pub enum BlobClass {
     /// Media blob (image / video / audio / document).
     Media = 1,
-    /// Archive segment blob (`docs/PROPOSAL.md §6`).
+    /// Archive segment blob (`docs/DESIGN.md §6`).
     ArchiveSegment = 2,
-    /// Encrypted search-index shard (`docs/PROPOSAL.md §7.8`).
+    /// Encrypted search-index shard (`docs/DESIGN.md §7.8`).
     SearchIndexShard = 3,
-    /// Backup segment blob (`docs/PROPOSAL.md §9`).
+    /// Backup segment blob (`docs/DESIGN.md §9`).
     BackupSegment = 4,
     /// Backup or archive manifest blob.
     Manifest = 5,
@@ -173,11 +173,11 @@ fn write_varint(mut value: u64, out: &mut Vec<u8>) {
 
 /// Build the KChat per-chunk AAD used for media, archive segments,
 /// backup segments, search index shards, and manifests on KChat's
-/// own backend (see `docs/PROPOSAL.md §8.3`).
+/// own backend (see `docs/DESIGN.md §8.3`).
 ///
 /// AAD = `"KCHAT_BLOB_CHUNK_V1" || blob_id(16)
-///        || blob_class(varint) || chunk_no(u32 BE)
-///        || chunk_count(u32 BE) || merkle_root(32)`
+/// || blob_class(varint) || chunk_no(u32 BE)
+/// || chunk_count(u32 BE) || merkle_root(32)`
 ///
 /// This AAD is *not* used by ZK Object Fabric Pattern C uploads,
 /// which use empty AAD; see [`crate::crypto::convergent`].

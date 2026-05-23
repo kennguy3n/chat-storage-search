@@ -1,25 +1,25 @@
-//! `transport` module — Phase 1 abstraction over the MLS delivery
-//! store and the broader Phase-2/3/4 transport surface.
+//! `transport` module — abstraction over the MLS delivery
+//! store and the broader transport surface.
 //!
 //! Two trait shapes live here:
 //!
-//! * [`DeliveryClient`] is the **narrow** Phase-1 trait used by
+//! * [`DeliveryClient`] is the **narrow** trait used by
 //!   [`crate::core_impl::CoreImpl::ingest_remote_messages`]. It
 //!   carries a single cursor-paginated `fetch_messages` method and
 //!   ships with a test-only [`MockDeliveryClient`] mock.
 //! * [`TransportClient`] is the **broader** trait surface specified
-//!   by `docs/PROPOSAL.md §10` and `docs/ARCHITECTURE.md §10`,
+//!   by `docs/DESIGN.md §10` and `docs/ARCHITECTURE.md §10`,
 //!   covering MLS message fetch, chunked blob upload (init / chunk
 //!   / commit), blob range fetch, archive manifest / segment fetch,
-//!   and search-index shard fetch. It is locked in Phase 1 so the
-//!   Phase-2 media engine, the Phase-3 archive engine, and the
-//!   Phase-4 backup / restore engines can already type their inputs
+//!   and search-index shard fetch. It is locked in so the
+//!   media engine, the archive engine, and the
+//!   backup / restore engines can already type their inputs
 //!   against the final shape; production HTTP / gRPC / MLS-blob
 //!   implementations land in those phases. [`NoopTransportClient`]
-//!   is the Phase-1 placeholder — every method returns
+//!   is the placeholder — every method returns
 //!   `Err(crate::Error::NotImplemented("transport"))`.
 //!
-//! `docs/PROPOSAL.md §10` and `docs/ARCHITECTURE.md §10.4` describe
+//! `docs/DESIGN.md §10` and `docs/ARCHITECTURE.md §10.4` describe
 //! the cursor-based fetch contract: the local core asks the
 //! transport for the messages newer than its last delivery cursor,
 //! the transport returns a page plus the next cursor, and the core
@@ -72,8 +72,8 @@ pub enum TransportError {
     ///
     /// The Display impl emits the wrapped string verbatim — no
     /// `network:` / `auth:` / `server:` prefix — so bridging
-    /// `Error::Transport(msg.into())` sites preserve the exact message
-    /// they shipped before the workstream-B.8 migration. New typed
+    /// `Error::Transport(msg.into)` sites preserve the exact message
+    /// they shipped before the typed-error migration. New typed
     /// failure modes should prefer one of the three categorised
     /// variants instead.
     #[error("{0}")]
@@ -99,7 +99,7 @@ pub struct RawDeliveryMessage {
     pub created_at_ms: i64,
     /// Plaintext text body, when present.
     pub text_content: Option<String>,
-    /// Zero or more media descriptors per `docs/PROPOSAL.md §3.2`.
+    /// Zero or more media descriptors per `docs/DESIGN.md §3.2`.
     pub media_descriptors: Vec<MediaDescriptor>,
     /// Identifier of the message this is a reply to, if any.
     pub reply_to: Option<String>,
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn raw_delivery_message_default_shape() {
         // Smoke test that the public field set is still constructable
-        // — guards against accidental field renames breaking the
+        // guards against accidental field renames breaking the
         // bridge layer.
         let _ = RawDeliveryMessage {
             message_id: String::new(),
@@ -329,14 +329,14 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// TransportClient — broader surface (`docs/PROPOSAL.md §10`)
+// TransportClient — broader surface (`docs/DESIGN.md §10`)
 // ---------------------------------------------------------------------------
 
 /// Cursor-paginated MLS message fetch response.
 ///
 /// Returned by [`TransportClient::fetch_messages`]. Mirrors
 /// [`FetchResult`] but carries the canonical name from
-/// `docs/PROPOSAL.md §10` so the broader trait shape can grow
+/// `docs/DESIGN.md §10` so the broader trait shape can grow
 /// independently of the narrow [`DeliveryClient`] used by
 /// [`crate::core_impl::CoreImpl::ingest_remote_messages`] today.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,13 +431,13 @@ pub struct EncryptedManifest {
 /// `Error::NotImplemented("transport")` for every method.
 pub type TransportResult<T> = crate::Result<T>;
 
-/// Phase-1 transport surface — `docs/PROPOSAL.md §10`,
+/// transport surface — `docs/DESIGN.md §10`,
 /// `docs/ARCHITECTURE.md §10`.
 ///
 /// **Async note.** The methods are declared as synchronous
 /// `Result<_>`-returning functions for now, matching the pattern in
 /// [`crate::KChatCore`] (see `crates/core/src/lib.rs` lines
-/// 329-333). Phase 2+ flips them to `async fn` once the production
+/// 329-333). + flips them to `async fn` once the production
 /// HTTP / gRPC / MLS-blob clients land.
 ///
 /// **Object-safe.** No generic methods, no `Self`-typed return
@@ -488,7 +488,7 @@ pub trait TransportClient: Send + Sync {
     fn commit_blob(&self, blob_id: &str) -> TransportResult<CommitBlobResponse>;
 
     /// Fetch a byte range of a previously committed blob. Used by
-    /// the Phase-3 archive / Phase-4 restore engines for
+    /// the archive / restore engines for
     /// scroll-back rehydration and partial-segment download.
     fn fetch_blob_range(&self, blob_id: &str, range: Range<u64>) -> TransportResult<Vec<u8>>;
 
@@ -509,7 +509,7 @@ pub trait TransportClient: Send + Sync {
     /// Fetch the encrypted search-index shards covering
     /// `(conversation_hash, bucket, shard_type)`. Returned bytes
     /// are the concatenated shard payloads in
-    /// `docs/PROPOSAL.md §7.8` framing.
+    /// `docs/DESIGN.md §7.8` framing.
     fn fetch_index_shards(
         &self,
         conversation_hash: &str,
@@ -520,7 +520,7 @@ pub trait TransportClient: Send + Sync {
     /// Upload one encrypted search-index shard for the supplied
     /// `(conversation_hash, bucket, shard_type)` triple. The bytes
     /// are the CBOR-encoded
-    /// [`crate::formats::search_shard::SearchIndexShard`] frame —
+    /// [`crate::formats::search_shard::SearchIndexShard`] frame
     /// the AEAD seal is already wrapped around the FTS / fuzzy
     /// payload by [`crate::search::shard_builder::build_text_search_shard`]
     /// and friends, so the transport layer only needs to ferry
@@ -545,12 +545,12 @@ pub trait TransportClient: Send + Sync {
     }
 }
 
-/// Phase-1 placeholder [`TransportClient`] implementation.
+/// placeholder [`TransportClient`] implementation.
 ///
 /// Every method returns
 /// `Err(crate::Error::NotImplemented("transport"))`. `CoreImpl`
 /// uses this as the default until a production transport is
-/// installed by Phase 2+ work, so callers can already type their
+/// installed by + work, so callers can already type their
 /// inputs against the final shape without waiting for the real
 /// HTTP / gRPC / MLS-blob client to land.
 #[derive(Debug, Default, Clone, Copy)]
@@ -625,7 +625,7 @@ impl TransportClient for NoopTransportClient {
 // ---------------------------------------------------------------------------
 
 /// In-memory programmable [`TransportClient`] mock, sized to the
-/// Phase 5 + Phase 7 test surfaces.
+/// + test surfaces.
 ///
 /// `MockTransportClient` covers the two transport
 /// surfaces the encrypted-shard pipeline cares about:
@@ -633,7 +633,7 @@ impl TransportClient for NoopTransportClient {
 /// 1. [`TransportClient::fetch_index_shards`] — backed by a
 ///    `(conversation_hash, bucket, shard_type) → ciphertext` map
 ///    seeded with [`MockTransportClient::stage_index_shard`]. An
-///    unset entry returns `Ok(Vec::new())`, matching the
+///    unset entry returns `Ok(Vec::new)`, matching the
 ///    "no shard uploaded yet" contract documented on
 ///    [`TransportClient::fetch_index_shards`] and exercised by
 ///    the cold-result hydration path in
@@ -647,7 +647,7 @@ impl TransportClient for NoopTransportClient {
 /// Programmable failure injection is supplied via
 /// [`MockTransportClient::fail_index_shard_fetch_with`] and
 /// [`MockTransportClient::fail_index_shard_upload_with`] so the
-/// Phase-7 failure-suite tests (`docs/PHASES.md §Phase 7`) can
+/// failure-suite tests can
 /// drive transport errors without spinning up a custom mock per
 /// scenario.
 ///

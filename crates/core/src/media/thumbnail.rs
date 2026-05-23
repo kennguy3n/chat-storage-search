@@ -1,6 +1,6 @@
-//! Thumbnail generation for the Phase 2 media pipeline.
+//! Thumbnail generation for the media pipeline.
 //!
-//! `docs/PROPOSAL.md §3.2` lists the `thumbnail_only` and
+//! `docs/DESIGN.md §3.2` lists the `thumbnail_only` and
 //! `original_local` slots in the [`crate::local_store::state_machines::MediaState`]
 //! lifecycle. [`process_media`](crate::media::processor::process_media)
 //! produces the AEAD-sealed original; [`ThumbnailGenerator`] produces
@@ -8,7 +8,7 @@
 //! the original has been (or even instead of being) downloaded /
 //! decrypted.
 //!
-//! Phase 2 keeps the surface deliberately narrow:
+//! Keeps the surface deliberately narrow:
 //!
 //! * Image inputs (PNG / JPEG, decoded via the lean
 //!   [`image`](https://docs.rs/image) crate with
@@ -16,9 +16,9 @@
 //!   inside `max_dimension`, and re-encoded as PNG so the thumbnail
 //!   is **always** a deterministic PNG regardless of the input MIME.
 //! * Non-image MIME types return [`Error::Message`]; full
-//!   video / document / audio thumbnailing lands later in Phase 6
+//!   video / document / audio thumbnailing lands later in
 //!   alongside the on-device vision and OCR models (see
-//!   `docs/PHASES.md` Phase 6).
+//!   ).
 //!
 //! The returned [`ThumbnailResult::thumbnail_bytes`] is the PNG
 //! payload that the caller feeds into
@@ -42,7 +42,7 @@ pub const THUMBNAIL_MIME_TYPE: &str = "image/png";
 
 /// Default upper bound on the long edge of a generated thumbnail.
 ///
-/// 256 px is what `docs/PROPOSAL.md §3.2` calls out for the
+/// 256 px is what `docs/DESIGN.md §3.2` calls out for the
 /// `thumbnail_only` body state — it keeps the encoded blob small
 /// enough to fit in a single AEAD chunk without hurting timeline
 /// fidelity at common DPRs.
@@ -60,22 +60,22 @@ pub struct ThumbnailResult {
     /// Pixel height of the encoded thumbnail.
     pub height: u32,
     /// MIME type of [`Self::thumbnail_bytes`]. Always
-    /// [`THUMBNAIL_MIME_TYPE`] for Phase 2.
+    /// [`THUMBNAIL_MIME_TYPE`] for
     pub mime_type: String,
 }
 
-/// Phase-2 thumbnail generator.
+/// thumbnail generator.
 ///
 /// The generator is currently stateless — it carries no
 /// configuration of its own — but the type is kept around so the
-/// public surface is identical to what Phase 6 will plug in (which
+/// public surface is identical to what will plug in (which
 /// will hold the vision / OCR pipelines and the codec selection
 /// logic).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ThumbnailGenerator;
 
 impl ThumbnailGenerator {
-    /// Construct a new thumbnail generator. Phase 2 has no
+    /// Construct a new thumbnail generator. has no
     /// configuration so this is just `Self`.
     pub fn new() -> Self {
         Self
@@ -148,7 +148,7 @@ impl ThumbnailGenerator {
 }
 
 /// Map a MIME type to the `image::ImageFormat` that decodes it, or
-/// return [`Error::Message`] for unsupported types. Phase 2 only
+/// return [`Error::Message`] for unsupported types. only
 /// supports PNG and JPEG inputs.
 fn image_format_for_mime(mime_type: &str) -> Result<ImageFormat, Error> {
     match mime_type {
@@ -262,7 +262,7 @@ mod tests {
             "video/mp4",
             "application/pdf",
             "audio/ogg",
-            "image/webp", // not in Phase 2 feature set
+            "image/webp", // not in the supported MIME set
             "image/gif",
             "text/plain",
         ] {
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn default_max_dimension_constant_matches_proposal() {
         // Sanity check that the `DEFAULT_MAX_DIMENSION` constant
-        // matches `docs/PROPOSAL.md §3.2` (256 px long edge).
+        // matches `docs/DESIGN.md §3.2` (256 px long edge).
         assert_eq!(DEFAULT_MAX_DIMENSION, 256);
     }
 }
