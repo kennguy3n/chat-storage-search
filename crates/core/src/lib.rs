@@ -292,8 +292,7 @@ pub enum SearchScope {
 /// * [`SearchTarget::B2cAll`] — every conversation with
 ///   `scope = "b2c"`.
 /// * [`SearchTarget::Starred`] — every conversation the user
-///   has starred. Resolution
-///   is delegated to a
+///   has starred. Resolution is delegated to a
 ///   [`crate::search::search_target::ConversationGroupResolver`]
 ///   because the starred-state is held by the orchestration
 ///   layer rather than the local store schema.

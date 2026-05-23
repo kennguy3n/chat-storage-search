@@ -62,12 +62,11 @@ pub struct SegmentBuildRequest {
     /// archive-segment-type variant (i.e.
     /// [`SegmentType::is_archive_segment`] returns true). Defaults
     /// to [`SegmentType::MessageDelta`] for backwards compatibility
-    /// with the / Task 6 builder which only emitted
-    /// delta-style segments.
+    /// with the original delta-only builder.
     ///
-    /// (this file) extends the builder with two
-    /// additional payload shapes that share the same CBOR / zstd
-    /// / XChaCha20-Poly1305 pipeline:
+    /// The current builder accepts two additional payload shapes
+    /// that share the same CBOR / zstd / XChaCha20-Poly1305
+    /// pipeline:
     ///
     /// * [`SegmentType::TimelineSkeleton`] — events that landed
     ///   only the skeleton row (no body), used by the scroll-back

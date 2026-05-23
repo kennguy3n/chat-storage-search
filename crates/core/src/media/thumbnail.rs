@@ -74,8 +74,9 @@ pub struct ThumbnailResult {
 pub struct ThumbnailGenerator;
 
 impl ThumbnailGenerator {
-    /// Construct a new thumbnail generator. has no
-    /// configuration so this is just `Self`.
+    /// Construct a new thumbnail generator. The generator is
+    /// stateless and takes no configuration, so this just returns
+    /// `Self`.
     pub fn new() -> Self {
         Self
     }

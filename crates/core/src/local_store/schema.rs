@@ -144,8 +144,8 @@ CREATE TABLE IF NOT EXISTS media_search_index (
 -- Backup pipeline. Mirrors `archive_event_journal` with optional
 -- `conversation_id` / `message_id` discriminators; the backup
 -- segment builder dispatches on `event_type` and conversation
--- id when packing an incremental segment (see
--- — backup segments).
+-- id when packing an incremental segment (see the backup
+-- segment builder in `crates/core/src/backup/segment_builder.rs`).
 CREATE TABLE IF NOT EXISTS backup_event_journal (
     event_seq       INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type      TEXT NOT NULL,
