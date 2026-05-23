@@ -49,8 +49,8 @@ use kchat_core::{Error, SearchQuery, SearchScope};
 const BENCH_KEY: [u8; 32] = [0x55; 32];
 const BUCKET: &str = "2026-04";
 const NEEDLE: &str = "lighthouse";
-/// One month's worth of messages — matches the budget
-/// "one-month bucket" quoted in ``.
+/// One month's worth of messages — matches the "one-month bucket"
+/// budget quoted in `docs/DESIGN.md`.
 const SHARD_ROWS: usize = 1_000;
 /// Simulated round-trip transport latency for the
 /// "combined local + cold" path. Treat as p50 Wi-Fi.

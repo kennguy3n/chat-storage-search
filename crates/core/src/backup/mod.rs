@@ -1,9 +1,8 @@
 //! `backup` — backup pipeline.
 //!
-//! See `docs/DESIGN.md §6` (cloud backup) and
-//! For the high-level design. The module is structured
-//! around the same pattern the archive pipeline uses on
-//! [`crate::archive`]:
+//! See `docs/DESIGN.md §6` for the high-level design. The module
+//! is structured around the same pattern the archive pipeline
+//! uses in [`crate::archive`]:
 //!
 //! * [`event_journal`] — append-only log of durable mutations
 //!   plus a single-row cursor advanced by the segment builder.

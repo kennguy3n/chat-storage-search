@@ -159,8 +159,8 @@ impl PressureLevel {
 /// Stateless storage budget enforcer.
 ///
 /// Holds no internal cache — every call re-queries the database.
-/// + may layer a debounced cache on top once the
-///   orchestration layer is in place.
+/// A future iteration may layer a debounced cache on top once the
+/// orchestration layer is in place.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StorageBudgetEnforcer;
 

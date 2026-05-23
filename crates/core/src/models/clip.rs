@@ -4,13 +4,11 @@
 //! `docs/DESIGN.md §7.6` and §7.7. MobileCLIP-S2 is the
 //! image-side encoder that pairs with the XLM-R text encoder for
 //! cross-modal semantic search (a query is text-embedded and
-//! matched against image embeddings via HNSW). lands the
-//! actual inference loop; this module is the scaffold
-//! for the `ort::Session` creator that mirrors the DirectML →
-//! CPU best-effort pattern in
-//! [`crate::models::embeddings_onnx`] (which also owns the
-//! shared EP-selection state machine — see that module for the
-//! detailed contract).
+//! matched against image embeddings via HNSW). This module hosts
+//! the `ort::Session` creator that mirrors the DirectML → CPU
+//! best-effort pattern in [`crate::models::embeddings_onnx`]
+//! (which also owns the shared EP-selection state machine — see
+//! that module for the detailed contract).
 //!
 //! Re-exports the EP-selection types from `embeddings_onnx` so
 //! call sites that only depend on `models::clip` still see the
@@ -56,7 +54,6 @@ pub const MOBILECLIP_S2_INT8_FILENAME: &str = "mobileclip_s2-v1-int8.onnx";
 
 /// Canonical on-disk filename for the INT4 (`MatMulNBits`)
 /// MobileCLIP-S2 artifact shipped to tight-storage devices.
-///.
 pub const MOBILECLIP_S2_INT4_FILENAME: &str = "mobileclip_s2-v1-int4.onnx";
 
 #[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
@@ -127,9 +124,9 @@ mod posix_cpu {
 
     /// macOS / Linux flavor of the MobileCLIP-S2 session
     /// creator. Always registers the CPU EP. The cross-platform
-    /// inference seam (CoreML EP on Apple, NNAPI EP on
-    /// Android) lands later in — this scaffold focuses
-    /// on the Windows DirectML path called out in
+    /// inference seam (CoreML EP on Apple, NNAPI EP on Android)
+    /// is layered above this; this entry point focuses on the
+    /// Windows DirectML path called out in
     /// `docs/ARCHITECTURE.md §11.4`.
     pub fn create_mobileclip_session(
         model_path: &Path,

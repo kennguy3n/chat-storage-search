@@ -13,8 +13,7 @@
 //! builder). Both tables are defined in
 //! [`crate::local_store::schema::SCHEMA_SQL`].
 //!
-//! See `docs/DESIGN.md §6.4` (backup event taxonomy) and
-//! for context.
+//! See `docs/DESIGN.md §6.4` (backup event taxonomy) for context.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};

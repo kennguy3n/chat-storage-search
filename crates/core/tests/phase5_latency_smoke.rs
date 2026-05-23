@@ -382,7 +382,7 @@ fn assert_p95_under_budget(
     );
 }
 
-/// Task 4: multilingual p95 gate.
+/// Multilingual p95 gate.
 ///
 /// Same shape as the existing one-bucket gate but explicitly
 /// stresses the script-aware fuzzy path with a larger corpus
@@ -402,7 +402,7 @@ fn phase5_cold_shard_p95_multilingual_under_budget() {
     assert_p95_under_budget(&catalog, ITERATIONS, P95_BUDGET);
 }
 
-/// Task 4: large-bucket stress test.
+/// Large-bucket stress test.
 ///
 /// 5 000-row bucket — five times the headline corpus. The p95
 /// budget grows linearly with corpus size so a 5x bucket gets
@@ -424,7 +424,7 @@ fn phase5_cold_shard_p95_large_bucket_under_budget() {
     assert_p95_under_budget(&catalog, ITERATIONS, P95_BUDGET);
 }
 
-/// Task 4: multi-shard p95 gate.
+/// Multi-shard p95 gate.
 ///
 /// Splits the corpus across 3 buckets so the cold fan-out
 /// fetches 3 text + 3 fuzzy shards per search. The p95 must

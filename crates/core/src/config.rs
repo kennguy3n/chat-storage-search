@@ -1,9 +1,8 @@
 //! Configuration for [`crate::KChatCore`].
 //!
-//! Captures only the platform identifier and the on-disk
-//! root directory; later phases extend the struct (network policy,
-//! ML model directory, search budget, etc.) without breaking the
-//! existing fields.
+//! The struct is grow-only: platform identifier, on-disk root
+//! directory, ML model directory, search budget, network policy,
+//! and so on can all be added without breaking the existing fields.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,8 +23,7 @@ pub enum Platform {
 /// `docs/DESIGN.md §10.1` documents the
 /// `archive_backend = "kchat" | "zkof"` configuration. The KChat
 /// backend (PostgreSQL blob service) is the default; ZK Object
-/// Fabric (S3 API) is the optional alternative that lands in
-///
+/// Fabric (S3 API) is the optional alternative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ArchiveBackend {
     /// KChat backend's `/v1/blobs/*` and `/v1/archive/*` endpoints.
@@ -43,8 +41,9 @@ pub enum ArchiveBackend {
 /// user's own cloud (iCloud, Google Drive, ZKOF) instead of the
 /// KChat backend keeps backend storage to text deltas, indexes,
 /// thumbnails, and key wraps. The variants are intentionally a
-/// superset: `KChatBackend` is the default, the user-cloud
-/// variants land in and may grow inner fields then.
+/// superset: `KChatBackend` is the default; the user-cloud
+/// variants carry the inner fields each backend needs to address
+/// a specific container or bucket.
 ///
 /// The serialized variant tags (`"kchat_backend"`, `"icloud"`,
 /// `"google_drive"`, `"zk_object_fabric"`) are pinned via explicit
@@ -62,21 +61,20 @@ pub enum StorageSink {
     /// KChat backend's blob service.
     #[serde(rename = "kchat_backend")]
     KChatBackend,
-    /// iCloud (CloudKit file storage). Implementation lands in
+    /// iCloud (CloudKit file storage).
     #[serde(rename = "icloud")]
     ICloud {
         /// CloudKit container path (or platform-specific equivalent)
         /// where media blobs are stored.
         container_path: String,
     },
-    /// Google Drive (Drive API via platform bridge). Implementation
-    /// lands in
+    /// Google Drive (Drive API via platform bridge).
     #[serde(rename = "google_drive")]
     GoogleDrive {
         /// Drive folder ID where media blobs are stored.
         folder_id: String,
     },
-    /// ZK Object Fabric (S3 API). Implementation lands in
+    /// ZK Object Fabric (S3 API).
     #[serde(rename = "zk_object_fabric")]
     ZkObjectFabric {
         /// S3 bucket name media blobs are uploaded to.
@@ -94,18 +92,17 @@ pub enum StorageSink {
 /// observer at the transport / backend layer cannot distinguish
 /// "user is reading bucket X" from "user is paginating bucket Y".
 /// The default ([`PrivacyLevel::Standard`]) keeps the prefetch path
-/// cost-optimal and is what every / deployment
-/// already runs on.
+/// cost-optimal and is what every deployment already runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PrivacyLevel {
-    /// default. The prefetch issues exactly one fetch per
-    /// real segment id.
+    /// The default posture: the prefetch issues exactly one fetch
+    /// per real segment id.
     #[default]
     #[serde(rename = "standard")]
     Standard,
-    /// optional. The prefetch interleaves randomly
-    /// generated dummy segment ids with the real ones; the dummy
-    /// fetches return empty / 404 from the backend and are
+    /// The opt-in higher-privacy posture: the prefetch interleaves
+    /// randomly generated dummy segment ids with the real ones; the
+    /// dummy fetches return empty / 404 from the backend and are
     /// dropped on the receiving side. Trades transport bandwidth
     /// for traffic-analysis resistance.
     #[serde(rename = "high")]
@@ -137,31 +134,29 @@ pub struct KChatCoreConfig {
     /// [`PrivacyLevel::High`] enables dummy-request padding per
     /// `docs/DESIGN.md §5.6`.
     pub privacy_level: PrivacyLevel,
-    /// per-tenant search policy
-    /// overrides keyed by `tenant_id`. The orchestration layer
-    /// looks the active tenant up in this map and feeds the
-    /// resulting [`TenantSearchPolicy`] into the cold fan-out;
-    /// tenants without a registered override fall back to
-    /// [`TenantSearchPolicy::default`] (which allows everything
-    /// the legacy engine allowed).
+    /// Per-tenant search policy overrides keyed by `tenant_id`.
+    /// The orchestration layer looks the active tenant up in this
+    /// map and feeds the resulting [`TenantSearchPolicy`] into the
+    /// cold fan-out; tenants without a registered override fall
+    /// back to [`TenantSearchPolicy::default`] (which allows
+    /// every search target).
     pub tenant_search_policies: HashMap<String, TenantSearchPolicy>,
-    /// maximum number of cold
-    /// shard fetches the orchestration layer is allowed to
-    /// issue **in parallel** for a single search. Defaults to
-    /// `4`. Setting this to `1` collapses the parallel path
-    /// back to a sequential loop. The parallel fan-out lives
-    /// in
+    /// Maximum number of cold shard fetches the orchestration
+    /// layer is allowed to issue **in parallel** for a single
+    /// search. Defaults to `4`. Setting this to `1` collapses the
+    /// parallel path back to a sequential loop. The parallel
+    /// fan-out lives in
     /// [`crate::search::query_engine::QueryEngine::execute_search_with_cold_source_parallel`]
     /// and is gated on the [`crate::search::query_engine::ColdShardSource`]
     /// implementation being `Send + Sync` — the legacy entry
     /// point is preserved unchanged for sources that are not.
     pub max_cold_fetch_concurrency: usize,
-    /// when set to
-    /// `Some((source, target))`, the eviction path automatically
-    /// queues a one-off [`crate::scheduler::OneOffTask::MediaMigration`]
-    /// after a successful eviction pass. `None` (the default)
-    /// disables auto-scheduling — callers can still drive
-    /// migrations manually via
+    /// When set to `Some((source, target))`, the eviction path
+    /// automatically queues a one-off
+    /// [`crate::scheduler::OneOffTask::MediaMigration`] after a
+    /// successful eviction pass. `None` (the default) disables
+    /// auto-scheduling — callers can still drive migrations
+    /// manually via
     /// [`crate::core_impl::CoreImpl::schedule_media_migration`].
     ///
     /// `(source, target)` are storage-sink tags as used by
@@ -170,8 +165,7 @@ pub struct KChatCoreConfig {
     pub auto_migrate_after_eviction: Option<(String, String)>,
 }
 
-/// per-platform p95 latency
-/// budgets for cold-shard search.
+/// Per-platform p95 latency budgets for cold-shard search.
 ///
 /// `docs/DESIGN.md §7.5` pins the cold-shard decrypt + search
 /// p95 budget at 1.5 s and gives a per-device target matrix:
@@ -179,7 +173,7 @@ pub struct KChatCoreConfig {
 /// a looser one, desktops are tighter still. The
 /// [`DeviceMatrixConfig`] surface lets a caller pick the right
 /// budget for the host device when running the on-device
-/// latency gates added in
+/// latency gates.
 ///
 /// Values are nanoseconds — same unit as
 /// [`crate::perf::PerfTrace::duration_ns`] and

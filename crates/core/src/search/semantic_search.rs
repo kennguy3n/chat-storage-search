@@ -18,9 +18,9 @@
 //! - Optional conversation filter joins through
 //!   `message_skeleton.conversation_id`.
 //!
-//! The HNSW upgrade is a follow-up — once it lands the
-//! engine will fan over the same `search_vector` rows but use
-//! the in-memory ANN graph instead of scanning every row. The
+//! The HNSW upgrade is a follow-up — once it lands, the engine
+//! will fan over the same `search_vector` rows but use the
+//! in-memory ANN graph instead of scanning every row. The
 //! [`SearchSemantic`] trait surface stays the same so the
 //! [`crate::search::query_engine`] reranking path doesn't need
 //! to change.

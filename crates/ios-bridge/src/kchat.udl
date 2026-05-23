@@ -66,7 +66,7 @@ enum ContentKind {
   "Any",
 };
 
-// Task 8: scoped search target.
+// Scoped search target.
 // Mirrors `kchat_core::SearchTarget`. UUID-bearing variants pass
 // the id(s) as String because UDL has no native UUID type.
 [Enum]
@@ -91,7 +91,7 @@ dictionary SearchQuery {
   i64? date_from;
   i64? date_to;
   ContentKind? content_kind;
- // Task 8: optional scoping.
+ // Optional scoping.
  // null preserves the legacy `SearchTarget::Global` default so
  // existing Swift call sites stay source-compatible.
   SearchTarget? target;

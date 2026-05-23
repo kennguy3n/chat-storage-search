@@ -16,9 +16,8 @@
 //!   inside `max_dimension`, and re-encoded as PNG so the thumbnail
 //!   is **always** a deterministic PNG regardless of the input MIME.
 //! * Non-image MIME types return [`Error::Message`]; full
-//!   video / document / audio thumbnailing lands later in
-//!   alongside the on-device vision and OCR models (see
-//!   ).
+//!   video / document / audio thumbnailing is layered in
+//!   alongside the on-device vision and OCR models.
 //!
 //! The returned [`ThumbnailResult::thumbnail_bytes`] is the PNG
 //! payload that the caller feeds into

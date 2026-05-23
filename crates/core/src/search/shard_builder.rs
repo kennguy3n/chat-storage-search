@@ -17,9 +17,9 @@
 //! 3. zstd-compress the CBOR.
 //! 4. AEAD-seal the compressed bytes with the appropriate
 //!    `K_text_index_shard(shard_id)` /
-//!    `K_fuzzy_index_shard(shard_id)` (reuses the
-//!    text-index hierarchy for fuzzy shards until the per-fuzzy
-//!    derivation lands in ).
+//!    `K_fuzzy_index_shard(shard_id)` (the text-index hierarchy
+//!    is reused for fuzzy shards until the per-fuzzy derivation
+//!    is introduced).
 //! 5. Wrap the ciphertext into a [`SearchIndexShard`] so the
 //!    backup manifest can carry it.
 //!
@@ -143,7 +143,6 @@ pub const VECTOR_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_VECTOR_SHARD_PAYLOAD_V1";
 pub const MEDIA_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_MEDIA_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`BloomShardPayload`].
-///.
 pub const BLOOM_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_BLOOM_SHARD_PAYLOAD_V1";
 
 /// CBOR-sealed plaintext of a text [`SearchIndexShard`].
@@ -167,7 +166,6 @@ pub struct FuzzyShardPayload {
 }
 
 /// CBOR-sealed plaintext of a vector [`SearchIndexShard`]
-///.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorShardPayload {
     /// Always [`VECTOR_SHARD_PAYLOAD_MAGIC`].
@@ -178,7 +176,6 @@ pub struct VectorShardPayload {
 }
 
 /// CBOR-sealed plaintext of a media [`SearchIndexShard`]
-///.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaShardPayload {
     /// Always [`MEDIA_SHARD_PAYLOAD_MAGIC`].
@@ -457,7 +454,6 @@ pub fn restore_fuzzy_search_shard(
 }
 
 /// Build an encrypted vector shard from the supplied rows.
-///.
 ///
 /// `k_vector_index_shard` is the per-shard AEAD key, typically
 /// `K_vector_index_shard(shard_id)` from
@@ -526,7 +522,6 @@ pub fn restore_vector_search_shard(
 }
 
 /// Build an encrypted media shard from the supplied rows.
-///.
 pub fn build_media_search_shard(
     rows: Vec<MediaIndexRow>,
     conversation_id: &str,

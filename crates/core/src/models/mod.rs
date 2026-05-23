@@ -3,12 +3,12 @@
 //! `docs/DESIGN.md §7.6` lays out the on-device ML model set:
 //! `XLM-R` for multilingual text embeddings, `MobileCLIP-S2` for
 //! image / video embeddings, and `Whisper-base` / `Whisper-tiny`
-//! for audio transcription. wires these models to ONNX
-//! Runtime via the [`ort`](https://crates.io/crates/ort) crate and
-//! lands the model manager (lazy download, versioning, INT8 / INT4
-//! quantization, integrity-checked artifacts).
+//! for audio transcription. This module wires those models to
+//! ONNX Runtime via the [`ort`](https://crates.io/crates/ort)
+//! crate and hosts the model manager (lazy download, versioning,
+//! INT8 / INT4 quantization, integrity-checked artifacts).
 //!
-//! The submodules below land incrementally:
+//! Submodules:
 //!
 //! * [`embeddings`] — XLM-R text-embedding seam **and** the
 //!   cross-pipeline [`embeddings::EmbeddingCache`] trait
@@ -38,8 +38,6 @@
 //!   [`embeddings_onnx`] / [`clip`] but pivots on
 //!   `cfg(target_arch = "aarch64", target_os = "macos" | "ios")`
 //!   instead of `cfg(target_os = "windows")`.
-//!
-//! See for the schedule.
 
 pub mod clip;
 pub mod document;

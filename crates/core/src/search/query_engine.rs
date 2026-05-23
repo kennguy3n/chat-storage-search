@@ -2,9 +2,10 @@
 //! filters.
 //!
 //! `docs/DESIGN.md §12` defines the [`SearchQuery`] /
-//! [`SearchScope`] / [`SearchResult`] surface. lands the
-//! local-store half: the engine reads from `search_fts` for free-text
-//! queries, fans the same query out to the script-aware fuzzy index
+//! [`SearchScope`] / [`SearchResult`] surface. This module
+//! implements the local-store half: the engine reads from
+//! `search_fts` for free-text queries, fans the same query out to
+//! the script-aware fuzzy index
 //! ([`FuzzySearchEngine`]) for typo / partial / cross-script matches,
 //! applies the structured filters (sender / conversation / date range
 //! / content kind) as SQL `WHERE` clauses against `message_skeleton`,
@@ -83,7 +84,6 @@ pub(crate) const FUZZY_WEIGHT: f64 = 1.0;
 /// surface-form matches when both signals are available, but
 /// still surfaces semantic-only hits when FTS misses.
 ///
-///.
 pub(crate) const SEMANTIC_WEIGHT: f64 = 1.5;
 
 /// Recency-decay weight in the merged rank score
@@ -1669,7 +1669,6 @@ impl<'a> QueryEngine<'a> {
     /// cosine-similarity engine that powers
     /// [`Self::execute_search_with_semantic`].
     /// the "on-device reranking" item from
-    ///.
     ///
     /// The pass is purely local: it reads from `search_vector`
     /// and never fans to the cold archive, regardless of

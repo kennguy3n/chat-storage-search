@@ -107,7 +107,6 @@ impl Default for ModelManagerConfig {
 pub const TIGHT_STORAGE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Static descriptor for a model artifact.
-///.
 ///
 /// Unlike [`ModelArtifact`] (which carries dynamic on-disk state
 /// file path, size, sha256), this is a compile-time constant
@@ -347,7 +346,6 @@ impl ModelManager {
 
     /// Pick the correct [`ModelArtifactSpec`] for `model_id`
     /// given the device's free `available_storage`.
-    /// Task 5.
     ///
     /// Defers the storage-tier decision to
     /// [`Self::select_quantization`] and looks up the matching

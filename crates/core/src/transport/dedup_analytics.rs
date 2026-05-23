@@ -133,7 +133,6 @@ impl StorageSavings {
 }
 
 /// One dedup-related event captured at the ZKOF sink boundary.
-///.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DedupEvent {
     /// An object was uploaded to the ZK Object Fabric. When

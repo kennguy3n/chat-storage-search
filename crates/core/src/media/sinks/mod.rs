@@ -1,4 +1,4 @@
-//! Media blob sink trait surface — /
+//! Media blob sink trait surface.
 //!
 //! `docs/DESIGN.md §5.7` (tiered media storage) introduces a
 //! three-tier storage model:
@@ -18,10 +18,10 @@
 //! [`crate::config::KChatCoreConfig`]; only media originals are
 //! routed through this trait.
 //!
-//! Lands the trait surface and the `Noop` placeholder that
-//! returns [`crate::Error::NotImplemented`] from every method.
-//! Lands the iCloud, Google Drive, and ZK Object Fabric
-//! implementations in the sibling modules of this directory.
+//! This module exposes the trait surface and the `Noop`
+//! placeholder that returns [`crate::Error::NotImplemented`] from
+//! every method. The iCloud, Google Drive, and ZK Object Fabric
+//! implementations live in the sibling modules of this directory.
 
 use crate::crypto::aead::BlobClass;
 

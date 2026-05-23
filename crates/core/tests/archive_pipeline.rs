@@ -5,7 +5,7 @@
 //! 1. Open an in-memory `LocalStoreDb`.
 //! 2. Seed a conversation + 5 messages via `MessagePersister`
 //!    each persist mirrors into both `backup_event_journal` and
-//!    `archive_event_journal` (Task 1 wiring).
+//!    `archive_event_journal`.
 //! 3. Read unsegmented archive events.
 //! 4. Group by `(conversation_id, time_bucket)` via
 //!    `ArchiveSegmentBuilder::group_events_by_bucket`.
@@ -681,9 +681,9 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
 ///    three segments — including the two that were sealed under
 ///    retired epoch keys.
 ///
-/// This is the integration shape Task 9 calls out: the manifest
-/// chain is the *only* thing a restoring device sees, so every
-/// retired epoch key must be reachable from the chain alone.
+/// This is the manifest-chain restore contract: the chain is the
+/// *only* thing a restoring device sees, so every retired epoch
+/// key must be reachable from the chain alone.
 #[test]
 fn archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore() {
     use kchat_core::archive::epoch_keys::EpochKeyManager;

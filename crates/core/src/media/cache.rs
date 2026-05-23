@@ -3,11 +3,11 @@
 //! `docs/DESIGN.md §5.4` (storage budget) and `docs/DESIGN.md
 //! §8.5` (rehydration) call out a local on-disk cache for media
 //! originals so the hydration path does not re-pay AEAD work for
-//! recently viewed assets. lands the bookkeeping side of
-//! the cache — the LRU index that tracks resident asset sizes and
-//! evicts the oldest entries when the budget is exceeded. The
-//! actual on-disk eviction (`fs::remove_file`) is wired in by the
-//! eviction pipeline in along with the
+//! recently viewed assets. This module covers the bookkeeping
+//! side of the cache — the LRU index that tracks resident asset
+//! sizes and evicts the oldest entries when the budget is
+//! exceeded. The actual on-disk eviction (`fs::remove_file`) is
+//! wired in by the eviction pipeline alongside the
 //! `media_state = Evicted` transition.
 //!
 //! The cache is intentionally *index-only*: it stores

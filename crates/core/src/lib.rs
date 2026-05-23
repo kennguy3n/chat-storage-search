@@ -145,7 +145,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 // Most of the codebase still constructs the old string-typed
 // variants — `Error::Storage(format!("...").into)` etc. The
 // `From<&str>` / `From<String>` impls below let those call sites
-// keep compiling while wave-by-wave the typed
+// keep compiling while the typed
 // `StorageError::DatabaseLocked` / `SearchError::QueryParse` /
 // `MessageError::Validation` variants replace them. Once the
 // migration finishes and no string-typed constructions remain, these
@@ -350,20 +350,19 @@ impl SearchTarget {
 /// Top-level search query.
 ///
 /// `docs/DESIGN.md §12` defines the field shape; the unified
-/// query engine (`search/query_engine.rs`, lands in )
-/// fans the query out to FTS5, fuzzy, vector, and media indexes.
+/// query engine in [`crate::search::query_engine`] fans the query
+/// out to FTS5, fuzzy, vector, and media indexes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// User-typed query string. May interleave scripts.
     pub query_string: String,
     /// Optional sender filter.
     pub sender_filter: Option<String>,
-    /// Optional conversation filter. (
-    /// batch) introduces [`SearchQuery::target`] as the
-    /// preferred filter; this field stays as a deprecated
-    /// alias that maps onto
-    /// [`SearchTarget::Conversation`] when [`Self::target`]
-    /// is [`SearchTarget::Global`].
+    /// Optional conversation filter. The richer
+    /// [`SearchQuery::target`] field is the preferred filter;
+    /// this field stays as a deprecated alias that maps onto
+    /// [`SearchTarget::Conversation`] when [`Self::target`] is
+    /// left at [`SearchTarget::Global`].
     pub conversation_filter: Option<Uuid>,
     /// Inclusive lower-bound `created_at_ms`.
     pub date_from: Option<i64>,
@@ -381,9 +380,10 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     /// Resolve the effective target for this query.
-    /// preserves the legacy `conversation_filter` field by
-    /// mapping it to [`SearchTarget::Conversation`] when the
-    /// new `target` is left at its default ([`SearchTarget::Global`]).
+    ///
+    /// Preserves the legacy `conversation_filter` field by mapping
+    /// it to [`SearchTarget::Conversation`] when the new `target`
+    /// is left at its default ([`SearchTarget::Global`]).
     pub fn effective_target(&self) -> SearchTarget {
         if matches!(self.target, SearchTarget::Global) {
             if let Some(c) = self.conversation_filter {
@@ -397,8 +397,8 @@ impl SearchQuery {
 /// One result row from the unified search engine.
 ///
 /// `rank_score` is the merged (FTS / fuzzy / vector / recency /
-/// pinned) score; the ranking formula lands with the search engine
-/// implementation in
+/// pinned) score produced by the unified query engine in
+/// [`crate::search::query_engine`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Stable message identifier.
@@ -420,15 +420,14 @@ pub struct SearchResult {
     /// Raw cosine similarity between the query embedding and the
     /// row's stored embedding, when this hit went through the
     /// semantic-search engine. `None` for pure FTS / fuzzy hits.
-    ///. The reranker
+    /// The reranker
     /// ([`crate::search::query_engine::QueryEngine::rerank_with_semantic`])
     /// reads this field for ordering decisions.
     #[serde(default)]
     pub semantic_score: Option<f64>,
 }
 
-/// streaming search
-/// event surface.
+/// Streaming search event surface.
 ///
 /// `docs/DESIGN.md §7.5` calls for the search UX to render
 /// the local FTS / fuzzy hits immediately while the cold-bucket
@@ -606,7 +605,6 @@ pub struct HydratedMessage {
     /// [`crate::transport::offline::OfflineDetector`] reported
     /// offline, and the renderer should display an offline cold
     /// state until reconnection retriggers hydration.
-    /// Task 6.
     #[serde(default)]
     pub offline: bool,
 }
@@ -631,9 +629,8 @@ pub struct SendMediaResult {
 /// Result of [`KChatCore::run_incremental_backup`].
 ///
 /// Populated by [`crate::core_impl::CoreImpl::run_incremental_backup`]
-/// once the backup engine wiring is installed (Task 3 of the
-/// /4 batch). Default is the no-events / no-keys-installed
-/// shape.
+/// once the backup engine wiring is installed. The default value
+/// represents the no-events / no-keys-installed shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupResult {
     /// Number of sealed [`crate::backup::segment_builder::BuiltBackupSegment`]
@@ -665,7 +662,6 @@ pub struct BackupResult {
     /// [`KChatCore::run_incremental_backup`] was called. The
     /// segments (if any) were sealed locally; the upload step
     /// was skipped and is expected to retry on reconnection.
-    ///.
     #[serde(default)]
     pub deferred: bool,
 }
@@ -689,26 +685,26 @@ pub struct OffloadResult {
 
 /// Result of [`KChatCore::restore_from_backup`].
 ///
-/// placeholder. The full restore contract (manifest chain
-/// verified, segments installed, deferred rehydration plan, …)
-/// lands with the restore engine in
+/// Placeholder result type. The full restore contract (manifest
+/// chain verified, segments installed, deferred rehydration plan,
+/// …) is filled in by the restore engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResult {}
 
 /// Source descriptor for [`KChatCore::restore_from_backup`].
 ///
-/// placeholder. The full source contract (backup root key
-/// reference, manifest chain head, transport handle for the backup
-/// sink, …) lands with the restore engine in
+/// Placeholder source type. The full source contract (backup root
+/// key reference, manifest chain head, transport handle for the
+/// backup sink, …) is filled in by the restore engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupSource {}
 
 /// Result of [`KChatCore::register_device`].
 ///
-/// placeholder. The full registration contract (MLS
+/// Placeholder result type. The full registration contract (MLS
 /// credential bundle, KeyPackage handle, server-assigned device
-/// id, attestation evidence, …) lands when the MLS / device-key
-/// layer arrives later in /
+/// id, attestation evidence, …) is filled in by the MLS /
+/// device-key layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRegistration {}
 
@@ -720,9 +716,9 @@ pub struct DeviceRegistration {}
 /// only the fields needed to render a chat bubble — sender, time,
 /// reply-to, edit / delete stamps, and the (optional) plaintext body
 /// without leaking the internal `local_store::schema` types
-/// through the public API. engines extend this with
-/// hydrated media descriptors, hydration provenance, and rich
-/// metadata.
+/// through the public API. Richer views can layer hydrated media
+/// descriptors, hydration provenance, and additional metadata on
+/// top.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageView {
     /// Stable message identifier.
@@ -774,10 +770,9 @@ pub trait KChatCore: Send + Sync {
     /// `device_id`. Returns a [`DeviceRegistration`] handle the
     /// caller persists.
     ///
-    /// **stub.** The full MLS credential / KeyPackage
-    /// publication pipeline lands later in /
-    /// Until then this method returns
-    /// `Err(Error::NotImplemented("register_device"))`.
+    /// **Stub.** The full MLS credential / KeyPackage publication
+    /// pipeline is not yet implemented; until then this method
+    /// returns `Err(Error::NotImplemented("register_device"))`.
     fn register_device(&self, device_id: &str) -> Result<DeviceRegistration>;
 
     /// Create an outbox entry for an outbound text message and
@@ -862,13 +857,13 @@ pub trait KChatCore: Send + Sync {
     /// the in-process [`CoreImpl`] still mints fresh ids when the
     /// caller doesn't care.
     ///
-    /// wires this to
+    /// Internally this wires through
     /// [`crate::media::processor::process_media`] and the
     /// [`crate::media::thumbnail::ThumbnailGenerator`]. The actual
     /// upload to the configured [`TransportClient`] /
-    /// [`crate::media::sinks::MediaBlobSink`] is deferred
-    /// [`SendMediaResult::descriptor`] is the wire form callers ship
-    /// through MLS.
+    /// [`crate::media::sinks::MediaBlobSink`] is deferred; the
+    /// [`SendMediaResult::descriptor`] is the wire form callers
+    /// ship through MLS.
     fn send_media(
         &self,
         conversation_id: Uuid,
@@ -883,16 +878,16 @@ pub trait KChatCore: Send + Sync {
     /// rate-limited offload eviction can take the most-recent reason
     /// into account.
     ///
-    /// **stub.** The rehydration pipeline lands in
-    /// Until then this method returns
+    /// **Stub.** The rehydration pipeline is not yet wired through
+    /// this entry point; until then this method returns
     /// `Err(Error::NotImplemented("hydrate_message"))`.
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage>;
 
     /// Walk the backup event journal, pack new segments, and push
     /// them to the configured backup sink.
     ///
-    /// **stub.** The backup engine lands in Until
-    /// then this method returns
+    /// **Stub.** The backup engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("run_incremental_backup"))`.
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult>;
 
@@ -900,16 +895,16 @@ pub trait KChatCore: Send + Sync {
     /// demote message bodies to the offload tier, drop FTS / fuzzy
     /// rows on demoted messages, and rewrite the backup journal.
     ///
-    /// **stub.** The offload engine lands in Until
-    /// then this method returns
+    /// **Stub.** The offload engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("enforce_storage_budget"))`.
     fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult>;
 
     /// Verify the manifest chain pointed at by `source` and replay
     /// every journal segment back into the local store.
     ///
-    /// **stub.** The restore engine lands in Until
-    /// then this method returns
+    /// **Stub.** The restore engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("restore_from_backup"))`.
     fn restore_from_backup(&self, source: BackupSource) -> Result<RestoreResult>;
 }

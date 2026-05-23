@@ -1,11 +1,10 @@
 //! Combined FTS5 + fuzzy multilingual integration tests.
 //!
-//! The decision gate: "Text messages can be
-//! stored, searched (multilingual)". The companion
-//! `multilingual_search.rs` covers the FTS5 / structured-filter half
-//! of that gate; this file exercises the **combined** FTS5 + fuzzy
-//! pipeline that PR #6 introduced and PRs in this series wired into
-//! `MessagePersister` (Task 1) and `QueryEngine` (Task 2).
+//! The decision gate: "Text messages can be stored, searched
+//! (multilingual)". The companion `multilingual_search.rs`
+//! covers the FTS5 / structured-filter half of that gate; this
+//! file exercises the **combined** FTS5 + fuzzy pipeline wired
+//! through `MessagePersister` and `QueryEngine`.
 //!
 //! Each test goes through the public seam: messages are persisted via
 //! [`MessagePersister`] (which now indexes both `search_fts` and

@@ -333,8 +333,7 @@ pub struct TranscriptionResult {
 }
 
 /// On-device Whisper transcription seam used by media ingest
-/// (`docs/DESIGN.md §7.6` / §7.7, of this
-/// batch).
+/// (`docs/DESIGN.md §7.6` / §7.7).
 ///
 /// Implementations MUST be object-safe and `Send + Sync` so the
 /// `CoreImpl` can park them behind a `Mutex<Option<Box<dyn _>>>`

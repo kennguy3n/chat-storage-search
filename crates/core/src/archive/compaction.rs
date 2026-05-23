@@ -1,4 +1,4 @@
-//! / archive compaction.
+//! Archive compaction.
 //!
 //! Periodically the orchestration layer needs to shrink the
 //! archive footprint per `(account, conversation, time_bucket)`:
@@ -8,11 +8,10 @@
 //! Storage cost trends toward the *post-tombstone* size of the
 //! conversation, not the cumulative arrival history.
 //!
-//! calls this out as the production-scale
-//! archive-compaction work item; this module provides the shared
-//! building blocks. [`crate::core_impl::CoreImpl::compact_archive`]
-//! is the orchestration layer that wires these blocks against the
-//! local store + transport / S3 backends.
+//! This module provides the shared building blocks for that work;
+//! [`crate::core_impl::CoreImpl::compact_archive`] is the
+//! orchestration layer that wires them against the local store
+//! and the transport / S3 backends.
 //!
 //! The module is intentionally separate from
 //! [`crate::backup::compaction`]:

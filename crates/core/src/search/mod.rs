@@ -1,11 +1,12 @@
 //! `search` module — search engine surface.
 //!
-//! Lands the multilingual tokenization spec ([`tokenizer`]):
-//! the FTS5 `tokenize = '...'` literal, the ISO-15924 [`ScriptClass`],
+//! The multilingual tokenization spec lives in [`tokenizer`]: the
+//! FTS5 `tokenize = '...'` literal, the ISO-15924 [`ScriptClass`],
 //! the trigram-vs-bigram [`FuzzyGranularity`] mapping, and the
 //! mixed-script `segment_by_script` helper that the fuzzy indexer
-//! uses to tag rows. The actual FTS5 / fuzzy / vector engines land in
-//! Phases 1, 5, and 6 respectively — see.
+//! uses to tag rows. The FTS5 ([`query_engine`]), fuzzy
+//! ([`fuzzy_search`]), and vector ([`semantic_search`]) engines sit
+//! alongside it.
 //!
 //! [`ScriptClass`]: tokenizer::ScriptClass
 //! [`FuzzyGranularity`]: tokenizer::FuzzyGranularity

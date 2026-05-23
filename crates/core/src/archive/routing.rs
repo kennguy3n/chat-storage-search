@@ -310,8 +310,8 @@ pub fn route_archive_download(
 ///
 /// The KChat backend's manifest-upload endpoint is *not* part of
 /// the [`TransportClient`] surface today — only the *fetch* side
-/// (`fetch_archive_manifests`) is wired in / 2. Until the
-/// upload endpoint lands the KChat path returns
+/// (`fetch_archive_manifests`) is wired in. Until the upload
+/// endpoint lands, the KChat path returns
 /// [`Error::NotImplemented`] with a descriptive label so the
 /// dispatch surface stays honest. The ZKOF path delegates straight
 /// to [`ZkofArchiveAdapter::upload_manifest`].

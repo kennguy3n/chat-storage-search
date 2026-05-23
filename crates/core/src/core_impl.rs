@@ -24,9 +24,10 @@
 //!
 //! * The transport-driven [`KChatCore::ingest_remote_messages`] is a
 //!   stub returning [`IngestResult::default()`] — the MLS delivery
-//!   client lands later in For now, callers (and tests) use
-//!   the inherent [`CoreImpl::ingest_messages`] entry point that
-//!   takes an in-memory slice of [`IngestedMessage`] values directly.
+//!   client is not yet wired through this entry point. For now,
+//!   callers (and tests) use the inherent
+//!   [`CoreImpl::ingest_messages`] entry point that takes an
+//!   in-memory slice of [`IngestedMessage`] values directly.
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
@@ -317,8 +318,8 @@ pub struct CoreImpl {
     /// sealed-segment ledger (`backup_segment_ledger`)
     /// previously held directly on `CoreImpl` as the
     /// `backup_keys` / `previous_backup_manifest` /
-    /// `tracked_backup_segments` fields. All `install_backup_keys`
-    /// / `has_backup_keys` / `hydrate_*` /
+    /// `tracked_backup_segments` fields. All `install_backup_keys` /
+    /// `has_backup_keys` / `hydrate_*` /
     /// `run_incremental_backup_*` / `compact_backup` methods on
     /// `CoreImpl` delegate state reads / writes through this
     /// coordinator. See `crate::backup::coordinator` for the
@@ -812,8 +813,8 @@ impl CoreImpl {
         Ok((results, cold_count))
     }
 
-    /// Run a unified search with cold-bucket fan-out via
-    /// `cold_source` ().
+    /// Run a unified search with cold-bucket fan-out via the
+    /// supplied `cold_source`.
     ///
     /// The orchestration layer (bridge crate / async runtime) is
     /// expected to implement [`ColdShardSource`] by querying
@@ -852,8 +853,7 @@ impl CoreImpl {
         Ok(results)
     }
 
-    /// streaming-search
-    /// orchestration entry point.
+    /// Streaming-search orchestration entry point.
     ///
     /// Wraps
     /// [`crate::search::query_engine::QueryEngine::execute_search_streaming`]
@@ -910,9 +910,9 @@ impl CoreImpl {
 
     /// Build encrypted text + fuzzy search shards for a given
     /// `(conversation_id, time_bucket)` and ferry them to the
-    /// archive backend ().
+    /// archive backend.
     ///
-    /// ` 5` calls for the orchestration
+    /// `docs/DESIGN.md §12.5` calls for the orchestration
     /// layer to:
     ///
     /// 1. Pull the FTS / fuzzy rows for the bucket out of local
@@ -1047,7 +1047,7 @@ impl CoreImpl {
 
     /// Drive one incremental backup pass and ferry the freshly
     /// affected `(conversation_id, time_bucket)` search shards
-    /// up through the supplied transport ().
+    /// up through the supplied transport.
     ///
     /// Wraps [`Self::run_incremental_backup_inner`] with a
     /// post-seal sweep that:
@@ -1631,9 +1631,8 @@ impl CoreImpl {
     }
 
     /// Install the on-device Whisper transcriber used by media
-    /// ingest (`docs/DESIGN.md §7.6`, of the
-    /// batch). When set, audio media writes a
-    /// transcript row into `media_search_index` during
+    /// ingest (`docs/DESIGN.md §7.6`). When set, audio media
+    /// writes a transcript row into `media_search_index` during
     /// `send_media`. Write-once — the underlying Whisper ONNX
     /// session cannot be replaced live without leaking GPU
     /// allocations and racing in-flight transcription tasks.
@@ -1652,10 +1651,9 @@ impl CoreImpl {
     }
 
     /// Install the on-device document text-extraction bridge
-    /// used by media ingest (`docs/DESIGN.md §7.6`,
-    /// Task 2 of the batch). When set, PDF / DOCX
-    /// media writes per-page text rows into
-    /// `media_search_index` during `send_media`. Write-once
+    /// used by media ingest (`docs/DESIGN.md §7.6`). When set,
+    /// PDF / DOCX media writes per-page text rows into
+    /// `media_search_index` during `send_media`. Write-once —
     /// the platform document parser (PDFKit / Apache Tika /
     /// MlKit) is a per-process resource.
     pub fn install_document_extractor(
@@ -1673,9 +1671,8 @@ impl CoreImpl {
     }
 
     /// Install the on-device video keyframe sampler used by
-    /// media ingest (`docs/DESIGN.md §7.6`, of
-    /// the batch). When set together with an
-    /// [`crate::models::clip::ImageEmbedder`], video media
+    /// media ingest (`docs/DESIGN.md §7.6`). When set together
+    /// with an [`crate::models::clip::ImageEmbedder`], video media
     /// embeds the first keyframe via MobileCLIP-S2 and writes
     /// the embedding to `search_vector` during `send_media`.
     /// Write-once — platform video decoders (AVFoundation /
@@ -1695,11 +1692,10 @@ impl CoreImpl {
     }
 
     /// Install the offline-detection probe used by the
-    /// backup-defer / hydrate-offline paths (of
-    /// the batch). Wrapped in `Arc` so multiple
-    /// workers can share one detector. Write-once: returns
-    /// [`Error::Storage`] if an offline detector has already
-    /// been installed.
+    /// backup-defer / hydrate-offline paths. Wrapped in `Arc` so
+    /// multiple workers can share one detector. Write-once:
+    /// returns [`Error::Storage`] if an offline detector has
+    /// already been installed.
     pub fn install_offline_detector(
         &self,
         detector: Arc<dyn crate::transport::offline::OfflineDetector>,
@@ -1722,12 +1718,12 @@ impl CoreImpl {
             .unwrap_or(true)
     }
 
-    /// Install the performance-trace collector (
-    /// of the batch). Wrapped in `Arc` so callers can
-    /// share one collector across the lifetime of the process
-    /// and read out traces with [`Self::collect_perf_stats`].
-    /// Write-once: returns [`Error::Storage`] if a collector has
-    /// already been installed.
+    /// Install the performance-trace collector. Wrapped in
+    /// `Arc` so callers can share one collector across the
+    /// lifetime of the process and read out traces with
+    /// [`Self::collect_perf_stats`]. Write-once: returns
+    /// [`Error::Storage`] if a collector has already been
+    /// installed.
     pub fn install_perf_collector(
         &self,
         collector: Arc<dyn crate::perf::PerfCollector>,
@@ -2054,7 +2050,7 @@ impl CoreImpl {
     }
 
     /// Replay the supplied search-index shards into the local
-    /// `search_fts` / `search_fuzzy` tables ().
+    /// `search_fts` / `search_fuzzy` tables.
     ///
     /// Wires
     /// [`crate::restore::pipeline::RestorePipeline::restore_search_index_shards_with_replay`]
@@ -2078,7 +2074,7 @@ impl CoreImpl {
     /// returned [`crate::search::shard_prefetch::PrefetchedShard`]
     /// under the shard key the caller registered for the triple,
     /// and replay the contained rows into the local
-    /// `search_fts` / `search_fuzzy` tables ().
+    /// `search_fts` / `search_fuzzy` tables.
     ///
     /// Returns a [`RestoreColdShardsSummary`] describing how many
     /// shards came back and how many rows landed in each table.
@@ -2192,7 +2188,7 @@ impl CoreImpl {
         self.archive.has_zkof_archive_backend()
     }
 
-    /// Cold-result hydration write-back ().
+    /// Cold-result hydration write-back.
     ///
     /// Walks the supplied [`SearchResult`] vec, picks out the
     /// rows flagged `is_cold = true`, groups them by
@@ -2469,11 +2465,11 @@ impl CoreImpl {
     /// without raising an error — every other [`ProcessorError`] is
     /// surfaced.
     ///
-    /// This is the **inherent** entry point used in while
-    /// the transport-driven [`KChatCore::ingest_remote_messages`]
+    /// This is the **inherent** entry point used while the
+    /// transport-driven [`KChatCore::ingest_remote_messages`]
     /// trait method is still a stub.
     ///
-    /// / Task 10: when a [`crate::models::embeddings::TextEmbedder`]
+    /// When a [`crate::models::embeddings::TextEmbedder`]
     /// has been installed via [`Self::install_text_embedder`],
     /// each text body is embedded and written to `search_vector`
     /// via the [`crate::models::embeddings::EmbeddingCache`]
@@ -2555,9 +2551,9 @@ impl CoreImpl {
             match persister.persist_ingested_message(msg) {
                 Ok(_) => {
                     result.new_messages += 1;
-                    // Best-effort cross-pipeline embedding (
-                    // Task 2 / 10). Failures are absorbed because
-                    // the message is already persisted; semantic
+                    // Best-effort cross-pipeline embedding.
+                    // Failures are absorbed because the message
+                    // is already persisted; semantic
                     // search will still work for messages that DID
                     // embed successfully, and the next ingest will
                     // retry this row's embedding the moment a real
@@ -2587,10 +2583,9 @@ impl CoreImpl {
         span.record("duplicate_count", result.duplicate_count);
         span.record("embeddings_computed", embeddings_computed);
 
-        // /6: forward the
-        // batch to any installed Spotlight / Windows Search
-        // bridge. Best-effort — failures here must not roll
-        // back the ingested rows.
+        // Forward the batch to any installed Spotlight / Windows
+        // Search bridge. Best-effort — failures here must not
+        // roll back the ingested rows.
         drop(db);
         self.maybe_index_in_desktop_search(messages);
 
@@ -2657,10 +2652,9 @@ impl CoreImpl {
         }
     }
 
-    /// /6: best-effort
-    /// fan-out of newly ingested messages to the installed
-    /// macOS Spotlight / Windows Search bridges. No-op on
-    /// platforms where no bridge has been installed. Errors
+    /// Best-effort fan-out of newly ingested messages to the
+    /// installed macOS Spotlight / Windows Search bridges. No-op
+    /// on platforms where no bridge has been installed. Errors
     /// from the bridge are swallowed because the message has
     /// already been persisted; failure to update the OS search
     /// index must not roll back ingest.
@@ -2715,7 +2709,7 @@ impl CoreImpl {
     }
 
     /// Best-effort cross-pipeline image embedding (
-    /// Task 9). Runs only when (a) an
+    /// Runs only when (a) an
     /// [`crate::models::clip::ImageEmbedder`] is installed,
     /// (b) `mime_type` advertises an image, and (c) the shared
     /// embedding cache does not already carry a row for
@@ -2761,9 +2755,9 @@ impl CoreImpl {
         }
     }
 
-    /// Best-effort Whisper transcription for audio media (Phase
-    /// 6, Task 2 of the batch). Runs only when
-    /// (a) a [`crate::models::whisper::WhisperTranscriber`] is
+    /// Best-effort Whisper transcription for audio media. Runs
+    /// only when (a) a
+    /// [`crate::models::whisper::WhisperTranscriber`] is
     /// installed, (b) `mime_type` indicates audio, and (c) the
     /// optional [`crate::models::resource_gate::ResourceProbe`]
     /// reports the device is willing to run transcription work
@@ -2871,9 +2865,9 @@ impl CoreImpl {
         }
     }
 
-    /// Best-effort document text extraction for PDF / DOCX media
-    /// (of the batch). Runs only when
-    /// (a) a [`crate::models::document::DocumentExtractor`] is
+    /// Best-effort document text extraction for PDF / DOCX
+    /// media. Runs only when (a) a
+    /// [`crate::models::document::DocumentExtractor`] is
     /// installed and (b) `mime_type` is one of the supported
     /// document MIME types
     /// ([`crate::models::document::is_supported_document_mime`]).
@@ -2968,8 +2962,7 @@ impl CoreImpl {
     }
 
     /// Best-effort video keyframe sampling + MobileCLIP-S2
-    /// embedding fan-out for video media (of
-    /// the batch). Runs only when (a) a
+    /// embedding fan-out for video media. Runs only when (a) a
     /// [`crate::models::video::VideoKeyframeSampler`] is
     /// installed, (b) an
     /// [`crate::models::clip::ImageEmbedder`] is installed, and
@@ -4125,7 +4118,7 @@ impl CoreImpl {
             Some(built)
         };
 
-        // Phase D — let the orchestrator route the upload + write
+        // Step D — let the orchestrator route the upload + write
         // the new segment_map row before we transition the source
         // rows. If commit_compact returns an error the source rows
         // remain at `archive_verified` and the run is retryable.
@@ -4134,7 +4127,7 @@ impl CoreImpl {
             summary.segments_emitted += 1;
         }
 
-        // Phase E — flip every source segment to
+        // Step E — flip every source segment to
         // `archive_compacted`. A SAVEPOINT keeps the bulk of the
         // updates atomic against concurrent reads.
         {
@@ -4293,8 +4286,7 @@ impl KChatCore for CoreImpl {
 
     fn register_device(&self, _device_id: &str) -> Result<DeviceRegistration> {
         // stub: MLS credential / KeyPackage publication and
-        // device-key derivation arrive when the MLS layer lands
-        // later in /
+        // device-key derivation arrive when the MLS layer lands.
         Err(Error::NotImplemented("register_device"))
     }
 
@@ -4439,15 +4431,15 @@ impl KChatCore for CoreImpl {
             },
         );
 
-        // (workstream 6): route the unified search
-        // through `db_readers` so a concurrent UI search does not
-        // contend with the writer's mutex. The reader checked out
-        // here sees a stable WAL snapshot for the duration of
-        // `execute_search`; any writes that commit after checkout
-        // become visible to the *next* checkout, which matches
-        // the previous "writer-locked search" semantics for the
-        // caller (the previous implementation also held a single
-        // snapshot across the search).
+        // Route the unified search through `db_readers` so a
+        // concurrent UI search does not contend with the writer's
+        // mutex. The reader checked out here sees a stable WAL
+        // snapshot for the duration of `execute_search`; any
+        // writes that commit after checkout become visible to the
+        // *next* checkout, which matches the previous
+        // "writer-locked search" semantics for the caller (the
+        // previous implementation also held a single snapshot
+        // across the search).
         let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
             let engine = QueryEngine::new(reader.connection(), reader.icu_available());
             engine
@@ -5991,7 +5983,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 1 — edit / delete on the KChatCore trait
+    // edit / delete on the KChatCore trait
     // ----------------------------------------------------------------
 
     #[test]
@@ -6116,7 +6108,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 2 — get_message / get_conversation_messages
+    // get_message / get_conversation_messages
     // ----------------------------------------------------------------
 
     #[test]
@@ -6189,7 +6181,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — ingest_remote_messages wired to transport
+    // ingest_remote_messages wired to transport
     // ----------------------------------------------------------------
 
     fn raw_msg(conv: Uuid, mid: Uuid, ts: i64, text: &str) -> crate::transport::RawDeliveryMessage {
@@ -6382,7 +6374,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 5 — list_conversations reflects latest activity
+    // list_conversations reflects latest activity
     // ----------------------------------------------------------------
 
     #[test]
@@ -6413,7 +6405,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 3 — get_timeline (CoreImpl)
+    // get_timeline (CoreImpl)
     // ----------------------------------------------------------------
 
     #[test]
@@ -6507,7 +6499,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — get_message_with_body / get_message_body
+    // get_message_with_body / get_message_body
     // ----------------------------------------------------------------
 
     #[test]
@@ -6586,7 +6578,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 5 — delete_conversation
+    // delete_conversation
     // ----------------------------------------------------------------
 
     #[test]
@@ -6752,7 +6744,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — register_device stub
+    // register_device stub
     // ----------------------------------------------------------------
 
     #[test]
@@ -6766,7 +6758,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 8 — HydrationQueue wiring
+    // HydrationQueue wiring
     // ----------------------------------------------------------------
 
     #[test]
@@ -8093,7 +8085,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 3: run_incremental_backup wiring (`docs/DESIGN.md §6.2`).
+    // run_incremental_backup wiring (`docs/DESIGN.md §6.2`).
     // -----------------------------------------------------------------
 
     fn install_test_backup_keys(core: &CoreImpl) {
@@ -8236,7 +8228,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 5: compact_backup orchestration (`docs/DESIGN.md §6.6`).
+    // compact_backup orchestration (`docs/DESIGN.md §6.6`).
     // -----------------------------------------------------------------
 
     fn seed_backup_event_with_seq(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) -> i64 {

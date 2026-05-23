@@ -1,7 +1,7 @@
 //! `offload` module — storage-pressure enforcement.
 //!
-//! Of and `docs/DESIGN.md §5.4` lay out
-//! how the local store keeps itself within its storage budget:
+//! `docs/DESIGN.md §5.4` lays out how the local store keeps itself
+//! within its storage budget:
 //!
 //! * [`budget`] — observe storage usage, compare against a
 //!   declared budget, surface the resulting [`PressureLevel`].

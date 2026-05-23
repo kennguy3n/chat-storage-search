@@ -1,11 +1,11 @@
-//! failure-scenario foundation suite (Task 10).
+//! Failure-scenario foundation suite.
 //!
-//! enumerates 8 failure scenarios that
-//! must each have a self-contained reproduction in the test
-//! suite before the milestone closes. This file lands the first
-//! 4 — the chunked-upload, chunked-decrypt, backup-decrypt, and
-//! manifest-chain paths — so future contributors can extend the
-//! suite without reinventing the harness.
+//! `docs/DESIGN.md` enumerates failure scenarios that must each
+//! have a self-contained reproduction in the test suite. This
+//! file covers the chunked-upload, chunked-decrypt,
+//! backup-decrypt, and manifest-chain paths so future
+//! contributors can extend the suite without reinventing the
+//! harness.
 //!
 //! Each test:
 //! * uses an in-memory database / mock transport (no disk, no

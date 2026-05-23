@@ -1,12 +1,10 @@
-//! multi-scope search latency
-//! benchmarks.
+//! Multi-scope search latency benchmarks.
 //!
-//! calls for the new search surface to
-//! stay under the §12 latency budget even when the query
-//! exercises bloom pre-checks, the on-device shard cache, and
-//! the multi-scope target resolver. This bench suite wires up
-//! criterion so the histograms can be diffed against the
-//! baseline.
+//! `docs/DESIGN.md §12` requires the new search surface to stay
+//! under its latency budget even when the query exercises bloom
+//! pre-checks, the on-device shard cache, and the multi-scope
+//! target resolver. This bench suite wires up criterion so the
+//! histograms can be diffed against the baseline.
 //!
 //! Sub-benches:
 //!
@@ -155,8 +153,8 @@ fn seed_conversations(db: &LocalStoreDb, n: usize, community: &str) -> Vec<Uuid>
 // ---------------------------------------------------------------------------
 
 fn bench_bloom_precheck_one_month_bucket(c: &mut Criterion) {
-    // Build a bloom filter sized for ~1000 distinct words
-    // representative of a one-month bucket per
+    // Build a bloom filter sized for ~1000 distinct words —
+    // representative of one month's traffic for a single bucket.
     let words = synth_words(1_000);
     let filter = BloomFilter::from_words(&words, words.len());
     let queries: Vec<String> = (0..10).map(|i| format!("queryterm{i:04}")).collect();

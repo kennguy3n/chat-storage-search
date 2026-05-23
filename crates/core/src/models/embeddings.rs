@@ -4,18 +4,16 @@
 //! (cross-pipeline embedding cache). Two responsibilities live here:
 //!
 //! 1. The on-device XLM-R ONNX inference seam that semantic search
-//!    uses to embed queries and messages. fills this in.
+//!    uses to embed queries and messages.
 //! 2. The [`EmbeddingCache`] trait — the cross-pipeline cache that
 //!    lets the guardrail (`kennguy3n/slm-guardrail`) and the search
 //!    pipeline share one XLM-R inference per message.
 //!
-//! Lands the actual ONNX session glue. The cache trait
-//! surface and the default `search_vector`-backed implementation
-//! land here as forward-compatible scaffolding so the persistence
-//! layer (`crate::message::processor::MessagePersister` and the
+//! The cache trait surface and the default `search_vector`-backed
+//! implementation are exposed so the persistence layer
+//! (`crate::message::processor::MessagePersister` and the
 //! semantic-search engine) can hit the cache as soon as either
-//! pipeline writes embeddings — no flag day required when the ONNX
-//! wiring lands.
+//! pipeline writes embeddings.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -48,12 +46,10 @@ pub const XLMR_MODEL_VERSION: &str = "xlmr@v1";
 pub const XLMR_EMBEDDING_DIM: usize = 384;
 
 /// Canonical on-disk filename for the INT8 XLM-R artifact.
-///.
 pub const XLMR_INT8_FILENAME: &str = "xlmr-v1-int8.onnx";
 
 /// Canonical on-disk filename for the INT4 (`MatMulNBits`)
 /// XLM-R artifact shipped to tight-storage devices.
-/// Task 5.
 pub const XLMR_INT4_FILENAME: &str = "xlmr-v1-int4.onnx";
 
 // ---------------------------------------------------------------------------

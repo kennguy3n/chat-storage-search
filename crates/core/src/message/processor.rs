@@ -11,9 +11,9 @@
 //!   delivery confirms. `OutboxEntry::client_message_id` is a UUID
 //!   v7 so monotonic ordering survives crashes.
 //!
-//! 's deliverable is the **types and pure validators** here,
-//! not the database-backed implementation. The database glue lands
-//! when SQLCipher integration arrives in
+//! The deliverable scoped to this module is the **types and pure
+//! validators**; the database-backed implementation lives in
+//! [`MessagePersister`] below.
 
 use std::collections::HashSet;
 
@@ -56,9 +56,9 @@ pub enum ProcessorError {
     #[error("duplicate message")]
     DuplicateMessage,
 
-    /// A storage-layer call failed. surfaces specific causes
-    /// (database busy, AEAD open failure, …) as a stringified
-    /// description; richer typed surfacing arrives later in
+    /// A storage-layer call failed. Specific causes (database
+    /// busy, AEAD open failure, …) are surfaced as a stringified
+    /// description.
     #[error("storage: {0}")]
     StorageError(String),
 
@@ -345,8 +345,8 @@ impl<'a> MessagePersister<'a> {
             ));
         };
 
-        // Task 9 (`docs/DESIGN.md §5.7`): a message arriving with
-        // a `MediaDescriptor` carries the *thumbnail* + the
+        // `docs/DESIGN.md §5.7`: a message arriving with a
+        // `MediaDescriptor` carries the *thumbnail* + the
         // backend-side metadata for the original. The original
         // bytes haven't been pulled yet, so the skeleton lands in
         // `MediaState::ThumbnailOnly` whenever any descriptor is

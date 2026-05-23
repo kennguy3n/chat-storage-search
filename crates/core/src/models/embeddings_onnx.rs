@@ -255,7 +255,7 @@ mod posix_cpu {
     ///
     /// Always registers the CPU EP. The cross-platform
     /// inference seam (CoreML EP on Apple, NNAPI EP on Android,
-    /// etc.) lands later in — this scaffold focuses on
+    /// etc.) is layered above this; this entry point focuses on
     /// the Windows DirectML path called out in
     /// `docs/ARCHITECTURE.md §11.4`.
     pub fn create_xlmr_session(

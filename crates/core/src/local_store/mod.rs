@@ -1,6 +1,6 @@
 //! `local_store` module — encrypted on-device storage surface.
 //!
-//! Foundation lands here:
+//! Submodules:
 //!
 //! * [`schema`] — the SQLCipher CREATE TABLE statements
 //!   (`SCHEMA_SQL`) plus the typed Rust row structs that mirror them
@@ -10,10 +10,10 @@
 //! * [`state_machines`] — the `body_state` / `media_state` /
 //!   `archive_state` / `backup_state` / `restore_state` enums with
 //!   `try_transition`, `Display` / `FromStr`, and serde support.
-//!
-//! The actual `rusqlite::Connection` bindings, prepared-statement
-//! cache, migrations, and platform `K_local_db` wrap (Keychain /
-//! Keystore / DPAPI) land later in — see.
+//! * [`db`] — the `rusqlite::Connection` bindings, prepared-statement
+//!   cache, migrations, and SQLCipher key plumbing. The platform
+//!   `K_local_db` wrap (Keychain / Keystore / DPAPI) is layered above
+//!   this module by the bridge crates.
 
 pub mod db;
 pub mod schema;

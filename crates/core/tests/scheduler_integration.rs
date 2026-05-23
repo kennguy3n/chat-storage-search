@@ -1,5 +1,4 @@
 //! Integration tests for the in-process background scheduler
-//!.
 //!
 //! These tests exercise the public `BackgroundScheduler` trait
 //! surface end-to-end: schedule a handler, wait for it to fire,

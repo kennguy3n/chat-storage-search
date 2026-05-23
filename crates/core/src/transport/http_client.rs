@@ -1,5 +1,4 @@
-//! Production HTTP/JSON [`TransportClient`] — (
-//! final batch), Task 4.
+//! Production HTTP/JSON [`TransportClient`].
 //!
 //! `docs/DESIGN.md §10` and `docs/ARCHITECTURE.md §10` pin the
 //! REST endpoint shape:

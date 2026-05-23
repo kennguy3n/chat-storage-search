@@ -1,6 +1,6 @@
 //! `archive` module — personal cold-storage pipeline.
 //!
-//! Of deliverables:
+//! Submodules:
 //!
 //! * [`event_journal`] — append-only log of every durable mutation
 //!   that should ride into the next archive segment.

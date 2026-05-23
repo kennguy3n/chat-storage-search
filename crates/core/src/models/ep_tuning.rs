@@ -1,5 +1,4 @@
 //! Platform ML execution-provider selection state machine
-//!.
 //!
 //! `docs/ARCHITECTURE.md §11.4` calls for a per-platform
 //! ONNX Runtime execution-provider (EP) selection policy:

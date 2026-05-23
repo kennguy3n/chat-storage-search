@@ -1,11 +1,9 @@
 //! `message` module — send / receive pipeline.
 //!
-//! Lands the [`processor`] skeleton: pure-Rust validators,
-//! the `IngestedMessage` / `OutboxEntry` / `IngestResult` shapes,
-//! and the `MessageProcessor` placeholder that the SQLCipher-backed
-//! implementation will fill in. The actual prepared-statement /
-//! transaction work lands with the `local_store` SQLCipher
-//! integration — see.
+//! Hosts the [`processor`] surface: pure-Rust validators, the
+//! `IngestedMessage` / `OutboxEntry` / `IngestResult` shapes, and
+//! the SQLCipher-backed `MessagePersister` that lands ingested
+//! payloads into the local store.
 
 pub mod processor;
 

@@ -271,15 +271,14 @@ pub struct RehydrationPlan {
     pub from_state: MediaState,
 }
 
-/// Of the three-phase rehydration: read the `media_asset`
-/// row, validate the legal pre-state, and pull every field the
-/// download phase needs.
+/// Phase 1 of the three-phase rehydration: read the
+/// `media_asset` row, validate the legal pre-state, and pull
+/// every field the download phase needs.
 ///
 /// Implements the metadata-read half of `docs/DESIGN.md §5.5` so
 /// the long-running download phase can run with the db mutex
 /// **released** — concurrent `send_text` / `search` / `ingest`
-/// callers must not block on a multi-chunk media fetch (Task 2 of
-/// the /4 batch).
+/// callers must not block on a multi-chunk media fetch.
 pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<RehydrationPlan, Error> {
     let row = db
         .get_media_asset(asset_id)
@@ -340,9 +339,9 @@ pub fn prepare_rehydration(db: &LocalStoreDb, asset_id: &str) -> Result<Rehydrat
     })
 }
 
-/// Of the three-phase rehydration: unwrap `K_asset`, drive
-/// the chunked download, AEAD-open every chunk, and verify the
-/// whole-object BLAKE3 root.
+/// Phase 2 of the three-phase rehydration: unwrap `K_asset`,
+/// drive the chunked download, AEAD-open every chunk, and verify
+/// the whole-object BLAKE3 root.
 ///
 /// Holds **no** db reference — the `LocalStoreDb` mutex stays
 /// released for the (potentially many seconds long) duration of
@@ -383,9 +382,9 @@ pub fn execute_rehydration_download(
     }
 }
 
-/// Of the three-phase rehydration: flip `media_state` from
-/// `from_state → DownloadInProgress → OriginalLocal` and update
-/// `bytes_local`, all under a single
+/// Phase 3 of the three-phase rehydration: flip `media_state`
+/// from `from_state → DownloadInProgress → OriginalLocal` and
+/// update `bytes_local`, all under a single
 /// `SAVEPOINT rehydrate_media_state` so a partial failure rolls
 /// back to the pre-call state.
 ///
@@ -457,9 +456,8 @@ pub fn commit_rehydration(
 /// driven by the row in `media_asset` for `asset_id`.
 ///
 /// Implements the lazy-rehydrate flow from
-/// `docs/DESIGN.md §5.5`. As of Task 2 of the /4 batch
-/// this function is a thin wrapper that composes the three
-/// independently usable phases:
+/// `docs/DESIGN.md §5.5`. This function is a thin wrapper that
+/// composes the three independently usable phases:
 ///
 /// 1. [`prepare_rehydration`] reads the `media_asset` row and
 ///    builds a [`RehydrationPlan`].

@@ -1,4 +1,4 @@
-//! Background-task scheduler foundation (/7, Task 9).
+//! Background-task scheduler foundation.
 //!
 //! `docs/DESIGN.md §6` calls out that the offload / backup /
 //! index-maintenance / model-warmup pipelines must run on
@@ -163,9 +163,8 @@ pub enum OneOffTask {
         /// holding live references.
         plan: MediaMigrationPlanSnapshot,
     },
-    /// (Task 8 of the previous batch) — pre-warm the
-    /// on-device shard cache for a list of conversations /
-    /// buckets so the next search hits the cache.
+    /// Pre-warm the on-device shard cache for a list of
+    /// conversations / buckets so the next search hits the cache.
     ShardWarming {
         /// Conversation ids to warm.
         conversations: Vec<String>,

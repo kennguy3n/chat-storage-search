@@ -1,9 +1,8 @@
-//! large-scale integration
-//! test scaffold.
+//! Large-scale integration test scaffold.
 //!
 //! The failure-test suite enumerates "large-scale ingestion,
 //! search, and backup/restore stress tests" as a gating item
-//! alongside the failure-scenario suite. This file lands the
+//! alongside the failure-scenario suite. This file covers the
 //! first three:
 //!
 //! * [`large_scale_ingest_and_search_10k_messages`] — seeds

@@ -10,7 +10,7 @@
 //! * The 32-byte `K_local_db` from
 //!   [`crate::crypto::key_hierarchy`] is set with `PRAGMA key`. The
 //!   platform-specific wrap of `K_local_db` (Keychain / Keystore /
-//!   DPAPI) is layered above this struct and lands later in
+//!   DPAPI) is layered above this struct by the bridge crates.
 //! * Schema bring-up runs [`super::schema::SCHEMA_SQL`]. If the build
 //!   does not ship the FTS5 ICU tokenizer the schema is rewritten to
 //!   the [`unicode61` fallback](crate::search::tokenizer::FTS5_TOKENIZE_UNICODE61)
