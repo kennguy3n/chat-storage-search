@@ -158,4 +158,96 @@ mod tests {
         let decoded: String = from_slice(&bytes).expect("decode");
         assert_eq!(decoded, "hello");
     }
+
+    // -----------------------------------------------------------------
+    // Wire-format golden vector.
+    //
+    // The manifest chain (`crate::formats::manifest::compute_manifest_hash`)
+    // and the signing payload (`canonical_signing_payload`) re-encode
+    // structs to CBOR and operate on the resulting bytes. If a future
+    // `ciborium` upgrade changes its struct-as-map encoding by even a
+    // single byte (e.g. flipped to indefinite-length maps, alternate
+    // text-string encoding, key reordering), pre-existing manifest chains
+    // would fail signature verification on upgrade — silently, with no
+    // compile-time signal.
+    //
+    // This test locks the wire format to today's encoding using a
+    // struct that mirrors the production manifest shape: a `serde_bytes`-
+    // tagged fixed-size byte field (the BLAKE3 anchor), an integer field
+    // (the chain sequence), and a UTF-8 string field (the device id).
+    // The expected bytes were captured from `ciborium 0.2.2` and pinned
+    // here so any future ciborium release that breaks byte-equivalence
+    // fails this test instead of silently breaking the manifest chain
+    // for every user on upgrade.
+    //
+    // If this test ever fails after a `ciborium` bump:
+    //
+    //   * VERIFY that the encoding change is intentional and harmless
+    //     (e.g. the bump fixes a real bug in encoding, not just a
+    //     stylistic reorder of fields).
+    //   * If so, regenerate `EXPECTED` with `to_vec(&ManifestShape::sample())`
+    //     and ship a one-time chain rewrite migration alongside the
+    //     ciborium upgrade — do NOT just update the constant blindly.
+    //   * If the change is unintentional / a regression, pin to the last
+    //     known-good ciborium version and file a ciborium issue.
+    // -----------------------------------------------------------------
+
+    /// Shape that mirrors the production manifest fields exercised by
+    /// `crate::formats::manifest`: a fixed-size byte array (CBOR byte
+    /// string via `serde_bytes`), a u64 sequence counter, and a UTF-8
+    /// device-id string.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct ManifestShape {
+        #[serde(with = "serde_bytes")]
+        anchor_hash: [u8; 4],
+        sequence: u64,
+        device_id: String,
+    }
+
+    impl ManifestShape {
+        fn sample() -> Self {
+            Self {
+                anchor_hash: *b"BLK3",
+                sequence: 0x0102_0304,
+                device_id: "device-1".into(),
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_shape_encodes_to_golden_bytes() {
+        // Golden vector captured from ciborium 0.2.2 on 2026-05-23.
+        // See module-level comment above for the regeneration protocol.
+        //
+        // Decoded:
+        //   A3                                  # map(3)
+        //     6B 61 6E 63 68 6F 72 5F 68 61 73  # text(11) "anchor_hash"
+        //     68
+        //     44 42 4C 4B 33                    # bytes(4) b"BLK3"
+        //     68 73 65 71 75 65 6E 63 65        # text(8) "sequence"
+        //     1A 01 02 03 04                    # unsigned(0x01020304)
+        //     69 64 65 76 69 63 65 5F 69 64     # text(9) "device_id"
+        //     68 64 65 76 69 63 65 2D 31        # text(8) "device-1"
+        const EXPECTED: &[u8] = &[
+            0xa3, // map(3)
+            0x6b, b'a', b'n', b'c', b'h', b'o', b'r', b'_', b'h', b'a', b's', b'h', //
+            0x44, b'B', b'L', b'K', b'3', //
+            0x68, b's', b'e', b'q', b'u', b'e', b'n', b'c', b'e', //
+            0x1a, 0x01, 0x02, 0x03, 0x04, //
+            0x69, b'd', b'e', b'v', b'i', b'c', b'e', b'_', b'i', b'd', //
+            0x68, b'd', b'e', b'v', b'i', b'c', b'e', b'-', b'1', //
+        ];
+
+        let actual = to_vec(&ManifestShape::sample()).expect("encode");
+        assert_eq!(
+            actual, EXPECTED,
+            "ciborium struct-as-map encoding drifted; manifest chain hashes \
+             would silently change on upgrade. Read the module-level comment \
+             above this test before regenerating the golden vector."
+        );
+
+        // Round-trip — the golden bytes decode back to the same value.
+        let decoded: ManifestShape = from_slice(EXPECTED).expect("decode golden");
+        assert_eq!(decoded, ManifestShape::sample());
+    }
 }
