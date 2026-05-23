@@ -1,8 +1,6 @@
-//! Desktop in-process background scheduler — Phase 7, batch-5
-//! (2026-05-04).
+//! Desktop in-process background scheduler.
 //!
-//! `docs/PHASES.md` Phase 7 calls for a desktop scheduler that
-//! runs the recurring kchat loops on a Rust-native worker
+//! Runs the recurring kchat loops on a Rust-native worker
 //! thread when no platform scheduler bridge
 //! (`NSBackgroundActivityScheduler` on macOS, Windows Task
 //! Scheduler on Windows) is wired in. The desktop binary can

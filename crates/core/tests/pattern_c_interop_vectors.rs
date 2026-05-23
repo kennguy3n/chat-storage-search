@@ -12,7 +12,7 @@
 //!
 //! The Rust implementation in `crate::crypto::convergent` must
 //! produce **bit-identical** output to the Go SDK. These vectors
-//! are the Phase 0 contract; any change in the Go SDK that breaks a
+//! are the contract; any change in the Go SDK that breaks a
 //! vector should be matched by a deliberate, reviewed update here.
 
 use kchat_core::crypto::content_hash::content_hash;

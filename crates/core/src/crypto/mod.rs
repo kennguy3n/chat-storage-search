@@ -1,17 +1,17 @@
 //! Crypto primitives for the KChat core.
 //!
-//! Phase 0 implements:
+//! Implements:
 //! * [`content_hash`] — BLAKE3 content hashing (one-shot + streaming).
 //! * [`key_hierarchy`] — HKDF-SHA256 key derivation tree rooted at
 //!   `K_user_master`.
 //! * [`aead`] — XChaCha20-Poly1305 (default) and AES-256-GCM AEADs,
 //!   plus the KChat per-chunk AAD construction from
-//!   `docs/PROPOSAL.md §8.3`.
+//!   `docs/DESIGN.md §8.3`.
 //! * [`convergent`] — ZK Object Fabric Pattern C convergent
 //!   encryption, byte-identical to the Go SDK at
 //!   `kennguy3n/zk-object-fabric/encryption/client_sdk`.
 //! * [`key_wrap`] — AES-256-KW (RFC 3394) for `K_asset` wrapping by
-//!   `K_local_db` / `K_archive_root` / `K_backup_root`. Phase 1
+//!   `K_local_db` / `K_archive_root` / `K_backup_root`.
 //!   layers the platform-specific wraps for `K_local_db` itself
 //!   (Keychain / Keystore / DPAPI) on top of the same primitives.
 

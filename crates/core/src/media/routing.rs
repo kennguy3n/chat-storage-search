@@ -1,5 +1,5 @@
 //! Media upload / download routing between the KChat backend and an
-//! optional [`MediaBlobSink`] (`docs/PROPOSAL.md §5.7`).
+//! optional [`MediaBlobSink`] (`docs/DESIGN.md §5.7`).
 //!
 //! Tiered media storage:
 //!
@@ -53,7 +53,7 @@ pub const KCHAT_BACKEND_SINK: &str = "kchat_backend";
 /// signature still takes it so callers don't have to special-case
 /// the routing decision before calling this function.
 ///
-/// Routing rules (`docs/PROPOSAL.md §5.7`):
+/// Routing rules (`docs/DESIGN.md §5.7`):
 ///
 /// * `is_thumbnail == true` → always Tier 0.
 /// * `is_thumbnail == false` and `config.media_blob_sink.is_some()`
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn original_falls_back_when_sink_instance_missing() {
         // Config says "use a sink" but the caller didn't inject one
-        // — fall back to transport instead of erroring.
+        // fall back to transport instead of erroring.
         let merkle = [0x44u8; 32];
         let chunks = dummy_chunks(1);
         let transport = StubTransport::new()

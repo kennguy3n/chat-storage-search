@@ -1,6 +1,6 @@
 //! State-machine enums for the local store.
 //!
-//! `docs/PROPOSAL.md §4` and `docs/ARCHITECTURE.md §5` lock the four
+//! `docs/DESIGN.md §4` and `docs/ARCHITECTURE.md §5` lock the four
 //! per-message state machines (`body_state`, `media_state`,
 //! `archive_state`, `backup_state`) and the global `restore_state`.
 //! Each enum here matches the state diagrams in those documents
@@ -42,12 +42,12 @@ pub enum StateTransitionError {
 }
 
 // ---------------------------------------------------------------------------
-// body_state — PROPOSAL.md §4 / ARCHITECTURE.md §5
+// body_state — DESIGN.md §4 / ARCHITECTURE.md §5
 // ---------------------------------------------------------------------------
 
 /// Per-message body lifecycle.
 ///
-/// `docs/PROPOSAL.md §4` / `docs/ARCHITECTURE.md §5`. The terminal
+/// `docs/DESIGN.md §4` / `docs/ARCHITECTURE.md §5`. The terminal
 /// states ([`BodyState::DeletedForMe`], [`BodyState::DeletedForEveryone`],
 /// [`BodyState::Unavailable`]) have no outgoing transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,7 +129,7 @@ impl FromStr for BodyState {
 }
 
 // ---------------------------------------------------------------------------
-// media_state — PROPOSAL.md §4 / ARCHITECTURE.md §5
+// media_state — DESIGN.md §4 / ARCHITECTURE.md §5
 // ---------------------------------------------------------------------------
 
 /// Per-asset media lifecycle.
@@ -207,7 +207,7 @@ impl FromStr for MediaState {
 }
 
 // ---------------------------------------------------------------------------
-// archive_state — PROPOSAL.md §4 / ARCHITECTURE.md §5
+// archive_state — DESIGN.md §4 / ARCHITECTURE.md §5
 // ---------------------------------------------------------------------------
 
 /// Personal archive lifecycle for a message-skeleton row or an
@@ -284,7 +284,7 @@ impl FromStr for ArchiveState {
 }
 
 // ---------------------------------------------------------------------------
-// backup_state — PROPOSAL.md §4 / ARCHITECTURE.md §5
+// backup_state — DESIGN.md §4 / ARCHITECTURE.md §5
 // ---------------------------------------------------------------------------
 
 /// Backup lifecycle for a message-skeleton row or a backup segment.
@@ -362,7 +362,7 @@ impl FromStr for BackupState {
 
 /// Disaster-recovery restore lifecycle.
 ///
-/// Skeleton-first restore (`docs/PROPOSAL.md §11`): the restore
+/// Skeleton-first restore (`docs/DESIGN.md §11`): the restore
 /// pipeline visits every state in declaration order. The terminal
 /// state is [`RestoreState::FullRestoreComplete`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

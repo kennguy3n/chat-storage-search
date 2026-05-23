@@ -1,4 +1,4 @@
-//! Phase-4 key recovery foundation.
+//! key recovery foundation.
 //!
 //! Two recovery flows live here:
 //!
@@ -14,7 +14,7 @@
 //!    that code and pulls the bundle off the wire.
 //!
 //! Server-side escrow is **off by default** per
-//! `docs/PHASES.md §Phase 4` — neither flow involves the
+//! neither flow involves the
 //! KChat server seeing the user's master key.
 //!
 //! All secret material flows through
@@ -289,7 +289,7 @@ pub fn prepare_device_transfer(
 
 /// Open a [`DeviceTransferPayload`] under `transfer_code`.
 ///
-/// The decoded envelope must hold exactly four 32-byte keys —
+/// The decoded envelope must hold exactly four 32-byte keys
 /// any other shape surfaces as [`Error::Storage`] (CBOR / length
 /// mismatch) or [`Error::Crypto`] (AEAD failure).
 pub fn accept_device_transfer(
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn passphrase_whitespace_only_rejected() {
         // Passphrases that are only whitespace must fail the same
-        // way as the empty string — otherwise a paste-induced "  "
+        // way as the empty string — otherwise a paste-induced " "
         // would silently derive a valid key under any salt.
         let salt = fresh_salt();
         for whitespace in ["   ", "\t", "\n", " \t\n "] {

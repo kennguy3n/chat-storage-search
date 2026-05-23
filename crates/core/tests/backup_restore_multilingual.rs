@@ -1,6 +1,6 @@
-//! Phase 4 multilingual backup → restore corpus test.
+//! Multilingual backup → restore corpus test.
 //!
-//! `docs/PHASES.md §Phase 4` decision gate: "Backup chain restores
+//! The decision gate: "Backup chain restores
 //! conversations, skeletons, and recent bodies across every script
 //! the search layer supports". This test seeds eight scripts of
 //! plaintext, runs the backup pipeline (segment build + manifest

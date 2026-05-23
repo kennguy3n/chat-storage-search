@@ -2,7 +2,7 @@
 //!
 //! The [`RestoreState`] enum, transition rules, and serde wire
 //! form live in
-//! [`crate::local_store::state_machines`] —
+//! [`crate::local_store::state_machines`]
 //! `state_machine.rs` here only owns the SQL.
 //!
 //! The `restore_state` table is a single-row table (`CHECK

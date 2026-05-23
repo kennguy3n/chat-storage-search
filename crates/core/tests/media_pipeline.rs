@@ -1,6 +1,6 @@
-//! End-to-end integration test for the Phase-2 media pipeline.
+//! End-to-end integration test for the media pipeline.
 //!
-//! `docs/PHASES.md` Phase 2 ties together five separate modules
+//! The integration ties together five separate modules
 //! (`media::processor`, `media::chunker`, `media::cache`,
 //! `media::caption`, `media::routing`); this test exercises the
 //! happy path that connects them so a future regression in any one

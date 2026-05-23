@@ -1,12 +1,12 @@
-//! macOS-specific desktop integration scaffold.
+//! macOS-specific desktop integration.
 //!
-//! Phase 7, Task 5 (2026-05-04 batch). The two seams here are:
+//! The two seams here are:
 //!
 //! * [`SpotlightBridge`] — kchat's outbound interface to the
 //!   macOS Spotlight indexer. The eventual production
 //!   implementation builds an `NSUserActivity` / Core Spotlight
 //!   `CSSearchableItem` per message and pushes it through
-//!   `CSSearchableIndex.default()`. This module ships a
+//!   `CSSearchableIndex.default`. This module ships a
 //!   [`NoopSpotlightBridge`] for any environment where the
 //!   real platform bridge is not yet wired up (CI on Linux,
 //!   unit tests, headless macOS dev builds).
@@ -18,14 +18,14 @@
 //!   loops as `NSBackgroundActivityScheduler` activities
 //!   constrained to repeating intervals.
 //!
-//! Both seams are object-safe (`Box<dyn ...>`) and `Send + Sync`
+//! Both seams are object-safe (`Box<dyn...>`) and `Send + Sync`
 //! so the desktop crate can park them inside an
 //! `Arc<dyn SpotlightBridge>` / `Arc<dyn BackgroundScheduler>`
 //! and hand them to the platform layer.
 //!
 //! References:
-//! * `docs/PROPOSAL.md §7.4` — Spotlight anchors.
-//! * `docs/PHASES.md` Phase 7 — desktop integration.
+//! * `docs/DESIGN.md §7.4` — Spotlight anchors.
+//! * `docs/ARCHITECTURE.md §11` — desktop integration.
 
 use kchat_core::scheduler::BackgroundScheduler;
 use kchat_core::Error;
@@ -67,7 +67,7 @@ pub trait SpotlightBridge: Send + Sync + std::fmt::Debug {
     fn remove_conversation(&self, conversation_id: &str) -> Result<(), Error>;
 }
 
-/// Phase-7 placeholder Spotlight bridge.
+/// placeholder Spotlight bridge.
 ///
 /// Every method silently succeeds (`Ok(())`) — the desktop
 /// orchestration layer can install it on Linux CI runners
@@ -107,7 +107,7 @@ impl SpotlightBridge for NoopSpotlightBridge {
 // MacOsSchedulerBridge — outbound NSBackgroundActivityScheduler seam
 // ---------------------------------------------------------------------------
 
-/// Phase-7 placeholder for the macOS
+/// placeholder for the macOS
 /// `NSBackgroundActivityScheduler` bridge. Every method returns
 /// [`Error::NotImplemented`] so the orchestration layer can
 /// distinguish "no bridge installed" from "scheduler accepted

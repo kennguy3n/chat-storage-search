@@ -1,12 +1,12 @@
 // UniFFI Definition Language for the iOS bridge.
 //
 // Mirrors the public surface of the `kchat-core` crate (see
-// `docs/PROPOSAL.md §12` and `crates/core/src/lib.rs`). UUIDs are
+// `docs/DESIGN.md §12` and `crates/core/src/lib.rs`). UUIDs are
 // modelled as `string` here so the FFI layer is portable across
 // languages that lack a built-in UUID type — the bridge implementation
 // at `src/lib.rs` parses and validates them inside each method.
 //
-// Phase 1 scaffold: every type / enum / interface in this file maps
+// scaffold: every type / enum / interface in this file maps
 // directly to a wrapper in `src/lib.rs`. The wrappers convert into
 // the canonical types from `kchat-core` and back.
 
@@ -66,7 +66,7 @@ enum ContentKind {
   "Any",
 };
 
-// Phase 8 (2026-05-04 batch 6) — Task 8: scoped search target.
+// Scoped search target.
 // Mirrors `kchat_core::SearchTarget`. UUID-bearing variants pass
 // the id(s) as String because UDL has no native UUID type.
 [Enum]
@@ -86,31 +86,31 @@ interface SearchTarget {
 dictionary SearchQuery {
   string query_string;
   string? sender_filter;
-  // UUID string. Empty / null -> no filter.
+ // UUID string. Empty / null -> no filter.
   string? conversation_filter;
   i64? date_from;
   i64? date_to;
   ContentKind? content_kind;
-  // Phase 8 (2026-05-04 batch 6) — Task 8: optional scoping.
-  // null preserves the legacy `SearchTarget::Global` default so
-  // existing Swift call sites stay source-compatible.
+ // Optional scoping.
+ // null preserves the legacy `SearchTarget::Global` default so
+ // existing Swift call sites stay source-compatible.
   SearchTarget? target;
 };
 
 dictionary SearchResult {
-  // UUID string.
+ // UUID string.
   string message_id;
-  // UUID string.
+ // UUID string.
   string conversation_id;
   string sender_id;
   i64 created_at_ms;
   string? snippet;
   f64 rank_score;
   boolean is_cold;
-  // Raw cosine similarity from the semantic re-rank pass, when
-  // the hit went through `crate::search::merge_results`. `null`
-  // for FTS-only hits and for paths that never invoked the
-  // semantic ranker. Mirrors `kchat_core::SearchResult::semantic_score`.
+ // Raw cosine similarity from the semantic re-rank pass, when
+ // the hit went through `crate::search::merge_results`. `null`
+ // for FTS-only hits and for paths that never invoked the
+ // semantic ranker. Mirrors `kchat_core::SearchResult::semantic_score`.
   f64? semantic_score;
 };
 
@@ -119,14 +119,14 @@ dictionary SearchResult {
 // ---------------------------------------------------------------------------
 
 dictionary MessageView {
-  // UUID string.
+ // UUID string.
   string message_id;
-  // UUID string.
+ // UUID string.
   string conversation_id;
   string sender_id;
   i64 created_at_ms;
   i64 received_at_ms;
-  // UUID string. Empty / null -> not a reply.
+ // UUID string. Empty / null -> not a reply.
   string? reply_to;
   i64? edited_at_ms;
   i64? deleted_at_ms;
@@ -151,7 +151,7 @@ dictionary IngestResult {
   string? next_cursor;
 };
 
-// Result of `KChatCore.register_device` — Phase-1 placeholder, the
+// Result of `KChatCore.register_device` — placeholder, the
 // MLS credential / KeyPackage payload lands later.
 dictionary DeviceRegistration {
 };
@@ -161,19 +161,19 @@ dictionary DeviceRegistration {
 // ---------------------------------------------------------------------------
 
 interface KChatCore {
-  // Open `{config.data_dir}/kchat.db` with the supplied 32-byte key.
-  // Errors with `KChatError.Storage` if the database cannot be
-  // opened or with `KChatError.InvalidArgument` if `key` is not
-  // exactly 32 bytes.
+ // Open `{config.data_dir}/kchat.db` with the supplied 32-byte key.
+ // Errors with `KChatError.Storage` if the database cannot be
+ // opened or with `KChatError.InvalidArgument` if `key` is not
+ // exactly 32 bytes.
   [Throws=KChatError]
   constructor(KChatCoreConfig config, bytes key);
 
-  // Re-open the local store at `config.data_dir`, retaining the
-  // 32-byte key passed at construction.
+ // Re-open the local store at `config.data_dir`, retaining the
+ // 32-byte key passed at construction.
   [Throws=KChatError]
   void initialize(KChatCoreConfig config);
 
-  // Phase-1 stub. Returns `KChatError.NotImplemented`.
+ // stub. Returns `KChatError.NotImplemented`.
   [Throws=KChatError]
   DeviceRegistration register_device(string device_id);
 

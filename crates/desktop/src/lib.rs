@@ -1,22 +1,22 @@
 //! Desktop (macOS / Windows) consumer crate for kchat-core.
 //!
-//! Phase 7 (2026-05-04 batch): the platform-specific integration
+//! the platform-specific integration
 //! scaffolds live in [`macos`] and [`windows`]. Both modules are
 //! compiled on every host so unit tests can exercise the
 //! object-safety and noop-bridge behaviour without spinning up
 //! the actual platform runtime. The desktop orchestration layer
 //! is responsible for installing only the bridge that matches
-//! the running OS — see `docs/PROPOSAL.md §7.4`.
+//! the running OS — see `docs/DESIGN.md §7.4`.
 //!
-//! `pub use kchat_core as core` keeps the Phase-0 re-export so
+//! `pub use kchat_core as core` keeps the re-export so
 //! downstream desktop binaries can already depend on this crate
 //! and reach the rest of kchat-core through a stable name.
 //!
 //! ## Tracing
 //!
-//! `kchat-core` emits `tracing` spans / events on every hot path
-//! (Phase A.3). **Desktop binaries opt in** to seeing them by
-//! calling [`install_tracing_subscriber`] once on startup —
+//! `kchat-core` emits `tracing` spans / events on every hot path.
+//! **Desktop binaries opt in** to seeing them by
+//! calling [`install_tracing_subscriber`] once on startup
 //! unlike the iOS and Android bridges which auto-install on the
 //! first `KChatCore::new` / `KChatBridgeHandle::initialize`, the
 //! desktop crate is the asymmetric case because Tauri / Slint /
@@ -30,7 +30,7 @@
 //! ```no_run
 //! # fn main() {
 //! kchat_desktop::install_tracing_subscriber();
-//! // ... continue building your Tauri / Slint / Electron app
+//! //... continue building your Tauri / Slint / Electron app
 //! # }
 //! ```
 //!

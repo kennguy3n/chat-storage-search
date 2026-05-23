@@ -1,4 +1,4 @@
-//! Phase 7, Task 7 (2026-05-04 batch) — production-scale
+//! production-scale
 //! integration test.
 //!
 //! Bumps the existing `tests/large_scale.rs` scaffold to a
@@ -16,8 +16,8 @@
 //! 3. Multilingual search across all 11 scripts. Each script's
 //!    distinguishing token must surface at least one hit.
 //! 4. Search-latency budget: p95 over a stratified query mix
-//!    must stay below 150 ms (the Phase 1 budget defended in
-//!    `docs/PROPOSAL.md §6.4`).
+//!    must stay below 150 ms (the budget defended in
+//!    `docs/DESIGN.md §6.4`).
 //!
 //! The whole file is `#[ignore]` because of the size — it is
 //! not part of the default `cargo test` matrix. Run with

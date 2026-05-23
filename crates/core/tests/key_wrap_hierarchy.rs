@@ -1,5 +1,5 @@
 //! Integration test for the [`crate::crypto::key_wrap`] module wired
-//! against the real key hierarchy. Phase 0 must guarantee that:
+//! against the real key hierarchy. must guarantee that:
 //!
 //! * `K_asset` survives a wrap-then-unwrap round trip under any
 //!   hierarchy root,

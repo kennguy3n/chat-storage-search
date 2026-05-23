@@ -1,4 +1,4 @@
-//! Integration test for the Phase 5, Task 1 cold-bucket search
+//! Integration test for the cold-bucket search
 //! fan-out.
 //!
 //! End-to-end exercise of [`QueryEngine::execute_search_with_cold_source`]
@@ -17,9 +17,9 @@
 //! 4. Run the unified search via
 //!    [`QueryEngine::execute_search_with_cold_source`] and verify
 //!    that:
-//!    * `IncludeCold` returns the shard rows with `is_cold = true`.
-//!    * `LocalOnly` skips the cold source entirely.
-//!    * Conversation-filter scoping reaches into the cold path.
+//! * `IncludeCold` returns the shard rows with `is_cold = true`.
+//! * `LocalOnly` skips the cold source entirely.
+//! * Conversation-filter scoping reaches into the cold path.
 
 use std::collections::HashMap;
 
@@ -282,7 +282,7 @@ fn cold_shard_conversation_filter_scopes_fan_out() {
     assert_eq!(results[0].message_id, mid_a);
 }
 
-/// Phase 5, Task 1 regression: a message that exists in **both**
+/// regression: a message that exists in **both**
 /// the local FTS / fuzzy result set and a cold shard for the same
 /// `(conversation_id, time_bucket)` must
 ///
@@ -425,8 +425,8 @@ fn cold_shard_merge_does_not_double_weight_local_rows() {
     // kind factor is strictly < 1 for any non-zero age × text
     // kind, the buggy result would be:
     //
-    //     merged_buggy = (local_only_score + raw_cold) * recency * kind
-    //                  < local_only_score + raw_cold
+    // merged_buggy = (local_only_score + raw_cold) * recency * kind
+    // < local_only_score + raw_cold
     //
     // and could even fall below `local_only_score`. The fix path
     // sums raw cold contribution onto local without re-weighting
@@ -460,9 +460,9 @@ fn cold_shard_merge_does_not_double_weight_local_rows() {
     );
 }
 
-/// Phase 5, Task 1 contract: when the caller has narrowed the
+/// contract: when the caller has narrowed the
 /// search to a non-text content kind, the cold fan-out must
-/// short-circuit before consulting `ColdShardSource`. Phase 5
+/// short-circuit before consulting `ColdShardSource`.
 /// only ships text + fuzzy cold shards, so any cold fetch on a
 /// media-only query would (a) be wasted I/O and (b) leak text
 /// hits through the kind filter that the local pass enforced via
@@ -481,7 +481,7 @@ fn cold_shard_skips_fan_out_for_non_text_kind() {
         fn cold_buckets(&self) -> Result<Vec<(String, String)>, Error> {
             panic!(
                 "cold_buckets must not be called when content_kind is non-text \
-                 (Phase 5 ships text + fuzzy cold shards only)"
+                 (only text + fuzzy cold shards ship today)"
             );
         }
         fn fetch_text_rows(
@@ -504,8 +504,8 @@ fn cold_shard_skips_fan_out_for_non_text_kind() {
     let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     // Image / Video / Audio / Document all map to the `media`
-    // skeleton kind in Phase 1, and none of them have a cold
-    // shard variant in Phase 5. Each must skip the cold fan-out.
+    // skeleton kind in and none of them have a cold
+    // shard variant in Each must skip the cold fan-out.
     for kind in [
         ContentKind::Image,
         ContentKind::Video,

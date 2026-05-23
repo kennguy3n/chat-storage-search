@@ -1,4 +1,4 @@
-//! Integration tests for the Phase 8, batch-5
+//! Integration tests for the
 //! multi-scope-search foundation.
 //!
 //! Exercises the new [`SearchTarget`] variants

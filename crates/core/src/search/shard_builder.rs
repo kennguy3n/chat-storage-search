@@ -1,6 +1,6 @@
-//! Encrypted search-index shard build / restore (Phase 4, Task 6).
+//! Encrypted search-index shard build / restore.
 //!
-//! `docs/PROPOSAL.md §7.8` describes the encrypted shard layer
+//! `docs/DESIGN.md §7.8` describes the encrypted shard layer
 //! that the cloud-backup / archive pipelines use to seal FTS and
 //! fuzzy index rows. This module is the **runtime** counterpart
 //! to [`crate::formats::search_shard::SearchIndexShard`] (the
@@ -17,9 +17,9 @@
 //! 3. zstd-compress the CBOR.
 //! 4. AEAD-seal the compressed bytes with the appropriate
 //!    `K_text_index_shard(shard_id)` /
-//!    `K_fuzzy_index_shard(shard_id)` (Phase 4 reuses the
-//!    text-index hierarchy for fuzzy shards until the per-fuzzy
-//!    derivation lands in Phase 5).
+//!    `K_fuzzy_index_shard(shard_id)` (the text-index hierarchy
+//!    is reused for fuzzy shards until the per-fuzzy derivation
+//!    is introduced).
 //! 5. Wrap the ciphertext into a [`SearchIndexShard`] so the
 //!    backup manifest can carry it.
 //!
@@ -81,7 +81,7 @@ pub struct FuzzyRow {
 }
 
 /// One row of `search_vector` ready to seal into a vector
-/// shard. Phase 6, Task 7.
+/// shard.
 ///
 /// `embedding` is the raw INT8-quantized blob — *not* the
 /// dequantized `Vec<f32>`. Keeping the wire format identical to
@@ -106,7 +106,7 @@ pub struct VectorRow {
 }
 
 /// One row of `media_search_index` ready to seal into a media
-/// shard. Phase 6, Task 7.
+/// shard.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaIndexRow {
     /// `media_asset.asset_id` for the row.
@@ -133,17 +133,16 @@ pub const FUZZY_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_FUZZY_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`VectorShardPayload`].
 ///
-/// Phase 6, Task 7. Distinct from the text / fuzzy magics so a
-/// malicious sealer cannot retag a vector shard as text (and
-/// vice-versa) — the restore path checks the magic against the
-/// expected discriminator before deserializing.
+/// Distinct from the text / fuzzy magics so a malicious sealer
+/// cannot retag a vector shard as text (and vice-versa) — the
+/// restore path checks the magic against the expected
+/// discriminator before deserializing.
 pub const VECTOR_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_VECTOR_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`MediaShardPayload`].
 pub const MEDIA_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_MEDIA_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`BloomShardPayload`].
-/// Phase 8 (2026-05-04 batch).
 pub const BLOOM_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_BLOOM_SHARD_PAYLOAD_V1";
 
 /// CBOR-sealed plaintext of a text [`SearchIndexShard`].
@@ -167,7 +166,6 @@ pub struct FuzzyShardPayload {
 }
 
 /// CBOR-sealed plaintext of a vector [`SearchIndexShard`]
-/// (Phase 6, Task 7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorShardPayload {
     /// Always [`VECTOR_SHARD_PAYLOAD_MAGIC`].
@@ -178,7 +176,6 @@ pub struct VectorShardPayload {
 }
 
 /// CBOR-sealed plaintext of a media [`SearchIndexShard`]
-/// (Phase 6, Task 7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaShardPayload {
     /// Always [`MEDIA_SHARD_PAYLOAD_MAGIC`].
@@ -188,9 +185,9 @@ pub struct MediaShardPayload {
     pub rows: Vec<MediaIndexRow>,
 }
 
-/// CBOR-sealed plaintext of a bloom-filter [`SearchIndexShard`]
-/// (Phase 8 — 2026-05-04 batch). The payload encodes the
-/// in-memory [`BloomFilter`] as `(bit_count, hash_count, bits)`.
+/// CBOR-sealed plaintext of a bloom-filter [`SearchIndexShard`].
+/// The payload encodes the in-memory [`BloomFilter`] as
+/// `(bit_count, hash_count, bits)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BloomShardPayload {
     /// Always [`BLOOM_SHARD_PAYLOAD_MAGIC`].
@@ -216,11 +213,11 @@ pub struct BuiltShard {
     /// Wire-format shard ready to attach to a backup manifest.
     pub shard: SearchIndexShard,
     /// `K_*_index_shard(shard_id)` the orchestrator just sealed
-    /// the shard under. Phase 5 will move this into a
+    /// the shard under. A follow-up will move this into a
     /// `wrapped_k_shard` field on the manifest entry — until
     /// then the orchestrator keeps it in memory the same way the
     /// backup pipeline keeps `K_backup_segment` next to
-    /// `BuiltBackupSegment` (Task 5).
+    /// `BuiltBackupSegment`.
     pub k_shard: KeyMaterial,
 }
 
@@ -258,7 +255,7 @@ fn build_shard_aad(
 /// transport pipeline uses this to translate a plaintext
 /// `conversation_id` into the opaque
 /// `conversation_id_hash` the backend stores its shards under
-/// (`docs/PROPOSAL.md §7.8`).
+/// (`docs/DESIGN.md §7.8`).
 pub fn keyed_conversation_id_hash(
     conversation_id: &str,
     conversation_hash_key: &KeyMaterial,
@@ -457,7 +454,6 @@ pub fn restore_fuzzy_search_shard(
 }
 
 /// Build an encrypted vector shard from the supplied rows.
-/// Phase 6, Task 7.
 ///
 /// `k_vector_index_shard` is the per-shard AEAD key, typically
 /// `K_vector_index_shard(shard_id)` from
@@ -526,7 +522,6 @@ pub fn restore_vector_search_shard(
 }
 
 /// Build an encrypted media shard from the supplied rows.
-/// Phase 6, Task 7.
 pub fn build_media_search_shard(
     rows: Vec<MediaIndexRow>,
     conversation_id: &str,
@@ -588,7 +583,7 @@ pub fn restore_media_search_shard(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8 — Bloom filter shards
+// Bloom filter shards
 // ---------------------------------------------------------------------------
 
 /// Default number of hash positions per word.
@@ -982,7 +977,7 @@ mod tests {
         );
     }
 
-    // ----- Phase 6, Task 7: vector + media shards --------------
+    // -----: vector + media shards --------------
 
     use crate::crypto::key_hierarchy::{derive_media_index_shard, derive_vector_index_shard};
 
@@ -1157,7 +1152,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // Phase 8 — Bloom shard tests
+    // Bloom shard tests
     // -------------------------------------------------------------
 
     fn fresh_bloom_shard_key() -> KeyMaterial {

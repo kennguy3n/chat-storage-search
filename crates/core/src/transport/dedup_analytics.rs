@@ -1,10 +1,9 @@
-//! Read-only dedup analytics integration with `kennguy3n/zk-object-fabric`'s
-//! ContentIndex (Phase 7, batch-5 — 2026-05-04).
+//! Read-only dedup analytics integration with
+//! `kennguy3n/zk-object-fabric`'s ContentIndex.
 //!
-//! `docs/PHASES.md` Phase 7 calls for "dedup analytics integration
-//! with `kennguy3n/zk-object-fabric`'s ContentIndex metrics
-//! (read-only telemetry, no plaintext leaks)". This module lands
-//! the trait surface and the `Noop` placeholder.
+//! This module exposes a trait surface for read-only telemetry
+//! aggregated by an upstream ContentIndex implementation, plus a
+//! `Noop` placeholder for builds that do not need the integration.
 //!
 //! ## Privacy contract
 //!
@@ -134,7 +133,6 @@ impl StorageSavings {
 }
 
 /// One dedup-related event captured at the ZKOF sink boundary.
-/// Phase 7 (2026-05-04 batch 10 — Task 10).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DedupEvent {
     /// An object was uploaded to the ZK Object Fabric. When
@@ -205,7 +203,7 @@ pub trait DedupAnalytics: Send + Sync + std::fmt::Debug {
     /// [`Self::query_dedup_ratio`].
     fn query_storage_savings(&self, tenant_id: &str) -> Result<StorageSavings>;
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 10): record one
+    /// record one
     /// dedup-related event. The default implementation no-ops so
     /// existing probes (notably [`NoopDedupAnalytics`]) keep
     /// compiling. The [`InProcessDedupAnalytics`] /
@@ -276,7 +274,7 @@ impl DedupAnalytics for FixedDedupAnalytics {
     }
 }
 
-/// Phase 7 (2026-05-04 batch 10 — Task 10) — in-process probe
+/// in-process probe
 /// that aggregates [`DedupEvent`] records emitted by the backup
 /// and media sinks into a [`DedupStats`] / [`StorageSavings`]
 /// snapshot.
@@ -395,7 +393,7 @@ impl DedupAnalytics for InProcessDedupAnalytics {
     }
 }
 
-/// Phase 7 (2026-05-04 batch 10 — Task 10) — ZK Object Fabric
+/// ZK Object Fabric
 /// dedup-analytics probe that wraps a live `S3Client` and reads
 /// the upstream `metadata/content_index/stats` snapshot.
 ///
@@ -569,7 +567,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 10 tests
+    // tests
     // ----------------------------------------------------------------
 
     #[test]
@@ -621,8 +619,8 @@ mod tests {
         assert_eq!(savings.objects_deduped, 1);
     }
 
-    /// Regression for the BUG-0002 finding: `Default::default()`
-    /// must produce the same recent-buffer behaviour as `new()`
+    /// Regression for the BUG-0002 finding: `Default::default`
+    /// must produce the same recent-buffer behaviour as `new`
     /// (capacity 512), not the broken `recent_capacity: 0` that
     /// the auto-derived `Default` produced.
     #[test]

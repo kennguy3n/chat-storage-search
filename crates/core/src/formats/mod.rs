@@ -1,6 +1,6 @@
 //! Shared on-wire / on-disk binary formats.
 //!
-//! Phase 0 locks the CBOR-encoded frames and manifests that travel
+//! Locks the CBOR-encoded frames and manifests that travel
 //! between the device, the KChat backend, and the ZK Object Fabric
 //! backup sink. Every type in this module:
 //!
@@ -12,7 +12,7 @@
 //! * uses `#[serde(with = "serde_bytes")]` on byte arrays so CBOR
 //!   emits a compact byte-string instead of an array of integers.
 //!
-//! See `docs/PROPOSAL.md`:
+//! See `docs/DESIGN.md`:
 //! * §5.1 — archive segment types,
 //! * §6.2 — backup segment frame,
 //! * §6.3 — backup manifest frame,
@@ -35,18 +35,18 @@ pub const ARCHIVE_SEGMENT_MAGIC: [u8; 12] = *b"KCHAT_ARC_V1";
 /// On-wire `version` field carried by every frame in this module.
 pub const FRAME_VERSION: u16 = 1;
 
-/// Segment-type discriminant covering both backup (`docs/PROPOSAL.md
-/// §6.2`) and archive (`docs/PROPOSAL.md §5.1`) segments.
+/// Segment-type discriminant covering both backup (`docs/DESIGN.md
+/// §6.2`) and archive (`docs/DESIGN.md §5.1`) segments.
 ///
 /// Backup segments carry a single payload type (`Events`); archive
 /// segments use the seven payload variants listed in §5.1. Mixing the
-/// two enums into one tagged value keeps the wire format uniform —
+/// two enums into one tagged value keeps the wire format uniform
 /// frames are always parsed with the same `SegmentType` decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentType {
     /// Backup segment payload: a CBOR-encoded slice of the backup
-    /// event journal (`docs/PROPOSAL.md §6.1`).
+    /// event journal (`docs/DESIGN.md §6.1`).
     Events,
 
     /// Archive segment: new / edited / deleted message bodies for a
@@ -91,7 +91,7 @@ impl SegmentType {
     }
 }
 
-/// Backup segment frame from `docs/PROPOSAL.md §6.2`.
+/// Backup segment frame from `docs/DESIGN.md §6.2`.
 ///
 /// The payload (`ciphertext`) is the AEAD-sealed, zstd-compressed
 /// CBOR encoding of a slice of the backup event journal. The frame
@@ -129,7 +129,7 @@ pub struct BackupSegmentFrame {
     pub nonce: [u8; 24],
 
     /// 32-byte BLAKE3 hash of the canonical AAD (per
-    /// `docs/PROPOSAL.md §8.3`). Lets a verifier authenticate the
+    /// `docs/DESIGN.md §8.3`). Lets a verifier authenticate the
     /// frame's metadata before opening the AEAD.
     #[serde(with = "serde_bytes_array")]
     pub aad_hash: [u8; 32],
@@ -140,7 +140,7 @@ pub struct BackupSegmentFrame {
     pub ciphertext: Vec<u8>,
 
     /// SHA-256 over `ciphertext`. Per-chunk integrity layer described
-    /// in `docs/PROPOSAL.md §8.3` (the per-chunk SHA-256 line).
+    /// in `docs/DESIGN.md §8.3` (the per-chunk SHA-256 line).
     #[serde(with = "serde_bytes_array")]
     pub ciphertext_sha256: [u8; 32],
 }
@@ -154,7 +154,7 @@ impl BackupSegmentFrame {
 }
 
 /// Archive segment frame mirroring [`BackupSegmentFrame`] for the
-/// personal-archive path described in `docs/PROPOSAL.md §5`.
+/// personal-archive path described in `docs/DESIGN.md §5`.
 ///
 /// Archive segments are sealed with `K_archive_segment(segment_id)`
 /// derived from `K_archive_root` (see [`crate::crypto::key_hierarchy`]).
@@ -171,7 +171,7 @@ pub struct ArchiveSegmentFrame {
     pub segment_id: Uuid,
 
     /// One of the seven archive segment types from
-    /// `docs/PROPOSAL.md §5.1`.
+    /// `docs/DESIGN.md §5.1`.
     pub segment_type: SegmentType,
 
     /// First event sequence number covered by this segment

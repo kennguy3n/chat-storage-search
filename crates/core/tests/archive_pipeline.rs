@@ -1,11 +1,11 @@
-//! End-to-end Phase-3 archive pipeline integration test.
+//! End-to-end archive pipeline integration test.
 //!
 //! Exercises the full flow:
 //!
 //! 1. Open an in-memory `LocalStoreDb`.
-//! 2. Seed a conversation + 5 messages via `MessagePersister` —
+//! 2. Seed a conversation + 5 messages via `MessagePersister`
 //!    each persist mirrors into both `backup_event_journal` and
-//!    `archive_event_journal` (Task 1 wiring).
+//!    `archive_event_journal`.
 //! 3. Read unsegmented archive events.
 //! 4. Group by `(conversation_id, time_bucket)` via
 //!    `ArchiveSegmentBuilder::group_events_by_bucket`.
@@ -49,14 +49,14 @@ const MAY_BUCKET: &str = "2026-05";
 
 // `default_time_bucket` uses a coarse 30-days-per-month / 365-days-per-year
 // heuristic (see `archive::segment_builder::default_time_bucket`):
-//   year  = 1970 + (total_days / 365)
-//   month = 1   + ((total_days % 365) / 30).min(11)
+// year = 1970 + (total_days / 365)
+// month = 1 + ((total_days % 365) / 30).min(11)
 // To land in `2026-04` we want `years_since_1970 = 56` and
 // `(day_of_year / 30) = 3`, i.e. `total_days in [20530, 20559]`. The
 // constants below pick the middle of those windows.
 //
-//   APRIL_BUCKET_MS = 20_540 days * 86_400 s * 1_000 ms
-//   MAY_BUCKET_MS   = 20_570 days * 86_400 s * 1_000 ms
+// APRIL_BUCKET_MS = 20_540 days * 86_400 s * 1_000 ms
+// MAY_BUCKET_MS = 20_570 days * 86_400 s * 1_000 ms
 const APRIL_BUCKET_MS: i64 = 20_540 * 86_400 * 1_000;
 const MAY_BUCKET_MS: i64 = 20_570 * 86_400 * 1_000;
 
@@ -143,7 +143,7 @@ fn archive_pipeline_end_to_end() {
 
     // --- 5. Build segment under K_archive_segment derived from epoch key ---
     // We mint a placeholder segment id up-front so we can derive
-    // its key, but `build_segment` allocates its own segment_id —
+    // its key, but `build_segment` allocates its own segment_id
     // so derive against the segment id the builder returns.
     // First call build_segment with a temporary key, then re-build
     // would be wasteful; instead we derive a key keyed on a stable
@@ -262,7 +262,7 @@ fn archive_pipeline_end_to_end() {
     );
 }
 
-/// Phase 3, Task 6: end-to-end build + decrypt round-trip for the
+/// end-to-end build + decrypt round-trip for the
 /// new `TimelineSkeleton` and `Checkpoint` segment variants.
 ///
 /// Mirrors the existing `archive_pipeline_round_trip` shape but
@@ -342,9 +342,9 @@ fn archive_pipeline_timeline_skeleton_and_checkpoint_segments_round_trip() {
     assert_ne!(skeleton_seg.ciphertext, checkpoint_seg.ciphertext);
 }
 
-/// Phase 3, batch-5 (2026-05-04): the archive segment builder
+/// the archive segment builder
 /// covers the remaining four `SegmentType` variants from
-/// `docs/PROPOSAL.md §5.1` — `MediaKeyDelta`, `SearchTextIndex`,
+/// `docs/DESIGN.md §5.1` — `MediaKeyDelta`, `SearchTextIndex`,
 /// `SearchVectorIndex`, `MediaIndex`. Each shares the same
 /// CBOR → zstd → XChaCha20-Poly1305 pipeline, and the
 /// constructor on `SegmentBuildRequest` must preserve the
@@ -452,11 +452,11 @@ fn archive_pipeline_remaining_segment_types_round_trip_and_reject_non_archive() 
     );
 }
 
-/// Phase 3, Task 9: epoch-key rotation + archive compaction
+/// epoch-key rotation + archive compaction
 /// across an epoch boundary.
 ///
 /// Validates the cross-epoch invariants from
-/// `docs/PROPOSAL.md §2.1` end to end at the public-API surface:
+/// `docs/DESIGN.md §2.1` end to end at the public-API surface:
 ///
 /// 1. Create an `EpochKeyManager` rooted at epoch `2026-01` and
 ///    seal an archive segment under that epoch's segment key.
@@ -663,11 +663,11 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
     );
 }
 
-/// Phase 7 / Task 9 — full three-epoch manifest chain decode
+/// full three-epoch manifest chain decode
 /// after a simulated restore.
 ///
 /// Models the long-tail cross-epoch decrypt path documented in
-/// `docs/PROPOSAL.md §2.1`:
+/// `docs/DESIGN.md §2.1`:
 ///
 /// 1. Bootstrap the epoch manager at epoch `2026-01` and seal a
 ///    segment under that epoch's key.
@@ -681,9 +681,9 @@ fn archive_pipeline_epoch_rotation_and_cross_epoch_compaction() {
 ///    three segments — including the two that were sealed under
 ///    retired epoch keys.
 ///
-/// This is the integration shape Task 9 calls out: the manifest
-/// chain is the *only* thing a restoring device sees, so every
-/// retired epoch key must be reachable from the chain alone.
+/// This is the manifest-chain restore contract: the chain is the
+/// *only* thing a restoring device sees, so every retired epoch
+/// key must be reachable from the chain alone.
 #[test]
 fn archive_manifest_chain_carries_wrapped_keys_for_three_epoch_restore() {
     use kchat_core::archive::epoch_keys::EpochKeyManager;

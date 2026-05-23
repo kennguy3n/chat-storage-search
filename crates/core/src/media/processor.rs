@@ -1,7 +1,7 @@
 //! Media processor: turn a plaintext blob into the on-wire / on-disk
 //! representation expected by the rest of the core.
 //!
-//! `docs/PROPOSAL.md §3.2` (the `media_asset` row), `§5.7` (tiered
+//! `docs/DESIGN.md §3.2` (the `media_asset` row), `§5.7` (tiered
 //! media storage), and `§8` (chunking + AEAD) are the authoritative
 //! sources for the end-to-end flow that [`process_media`] implements:
 //!
@@ -10,7 +10,7 @@
 //!    [`crate::media::chunker::chunk_and_encrypt`] (with optional
 //!    `§8.2` size-class padding).
 //! 3. Wrap `K_asset` under `wrapping_key` using AES-256-KW
-//!    (`crate::crypto::key_wrap::wrap_key` — see `docs/PROPOSAL.md
+//!    (`crate::crypto::key_wrap::wrap_key` — see `docs/DESIGN.md
 //!    §7` and `crates/core/src/crypto/key_wrap.rs`).
 //! 4. Build the [`MediaDescriptor`] the local store and the archive
 //!    / backup engines round-trip through CBOR.
@@ -87,7 +87,7 @@ pub struct MediaProcessResult {
 ///
 /// `wrapping_key` is the bytes of one of `K_local_db`,
 /// `K_archive_root`, or `K_backup_root` (32 bytes); see
-/// `docs/PROPOSAL.md §7` and the
+/// `docs/DESIGN.md §7` and the
 /// [`crate::crypto::key_hierarchy`] module. `pad = true` runs the
 /// `§8.2` size-class padding so the on-wire blob length only reveals
 /// the size class.
@@ -103,7 +103,7 @@ pub fn process_media(
     rand::thread_rng().fill_bytes(k_asset_buf.as_mut_slice());
 
     // 2) Allocate identifiers up front so the chunker AAD agrees
-    //    with the descriptor.
+    // with the descriptor.
     let asset_id = Uuid::now_v7();
     let blob_id = Uuid::now_v7();
     let blob_id_bytes: [u8; 16] = *blob_id.as_bytes();
@@ -134,10 +134,10 @@ pub fn process_media(
     };
 
     // 6) Optional thumbnail. Errors are non-fatal — the original
-    //    media still uploads cleanly without a preview, and
-    //    non-image MIME types (`video/*`, `application/*`, `audio/*`)
-    //    deliberately collapse to `None` so the caller can branch on
-    //    the optional without inspecting the error variant.
+    // media still uploads cleanly without a preview, and
+    // non-image MIME types (`video/*`, `application/*`, `audio/*`)
+    // deliberately collapse to `None` so the caller can branch on
+    // the optional without inspecting the error variant.
     let thumbnail_bytes = ThumbnailGenerator::new()
         .generate_thumbnail(plaintext, mime_type, DEFAULT_MAX_DIMENSION)
         .ok()
@@ -259,15 +259,15 @@ mod tests {
         let res = process_media(&pt, "image/png", &wrapping, BlobClass::Media, false).unwrap();
 
         // 1) Unwrap K_asset and confirm we recover the same key the
-        //    chunker used.
+        // chunker used.
         let unwrapped = unwrap_key(&wrapping, &res.descriptor.wrapped_k_asset).unwrap();
-        // `as_ref::<[u8]>()` to disambiguate now that `hybrid_array`
+        // `as_ref::<[u8]>` to disambiguate now that `hybrid_array`
         // (pulled in by `ml-dsa`) also implements
         // `AsRef<Array<T, U>> for [T; N]`.
         assert_eq!(&unwrapped[..], &res.k_asset_raw[..]);
 
         // 2) Decrypt every chunk under the same blob_id / class /
-        //    merkle_root and confirm the plaintext matches.
+        // merkle_root and confirm the plaintext matches.
         let blob_id_bytes: [u8; 16] = *res.descriptor.blob_id.as_bytes();
         let decrypted = verify_and_decrypt(
             &res.sealed_chunks,
@@ -506,7 +506,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase-2 finishing pass: thumbnail wiring on `process_media`.
+    // finishing pass: thumbnail wiring on `process_media`.
     // -----------------------------------------------------------------
     use image::{ImageBuffer, ImageFormat as TestImageFormat, Rgb, Rgba};
     use std::io::Cursor as TestCursor;

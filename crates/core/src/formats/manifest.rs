@@ -1,6 +1,6 @@
 //! Backup and archive manifest specs.
 //!
-//! `docs/PROPOSAL.md §6.3` defines the backup manifest frame. Archive
+//! `docs/DESIGN.md §6.3` defines the backup manifest frame. Archive
 //! manifests share the same shape and chaining discipline but cover
 //! the personal-archive store described in §5; we model them as a
 //! parallel struct rather than overloading one type because the two
@@ -56,7 +56,7 @@ pub const GENESIS_PREVIOUS_HASH: [u8; 32] = [0u8; 32];
 // --- Manifest sub-records ---------------------------------------------------
 
 /// Reference to a sealed segment uploaded under this manifest
-/// (`docs/PROPOSAL.md §6.3`).
+/// (`docs/DESIGN.md §6.3`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestSegmentRef {
     /// Segment identifier (matches
@@ -115,7 +115,7 @@ pub struct ManifestMediaRef {
 }
 
 /// Tombstone record for a hard-deleted message, conversation, or
-/// asset (`docs/PROPOSAL.md §6.3`).
+/// asset (`docs/DESIGN.md §6.3`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tombstone {
     /// What was deleted (`"message"`, `"conversation"`, `"media"`,
@@ -133,7 +133,7 @@ pub struct Tombstone {
 /// `K_archive_root` (AES-256-KW) and recorded in the archive
 /// manifest chain.
 ///
-/// `docs/PROPOSAL.md §2.1` describes the cross-epoch decryption
+/// `docs/DESIGN.md §2.1` describes the cross-epoch decryption
 /// recipe: every retired epoch's key bytes are re-wrapped under
 /// `K_archive_root` whenever the active epoch rotates and stored
 /// in the *next* manifest. The restore path unwraps them on demand
@@ -156,7 +156,7 @@ pub struct WrappedEpochKeyRef {
 
 // --- BackupManifest ---------------------------------------------------------
 
-/// Backup manifest frame (`docs/PROPOSAL.md §6.3`).
+/// Backup manifest frame (`docs/DESIGN.md §6.3`).
 ///
 /// The manifest is itself sealed with `K_backup_manifest` and uploaded
 /// last so that a half-failed backup never leaves a manifest referring
@@ -212,7 +212,7 @@ pub struct BackupManifest {
     /// canonical payload as `manifest_signature`. Both signatures
     /// must verify for a manifest to be accepted.
     ///
-    /// `#[serde(default)]` is harmless on a pre-launch protocol —
+    /// `#[serde(default)]` is harmless on a pre-launch protocol
     /// the verifier still rejects a missing/empty signature
     /// because the ML-DSA-65 leg checks the byte length — and
     /// keeps any partial encoder regression failing loudly
@@ -238,7 +238,7 @@ impl BackupManifest {
 // --- ArchiveManifest --------------------------------------------------------
 
 /// Archive manifest frame for the personal-archive store
-/// (`docs/PROPOSAL.md §5.2`). Same shape as [`BackupManifest`] but a
+/// (`docs/DESIGN.md §5.2`). Same shape as [`BackupManifest`] but a
 /// disjoint generation chain: archive generation `N+1` points at
 /// archive generation `N` only, never at a backup manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

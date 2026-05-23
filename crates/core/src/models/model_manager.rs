@@ -1,6 +1,6 @@
-//! Model lifecycle manager — Phase 6, Task 5.
+//! Model lifecycle manager.
 //!
-//! `docs/PROPOSAL.md §7.6` describes lazy / eager model
+//! `docs/DESIGN.md §7.6` describes lazy / eager model
 //! distribution: XLM-R is eagerly pre-loaded (~80 MB), while
 //! MobileCLIP-S2 (~80 MB) and Whisper (~75–140 MB) are lazily
 //! downloaded on first use. Quantization is INT8 by default with
@@ -32,7 +32,7 @@ use crate::Result;
 ///
 /// - `Float32`: full-precision; used during research only.
 /// - `Int8`: default tier shipped to devices.
-/// - `Int4`: tight-storage tier (`docs/PROPOSAL.md §7.6` —
+/// - `Int4`: tight-storage tier (`docs/DESIGN.md §7.6`
 ///   ONNX `MatMulNBits`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Quantization {
@@ -103,14 +103,13 @@ impl Default for ModelManagerConfig {
 /// downgrades the default tier from `Int8` to `Int4`.
 ///
 /// 512 MiB matches the documented "tight-storage" cutoff in
-/// `docs/PROPOSAL.md §7.6`.
+/// `docs/DESIGN.md §7.6`.
 pub const TIGHT_STORAGE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Static descriptor for a model artifact. Phase 6, Task 5
-/// (2026-05-04 batch).
+/// Static descriptor for a model artifact.
 ///
 /// Unlike [`ModelArtifact`] (which carries dynamic on-disk state
-/// — file path, size, sha256), this is a compile-time constant
+/// file path, size, sha256), this is a compile-time constant
 /// describing the *expected* shape of the artifact:
 /// `(model_id, model_version, filename, quantization)`. The
 /// platform downloader bridge resolves the spec to a concrete
@@ -143,7 +142,7 @@ pub const XLMR_INT8_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
 };
 
 /// XLM-R INT4 artifact descriptor — the tight-storage tier
-/// (`docs/PROPOSAL.md §7.6`, ONNX `MatMulNBits`).
+/// (`docs/DESIGN.md §7.6`, ONNX `MatMulNBits`).
 pub const XLMR_INT4_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
     model_id: "xlmr",
     model_version: crate::models::embeddings::XLMR_MODEL_VERSION,
@@ -161,7 +160,7 @@ pub const MOBILECLIP_S2_INT8_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
 };
 
 /// MobileCLIP-S2 INT4 artifact descriptor — the tight-storage
-/// tier (`docs/PROPOSAL.md §7.6`).
+/// tier (`docs/DESIGN.md §7.6`).
 pub const MOBILECLIP_S2_INT4_ARTIFACT: ModelArtifactSpec = ModelArtifactSpec {
     model_id: "mobileclip_s2",
     model_version: crate::models::clip::MOBILECLIP_S2_MODEL_VERSION,
@@ -346,8 +345,7 @@ impl ModelManager {
     }
 
     /// Pick the correct [`ModelArtifactSpec`] for `model_id`
-    /// given the device's free `available_storage`. Phase 6,
-    /// Task 5 (2026-05-04 batch).
+    /// given the device's free `available_storage`.
     ///
     /// Defers the storage-tier decision to
     /// [`Self::select_quantization`] and looks up the matching
@@ -387,7 +385,7 @@ impl ModelManager {
     }
 
     // -------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 8: EP benchmark capture
+    // EP benchmark capture
     // and auto-selection.
     // -------------------------------------------------------------
 
@@ -605,7 +603,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 6, Task 5 (2026-05-04 batch) — INT4 selection +
+    // INT4 selection +
     // ModelArtifactSpec coverage.
     // -----------------------------------------------------------
 

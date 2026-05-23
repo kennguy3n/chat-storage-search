@@ -1,4 +1,4 @@
-//! Phase-3 / Phase-7 archive compaction.
+//! Archive compaction.
 //!
 //! Periodically the orchestration layer needs to shrink the
 //! archive footprint per `(account, conversation, time_bucket)`:
@@ -8,19 +8,18 @@
 //! Storage cost trends toward the *post-tombstone* size of the
 //! conversation, not the cumulative arrival history.
 //!
-//! `docs/PHASES.md §Phase 7` calls this out as the production-scale
-//! archive-compaction work item; this module provides the shared
-//! building blocks. [`crate::core_impl::CoreImpl::compact_archive`]
-//! is the orchestration layer that wires these blocks against the
-//! local store + transport / S3 backends.
+//! This module provides the shared building blocks for that work;
+//! [`crate::core_impl::CoreImpl::compact_archive`] is the
+//! orchestration layer that wires them against the local store
+//! and the transport / S3 backends.
 //!
 //! The module is intentionally separate from
 //! [`crate::backup::compaction`]:
 //!
 //! * Backup compaction merges by tier (Daily → Weekly → Monthly)
 //!   over a *global* segment ledger.
-//! * Archive compaction merges by `(conversation_id, time_bucket)`
-//!   — every segment in a bucket collapses into one compact
+//! * Archive compaction merges by `(conversation_id, time_bucket)`:
+//!   every segment in a bucket collapses into one compact
 //!   segment, regardless of age — once the bucket is "closed"
 //!   (all events past the bucket's right-edge have been
 //!   journaled). The state machine guard is the segment row's
@@ -112,11 +111,11 @@ pub struct ArchiveCompactionResult {
     /// Compact segments emitted (always equals
     /// `buckets_compacted`).
     pub segments_emitted: u64,
-    /// Sum of `ciphertext.len()` across the source segments that
+    /// Sum of `ciphertext.len` across the source segments that
     /// were superseded — a coarse "bytes saved before re-emission"
     /// measure.
     pub bytes_before: u64,
-    /// `ciphertext.len()` of the new compact segments. Pair with
+    /// `ciphertext.len` of the new compact segments. Pair with
     /// `bytes_before` for a savings ratio.
     pub bytes_after: u64,
 }

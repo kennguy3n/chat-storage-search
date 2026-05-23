@@ -8,7 +8,7 @@ description = "KChat Storage & Search — platform-agnostic core (E2EE local sto
 
 [features]
 default = []
-# Phase A.4 (production-hardening foundation): exposes the
+# (production-hardening foundation): exposes the
 # `#[cfg(test)]`-only constructors and test helpers (currently
 # `CoreImpl::new_in_memory` and `CoreImpl::with_db`) to *integration*
 # tests and to external crates that depend on `kchat-core` for
@@ -18,10 +18,10 @@ default = []
 # integration tests in `crates/core/tests/` need this feature
 # turned on (the CI `test` job passes
 # `--features kchat-core/test-support`); external crates declare
-# `kchat-core = { ..., features = ["test-support"] }` under
+# `kchat-core = {..., features = ["test-support"] }` under
 # their own `[dev-dependencies]` table.
 test-support = []
-# Enables the Phase 6 ONNX Runtime scaffold for XLM-R + MobileCLIP-S2.
+# Enables the ONNX Runtime scaffold for XLM-R + MobileCLIP-S2.
 # Off by default so the standard `cargo build --workspace` and
 # `cargo test --workspace` do not pull the `ort` crate. The
 # EP-selection state machine in `models::embeddings_onnx` and
@@ -32,7 +32,7 @@ test-support = []
 # `cfg(not(target_os = "windows"))` (CPU EP only). See
 # `docs/ARCHITECTURE.md §11.4`.
 onnx-runtime = ["dep:ort"]
-# Phase 2 (2026-05-04 final batch) — Task 4: production HTTP
+# production HTTP
 # transport. Off by default so the workspace build doesn't pull
 # `reqwest` and its transitive deps; bridge crates flip it on
 # when wiring `CoreImpl` against a real backend. See
@@ -59,7 +59,7 @@ ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 # ML-DSA-65 (FIPS 204) post-quantum signatures, paired with
 # Ed25519 in the hybrid manifest signing scheme — see
 # `crates/core/src/crypto/signing.rs` and
-# `docs/PROPOSAL.md §2.1`. Pinned to 0.0.4 because it tracks the
+# `docs/DESIGN.md §2.1`. Pinned to 0.0.4 because it tracks the
 # `signature` 2.x API surface used by `ed25519-dalek 2`; later
 # `0.1.0-rc.*` lines move to `signature` 3.x and `rand_core` 0.10
 # which conflict with the ed25519/rand stack the rest of the
@@ -80,12 +80,12 @@ unicode-normalization = "0.1"
 # the same events surface in the host OS's log stream without
 # the core crate caring about the destination.
 tracing = "0.1"
-# Image decoding + resizing for Phase 2 thumbnail generation
+# Image decoding + resizing for thumbnail generation
 # (`crates/core/src/media/thumbnail.rs`). `default-features = false`
 # keeps the dep tree lean — we only need PNG and JPEG codecs at this
 # phase. No dynamic library lookup is required.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# zstd compression for Phase 3 archive segments
+# zstd compression for archive segments
 # (`crates/core/src/archive/segment_builder.rs`). The bundled C
 # library is statically linked so callers don't need a system
 # `libzstd`.
@@ -99,7 +99,7 @@ zstd = { version = "0.13", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 instant-distance = "0.6"
 ort = { workspace = true, optional = true }
-# Phase 2 (2026-05-04 final batch) — Task 4: production
+# production
 # HTTP transport. Pinned with `rustls-tls` so we don't drag in
 # system OpenSSL on iOS / Android / desktop builds. `blocking`
 # matches the synchronous `TransportClient` trait shape; an
@@ -127,11 +127,11 @@ serde_json = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
-# Phase A.4: benches that exercise `LocalStoreDb::open_in_memory`
-# (or `CoreImpl::new_in_memory`, transitively) need the
-# `test-support` feature — the symbols don't exist in a build
-# without it. `required-features` makes Cargo skip these targets
-# with a clear message when the feature is off, instead of
+# Benches that exercise `LocalStoreDb::open_in_memory` (or
+# `CoreImpl::new_in_memory`, transitively) need the `test-support`
+# feature — the symbols don't exist in a build without it.
+# `required-features` makes Cargo skip these targets with a clear
+# message when the feature is off, instead of
 # erroring with an unresolved-symbol link failure. Invocation:
 # `cargo bench -p kchat-core --features test-support`. The
 # `phase6_int4_benchmarks` target uses a raw

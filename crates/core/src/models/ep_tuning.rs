@@ -1,5 +1,4 @@
-//! Platform ML execution-provider selection state machine —
-//! Phase 7, batch-5 (2026-05-04).
+//! Platform ML execution-provider selection state machine
 //!
 //! `docs/ARCHITECTURE.md §11.4` calls for a per-platform
 //! ONNX Runtime execution-provider (EP) selection policy:
@@ -346,7 +345,7 @@ impl EpSelector for NoopEpSelector {
     }
 }
 
-/// Phase 6 (2026-05-04 batch 10) — Task 3: prioritized list of
+/// prioritized list of
 /// execution providers to try when constructing an ONNX session.
 ///
 /// `docs/ARCHITECTURE.md §11.4` calls for the desktop / mobile
@@ -405,7 +404,7 @@ impl EpFallbackChain {
         *self.eps.last().expect("chain is non-empty by construction")
     }
 
-    /// Phase 6 (2026-05-04 final batch) — Task 3: walk the chain
+    /// walk the chain
     /// and return the first EP that is not in `failed`.
     ///
     /// Used by the always-compiled "session falls back to CPU on
@@ -436,7 +435,7 @@ impl EpFallbackChain {
 }
 
 // ---------------------------------------------------------------
-// Phase 7 (2026-05-04 batch 10) — Task 8: on-device EP benchmark
+// on-device EP benchmark
 // capture + persistent cache + auto-selection.
 // ---------------------------------------------------------------
 
@@ -612,7 +611,7 @@ impl EpBenchmarkCache {
     ///   meaningful (disk full, permission denied, hardware fault)
     ///   and should bubble up so the caller can surface them in
     ///   logs / telemetry.
-    /// * **Parse failure (corrupt CBOR, format change, bit-rot)** —
+    /// * **Parse failure (corrupt CBOR, format change, bit-rot)**
     ///   returns [`Self::default`] with a single stderr note. The
     ///   cache is a performance optimisation, not authoritative
     ///   state: re-benchmarking on the next run re-populates it.
@@ -866,7 +865,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 6 (2026-05-04 batch 10) — Task 3 EpFallbackChain.
+    // EpFallbackChain.
     // -----------------------------------------------------------
 
     #[test]
@@ -934,7 +933,7 @@ mod tests {
 
     #[test]
     fn create_session_falls_back_to_cpu_on_ep_failure() {
-        // Phase 6 (2026-05-04 final batch) — Task 3: with the
+        // with the
         // primary EP marked failed, `select_first_available`
         // must walk the chain and return CPU. Mirrors the
         // session-creation contract: if `DirectML.register`
@@ -967,7 +966,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 8 EP-benchmark tests.
+    // EP-benchmark tests.
     // -----------------------------------------------------------
 
     fn make_bench(ep: ExecutionProvider, latency_us: u64) -> EpBenchmark {

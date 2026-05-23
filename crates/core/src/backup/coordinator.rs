@@ -1,22 +1,22 @@
-//! Phase-B.9 backup coordinator.
+//! backup coordinator.
 //!
 //! Owns the in-memory backup state previously held directly on
 //! [`crate::core_impl::CoreImpl`]:
 //!
-//!   * `backup_keys` — the atomically-installed Phase-4 backup key
-//!     bundle (`K_backup_root` + Ed25519 hybrid signing key + stable
-//!     device id). See [`BackupKeys`] for the bundling rationale.
-//!   * `chain_state` — the in-memory tail of the manifest chain
-//!     *together with* the in-memory ledger of sealed segments
-//!     that have not yet been superseded by compaction. Bundled
-//!     under a single [`Mutex`] so the (manifest tail, segment
-//!     ledger) pair is observed atomically by every concurrent
-//!     reader and updated atomically by
-//!     [`Coordinator::commit_incremental`] /
-//!     [`Coordinator::commit_compaction`]. See [`BackupChainState`]
-//!     for the rationale; in particular, this replaces the prior
-//!     two-`Mutex` design whose atomicity depended on Rust's
-//!     reverse-declaration drop order.
+//! * `backup_keys` — the atomically-installed backup key
+//!   bundle (`K_backup_root` + Ed25519 hybrid signing key + stable
+//!   device id). See [`BackupKeys`] for the bundling rationale.
+//! * `chain_state` — the in-memory tail of the manifest chain
+//!   *together with* the in-memory ledger of sealed segments
+//!   that have not yet been superseded by compaction. Bundled
+//!   under a single [`Mutex`] so the (manifest tail, segment
+//!   ledger) pair is observed atomically by every concurrent
+//!   reader and updated atomically by
+//!   [`Coordinator::commit_incremental`] /
+//!   [`Coordinator::commit_compaction`]. See [`BackupChainState`]
+//!   for the rationale; in particular, this replaces the prior
+//!   two-`Mutex` design whose atomicity depended on Rust's
+//!   reverse-declaration drop order.
 //!
 //! The coordinator deliberately does **not** own the DB writer or
 //! orchestrate the multi-step
@@ -28,31 +28,31 @@
 //! orchestrators. The coordinator concentrates the two backup
 //! [`Mutex`]es behind a typed accessor surface so that:
 //!
-//!   * The "post-persist atomic in-memory commit" semantics
-//!     (manifest tail update + segment ledger append in the
-//!     incremental path; manifest tail update + segment ledger
-//!     replace in the compaction path) become single named
-//!     coordinator methods ([`Coordinator::commit_incremental`],
-//!     [`Coordinator::commit_compaction`]) that hold one lock for
-//!     the duration of the update.
-//!   * The "snapshot-and-clone" pattern used by callers that need
-//!     to drop the lock before performing I/O (segment seal,
-//!     manifest sign, compaction plan) becomes a typed
-//!     [`Coordinator::clone_keys`] /
-//!     [`Coordinator::previous_manifest`] /
-//!     [`Coordinator::tracked_segments`] surface. Because both
-//!     manifest and segment ledger now live under the same
-//!     [`Mutex`], each accessor is internally atomic against
-//!     concurrent commits (the commit helpers hold the same
-//!     guard); a future orchestrator that needs to read both
-//!     halves jointly can add a single-shot accessor at the time
-//!     the call site exists, rather than pre-baking a speculative
-//!     joint reader.
-//!   * Tests can read state via
-//!     [`Coordinator::tracked_segments`] /
-//!     [`Coordinator::previous_manifest`] /
-//!     [`Coordinator::has_keys`] instead of reaching into private
-//!     [`Mutex`]es with `.lock().unwrap()`.
+//! * The "post-persist atomic in-memory commit" semantics
+//!   (manifest tail update + segment ledger append in the
+//!   incremental path; manifest tail update + segment ledger
+//!   replace in the compaction path) become single named
+//!   coordinator methods ([`Coordinator::commit_incremental`],
+//!   [`Coordinator::commit_compaction`]) that hold one lock for
+//!   the duration of the update.
+//! * The "snapshot-and-clone" pattern used by callers that need
+//!   to drop the lock before performing I/O (segment seal,
+//!   manifest sign, compaction plan) becomes a typed
+//!   [`Coordinator::clone_keys`] /
+//!   [`Coordinator::previous_manifest`] /
+//!   [`Coordinator::tracked_segments`] surface. Because both
+//!   manifest and segment ledger now live under the same
+//!   [`Mutex`], each accessor is internally atomic against
+//!   concurrent commits (the commit helpers hold the same
+//!   guard); a future orchestrator that needs to read both
+//!   halves jointly can add a single-shot accessor at the time
+//!   the call site exists, rather than pre-baking a speculative
+//!   joint reader.
+//! * Tests can read state via
+//!   [`Coordinator::tracked_segments`] /
+//!   [`Coordinator::previous_manifest`] /
+//!   [`Coordinator::has_keys`] instead of reaching into private
+//!   [`Mutex`]es with `.lock().unwrap()`.
 //!
 //! The internal mutexes retain the lock-ordering position they
 //! held when they were direct fields on `CoreImpl` (tier 3
@@ -79,13 +79,13 @@
 //! to snapshot state, drop locks for I/O, and then atomically
 //! commit is:
 //!
-//!   1. `clone_keys` / `require_keys` first (read the bundle).
-//!   2. `previous_manifest` / `tracked_segments` next (each call
-//!      takes the `chain_state` lock for the duration of one
-//!      field clone).
-//!   3. `commit_incremental` / `commit_compaction` last (write
-//!      manifest + segments atomically, after the persist
-//!      SAVEPOINT has succeeded).
+//! 1. `clone_keys` / `require_keys` first (read the bundle).
+//! 2. `previous_manifest` / `tracked_segments` next (each call
+//!    takes the `chain_state` lock for the duration of one
+//!    field clone).
+//! 3. `commit_incremental` / `commit_compaction` last (write
+//!    manifest + segments atomically, after the persist
+//!    SAVEPOINT has succeeded).
 //!
 //! No method on the coordinator holds two locks simultaneously
 //! across an I/O call — every accessor either clones the inner
@@ -157,7 +157,7 @@ pub struct TrackedBackupSegment {
     /// [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`]
     /// generates `built.segment_id` internally — it is **not**
     /// the input to
-    /// [`crate::crypto::key_hierarchy::derive_backup_segment`] —
+    /// [`crate::crypto::key_hierarchy::derive_backup_segment`]
     /// so the orchestrator cannot re-derive the key on the open
     /// side. Persisted on the
     /// `backup_segment_ledger.wrapped_k_segment` column as an
@@ -184,21 +184,21 @@ pub struct TrackedBackupSegment {
 ///
 /// Concretely this addresses two related correctness concerns:
 ///
-///   * Update atomicity (writers): both commit helpers replace
-///     the manifest tail and the segment ledger under a single
-///     guard, so a concurrent reader cannot observe a
-///     "new segments + old manifest" or vice versa intermediate.
-///   * Snapshot atomicity (readers): each accessor
-///     ([`Coordinator::previous_manifest`] /
-///     [`Coordinator::tracked_segments`]) takes the same
-///     `chain_state` guard a writer holds, so any single field
-///     read is internally atomic against concurrent commits. A
-///     caller that needs the (manifest, segments) pair jointly
-///     consistent at the same point in time should request that
-///     accessor at the call site — doing so as a single
-///     guard-and-clone is trivial once a real caller exists,
-///     and adding one speculatively before any caller does is
-///     the kind of unused API surface that bit-rots.
+/// * Update atomicity (writers): both commit helpers replace
+///   the manifest tail and the segment ledger under a single
+///   guard, so a concurrent reader cannot observe a
+///   "new segments + old manifest" or vice versa intermediate.
+/// * Snapshot atomicity (readers): each accessor
+///   ([`Coordinator::previous_manifest`] /
+///   [`Coordinator::tracked_segments`]) takes the same
+///   `chain_state` guard a writer holds, so any single field
+///   read is internally atomic against concurrent commits. A
+///   caller that needs the (manifest, segments) pair jointly
+///   consistent at the same point in time should request that
+///   accessor at the call site — doing so as a single
+///   guard-and-clone is trivial once a real caller exists,
+///   and adding one speculatively before any caller does is
+///   the kind of unused API surface that bit-rots.
 #[derive(Clone, Default)]
 pub(crate) struct BackupChainState {
     /// In-memory tail of the manifest chain. Mirrors the persisted
@@ -213,7 +213,7 @@ pub(crate) struct BackupChainState {
     pub(crate) tracked_segments: Vec<TrackedBackupSegment>,
 }
 
-/// Phase-B.9 backup coordinator — owns the two backup
+/// backup coordinator — owns the two backup
 /// [`Mutex`]es previously held directly on
 /// [`crate::core_impl::CoreImpl`].
 pub(crate) struct Coordinator {

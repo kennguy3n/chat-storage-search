@@ -1,4 +1,4 @@
-//! Phase 7, batch-5 (2026-05-04) — media blob sink stress test.
+//! media blob sink stress test.
 //!
 //! Marked `#[ignore]` so the standard `cargo test --workspace`
 //! run never executes it. Run it explicitly with
@@ -204,7 +204,7 @@ fn ten_thousand_assets_round_trip_across_four_sinks() {
     }
 
     // 1. Every storage_sink column rounds back through the DB
-    //    helper.
+    // helper.
     core.with_db(|db| {
         assert_eq!(
             db.list_media_assets_by_storage_sink("kchat_backend")
@@ -233,7 +233,7 @@ fn ten_thousand_assets_round_trip_across_four_sinks() {
     });
 
     // 2. Sample every 1000th asset on every sink: fetch back,
-    //    confirm the bytes match.
+    // confirm the bytes match.
     for (tag, sink, count) in sinks.iter() {
         for k in (0..*count).step_by(1000) {
             let asset_id = format!("asset-{:08}", asset_offset(&sinks, tag) + k);
@@ -248,8 +248,8 @@ fn ten_thousand_assets_round_trip_across_four_sinks() {
     }
 
     // 3. Migrate a fraction of icloud assets over to google_drive
-    //    and verify the local store / sink contents reflect the
-    //    move.
+    // and verify the local store / sink contents reflect the
+    // move.
     let plan = core.plan_media_migration("icloud", "google_drive").unwrap();
     assert_eq!(plan.len(), icloud_count);
     let progress = NoopMigrationProgress;
@@ -286,12 +286,12 @@ fn asset_offset(sinks: &[(&str, &InMemorySink, usize); 4], tag: &str) -> usize {
 }
 
 // ---------------------------------------------------------------
-// Phase 7 (2026-05-04 final batch) — Task 16: real-bridge media
+// real-bridge media
 // sink stress.
 //
 // `InMemoryICloudBridge` and `InMemoryGoogleDriveBridge` give the
 // production `ICloudMediaBlobSink` / `GoogleDriveMediaBlobSink`
-// real byte storage so the round-trip exercises the Phase 3
+// real byte storage so the round-trip exercises the
 // metadata encoder/decoder, not just the in-memory chunked sink
 // shape. The migration round-trip test verifies every byte after
 // moving 1k assets between the two bridge-backed sinks.

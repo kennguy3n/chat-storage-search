@@ -1,7 +1,7 @@
-//! In-process background scheduler — Phase 7, batch-5
-//! (2026-05-04).
+//! In-process background scheduler
 //!
-//! `docs/PROPOSAL.md §6` and `docs/PHASES.md` Phase 7 call for a
+//!
+//! `docs/DESIGN.md §6` calls for a
 //! Rust-native scheduler that runs the recurring kchat loops
 //! (incremental backup, archive compaction, FTS / fuzzy index
 //! maintenance, media-cache eviction) on a background thread
@@ -46,7 +46,7 @@ use crate::Error;
 
 use super::{BackgroundScheduler, OneOffTask, TaskConstraints, TaskType};
 
-/// Phase 7 (2026-05-04 batch 10) — Task 9: device-state probe
+/// device-state probe
 /// the in-process scheduler consults before draining a one-off
 /// task. Production callers wire this into a platform battery /
 /// network monitor; tests pass a hand-rolled `bool` snapshot.
@@ -164,7 +164,7 @@ struct WorkerHandle {
 pub struct InProcessScheduler {
     handlers: Mutex<HashMap<TaskType, Arc<dyn TaskHandler>>>,
     workers: Mutex<HashMap<TaskType, WorkerHandle>>,
-    /// Phase 7 (2026-05-04 batch 10) — Task 9 one-shot queue.
+    /// one-shot queue.
     /// Each entry is the `(task, constraints)` pair the
     /// orchestrator enqueued; `run_pending_one_off_tasks` drains
     /// this queue and invokes the registered one-off handler.
@@ -175,7 +175,7 @@ pub struct InProcessScheduler {
     one_off_handler: Mutex<Option<Arc<OneOffTaskHandler>>>,
 }
 
-/// Phase 7 (2026-05-04 batch 10) — Task 9 one-off task handler.
+/// one-off task handler.
 ///
 /// Invoked from `run_pending_one_off_tasks` for each task whose
 /// constraints are currently satisfied. Returns `Ok(())` on
@@ -212,7 +212,7 @@ impl InProcessScheduler {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 9: install the
+    /// install the
     /// one-off task handler. The orchestration layer wires
     /// `CoreImpl::execute_media_migration` /
     /// `CoreImpl::warm_shard_cache` through this hook.
@@ -225,13 +225,13 @@ impl InProcessScheduler {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 9: number of one-off
+    /// number of one-off
     /// tasks currently waiting in the queue.
     pub fn pending_one_off_count(&self) -> usize {
         self.one_offs.lock().map(|q| q.len()).unwrap_or(0)
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 9: drain every
+    /// drain every
     /// queued one-off task whose constraints are satisfied
     /// against `probe`, invoke the registered handler, and
     /// return the number of tasks executed. Tasks whose
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn fn_closure_satisfies_task_handler_blanket_impl() {
         // Compile-time test: the blanket impl
-        // `impl<F: Fn()->Result> TaskHandler for F` allows callers
+        // `impl<F: Fn->Result> TaskHandler for F` allows callers
         // to register a plain closure without manually wrapping
         // it in a struct.
         let s = InProcessScheduler::new();
@@ -689,7 +689,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 9 one-off scheduling.
+    // one-off scheduling.
     // ---------------------------------------------------------
 
     use super::super::{MediaMigrationPlanSnapshot, OneOffTask, TaskConstraints};
@@ -773,11 +773,10 @@ mod tests {
 
     #[test]
     fn run_pending_one_off_tasks_re_enqueues_when_no_handler_installed() {
-        // Regression for the silent-task-loss bug spotted by
-        // Devin Review: draining constraint-satisfied tasks
-        // before checking for a handler used to drop them
-        // permanently. The expected behaviour is that the
-        // tasks stay queued and fire when a handler arrives.
+        // Regression for a silent-task-loss bug: draining
+        // constraint-satisfied tasks before checking for a handler
+        // used to drop them permanently. The expected behaviour is
+        // that the tasks stay queued and fire when a handler arrives.
         let s = InProcessScheduler::new();
         s.schedule_one_off_task(fake_migration_task(), TaskConstraints::wifi_and_charging())
             .unwrap();

@@ -1,6 +1,6 @@
 //! AES-256-KW key wrapping (NIST 800-38F / RFC 3394).
 //!
-//! Phase 0 implements the construction the higher layers depend on:
+//! Implements the construction the higher layers depend on:
 //! a `K_asset` (32 bytes) wrapped under one of `K_local_db`,
 //! `K_archive_root`, or `K_backup_root` (also 32 bytes) so that the
 //! ciphertext alone never reveals the asset key. The wrapped output
@@ -11,13 +11,13 @@
 //! 1. The wrapping root comes from
 //!    [`crate::crypto::key_hierarchy::KeyMaterial`] (`K_local_db` for
 //!    local-only wraps; `K_archive_root` / `K_backup_root` for the
-//!    archive and backup paths described in `docs/PROPOSAL.md §2.1`
+//!    archive and backup paths described in `docs/DESIGN.md §2.1`
 //!    and `§5` / `§6`).
 //! 2. AES-256-KW seals the 32-byte asset key. Tampering with any
 //!    byte of the wrapped output, or unwrapping with the wrong
 //!    wrapping key, fails with [`CryptoError::Aead`].
 //!
-//! Phase 1 will layer the platform-specific wraps for `K_local_db`
+//! Will layer the platform-specific wraps for `K_local_db`
 //! itself (Keychain on iOS / macOS, Keystore on Android, DPAPI on
 //! Windows) on top of the same `wrap_key` / `unwrap_key` primitives.
 

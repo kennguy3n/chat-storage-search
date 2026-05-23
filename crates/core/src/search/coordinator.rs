@@ -1,21 +1,21 @@
-//! Phase-B.9 search coordinator.
+//! search coordinator.
 //!
 //! Owns the in-memory search-orchestration state previously held
 //! directly on [`crate::core_impl::CoreImpl`]:
 //!
-//!   * `hydration_queue` — the priority queue
-//!     ([`crate::offload::hydration::HydrationQueue`]) that
-//!     `search` / `search_and_prefetch_cold` / `search_streaming`
-//!     populate with cold-flagged results so the orchestration
-//!     layer can pop hydration requests in priority order
-//!     (`docs/PROPOSAL.md §5.5`).
-//!   * `conversation_group_resolver` — the Phase-8
-//!     [`crate::search::search_target::ConversationGroupResolver`]
-//!     bridge that translates a [`crate::SearchTarget`] into a
-//!     conversation-id set inside
-//!     [`crate::search::query_engine::QueryEngine::execute_search_with_target`].
-//!     Held in [`OnceLock`] so `search_with_target` resolves the
-//!     bridge with a lock-free atomic load.
+//! * `hydration_queue` — the priority queue
+//!   ([`crate::offload::hydration::HydrationQueue`]) that
+//!   `search` / `search_and_prefetch_cold` / `search_streaming`
+//!   populate with cold-flagged results so the orchestration
+//!   layer can pop hydration requests in priority order
+//!   (`docs/DESIGN.md §5.5`).
+//! * `conversation_group_resolver` — the
+//!   [`crate::search::search_target::ConversationGroupResolver`]
+//!   bridge that translates a [`crate::SearchTarget`] into a
+//!   conversation-id set inside
+//!   [`crate::search::query_engine::QueryEngine::execute_search_with_target`].
+//!   Held in [`OnceLock`] so `search_with_target` resolves the
+//!   bridge with a lock-free atomic load.
 //!
 //! The coordinator deliberately does **not** own the large search
 //! orchestrator methods themselves (`search_and_prefetch_cold`,
@@ -28,34 +28,34 @@
 //! and the model bridges (text embedder, cold-shard cache), and
 //! continue to live on [`crate::core_impl::CoreImpl`] as
 //! orchestrators that call the coordinator's typed accessor
-//! surface in place of the previous direct `self.hydration_queue.lock()`
-//! / `self.conversation_group_resolver.get()` calls.
+//! surface in place of the previous direct `self.hydration_queue.lock`
+//! / `self.conversation_group_resolver.get` calls.
 //!
 //! The accessor surface centralises three patterns that were
 //! previously open-coded at each call site:
 //!
-//!   * **Best-effort enqueue** (poisoned-mutex tolerant) — used by
-//!     [`Coordinator::enqueue_cold_results`] for the
-//!     [`crate::HydrationReason::SearchResultTap`] backfill in
-//!     [`crate::core_impl::CoreImpl::enqueue_cold_results_for_hydration`].
-//!     A poisoned queue mutex is logged-and-skipped so the search
-//!     results still flow back to the caller.
-//!   * **Failable enqueue** (poisoned-mutex surfaced) — used by
-//!     [`Coordinator::enqueue_request`] /
-//!     [`Coordinator::enqueue_prefetch_window`] from
-//!     [`crate::core_impl::CoreImpl::hydrate_message`] and
-//!     [`crate::core_impl::CoreImpl::enqueue_prefetch_window`]
-//!     where the orchestrator wants to surface the poisoned-mutex
-//!     state to the caller rather than silently drop the request.
-//!   * **Lock-free resolver lookup** — used by
-//!     [`Coordinator::resolver_or_default`] to resolve the
-//!     installed
-//!     [`crate::search::search_target::ConversationGroupResolver`]
-//!     in [`crate::core_impl::CoreImpl::search_with_target`]
-//!     without contending on a mutex before every reader-pool
-//!     checkout. Falls back to the
-//!     [`crate::search::search_target::NoopConversationGroupResolver`]
-//!     default when nothing has been installed yet.
+//! * **Best-effort enqueue** (poisoned-mutex tolerant) — used by
+//!   [`Coordinator::enqueue_cold_results`] for the
+//!   [`crate::HydrationReason::SearchResultTap`] backfill in
+//!   [`crate::core_impl::CoreImpl::enqueue_cold_results_for_hydration`].
+//!   A poisoned queue mutex is logged-and-skipped so the search
+//!   results still flow back to the caller.
+//! * **Failable enqueue** (poisoned-mutex surfaced) — used by
+//!   [`Coordinator::enqueue_request`] /
+//!   [`Coordinator::enqueue_prefetch_window`] from
+//!   [`crate::core_impl::CoreImpl::hydrate_message`] and
+//!   [`crate::core_impl::CoreImpl::enqueue_prefetch_window`]
+//!   where the orchestrator wants to surface the poisoned-mutex
+//!   state to the caller rather than silently drop the request.
+//! * **Lock-free resolver lookup** — used by
+//!   [`Coordinator::resolver_or_default`] to resolve the
+//!   installed
+//!   [`crate::search::search_target::ConversationGroupResolver`]
+//!   in [`crate::core_impl::CoreImpl::search_with_target`]
+//!   without contending on a mutex before every reader-pool
+//!   checkout. Falls back to the
+//!   [`crate::search::search_target::NoopConversationGroupResolver`]
+//!   default when nothing has been installed yet.
 //!
 //! No method on the coordinator holds a lock across an I/O call
 //! or across a call into the query engine — every accessor either
@@ -78,23 +78,23 @@ use crate::{Error, HydrationReason, Result, SearchResult};
 /// is allocated **once per process** and every fallback path
 /// returns a cheap `Arc` clone (one atomic increment) instead
 /// of allocating a fresh `NoopConversationGroupResolver` on
-/// every `search_with_target` call — see PR #57 review feedback.
+/// every `search_with_target` call.
 /// The resolver is stateless so a shared instance is
 /// observationally identical to per-call construction.
 static NOOP_RESOLVER: LazyLock<Arc<dyn ConversationGroupResolver>> =
     LazyLock::new(|| Arc::new(NoopConversationGroupResolver::new()));
 
-/// Phase-B.9 search coordinator — owns the
+/// search coordinator — owns the
 /// [`HydrationQueue`] mutex and the
 /// [`ConversationGroupResolver`] [`OnceLock`] previously held
 /// directly on [`crate::core_impl::CoreImpl`].
 pub(crate) struct Coordinator {
-    /// Phase-3 hydration priority queue. `hydrate_message`
+    /// hydration priority queue. `hydrate_message`
     /// enqueues a request before serving from local storage so
     /// the orchestration layer can later pop pending fetches in
-    /// priority order (`docs/PROPOSAL.md §5.5`).
+    /// priority order (`docs/DESIGN.md §5.5`).
     hydration_queue: Mutex<HydrationQueue>,
-    /// Phase-8 multi-scope search resolver. Write-once via
+    /// multi-scope search resolver. Write-once via
     /// [`Self::install_resolver`]; the query engine treats "not
     /// installed" as the default
     /// [`NoopConversationGroupResolver`] (Channel resolves to its
@@ -207,8 +207,8 @@ impl Coordinator {
     // Conversation group resolver
     // ----------------------------------------------------------------
 
-    /// Install the Phase-8 multi-scope search resolver. Write-once
-    /// — returns [`StorageError::SubsystemAlreadyInstalled`] if a
+    /// Install the multi-scope search resolver. Write-once
+    /// returns [`StorageError::SubsystemAlreadyInstalled`] if a
     /// resolver has already been installed.
     pub(crate) fn install_resolver(
         &self,

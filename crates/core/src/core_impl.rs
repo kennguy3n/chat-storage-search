@@ -1,12 +1,12 @@
 //! Concrete [`KChatCore`] implementation.
 //!
-//! `docs/PROPOSAL.md §12` specifies the public API trait;
-//! [`CoreImpl`] is the Phase-1 in-process implementation that wires
+//! `docs/DESIGN.md §12` specifies the public API trait;
+//! [`CoreImpl`] is the in-process implementation that wires
 //! the trait to the SQLCipher [`LocalStoreDb`], the
 //! [`MessagePersister`] for outbox / ingest persistence, and the
 //! [`QueryEngine`] for unified FTS5 + structured search.
 //!
-//! What is wired in Phase 1:
+//! What is wired in
 //!
 //! * [`CoreImpl::new`] opens (or creates) `{data_dir}/kchat.db` with
 //!   the supplied 32-byte `K_local_db`.
@@ -24,9 +24,10 @@
 //!
 //! * The transport-driven [`KChatCore::ingest_remote_messages`] is a
 //!   stub returning [`IngestResult::default()`] — the MLS delivery
-//!   client lands later in Phase 1. For now, callers (and tests) use
-//!   the inherent [`CoreImpl::ingest_messages`] entry point that
-//!   takes an in-memory slice of [`IngestedMessage`] values directly.
+//!   client is not yet wired through this entry point. For now,
+//!   callers (and tests) use the inherent
+//!   [`CoreImpl::ingest_messages`] entry point that takes an
+//!   in-memory slice of [`IngestedMessage`] values directly.
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
@@ -88,10 +89,10 @@ const DEFAULT_READER_POOL_SIZE: usize = 4;
 
 /// Cap each backup segment so an event-journal backlog does not
 /// produce a single oversized seal. Mirrors the archive
-/// segment cap (`docs/PROPOSAL.md §5.2`). Used by both
+/// segment cap (`docs/DESIGN.md §5.2`). Used by both
 /// [`CoreImpl::run_incremental_backup_inner`] and the Task-1
 /// shard-aware wrapper
-/// [`CoreImpl::run_incremental_backup_with_search_shards`] —
+/// [`CoreImpl::run_incremental_backup_with_search_shards`]
 /// kept in one module-level place so the two paths cannot
 /// drift.
 const MAX_EVENTS_PER_BACKUP_SEGMENT: usize = 4_096;
@@ -111,12 +112,12 @@ pub(crate) struct SealedBackupEventRef {
 }
 
 // `BackupKeys` (and its atomic-bundle rationale) lives in
-// `crate::backup::coordinator` as of Phase B.9 — the `Coordinator`
+// `crate::backup::coordinator` — the `Coordinator`
 // there owns the bundle and the in-memory manifest tail / segment
 // ledger previously held directly on `CoreImpl`.
 //
 // `ZkofArchiveBackend` (and its atomic-install rationale) lives in
-// `crate::archive::coordinator` as of Phase B.9 — the `Coordinator`
+// `crate::archive::coordinator` — the `Coordinator`
 // there owns the bundle and the surrounding state previously held
 // directly on `CoreImpl`.
 pub(crate) use crate::backup::coordinator::BackupKeys;
@@ -137,18 +138,18 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 /// [`LocalStoreReaderPool`]) which is already internally
 /// thread-safe.
 ///
-/// # Concurrency model (Phase B.1)
+/// # Concurrency model
 ///
 /// Under SQLite **WAL mode** the writer and the readers do not
 /// block each other:
-///   * Writes (`send_text`, `ingest_messages`, `delete_*`,
-///     `edit_message`, `run_incremental_backup`, etc.) take the
-///     [`db_writer`] mutex and run the mutating SQL there.
-///   * Reads that don't need the writer's connection (timeline
-///     fetch, conversation list, message hydration) check a
-///     reader out of [`db_readers`] via
-///     [`LocalStoreReaderPool::with_reader`] and run SELECTs on
-///     that connection while the writer's mutex is *not* held.
+/// * Writes (`send_text`, `ingest_messages`, `delete_*`,
+///   `edit_message`, `run_incremental_backup`, etc.) take the
+///   [`db_writer`] mutex and run the mutating SQL there.
+/// * Reads that don't need the writer's connection (timeline
+///   fetch, conversation list, message hydration) check a
+///   reader out of [`db_readers`] via
+///   [`LocalStoreReaderPool::with_reader`] and run SELECTs on
+///   that connection while the writer's mutex is *not* held.
 ///
 /// The reader pool is sized at [`DEFAULT_READER_POOL_SIZE`]
 /// connections by default; the constructor opens them eagerly so
@@ -156,58 +157,58 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 /// on its critical path. See
 /// [`LocalStoreDb::open_reader_pool`] for the open semantics.
 ///
-/// # Subsystem field organisation (Phase B.2)
+/// # Subsystem field organisation
 ///
 /// The 24 originally-`Mutex<Option<_>>` "platform-bridge"
 /// subsystem fields have been split by their actual mutation
 /// shape:
 ///
-///   * **15 bridges that are installed exactly once at boot**
-///     (`text_embedder`, `image_embedder`, `whisper_transcriber`,
-///     `document_extractor`, `video_keyframe_sampler`,
-///     `ocr_bridge`, `resource_probe`, `offline_detector`,
-///     `perf_collector`, `dedup_analytics`,
-///     `spotlight_anchor`, `windows_search_anchor`,
-///     `delivery_client`, `scheduler`, `ep_benchmark_runner`)
-///     live in [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are
-///     lock-free atomic loads; the corresponding `install_*` /
-///     `set_delivery_client` setters return
-///     [`Error::Storage`] on double-install. The 16th bridge —
-///     the Phase-8 `conversation_group_resolver` — moved to
-///     [`crate::search::coordinator::Coordinator`] in Phase B.9
-///     (see the `search` field below) and keeps the same
-///     [`OnceLock`] semantics behind a typed accessor surface.
-///   * **Phase-B.9 backup coordinator** — the atomic backup key
-///     bundle (`BackupKeys` — `K_backup_root` + hybrid signing
-///     key + stable device id), the in-memory manifest chain tail
-///     (`previous_backup_manifest`), and the in-memory sealed
-///     segment ledger (`tracked_backup_segments`) all moved to
-///     [`crate::backup::coordinator::Coordinator`] in Phase B.9
-///     (see the `backup` field below). The bundle struct keeps
-///     the "all three pieces installed atomically" invariant
-///     non-bypassable; the coordinator's
-///     [`crate::backup::coordinator::Coordinator::commit_incremental`]
-///     / `commit_compaction` helpers couple the post-persist
-///     manifest tail update with the segment ledger update into
-///     one named operation. The ZKOF archive bundle similarly
-///     lives in
-///     [`crate::archive::coordinator::Coordinator`] (Phase B.9).
-///   * **Genuinely-mutable in-flight state** (`ep_benchmark_cache`)
-///     stays in [`Mutex`]`<T>` because it is mutated mid-flight
-///     (cache update). The Phase-3 hydration priority queue
-///     ([`crate::offload::hydration::HydrationQueue`]) moved to
-///     [`crate::search::coordinator::Coordinator`] in Phase B.9
-///     (see the `search` field below). The archive epoch manager
-///     and ZKOF backend are owned by
-///     [`crate::archive::coordinator::Coordinator`] (see the
-///     `archive` field below). `CoreImpl` no longer holds the
-///     backup, archive, or search-orchestration mutexes
-///     directly; install / rotate / build-router / enqueue
-///     methods delegate to the coordinators.
-///   * The DB connections are split into
-///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
-///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
-///     reads (Phase B.1).
+/// * **15 bridges that are installed exactly once at boot**
+///   (`text_embedder`, `image_embedder`, `whisper_transcriber`,
+///   `document_extractor`, `video_keyframe_sampler`,
+///   `ocr_bridge`, `resource_probe`, `offline_detector`,
+///   `perf_collector`, `dedup_analytics`,
+///   `spotlight_anchor`, `windows_search_anchor`,
+///   `delivery_client`, `scheduler`, `ep_benchmark_runner`)
+///   live in [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are
+///   lock-free atomic loads; the corresponding `install_*` /
+///   `set_delivery_client` setters return
+///   [`Error::Storage`] on double-install. The 16th bridge
+///   the `conversation_group_resolver` — moved to
+///   [`crate::search::coordinator::Coordinator`]
+///   (see the `search` field below) and keeps the same
+///   [`OnceLock`] semantics behind a typed accessor surface.
+/// * **backup coordinator** — the atomic backup key
+///   bundle (`BackupKeys` — `K_backup_root` + hybrid signing
+///   key + stable device id), the in-memory manifest chain tail
+///   (`previous_backup_manifest`), and the in-memory sealed
+///   segment ledger (`tracked_backup_segments`) all moved to
+///   [`crate::backup::coordinator::Coordinator`]
+///   (see the `backup` field below). The bundle struct keeps
+///   the "all three pieces installed atomically" invariant
+///   non-bypassable; the coordinator's
+///   [`crate::backup::coordinator::Coordinator::commit_incremental`]
+///   / `commit_compaction` helpers couple the post-persist
+///   manifest tail update with the segment ledger update into
+///   one named operation. The ZKOF archive bundle similarly
+///   lives in
+///   [`crate::archive::coordinator::Coordinator`].
+/// * **Genuinely-mutable in-flight state** (`ep_benchmark_cache`)
+///   stays in [`Mutex`]`<T>` because it is mutated mid-flight
+///   (cache update). The hydration priority queue
+///   ([`crate::offload::hydration::HydrationQueue`]) moved to
+///   [`crate::search::coordinator::Coordinator`]
+///   (see the `search` field below). The archive epoch manager
+///   and ZKOF backend are owned by
+///   [`crate::archive::coordinator::Coordinator`] (see the
+///   `archive` field below). `CoreImpl` no longer holds the
+///   backup, archive, or search-orchestration mutexes
+///   directly; install / rotate / build-router / enqueue
+///   methods delegate to the coordinators.
+/// * The DB connections are split into
+///   `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
+///   and `db_readers: `[`LocalStoreReaderPool`] for concurrent
+///   reads.
 ///
 /// # Lock ordering
 ///
@@ -216,44 +217,44 @@ pub use crate::backup::coordinator::TrackedBackupSegment;
 /// them in this order; methods that only need a subset acquire
 /// only those:
 ///
-///   1. **Subsystem lookup** — `OnceLock::get()` on the 16
-///      bridge fields. Lock-free, no ordering constraint with
-///      the locks below.
-///   2. **In-flight state** — `search` (its internal
-///      `hydration_queue` mutex — see
-///      `crate::search::coordinator`), `archive` (its internal
-///      `current_epoch` / `zkof_archive` mutexes — see
-///      `crate::archive::coordinator`), `ep_benchmark_cache`
-///      (each independent of the others; no method holds two of
-///      these simultaneously).
-///   3. **Backup bundles** — the three backup mutexes
-///      (`backup_keys`, `previous_backup_manifest`,
-///      `tracked_backup_segments`) are owned by
-///      [`crate::backup::coordinator::Coordinator`] (see the
-///      `backup` field below). `run_incremental_backup` /
-///      `compact_backup` clone keys via
-///      [`crate::backup::coordinator::Coordinator::require_keys`]
-///      first, snapshot the manifest tail via
-///      [`crate::backup::coordinator::Coordinator::previous_manifest`]
-///      next, snapshot the segment ledger via
-///      [`crate::backup::coordinator::Coordinator::tracked_segments`]
-///      next, perform I/O / persist with the locks released, and
-///      finally call
-///      [`crate::backup::coordinator::Coordinator::commit_incremental`]
-///      / `commit_compaction` to atomically update the chain tail
-///      and segment ledger. Never holds two backup locks across
-///      an I/O call.
-///   4. **Database** — `db_writer` for writes,
-///      `db_readers.with_reader(...)` for reads. The DB lock is
-///      acquired *last* and released *first*; nothing inside a
-///      `db_writer.lock()` guard takes any of the locks above.
-///      The reader pool is independent of the writer mutex
-///      under WAL.
+/// 1. **Subsystem lookup** — `OnceLock::get()` on the 16
+///    bridge fields. Lock-free, no ordering constraint with
+///    the locks below.
+/// 2. **In-flight state** — `search` (its internal
+///    `hydration_queue` mutex — see
+///    `crate::search::coordinator`), `archive` (its internal
+///    `current_epoch` / `zkof_archive` mutexes — see
+///    `crate::archive::coordinator`), `ep_benchmark_cache`
+///    (each independent of the others; no method holds two of
+///    these simultaneously).
+/// 3. **Backup bundles** — the three backup mutexes
+///    (`backup_keys`, `previous_backup_manifest`,
+///    `tracked_backup_segments`) are owned by
+///    [`crate::backup::coordinator::Coordinator`] (see the
+///    `backup` field below). `run_incremental_backup` /
+///    `compact_backup` clone keys via
+///    [`crate::backup::coordinator::Coordinator::require_keys`]
+///    first, snapshot the manifest tail via
+///    [`crate::backup::coordinator::Coordinator::previous_manifest`]
+///    next, snapshot the segment ledger via
+///    [`crate::backup::coordinator::Coordinator::tracked_segments`]
+///    next, perform I/O / persist with the locks released, and
+///    finally call
+///    [`crate::backup::coordinator::Coordinator::commit_incremental`]
+///    / `commit_compaction` to atomically update the chain tail
+///    and segment ledger. Never holds two backup locks across
+///    an I/O call.
+/// 4. **Database** — `db_writer` for writes,
+///    `db_readers.with_reader(...)` for reads. The DB lock is
+///    acquired *last* and released *first*; nothing inside a
+///    `db_writer.lock()` guard takes any of the locks above.
+///    The reader pool is independent of the writer mutex
+///    under WAL.
 ///
-/// The OnceLock conversion in Phase B.2 means installer methods
+/// The lock-free `OnceLock` representation of the bridge fields means installer methods
 /// no longer participate in this ordering (they are install-time
 /// only, not steady-state), and hot-path reads of the 16 bridge
-/// subsystems no longer take any lock at all. Phase B.9 moved
+/// subsystems no longer take any lock at all. The coordinator extraction moved
 /// archive epoch / ZKOF locks behind the
 /// [`crate::archive::coordinator::Coordinator`] facade — they
 /// retain the same ordering position but are no longer fields
@@ -274,7 +275,7 @@ pub struct CoreImpl {
     /// can re-open the database at a different `data_dir` without
     /// requiring the caller to re-supply the key.
     key: Zeroizing<[u8; 32]>,
-    /// Phase-2 MLS delivery-store client used by
+    /// MLS delivery-store client used by
     /// [`KChatCore::ingest_remote_messages`] to pull staged
     /// frames. Write-once via
     /// [`CoreImpl::with_transport`] /
@@ -289,9 +290,9 @@ pub struct CoreImpl {
     /// I/O-bound) `fetch_messages` call. Tests that need a
     /// different client construct a fresh [`CoreImpl`].
     delivery_client: OnceLock<Arc<dyn DeliveryClient>>,
-    /// Phase-B.9 search coordinator — owns the Phase-3 hydration
+    /// search coordinator — owns the hydration
     /// priority queue
-    /// ([`crate::offload::hydration::HydrationQueue`]) and the Phase-8
+    /// ([`crate::offload::hydration::HydrationQueue`]) and the
     /// multi-scope search resolver
     /// ([`crate::search::search_target::ConversationGroupResolver`])
     /// previously held directly on `CoreImpl` as the
@@ -302,29 +303,29 @@ pub struct CoreImpl {
     /// `crate::search::coordinator` for the per-method
     /// documentation.
     search: crate::search::coordinator::Coordinator,
-    /// Phase-B.9 archive coordinator — owns the epoch-key
-    /// lifecycle (`docs/PROPOSAL.md §2.1`) and the ZKOF backend
+    /// archive coordinator — owns the epoch-key
+    /// lifecycle (`docs/DESIGN.md §2.1`) and the ZKOF backend
     /// wiring previously held directly on `CoreImpl` as the
     /// `current_epoch` and `zkof_archive` fields. All archive
     /// epoch / router methods on `CoreImpl` delegate to this
     /// coordinator. See `crate::archive::coordinator` for the
     /// per-method documentation.
     archive: crate::archive::coordinator::Coordinator,
-    /// Phase-B.9 backup coordinator — owns the Phase-4 backup
+    /// backup coordinator — owns the backup
     /// key bundle (`K_backup_root` + hybrid signing key + stable
-    /// device id, `docs/PROPOSAL.md §6.2`), the in-memory manifest
+    /// device id, `docs/DESIGN.md §6.2`), the in-memory manifest
     /// chain tail (`backup_manifest_chain`), and the in-memory
     /// sealed-segment ledger (`backup_segment_ledger`)
     /// previously held directly on `CoreImpl` as the
     /// `backup_keys` / `previous_backup_manifest` /
-    /// `tracked_backup_segments` fields. All `install_backup_keys`
-    /// / `has_backup_keys` / `hydrate_*` /
+    /// `tracked_backup_segments` fields. All `install_backup_keys` /
+    /// `has_backup_keys` / `hydrate_*` /
     /// `run_incremental_backup_*` / `compact_backup` methods on
     /// `CoreImpl` delegate state reads / writes through this
     /// coordinator. See `crate::backup::coordinator` for the
     /// per-method documentation.
     backup: crate::backup::coordinator::Coordinator,
-    /// Phase-5 background scheduler bridge. Write-once via
+    /// background scheduler bridge. Write-once via
     /// [`CoreImpl::install_scheduler`] by the platform glue
     /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
     /// orchestration layer treats "not installed" as "no
@@ -338,7 +339,7 @@ pub struct CoreImpl {
     /// [`Self::submit_media_migration_plan`] /
     /// `schedule_periodic_storage_budget_check` paths.
     scheduler: OnceLock<Arc<dyn crate::scheduler::BackgroundScheduler>>,
-    /// Phase-6 on-device text-embedding seam. Write-once via
+    /// on-device text-embedding seam. Write-once via
     /// [`CoreImpl::install_text_embedder`]. When set, the
     /// message-ingest path computes XLM-R embeddings on every
     /// text body and writes them through the
@@ -351,7 +352,7 @@ pub struct CoreImpl {
     /// is itself a per-process resource that cannot be replaced
     /// without tearing down the model.
     text_embedder: OnceLock<Arc<dyn crate::models::embeddings::TextEmbedder>>,
-    /// Phase-B.9 media coordinator — owns the five Phase-6
+    /// media coordinator — owns the five
     /// on-device media-model bridge `OnceLock` slots previously
     /// held directly on `CoreImpl` as the `image_embedder`,
     /// `ocr_bridge`, `whisper_transcriber`, `document_extractor`
@@ -362,7 +363,7 @@ pub struct CoreImpl {
     /// surface. See `crate::media::coordinator` for the
     /// per-method documentation.
     media: crate::media::coordinator::Coordinator,
-    /// Phase-6 resource-state probe (battery, charging, thermal,
+    /// resource-state probe (battery, charging, thermal,
     /// network). Write-once via
     /// [`CoreImpl::install_resource_probe`]; the resource-gated
     /// background workers treat "not installed" as "always
@@ -371,7 +372,7 @@ pub struct CoreImpl {
     /// every Whisper / Vision / video-keyframe operation is a
     /// lock-free atomic load.
     resource_probe: OnceLock<Arc<dyn crate::models::resource_gate::ResourceProbe>>,
-    /// Phase-6 offline-detection seam. Write-once via
+    /// offline-detection seam. Write-once via
     /// [`CoreImpl::install_offline_detector`]; the
     /// orchestration layer treats "not installed" as "always
     /// online" so unit tests don't need to install a detector.
@@ -383,7 +384,7 @@ pub struct CoreImpl {
     /// hydrate / cold-read / backup-defer path) is a lock-free
     /// atomic load.
     offline_detector: OnceLock<Arc<dyn crate::transport::offline::OfflineDetector>>,
-    /// Phase-7 performance-trace collector. Write-once via
+    /// performance-trace collector. Write-once via
     /// [`CoreImpl::install_perf_collector`]; when set, the hot
     /// paths (`ingest_messages`, `search`,
     /// `run_incremental_backup`, `enforce_storage_budget`) emit
@@ -392,7 +393,7 @@ pub struct CoreImpl {
     /// lock-free atomic load — the collector is installed once
     /// at boot and the bridge crates never replace it.
     perf_collector: OnceLock<Arc<dyn crate::perf::PerfCollector>>,
-    /// Phase-7 dedup-analytics probe (read-only telemetry against
+    /// dedup-analytics probe (read-only telemetry against
     /// the upstream ZK Object Fabric ContentIndex). Write-once
     /// via [`CoreImpl::install_dedup_analytics`]; when set,
     /// [`CoreImpl::query_dedup_stats`] /
@@ -401,10 +402,10 @@ pub struct CoreImpl {
     /// privacy contract. Held in [`OnceLock`] for lock-free
     /// dashboard / dedup-event reads.
     dedup_analytics: OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
-    // Phase-8 multi-scope search resolver moved to
-    // `crate::search::coordinator::Coordinator` in Phase B.9 — see
+    // multi-scope search resolver moved to
+    // `crate::search::coordinator::Coordinator` — see
     // the `search` field above for the doc surface.
-    /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
+    /// macOS Spotlight bridge.
     /// Write-once via
     /// [`CoreImpl::install_spotlight_anchor`]. The
     /// `ingest_messages` path forwards a redacted summary of
@@ -416,13 +417,13 @@ pub struct CoreImpl {
     /// in [`Self::maybe_index_in_desktop_search`] becomes a
     /// lock-free atomic load.
     spotlight_anchor: OnceLock<Arc<dyn crate::desktop_index::SpotlightAnchor>>,
-    /// Phase-7 (2026-05-04 batch 10) Windows Search bridge.
+    /// Windows Search bridge.
     /// Write-once via
     /// [`CoreImpl::install_windows_search_anchor`]. Held in
     /// [`OnceLock`] for the same lock-free-read /
     /// process-singleton reasons as [`Self::spotlight_anchor`].
     windows_search_anchor: OnceLock<Arc<dyn crate::desktop_index::WindowsSearchAnchor>>,
-    /// Phase-7 (2026-05-04 batch 10 — Task 8) on-device EP
+    /// on-device EP
     /// benchmark runner. Write-once via
     /// [`CoreImpl::install_ep_benchmark_runner`]. When set,
     /// [`CoreImpl::run_ep_benchmark`] forwards calls into the
@@ -433,7 +434,7 @@ pub struct CoreImpl {
     /// platform bridge installs one runner at boot and the
     /// underlying ONNX session is a per-process resource.
     ep_benchmark_runner: OnceLock<Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>,
-    /// Phase-7 (2026-05-04 batch 10 — Task 8) persistent EP
+    /// persistent EP
     /// benchmark cache. Defaults to an empty cache; the
     /// orchestration layer can swap a loaded cache via
     /// [`CoreImpl::install_ep_benchmark_cache`].
@@ -531,7 +532,7 @@ pub struct UploadedShardMetadata {
 // so existing call sites stay source-compatible. The write path
 // (this module) and the read path
 // (`crate::search::cold_shard_source`) MUST share one alphabet
-// — see `crate::util` for the rationale.
+// see `crate::util` for the rationale.
 use crate::util::base64_urlsafe_encode;
 
 impl CoreImpl {
@@ -664,20 +665,20 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Epoch key lifecycle (`docs/PROPOSAL.md §2.1`)
+    // Epoch key lifecycle (`docs/DESIGN.md §2.1`)
     // ----------------------------------------------------------------
 
     /// Bootstrap a fresh `EpochKeyManager` for the supplied
     /// `K_archive_root` and `epoch_id` and install it as the
     /// active manager. Replaces any previously installed manager
-    /// — callers usually call this once at unlock time.
+    /// callers usually call this once at unlock time.
     ///
-    /// `docs/PROPOSAL.md §2.1`: `K_archive_root` is the long-lived
+    /// `docs/DESIGN.md §2.1`: `K_archive_root` is the long-lived
     /// device-keystore wrap that the platform decrypts on unlock.
     /// The manager owns the **derived** epoch key in a `Zeroizing`
     /// buffer; the root never leaves the caller's stack.
     ///
-    /// Phase-B.9 delegate: forwards to
+    /// Delegate to: forwards to
     /// [`crate::archive::coordinator::Coordinator::install_epoch_key_manager`].
     pub fn install_epoch_key_manager(
         &self,
@@ -689,14 +690,14 @@ impl CoreImpl {
     }
 
     /// Whether an epoch key manager is currently installed.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::has_epoch_key_manager`].
     pub fn has_epoch_key_manager(&self) -> bool {
         self.archive.has_epoch_key_manager()
     }
 
     /// Snapshot of the currently active epoch identifier (if any).
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::current_epoch_id`].
     pub fn current_epoch_id(&self) -> Result<Option<String>> {
         self.archive.current_epoch_id()
@@ -708,7 +709,7 @@ impl CoreImpl {
     /// **never** hand the byte slice out of the closure.
     ///
     /// Returns `Error::Storage` when no manager is installed.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::with_current_epoch_key`].
     pub fn with_current_epoch_key<F, T>(&self, f: F) -> Result<T>
     where
@@ -725,7 +726,7 @@ impl CoreImpl {
     /// next archive manifest's `wrapped_prior_epoch_keys` slot.
     ///
     /// Returns `Error::Storage` when no manager is installed.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::rotate_archive_epoch`].
     pub fn rotate_archive_epoch(
         &self,
@@ -739,7 +740,7 @@ impl CoreImpl {
     /// Recover a prior-epoch key from its wrapped manifest entry.
     /// Returned bytes belong to the caller and should be wrapped
     /// in a `Zeroizing` buffer at the call site.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::recover_epoch_key`].
     pub fn recover_epoch_key(
         &self,
@@ -751,7 +752,7 @@ impl CoreImpl {
 
     /// Forward-secrecy delete of a retired epoch key. Returns
     /// `true` if a key was actually removed from the manager.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::delete_archive_epoch_key`].
     pub fn delete_archive_epoch_key(&self, epoch_id: &str) -> Result<bool> {
         self.archive.delete_archive_epoch_key(epoch_id)
@@ -760,7 +761,7 @@ impl CoreImpl {
     /// Snapshot of every retired epoch's wrapped key, ready to
     /// drop into the next manifest's
     /// [`crate::archive::manifest_builder::ManifestBuildRequest::wrapped_prior_epoch_keys`].
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::wrapped_prior_epoch_keys_for_manifest`].
     pub fn wrapped_prior_epoch_keys_for_manifest(&self) -> Result<Vec<WrappedEpochKeyRef>> {
         self.archive.wrapped_prior_epoch_keys_for_manifest()
@@ -770,7 +771,7 @@ impl CoreImpl {
     /// hydration queue at priority
     /// [`HydrationReason::SearchResultTap`]. Used by
     /// [`Self::search`] when `scope == IncludeCold`. Best-effort
-    /// — a poisoned queue mutex is logged-and-skipped (the
+    /// a poisoned queue mutex is logged-and-skipped (the
     /// search results still flow back to the caller).
     fn enqueue_cold_results_for_hydration(&self, results: &[SearchResult]) {
         self.search.enqueue_cold_results(
@@ -812,8 +813,8 @@ impl CoreImpl {
         Ok((results, cold_count))
     }
 
-    /// Run a unified search with cold-bucket fan-out via
-    /// `cold_source` (Phase 5, Task 1).
+    /// Run a unified search with cold-bucket fan-out via the
+    /// supplied `cold_source`.
     ///
     /// The orchestration layer (bridge crate / async runtime) is
     /// expected to implement [`ColdShardSource`] by querying
@@ -852,8 +853,7 @@ impl CoreImpl {
         Ok(results)
     }
 
-    /// Phase 8 (2026-05-04 batch 10) — Task 2: streaming-search
-    /// orchestration entry point.
+    /// Streaming-search orchestration entry point.
     ///
     /// Wraps
     /// [`crate::search::query_engine::QueryEngine::execute_search_streaming`]
@@ -910,9 +910,9 @@ impl CoreImpl {
 
     /// Build encrypted text + fuzzy search shards for a given
     /// `(conversation_id, time_bucket)` and ferry them to the
-    /// archive backend (Phase 5, Task 2).
+    /// archive backend.
     ///
-    /// `docs/PHASES.md §Phase 5` calls for the orchestration
+    /// `docs/DESIGN.md §12.5` calls for the orchestration
     /// layer to:
     ///
     /// 1. Pull the FTS / fuzzy rows for the bucket out of local
@@ -1047,7 +1047,7 @@ impl CoreImpl {
 
     /// Drive one incremental backup pass and ferry the freshly
     /// affected `(conversation_id, time_bucket)` search shards
-    /// up through the supplied transport (Phase 5 / Task 1).
+    /// up through the supplied transport.
     ///
     /// Wraps [`Self::run_incremental_backup_inner`] with a
     /// post-seal sweep that:
@@ -1243,14 +1243,14 @@ impl CoreImpl {
 
     // ----------------------------------------------------------------
     // Timeline-skeleton rehydration on scroll-back
-    // (Task 4 — `docs/PROPOSAL.md §5.1`)
+    // (Task 4 — `docs/DESIGN.md §5.1`)
     // ----------------------------------------------------------------
 
     /// Rehydrate every [`MessageSkeleton`] for `(conversation_id,
     /// time_bucket)` from the personal archive into the local
     /// store, returning the freshly-inserted skeletons.
     ///
-    /// `docs/PROPOSAL.md §5.1` — when the user scrolls back past
+    /// `docs/DESIGN.md §5.1` — when the user scrolls back past
     /// the local-store horizon the orchestration layer pulls the
     /// matching archive segment(s) for the bucket via
     /// [`crate::archive::prefetch::batch_prefetch_bucket`],
@@ -1265,10 +1265,10 @@ impl CoreImpl {
     /// segments — typically pulled out of
     /// [`Self::with_current_epoch_key`] once the device unlocks
     /// `K_archive_root`. Cross-epoch buckets are the caller's job
-    /// — supply the correct epoch key for the bucket you are
+    /// supply the correct epoch key for the bucket you are
     /// rehydrating.
     ///
-    /// The function never overwrites an existing local skeleton —
+    /// The function never overwrites an existing local skeleton
     /// see [`LocalStoreDb::upsert_skeleton_from_archive`]. The
     /// returned `Vec` lists *only* the rows that landed for the
     /// first time, in `archive_segment_map` traversal order.
@@ -1306,7 +1306,7 @@ impl CoreImpl {
     /// `storage_backend = zk_object_fabric` through ZKOF /
     /// S3 instead of the KChat transport.
     ///
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::build_router`].
     fn build_archive_router<'a>(
         &self,
@@ -1315,7 +1315,7 @@ impl CoreImpl {
         self.archive.build_router(transport)
     }
 
-    /// Install the Phase-3 ZKOF archive backend (S3 client +
+    /// Install the ZKOF archive backend (S3 client +
     /// gateway config). Required before
     /// [`Self::rehydrate_timeline_skeletons`] can route any
     /// `storage_backend = zk_object_fabric` rows; the call is a
@@ -1325,7 +1325,7 @@ impl CoreImpl {
     /// reconfiguration to ZKOF picks up the wiring without
     /// re-installing.
     ///
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::install_zkof_archive_backend`].
     pub fn install_zkof_archive_backend(
         &self,
@@ -1335,7 +1335,7 @@ impl CoreImpl {
         self.archive.install_zkof_archive_backend(s3, config)
     }
 
-    /// Install a Phase-5 background scheduler bridge. The bridge
+    /// Install a background scheduler bridge. The bridge
     /// is platform glue (Swift `BGTaskScheduler` on iOS, Kotlin
     /// `WorkManager` on Android) that fills in the
     /// [`crate::scheduler::BackgroundScheduler`] trait.
@@ -1365,7 +1365,7 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search anchors.
+    // /6 desktop search anchors.
     // ----------------------------------------------------------------
 
     /// Install the macOS Spotlight bridge. The
@@ -1442,12 +1442,12 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 8: EP benchmark
+    // EP benchmark
     // capture + persistent cache + auto-selection.
     // ----------------------------------------------------------------
 
     /// Install (or replace) the on-device EP benchmark runner
-    /// (Phase 7 Task 8). Production callers wrap their
+    /// (Task 8). Production callers wrap their
     /// `ort::Session` factory in a runner; tests use
     /// [`crate::models::ep_tuning::NoopEpBenchmarkRunner`] or
     /// [`crate::models::ep_tuning::MockEpBenchmarkRunner`].
@@ -1534,12 +1534,12 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Phase-6 model bridges (Task 2 / 4 / 6 / 9)
+    // On-device model bridges
     // ----------------------------------------------------------------
 
     /// Install the on-device text-embedding bridge used by
     /// message ingest and the semantic-search query path
-    /// (`docs/PROPOSAL.md §7.6 / §7.6.1`, Phase 6, Task 2).
+    /// (`docs/DESIGN.md §7.6 / §7.6.1`).
     ///
     /// When set, the message-ingest path computes an XLM-R
     /// embedding for every text body and writes it through
@@ -1571,10 +1571,10 @@ impl CoreImpl {
     }
 
     /// Install the on-device image-embedding bridge used by
-    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
-    /// When set, MobileCLIP-S2 embeddings are written to
-    /// `search_vector` for image-typed media on ingest.
-    /// Write-once — same per-process-ONNX-session rationale as
+    /// media ingest (`docs/DESIGN.md §7.6`). When set,
+    /// MobileCLIP-S2 embeddings are written to `search_vector`
+    /// for image-typed media on ingest. Write-once — same
+    /// per-process-ONNX-session rationale as
     /// [`Self::install_text_embedder`].
     pub fn install_image_embedder(
         &self,
@@ -1591,11 +1591,11 @@ impl CoreImpl {
     }
 
     /// Install the platform OCR bridge used by media ingest
-    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped in
-    /// `Arc` so multiple background workers can fan out against
-    /// the same bridge with no serialisation. Write-once:
-    /// returns [`Error::Storage`] if an OCR bridge has already
-    /// been installed.
+    /// (`docs/DESIGN.md §7.6`). Wrapped in `Arc` so multiple
+    /// background workers can fan out against the same bridge
+    /// with no serialisation. Write-once: returns
+    /// [`Error::Storage`] if an OCR bridge has already been
+    /// installed.
     pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
         self.media.install_ocr_bridge(bridge)
     }
@@ -1608,10 +1608,9 @@ impl CoreImpl {
     }
 
     /// Install the device-resource probe used by the
-    /// resource-gated background workers
-    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 6). When unset,
-    /// the gate defaults to "all-clear" so unit tests don't need
-    /// to install a probe. Write-once: returns
+    /// resource-gated background workers (`docs/DESIGN.md §7.6`).
+    /// When unset, the gate defaults to "all-clear" so unit
+    /// tests don't need to install a probe. Write-once: returns
     /// [`Error::Storage`] if a resource probe has already been
     /// installed.
     pub fn install_resource_probe(
@@ -1631,9 +1630,8 @@ impl CoreImpl {
     }
 
     /// Install the on-device Whisper transcriber used by media
-    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 1 of the
-    /// 2026-05-04 batch). When set, audio media writes a
-    /// transcript row into `media_search_index` during
+    /// ingest (`docs/DESIGN.md §7.6`). When set, audio media
+    /// writes a transcript row into `media_search_index` during
     /// `send_media`. Write-once — the underlying Whisper ONNX
     /// session cannot be replaced live without leaking GPU
     /// allocations and racing in-flight transcription tasks.
@@ -1652,9 +1650,8 @@ impl CoreImpl {
     }
 
     /// Install the on-device document text-extraction bridge
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 2 of the 2026-05-04 batch). When set, PDF / DOCX
-    /// media writes per-page text rows into
+    /// used by media ingest (`docs/DESIGN.md §7.6`). When set,
+    /// PDF / DOCX media writes per-page text rows into
     /// `media_search_index` during `send_media`. Write-once —
     /// the platform document parser (PDFKit / Apache Tika /
     /// MlKit) is a per-process resource.
@@ -1673,9 +1670,8 @@ impl CoreImpl {
     }
 
     /// Install the on-device video keyframe sampler used by
-    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 3 of
-    /// the 2026-05-04 batch). When set together with an
-    /// [`crate::models::clip::ImageEmbedder`], video media
+    /// media ingest (`docs/DESIGN.md §7.6`). When set together
+    /// with an [`crate::models::clip::ImageEmbedder`], video media
     /// embeds the first keyframe via MobileCLIP-S2 and writes
     /// the embedding to `search_vector` during `send_media`.
     /// Write-once — platform video decoders (AVFoundation /
@@ -1695,11 +1691,10 @@ impl CoreImpl {
     }
 
     /// Install the offline-detection probe used by the
-    /// backup-defer / hydrate-offline paths (Phase 7, Task 6 of
-    /// the 2026-05-04 batch). Wrapped in `Arc` so multiple
-    /// workers can share one detector. Write-once: returns
-    /// [`Error::Storage`] if an offline detector has already
-    /// been installed.
+    /// backup-defer / hydrate-offline paths. Wrapped in `Arc` so
+    /// multiple workers can share one detector. Write-once:
+    /// returns [`Error::Storage`] if an offline detector has
+    /// already been installed.
     pub fn install_offline_detector(
         &self,
         detector: Arc<dyn crate::transport::offline::OfflineDetector>,
@@ -1722,12 +1717,12 @@ impl CoreImpl {
             .unwrap_or(true)
     }
 
-    /// Install the performance-trace collector (Phase 7, Task 8
-    /// of the 2026-05-04 batch). Wrapped in `Arc` so callers can
-    /// share one collector across the lifetime of the process
-    /// and read out traces with [`Self::collect_perf_stats`].
-    /// Write-once: returns [`Error::Storage`] if a collector has
-    /// already been installed.
+    /// Install the performance-trace collector. Wrapped in
+    /// `Arc` so callers can share one collector across the
+    /// lifetime of the process and read out traces with
+    /// [`Self::collect_perf_stats`]. Write-once: returns
+    /// [`Error::Storage`] if a collector has already been
+    /// installed.
     pub fn install_perf_collector(
         &self,
         collector: Arc<dyn crate::perf::PerfCollector>,
@@ -1756,7 +1751,7 @@ impl CoreImpl {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 7: per-operation
+    /// per-operation
     /// p50 / p95 / p99 dashboard, derived from the installed
     /// collector's buffered traces. Returns the empty vector
     /// when no collector is installed or the collector does not
@@ -1782,7 +1777,7 @@ impl CoreImpl {
             .collect()
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 7: budget check
+    /// budget check
     /// dashboard. Compares [`Self::get_perf_summary`] output
     /// against the supplied budgets and returns every violation.
     /// Empty `budgets` slice is allowed — the result is
@@ -1804,9 +1799,9 @@ impl CoreImpl {
         }
     }
 
-    /// Install the read-only dedup-analytics probe (Phase 7,
-    /// batch-5 — 2026-05-04). Wrapped in `Arc` so multiple
-    /// workers can share one probe. See
+    /// Install the read-only dedup-analytics probe.
+    ///
+    /// Wrapped in `Arc` so multiple workers can share one probe. See
     /// `crates/core/src/transport/dedup_analytics.rs` for the
     /// privacy contract — the probe MUST NOT receive plaintext,
     /// derived plaintext (FTS tokens, embeddings), or media
@@ -1859,7 +1854,7 @@ impl CoreImpl {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 10): record one
+    /// record one
     /// dedup event into the installed probe (if any). No-ops
     /// when no probe is installed so the upload hot paths never
     /// pay for a hashmap lookup.
@@ -1873,7 +1868,7 @@ impl CoreImpl {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 10): build a
+    /// build a
     /// [`crate::transport::dedup_analytics::DedupDashboard`] for
     /// `tenant_id`. The dashboard combines the upstream
     /// `query_dedup_ratio` / `query_storage_savings` snapshots
@@ -1893,10 +1888,10 @@ impl CoreImpl {
         })
     }
 
-    /// Install the multi-scope search resolver (Phase 8, batch-5
-    /// — 2026-05-04). Wrapped in `Arc` so the orchestration layer
-    /// can share one resolver across worker threads. When no
-    /// resolver is installed, the query engine uses the default
+    /// Install the multi-scope search resolver. Wrapped in
+    /// `Arc` so the orchestration layer can share one resolver
+    /// across worker threads. When no resolver is installed,
+    /// the query engine uses the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`].
     /// Write-once: returns [`Error::Storage`] if a resolver has
     /// already been installed.
@@ -1914,7 +1909,7 @@ impl CoreImpl {
         self.search.has_resolver()
     }
 
-    /// Phase 7, batch-5 — build a media-migration plan that
+    /// build a media-migration plan that
     /// moves every `media_asset` row whose `storage_sink` is
     /// `source_sink` to `target_sink`. Wraps
     /// [`crate::media::migration::plan_media_migration`].
@@ -1928,7 +1923,7 @@ impl CoreImpl {
             .map_err(|e| crate::Error::Storage(e.to_string().into()))
     }
 
-    /// Phase 7, batch-5 — execute a previously-built migration
+    /// execute a previously-built migration
     /// plan against the supplied sinks. The orchestration
     /// layer is responsible for constructing the plan via
     /// [`Self::plan_media_migration`] and for handing in
@@ -1964,7 +1959,7 @@ impl CoreImpl {
         )
     }
 
-    /// Phase 7 (2026-05-04 batch 10 — Task 9): schedule the
+    /// schedule the
     /// supplied [`crate::media::migration::MediaMigrationPlan`]
     /// as a one-off background task on the installed
     /// [`crate::scheduler::BackgroundScheduler`].
@@ -2014,7 +2009,7 @@ impl CoreImpl {
         )
     }
 
-    /// Run a unified search scoped to `target`. Phase-8 entry
+    /// Run a unified search scoped to `target`. This is the entry
     /// point that ferries the installed
     /// [`crate::search::search_target::ConversationGroupResolver`]
     /// (or the [`crate::search::search_target::NoopConversationGroupResolver`]
@@ -2054,7 +2049,7 @@ impl CoreImpl {
     }
 
     /// Replay the supplied search-index shards into the local
-    /// `search_fts` / `search_fuzzy` tables (Phase 4, Task 6).
+    /// `search_fts` / `search_fuzzy` tables.
     ///
     /// Wires
     /// [`crate::restore::pipeline::RestorePipeline::restore_search_index_shards_with_replay`]
@@ -2078,7 +2073,7 @@ impl CoreImpl {
     /// returned [`crate::search::shard_prefetch::PrefetchedShard`]
     /// under the shard key the caller registered for the triple,
     /// and replay the contained rows into the local
-    /// `search_fts` / `search_fuzzy` tables (Phase 5, Task 2).
+    /// `search_fts` / `search_fuzzy` tables.
     ///
     /// Returns a [`RestoreColdShardsSummary`] describing how many
     /// shards came back and how many rows landed in each table.
@@ -2186,13 +2181,13 @@ impl CoreImpl {
 
     /// Whether [`Self::install_zkof_archive_backend`] has been
     /// called.
-    /// Phase-B.9 delegate to
+    /// Delegate to
     /// [`crate::archive::coordinator::Coordinator::has_zkof_archive_backend`].
     pub fn has_zkof_archive_backend(&self) -> bool {
         self.archive.has_zkof_archive_backend()
     }
 
-    /// Cold-result hydration write-back (Phase 5, Task 3).
+    /// Cold-result hydration write-back.
     ///
     /// Walks the supplied [`SearchResult`] vec, picks out the
     /// rows flagged `is_cold = true`, groups them by
@@ -2260,7 +2255,7 @@ impl CoreImpl {
         // bucket loop so a re-acquire of the ZKOF config locks
         // does not happen on every iteration. The router
         // dispatches each `archive_segment_map` row to the
-        // backend named in its `storage_backend` column —
+        // backend named in its `storage_backend` column
         // KChat rows go through `transport`, ZKOF rows go
         // through the installed S3 client. Mirrors the wiring
         // used by [`Self::rehydrate_timeline_skeletons`].
@@ -2268,7 +2263,7 @@ impl CoreImpl {
 
         let mut hydrated = 0usize;
         for ((conv_id, time_bucket), wanted_ids) in buckets {
-            // Phase 1: fetch every segment for the bucket. Read
+            // fetch every segment for the bucket. Read
             // under the DB lock just long enough to enumerate
             // the segment rows, then drop so the per-segment
             // decrypt + replay does not starve concurrent
@@ -2283,7 +2278,7 @@ impl CoreImpl {
                 )?
             };
 
-            // Phase 2: walk events; for each wanted message_id
+            // walk events; for each wanted message_id
             // try to extract a text body from the archive
             // payload and rehydrate it.
             for segment in prefetched {
@@ -2397,7 +2392,7 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Lazy media rehydration on tap (Task 5 — `docs/PROPOSAL.md §5.5`)
+    // Lazy media rehydration on tap (Task 5 — `docs/DESIGN.md §5.5`)
     // ----------------------------------------------------------------
 
     /// Rehydrate the media blob attached to `message_id` from the
@@ -2409,7 +2404,7 @@ impl CoreImpl {
     /// resolves the `asset_id` from the message-key by calling
     /// [`LocalStoreDb::get_media_asset_by_message`] — the public
     /// API for the on-tap UI flow described in
-    /// `docs/PROPOSAL.md §5.2`.
+    /// `docs/DESIGN.md §5.2`.
     ///
     /// Returns `Ok(Some(plaintext))` when a download was issued,
     /// `Ok(None)` when no media row is attached to `message_id`.
@@ -2424,11 +2419,11 @@ impl CoreImpl {
     ) -> Result<Option<Vec<u8>>> {
         let mid = message_id.to_string();
 
-        // Phase 1: read all metadata under the db lock, then drop
+        // read all metadata under the db lock, then drop
         // the guard so the long-running chunked download in
         // phase 2 doesn't block concurrent
         // `send_text` / `search` / `ingest` callers
-        // (Task 2 of the Phase 3/4 batch).
+        // (Task 2 of the /4 batch).
         let plan = {
             let db = self.db_writer.lock().map_err(poisoned)?;
             let Some(asset) = db
@@ -2441,12 +2436,12 @@ impl CoreImpl {
             // MutexGuard drops here on the closing brace.
         };
 
-        // Phase 2: chunked download, AEAD-open, BLAKE3 verify —
+        // chunked download, AEAD-open, BLAKE3 verify
         // no db reference held.
         let plaintext =
             crate::media::download::execute_rehydration_download(&plan, transport, wrapping_key)?;
 
-        // Phase 3: re-acquire the db lock and flip the state
+        // re-acquire the db lock and flip the state
         // machine + bytes_local under SAVEPOINT.
         {
             let db = self.db_writer.lock().map_err(poisoned)?;
@@ -2469,11 +2464,11 @@ impl CoreImpl {
     /// without raising an error — every other [`ProcessorError`] is
     /// surfaced.
     ///
-    /// This is the **inherent** entry point used in Phase 1 while
-    /// the transport-driven [`KChatCore::ingest_remote_messages`]
+    /// This is the **inherent** entry point used while the
+    /// transport-driven [`KChatCore::ingest_remote_messages`]
     /// trait method is still a stub.
     ///
-    /// Phase 6, Task 2 / Task 10: when a [`crate::models::embeddings::TextEmbedder`]
+    /// When a [`crate::models::embeddings::TextEmbedder`]
     /// has been installed via [`Self::install_text_embedder`],
     /// each text body is embedded and written to `search_vector`
     /// via the [`crate::models::embeddings::EmbeddingCache`]
@@ -2487,21 +2482,21 @@ impl CoreImpl {
     // lockstep with the `PerfTrace::insert_metadata` keys inside
     // the method body. The mapping is:
     //
-    //   tracing field     PerfTrace key      source
-    //   --------------    ---------------    ----------------------
-    //   messages_in       messages_in        input slice length
-    //   new_messages      new_messages       result.new_messages
-    //   duplicate_count   duplicate_count    result.duplicate_count
-    //   embeddings_computed embeddings_computed running counter
-    //   error             error              `Err(_).to_string()` on the
-    //                                        early-return path
+    // tracing field PerfTrace key source
+    // -------------- --------------- ----------------------
+    // messages_in messages_in input slice length
+    // new_messages new_messages result.new_messages
+    // duplicate_count duplicate_count result.duplicate_count
+    // embeddings_computed embeddings_computed running counter
+    // error error `Err(_).to_string()` on the
+    // early-return path
     //
     // Keeping the two surfaces aligned means a dashboard consumer
     // can read the same value off either source without a rename
     // table, and saves a maintainer from chasing two different
     // names for the same thing. The `error` field is declared
     // `tracing::field::Empty` so the success path leaves it
-    // unset; on error we `Span::current().record("error", ...)`
+    // unset; on error we `Span::current().record("error",...)`
     // immediately before propagating the failure, mirroring the
     // PerfTrace `error` metadata so logcat / os_log / stderr
     // subscribers see the same diagnostic the in-app perf
@@ -2517,7 +2512,7 @@ impl CoreImpl {
         ),
     )]
     pub fn ingest_messages(&self, messages: &[IngestedMessage]) -> Result<IngestResult> {
-        // Phase 7, Task 8 (2026-05-04 batch): wrap the ingest hot
+        // wrap the ingest hot
         // path with a [`crate::perf::PerfTrace`] so an installed
         // collector can measure end-to-end ingest latency. We
         // record `messages_in` (input batch size) and the result
@@ -2555,9 +2550,9 @@ impl CoreImpl {
             match persister.persist_ingested_message(msg) {
                 Ok(_) => {
                     result.new_messages += 1;
-                    // Best-effort cross-pipeline embedding (Phase 6,
-                    // Task 2 / 10). Failures are absorbed because
-                    // the message is already persisted; semantic
+                    // Best-effort cross-pipeline embedding.
+                    // Failures are absorbed because the message
+                    // is already persisted; semantic
                     // search will still work for messages that DID
                     // embed successfully, and the next ingest will
                     // retry this row's embedding the moment a real
@@ -2587,10 +2582,9 @@ impl CoreImpl {
         span.record("duplicate_count", result.duplicate_count);
         span.record("embeddings_computed", embeddings_computed);
 
-        // Phase 7 (2026-05-04 batch 10) — Task 5/6: forward the
-        // batch to any installed Spotlight / Windows Search
-        // bridge. Best-effort — failures here must not roll
-        // back the ingested rows.
+        // Forward the batch to any installed Spotlight / Windows
+        // Search bridge. Best-effort — failures here must not
+        // roll back the ingested rows.
         drop(db);
         self.maybe_index_in_desktop_search(messages);
 
@@ -2657,10 +2651,9 @@ impl CoreImpl {
         }
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 5/6: best-effort
-    /// fan-out of newly ingested messages to the installed
-    /// macOS Spotlight / Windows Search bridges. No-op on
-    /// platforms where no bridge has been installed. Errors
+    /// Best-effort fan-out of newly ingested messages to the
+    /// installed macOS Spotlight / Windows Search bridges. No-op
+    /// on platforms where no bridge has been installed. Errors
     /// from the bridge are swallowed because the message has
     /// already been persisted; failure to update the OS search
     /// index must not roll back ingest.
@@ -2714,8 +2707,8 @@ impl CoreImpl {
         }
     }
 
-    /// Best-effort cross-pipeline image embedding (Phase 6,
-    /// Task 9). Runs only when (a) an
+    /// Best-effort cross-pipeline image embedding (
+    /// Runs only when (a) an
     /// [`crate::models::clip::ImageEmbedder`] is installed,
     /// (b) `mime_type` advertises an image, and (c) the shared
     /// embedding cache does not already carry a row for
@@ -2761,9 +2754,9 @@ impl CoreImpl {
         }
     }
 
-    /// Best-effort Whisper transcription for audio media (Phase
-    /// 6, Task 2 of the 2026-05-04 batch). Runs only when
-    /// (a) a [`crate::models::whisper::WhisperTranscriber`] is
+    /// Best-effort Whisper transcription for audio media. Runs
+    /// only when (a) a
+    /// [`crate::models::whisper::WhisperTranscriber`] is
     /// installed, (b) `mime_type` indicates audio, and (c) the
     /// optional [`crate::models::resource_gate::ResourceProbe`]
     /// reports the device is willing to run transcription work
@@ -2777,7 +2770,7 @@ impl CoreImpl {
     ///   `"transcript"` — for caller code that still consults
     ///   the legacy media-side index.
     /// * `search_fts` and `search_fuzzy`, keyed by `message_id`
-    ///   — so a `core.search()` call ranks the audio message
+    ///   so a `core.search()` call ranks the audio message
     ///   alongside text bodies and OCR / caption rows.
     /// * Optionally [`crate::models::embeddings::LocalStoreEmbeddingCache`]
     ///   under `XLMR_MODEL_VERSION` when a `TextEmbedder` is
@@ -2811,7 +2804,7 @@ impl CoreImpl {
         // Resource-gate transcription work. Whisper is the
         // strictest gate (`should_run_transcription`); skip
         // entirely when the gate refuses. Lock-free atomic load
-        // — the resource probe is installed once at boot.
+        // the resource probe is installed once at boot.
         if let Some(probe) = self.resource_probe.get() {
             let gate = ResourceGate::default();
             if !gate.should_run_transcription(&probe.current_resources()) {
@@ -2836,13 +2829,13 @@ impl CoreImpl {
         let _ = db.insert_media_search_index(asset_id, "transcript", transcript, language, None);
 
         // (2) Cross-modal FTS / fuzzy index keyed by
-        //     `message_id` — same shape `send_text` writes for
-        //     plain text bodies. Best-effort; a duplicate row
-        //     (e.g. the caption already inserted one) is
-        //     harmless because `search_fts` is content-addressed
-        //     by `(message_id, text_content)` from the engine's
-        //     POV and the fuzzy index PK is `(token, script,
-        //     message_id)`.
+        // `message_id` — same shape `send_text` writes for
+        // plain text bodies. Best-effort; a duplicate row
+        // (e.g. the caption already inserted one) is
+        // harmless because `search_fts` is content-addressed
+        // by `(message_id, text_content)` from the engine's
+        // POV and the fuzzy index PK is `(token, script,
+        // message_id)`.
         let _ = db.connection().execute(
             "INSERT INTO search_fts(
                 message_id, conversation_id, sender_id,
@@ -2859,8 +2852,8 @@ impl CoreImpl {
         let _ = FuzzyIndexWriter::new(db).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
-        //     up the audio body. Lock-free atomic load — the
-        //     text embedder is installed once at boot.
+        // up the audio body. Lock-free atomic load — the
+        // text embedder is installed once at boot.
         if let Some(embedder) = self.text_embedder.get() {
             let cache = LocalStoreEmbeddingCache::new(db.connection());
             if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
@@ -2871,9 +2864,9 @@ impl CoreImpl {
         }
     }
 
-    /// Best-effort document text extraction for PDF / DOCX media
-    /// (Phase 6, Task 3 of the 2026-05-04 batch). Runs only when
-    /// (a) a [`crate::models::document::DocumentExtractor`] is
+    /// Best-effort document text extraction for PDF / DOCX
+    /// media. Runs only when (a) a
+    /// [`crate::models::document::DocumentExtractor`] is
     /// installed and (b) `mime_type` is one of the supported
     /// document MIME types
     /// ([`crate::models::document::is_supported_document_mime`]).
@@ -2935,8 +2928,8 @@ impl CoreImpl {
             let _ = db.insert_media_search_index(asset_id, "caption", &formatted, language, None);
 
             // (2) Page-level FTS / fuzzy rows keyed by a
-            //     synthetic per-page id so the same `message_id`
-            //     can land multiple FTS rows without colliding.
+            // synthetic per-page id so the same `message_id`
+            // can land multiple FTS rows without colliding.
             let page_row_id = format!("{}#page{}", message_id, page.page_number);
             let _ = db.connection().execute(
                 "INSERT INTO search_fts(
@@ -2954,8 +2947,8 @@ impl CoreImpl {
             let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, trimmed);
 
             // (3) Optional XLM-R embedding per page. Lock-free
-            //     atomic load — the text embedder is installed
-            //     once at boot.
+            // atomic load — the text embedder is installed
+            // once at boot.
             if let Some(embedder) = self.text_embedder.get() {
                 let cache = LocalStoreEmbeddingCache::new(db.connection());
                 if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
@@ -2968,8 +2961,7 @@ impl CoreImpl {
     }
 
     /// Best-effort video keyframe sampling + MobileCLIP-S2
-    /// embedding fan-out for video media (Phase 6, Task 1 of
-    /// the 2026-05-04 batch). Runs only when (a) a
+    /// embedding fan-out for video media. Runs only when (a) a
     /// [`crate::models::video::VideoKeyframeSampler`] is
     /// installed, (b) an
     /// [`crate::models::clip::ImageEmbedder`] is installed, and
@@ -3004,7 +2996,7 @@ impl CoreImpl {
 
         let cache = LocalStoreEmbeddingCache::new(db.connection());
 
-        // Sample up to 5 keyframes per PROPOSAL §7.6 default.
+        // Sample up to 5 keyframes per DESIGN.md §7.6 default.
         let frames = match sampler.extract_keyframes(plaintext, mime_type, 5) {
             Ok(f) => f,
             Err(_) => return,
@@ -3062,7 +3054,7 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Conversation management — Task 4 (`docs/PROPOSAL.md §12`)
+    // Conversation management — Task 4 (`docs/DESIGN.md §12`)
     // ----------------------------------------------------------------
 
     /// Insert a new `conversation` row with the given id and optional
@@ -3070,9 +3062,9 @@ impl CoreImpl {
     /// `last_activity_ms` initialized to the supplied wall-clock
     /// timestamp.
     ///
-    /// **Phase-1 note.** Title encryption (`K_local_db`-AEAD-sealed
+    /// **note.** Title encryption (`K_local_db`-AEAD-sealed
     /// `title_cipher`) lands with the conversation-metadata
-    /// roadmap in Phase 2. For now `title` is stored verbatim as
+    /// roadmap in For now `title` is stored verbatim as
     /// UTF-8 bytes so the bridge can already round-trip the field
     /// through the public API.
     pub fn create_conversation(
@@ -3269,10 +3261,10 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Backup orchestration (Task 3 — `docs/PROPOSAL.md §6.2`)
+    // Backup orchestration (Task 3 — `docs/DESIGN.md §6.2`)
     // ----------------------------------------------------------------
 
-    /// Install the Phase-4 backup keys: the long-lived
+    /// Install the backup keys: the long-lived
     /// `K_backup_root` (root of the backup KDF tree), the Ed25519
     /// device signing key used to sign backup manifests, and the
     /// stable `device_id` stamped into every manifest's AAD.
@@ -3289,7 +3281,7 @@ impl CoreImpl {
         signing_key: crate::crypto::signing::HybridSigningKey,
         device_id: String,
     ) -> Result<()> {
-        // Phase-5 hardening: the `wrapped_k_segment` BLOB column
+        // hardening: the `wrapped_k_segment` BLOB column
         // on `backup_segment_ledger` is sealed under
         // `K_backup_root`. Materialise the in-memory ledger
         // BEFORE handing it (and the keys) to the coordinator, so
@@ -3322,7 +3314,7 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // Phase-5 hardening — DB-backed manifest chain / segment ledger
+    // hardening — DB-backed manifest chain / segment ledger
     // ----------------------------------------------------------------
 
     /// Load the latest persisted [`BackupManifest`] from
@@ -3564,7 +3556,7 @@ impl CoreImpl {
 
     /// Drive one incremental backup pass.
     ///
-    /// Implements `docs/PROPOSAL.md §6.2` end-to-end:
+    /// Implements `docs/DESIGN.md §6.2` end-to-end:
     ///
     /// 1. Read every event past the
     ///    [`crate::backup::event_journal::BackupEventJournal`]
@@ -3610,7 +3602,7 @@ impl CoreImpl {
                         // shares it so the two paths never disagree on how many
                         // events a single seal contains.
 
-        // Phase 1 — read unsegmented events (db lock).
+        // read unsegmented events (db lock).
         let (events_with_seq, last_seq) = {
             let db = self.db_writer.lock().map_err(poisoned)?;
             let journal = BackupEventJournal::new();
@@ -3658,7 +3650,7 @@ impl CoreImpl {
             .max()
             .expect("non-empty events implies a max");
 
-        // Phase 2 — seal the segment outside the db lock.
+        // seal the segment outside the db lock.
         // `keys` is an `Arc<BackupKeys>` so this snapshot is an
         // 8 byte refcount bump rather than a ~6 KB
         // `HybridSigningKey` copy on the stack.
@@ -3703,7 +3695,7 @@ impl CoreImpl {
             k_segment: k_segment.clone(),
         };
 
-        // Phase-5 hardening: atomically advance the
+        // hardening: atomically advance the
         // `backup_event_cursor`, persist the segment ledger row,
         // and upsert the manifest chain tail inside a single
         // SAVEPOINT. The persist MUST happen before the in-memory
@@ -3847,7 +3839,7 @@ impl CoreImpl {
             segments_superseded += group.members.len() as u64;
             groups_compacted += 1;
 
-            // Tombstones drop the original delete events too —
+            // Tombstones drop the original delete events too
             // matching the semantics already validated in
             // `crate::backup::compaction::apply_tombstones`.
             let survivors = apply_tombstones(events);
@@ -3905,7 +3897,7 @@ impl CoreImpl {
         let sealed_manifest = build_backup_manifest(request, &keys.signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
 
-        // Phase-5 hardening: atomically rewrite the persisted
+        // hardening: atomically rewrite the persisted
         // ledger and the manifest chain tail inside a single
         // SAVEPOINT so a crash cannot leave the ledger compacted
         // while the manifest still references the pre-compaction
@@ -3940,8 +3932,8 @@ impl CoreImpl {
     }
 
     // -----------------------------------------------------------------
-    // Phase-3 / Phase-7 archive compaction (Task 9 — `docs/PHASES.md
-    // §Phase 7`).
+    // / archive compaction (Task 9 — `
+    // §`).
     // -----------------------------------------------------------------
 
     /// Compact the archive segments for a single
@@ -3952,7 +3944,7 @@ impl CoreImpl {
     /// 1. Selects every `archive_segment_map` row matching
     ///    `conversation_id` / `time_bucket` whose state is
     ///    [`ArchiveState::ArchiveVerified`]. Earlier states (still
-    ///    being uploaded, not yet verified) are not eligible —
+    ///    being uploaded, not yet verified) are not eligible
     ///    re-sealing in flight would race with the integrity
     ///    cross-check.
     /// 2. Fetches each row's ciphertext via the supplied
@@ -3988,7 +3980,7 @@ impl CoreImpl {
         F: FnMut(&str) -> Result<[u8; 32]>,
         C: FnMut(&crate::archive::segment_builder::BuiltSegment) -> Result<()>,
     {
-        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // instrument the
         // compaction hot path. The result counters land on the
         // trace metadata so downstream dashboards can correlate
         // latency with bucket size.
@@ -4125,7 +4117,7 @@ impl CoreImpl {
             Some(built)
         };
 
-        // Phase D — let the orchestrator route the upload + write
+        // Step D — let the orchestrator route the upload + write
         // the new segment_map row before we transition the source
         // rows. If commit_compact returns an error the source rows
         // remain at `archive_verified` and the run is retryable.
@@ -4134,7 +4126,7 @@ impl CoreImpl {
             summary.segments_emitted += 1;
         }
 
-        // Phase E — flip every source segment to
+        // Step E — flip every source segment to
         // `archive_compacted`. A SAVEPOINT keeps the bulk of the
         // updates atomic against concurrent reads.
         {
@@ -4292,9 +4284,8 @@ impl KChatCore for CoreImpl {
     }
 
     fn register_device(&self, _device_id: &str) -> Result<DeviceRegistration> {
-        // Phase-1 stub: MLS credential / KeyPackage publication and
-        // device-key derivation arrive when the MLS layer lands
-        // later in Phase 1 / Phase 2.
+        // stub: MLS credential / KeyPackage publication and
+        // device-key derivation arrive when the MLS layer lands.
         Err(Error::NotImplemented("register_device"))
     }
 
@@ -4314,12 +4305,12 @@ impl KChatCore for CoreImpl {
         Ok(mid)
     }
 
-    // Phase A.3: trace the transport-fetch + ingest pair as a
+    // trace the transport-fetch + ingest pair as a
     // single span. The inner `ingest_messages` already has its own
     // span (see `CoreImpl::ingest_messages`), so a tracing
     // subscriber sees a clean parent/child relationship:
-    // `ingest_remote_messages { conversation_id, ... } >
-    // ingest_messages { batch_size, ... }`. This lets dashboards
+    // `ingest_remote_messages { conversation_id,... } >
+    // ingest_messages { batch_size,... }`. This lets dashboards
     // attribute wall-clock to the transport-fetch phase vs the
     // local-persist phase. Fields kept lean to avoid leaking
     // cursor opaque tokens or message payloads into traces.
@@ -4328,15 +4319,15 @@ impl KChatCore for CoreImpl {
     // the `fields(...)` expression list is *also* in `skip(...)`.
     // This is intentional, not contradictory — the two lists do
     // different things:
-    //   * `skip(p)`  suppresses the macro's *automatic* Debug-
-    //                formatted recording of `p` as a span field
-    //                named `p`. Without `skip`, `tracing` would
-    //                eagerly emit a `Debug`-formatted `?p` field.
-    //   * `fields(p = %p)` (or `p = expr`) records an *explicit*
-    //                field whose value is computed from the
-    //                parameter using the named formatter (`%` =
-    //                Display, `?` = Debug, no prefix = `Value`
-    //                impl).
+    // * `skip(p)` suppresses the macro's *automatic* Debug-
+    // formatted recording of `p` as a span field
+    // named `p`. Without `skip`, `tracing` would
+    // eagerly emit a `Debug`-formatted `?p` field.
+    // * `fields(p = %p)` (or `p = expr`) records an *explicit*
+    // field whose value is computed from the
+    // parameter using the named formatter (`%` =
+    // Display, `?` = Debug, no prefix = `Value`
+    // impl).
     // The result is: opaque or large parameters (cursors, byte
     // buffers) never leak as auto-Debug, but their explicit
     // Display/length/`is_some()` projection still appears. This
@@ -4423,7 +4414,7 @@ impl KChatCore for CoreImpl {
         ),
     )]
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
-        // Phase 7, Task 8 (2026-05-04 batch): emit a `search`
+        // emit a `search`
         // [`crate::perf::PerfTrace`]. We capture `query_len`
         // (input characters), `scope`, and the resulting hit
         // count. The trace ends after the cold-hit enqueue so a
@@ -4439,15 +4430,15 @@ impl KChatCore for CoreImpl {
             },
         );
 
-        // Phase B.1 (workstream 6): route the unified search
-        // through `db_readers` so a concurrent UI search does not
-        // contend with the writer's mutex. The reader checked out
-        // here sees a stable WAL snapshot for the duration of
-        // `execute_search`; any writes that commit after checkout
-        // become visible to the *next* checkout, which matches
-        // the previous "writer-locked search" semantics for the
-        // caller (the previous implementation also held a single
-        // snapshot across the search).
+        // Route the unified search through `db_readers` so a
+        // concurrent UI search does not contend with the writer's
+        // mutex. The reader checked out here sees a stable WAL
+        // snapshot for the duration of `execute_search`; any
+        // writes that commit after checkout become visible to the
+        // *next* checkout, which matches the previous
+        // "writer-locked search" semantics for the caller (the
+        // previous implementation also held a single snapshot
+        // across the search).
         let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
             let engine = QueryEngine::new(reader.connection(), reader.icu_available());
             engine
@@ -4467,7 +4458,7 @@ impl KChatCore for CoreImpl {
         };
         // When the caller requested the personal archive, enqueue
         // every cold-flagged result for hydration at priority
-        // `SearchResultTap` (`docs/PROPOSAL.md §5.5`). The enqueue
+        // `SearchResultTap` (`docs/DESIGN.md §5.5`). The enqueue
         // is best-effort: if the queue mutex is poisoned we
         // surface the search results regardless so the UI can
         // render — the orchestrator will retry the enqueue on the
@@ -4585,17 +4576,17 @@ impl KChatCore for CoreImpl {
         }
 
         // 1) Run the chunk + AEAD seal pipeline. The wrapping key is
-        //    `K_local_db` (the bytes already retained on `self.key`)
-        //    so the wrapped `K_asset` is recoverable from the local
-        //    store alone — Phase 3 will rewrap under
-        //    `K_archive_root` when an asset is offloaded.
+        // `K_local_db` (the bytes already retained on `self.key`)
+        // so the wrapped `K_asset` is recoverable from the local
+        // store alone — will rewrap under
+        // `K_archive_root` when an asset is offloaded.
         let processed = process_media(&plaintext, mime_type, &self.key, BlobClass::Media, true)?;
 
         // 2) Optionally generate a thumbnail. Errors during thumbnail
-        //    generation are non-fatal — the timeline can render the
-        //    media row without a thumbnail today, and Phase 6 will
-        //    plug in the vision / OCR pipelines that produce richer
-        //    previews.
+        // generation are non-fatal — the timeline can render the
+        // media row without a thumbnail today, and will
+        // plug in the vision / OCR pipelines that produce richer
+        // previews.
         let _thumbnail = ThumbnailGenerator::new()
             .generate_thumbnail(&plaintext, mime_type, DEFAULT_MAX_DIMENSION)
             .ok();
@@ -4606,8 +4597,8 @@ impl KChatCore for CoreImpl {
         let blob_id = descriptor.blob_id;
 
         // 3) Persist skeleton + body + media_asset rows inside a
-        //    single SAVEPOINT so a failure mid-write doesn't leave
-        //    dangling references.
+        // single SAVEPOINT so a failure mid-write doesn't leave
+        // dangling references.
         let db = self.db_writer.lock().map_err(poisoned)?;
         let conn = db.connection();
         conn.execute_batch("SAVEPOINT send_media;")
@@ -4670,7 +4661,7 @@ impl KChatCore for CoreImpl {
                 message_id: skel.message_id.clone(),
                 mime_type: mime_type.to_string(),
                 bytes_total: descriptor.bytes_total as i64,
-                // Phase 2 keeps the original locally until the
+                // keeps the original locally until the
                 // upload pipeline confirms — `bytes_local` matches
                 // `bytes_total` for now.
                 bytes_local: descriptor.bytes_total as i64,
@@ -4687,7 +4678,7 @@ impl KChatCore for CoreImpl {
             db.insert_media_asset(&asset)
                 .map_err(|e| Error::Storage(e.to_string().into()))?;
 
-            // Phase 6, Task 9: best-effort MobileCLIP-S2 image
+            // best-effort MobileCLIP-S2 image
             // embedding. Runs only when (a) an
             // [`crate::models::clip::ImageEmbedder`] is installed,
             // (b) the MIME type indicates an image, and (c) the
@@ -4697,7 +4688,7 @@ impl KChatCore for CoreImpl {
             // persisted and FTS-searchable through its caption.
             self.maybe_embed_image_message(&db, &skel.message_id, mime_type, &plaintext);
 
-            // Phase 6, Task 2 (2026-05-04 batch): best-effort
+            // best-effort
             // Whisper transcription for audio media. Fans the
             // transcript out into `media_search_index`,
             // `search_fts`, `search_fuzzy`, and the shared XLM-R
@@ -4713,7 +4704,7 @@ impl KChatCore for CoreImpl {
                 &plaintext,
             );
 
-            // Phase 6, Task 3 (2026-05-04 batch): best-effort PDF
+            // best-effort PDF
             // / DOCX page text extraction with page-level FTS /
             // fuzzy / XLM-R fan-out. Failures are absorbed.
             self.maybe_extract_document_pages(
@@ -4727,7 +4718,7 @@ impl KChatCore for CoreImpl {
                 &plaintext,
             );
 
-            // Phase 6, Task 3 (2026-05-04 batch): best-effort
+            // best-effort
             // video keyframe sampling + MobileCLIP-S2 embedding.
             // Runs only when (a) a sampler is installed, (b) an
             // image embedder is installed, and (c) the MIME type
@@ -4748,7 +4739,7 @@ impl KChatCore for CoreImpl {
             )
             .map_err(|e| Error::Storage(e.to_string().into()))?;
 
-            // Append a backup_event_journal entry so the Phase 4
+            // Append a backup_event_journal entry so the
             // backup drainer sees this media message during
             // incremental backups. Same `event_type` ('outbox_pending')
             // and CBOR shape as the send_text path's
@@ -4770,7 +4761,7 @@ impl KChatCore for CoreImpl {
             })
             .map_err(|e| Error::Storage(e.to_string().into()))?;
 
-            // Mirror the media send into the Phase-3 archive event
+            // Mirror the media send into the archive event
             // journal so the segment builder pulls the asset into
             // its next `MessageDelta` segment alongside any text
             // messages from the same time bucket. The write rides
@@ -4822,7 +4813,7 @@ impl KChatCore for CoreImpl {
         ),
     )]
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage> {
-        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // instrument the
         // hydrate hot path with a [`PerfTrace`] so an installed
         // collector can measure end-to-end hydration latency.
         // The closure captures `trace` mutably so the success
@@ -4839,7 +4830,7 @@ impl KChatCore for CoreImpl {
         // while the surrounding error block reuses the same handle.
         let span_ref = &span;
         let result: Result<HydratedMessage> = (|| {
-            // Phase-3 foundation: serve from local storage when a body is
+            // foundation: serve from local storage when a body is
             // already present, otherwise return the skeleton with
             // `is_cold = true`. The remote archive fetch path is still
             // queued for `Task 10+` once the manifest reader lands.
@@ -4864,7 +4855,7 @@ impl KChatCore for CoreImpl {
                     // Detect whether an evicted media asset is
                     // attached. We surface this so the worker can
                     // lazily re-download the blob when the user
-                    // taps the row (Task 5 — Phase 3 §5.5). The
+                    // taps the row (Task 5 — §5.5). The
                     // lookup is cheap (`media_asset` carries an
                     // index on `message_id`) and runs inside the
                     // same pool checkout as the skeleton fetch
@@ -4921,7 +4912,7 @@ impl KChatCore for CoreImpl {
                 })?;
             }
 
-            // Phase 7, Task 6 (2026-05-04 batch): expose an explicit
+            // expose an explicit
             // `offline` flag on the hydration result so renderers
             // can distinguish "cold but reachable, fetch in flight"
             // from "cold and offline, retry on reconnect". The flag
@@ -4969,7 +4960,7 @@ impl KChatCore for CoreImpl {
         ),
     )]
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
-        // Phase 7, Task 8 (2026-05-04 batch): instrument the
+        // instrument the
         // backup hot path. `start_ns` is captured up front so
         // the trace covers both the offline short-circuit and
         // the full segment-build + upload path.
@@ -4977,7 +4968,7 @@ impl KChatCore for CoreImpl {
         let mut trace = crate::perf::PerfTrace::new("run_incremental_backup");
         trace.insert_metadata("reason", reason);
 
-        // Phase 7, Task 6 (2026-05-04 batch): defer the upload
+        // defer the upload
         // when the device is offline. The segment building is
         // unchanged — sealed segments still land in
         // `tracked_backup_segments` so the next online run
@@ -5033,7 +5024,7 @@ impl KChatCore for CoreImpl {
         ),
     )]
     fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult> {
-        // Phase 7, Task 8 (2026-05-04 batch): wrap the eviction
+        // wrap the eviction
         // hot path with [`crate::perf::PerfTrace`]. We capture
         // `pressure_level`, `evicted_count`, and `freed_bytes`
         // so callers can plot pressure-vs-recovery curves. The
@@ -5046,7 +5037,7 @@ impl KChatCore for CoreImpl {
         let mut trace = crate::perf::PerfTrace::new("enforce_storage_budget");
         trace.insert_metadata("reason", reason);
 
-        // Phase-3 foundation: assess pressure and execute an
+        // foundation: assess pressure and execute an
         // empty plan when no candidates are surfaced. The body is
         // wrapped in an immediately-invoked closure so every error
         // path closes the trace before propagating, per the
@@ -5076,12 +5067,12 @@ impl KChatCore for CoreImpl {
             // `MIN_OFFLOAD_AGE_MS`: keep media less than 24 h old
             // resident locally so the typical
             // "scroll back to yesterday" pattern does not trigger an
-            // immediate refetch from cold storage. Phase 5 will lift
+            // immediate refetch from cold storage. will lift
             // this into a per-tenant configurable knob.
             const MIN_OFFLOAD_AGE_MS: i64 = 24 * 60 * 60 * 1000;
             let candidates =
                 collect_eviction_candidates(db.connection(), MIN_OFFLOAD_AGE_MS, now_ms)?;
-            // Tiered eviction (`docs/PROPOSAL.md §5.4`): exhaust the
+            // Tiered eviction (`docs/DESIGN.md §5.4`): exhaust the
             // cloud-offload pool first; only fall through to the
             // KChat-backend pool if the cloud pass underran the budget.
             let tiered =
@@ -5107,7 +5098,7 @@ impl KChatCore for CoreImpl {
                 trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
                 trace.insert_metadata("evicted_count", out.evicted_count.to_string());
 
-                // Phase 7 (2026-05-04 batch 10 — Task 9): when
+                // when
                 // configured, attempt to schedule a media
                 // migration after a non-empty eviction pass. We
                 // swallow scheduling errors here because the
@@ -5151,13 +5142,13 @@ impl KChatCore for CoreImpl {
     }
 
     fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
-        // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
+        // instrument the
         // restore hot path. Each transition is also recorded as a
         // `transition` metadata field for finer-grained
         // attribution.
         let mut trace = crate::perf::PerfTrace::new("restore_from_backup");
 
-        // Phase-4 wiring: drive the restore state machine end-to-end
+        // wiring: drive the restore state machine end-to-end
         // through the skeleton-first pipeline. The transport-side
         // contract on `BackupSource` (manifest chain handle, segment
         // download channel, search-shard segments, …) is still a
@@ -5208,7 +5199,7 @@ pub(crate) fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
 
 /// Map a UI-supplied reason string to a [`HydrationReason`].
 ///
-/// `docs/PROPOSAL.md §5.5` defines the priority ladder. Unknown
+/// `docs/DESIGN.md §5.5` defines the priority ladder. Unknown
 /// strings collapse to `OpportunisticFill` (P5), the lowest
 /// priority — that way a stale or typo'd reason never starves a
 /// real P0 search-result tap behind it.
@@ -5555,7 +5546,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase-1 stub trait methods — Task 3
+    // stub trait methods — Task 3
     // ----------------------------------------------------------------
 
     fn fake_image_bytes() -> Vec<u8> {
@@ -5695,7 +5686,7 @@ mod tests {
     #[test]
     fn send_media_writes_backup_event_journal_entry() {
         // Bug guard: send_media must mirror send_text and append
-        // a `backup_event_journal` row so the Phase 4 backup
+        // a `backup_event_journal` row so the backup
         // drainer sees the media message. Without this, media
         // messages are silently excluded from incremental backups.
         let core = fresh_core();
@@ -5736,7 +5727,7 @@ mod tests {
 
     #[test]
     fn send_media_writes_archive_event() {
-        // Phase-3 mirror of `send_media_writes_backup_event_journal_entry`:
+        // mirror of `send_media_writes_backup_event_journal_entry`:
         // the same SAVEPOINT must also append a `media_received`
         // row to `archive_event_journal` so the segment builder
         // pulls the media asset into the next archive segment.
@@ -5876,7 +5867,7 @@ mod tests {
 
     #[test]
     fn run_incremental_backup_with_empty_store_is_noop() {
-        // Phase-4 wiring (Task 3): when no events have been
+        // wiring (Task 3): when no events have been
         // journaled and no backup keys are installed, the call
         // short-circuits to a default `BackupResult` rather than
         // erroring — there is nothing to seal, so there is no
@@ -5991,7 +5982,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 1 — edit / delete on the KChatCore trait
+    // edit / delete on the KChatCore trait
     // ----------------------------------------------------------------
 
     #[test]
@@ -6116,7 +6107,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 2 — get_message / get_conversation_messages
+    // get_message / get_conversation_messages
     // ----------------------------------------------------------------
 
     #[test]
@@ -6189,7 +6180,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — ingest_remote_messages wired to transport
+    // ingest_remote_messages wired to transport
     // ----------------------------------------------------------------
 
     fn raw_msg(conv: Uuid, mid: Uuid, ts: i64, text: &str) -> crate::transport::RawDeliveryMessage {
@@ -6382,7 +6373,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 5 — list_conversations reflects latest activity
+    // list_conversations reflects latest activity
     // ----------------------------------------------------------------
 
     #[test]
@@ -6413,7 +6404,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 3 — get_timeline (CoreImpl)
+    // get_timeline (CoreImpl)
     // ----------------------------------------------------------------
 
     #[test]
@@ -6507,7 +6498,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — get_message_with_body / get_message_body
+    // get_message_with_body / get_message_body
     // ----------------------------------------------------------------
 
     #[test]
@@ -6586,7 +6577,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 5 — delete_conversation
+    // delete_conversation
     // ----------------------------------------------------------------
 
     #[test]
@@ -6752,7 +6743,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 4 — register_device stub
+    // register_device stub
     // ----------------------------------------------------------------
 
     #[test]
@@ -6766,7 +6757,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Task 8 — HydrationQueue wiring
+    // HydrationQueue wiring
     // ----------------------------------------------------------------
 
     #[test]
@@ -6821,7 +6812,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase-3: timeline-skeleton rehydration on CoreImpl.
+    // timeline-skeleton rehydration on CoreImpl.
     // ------------------------------------------------------------------
 
     #[test]
@@ -7011,7 +7002,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Epoch key manager wiring (Task 2 — `docs/PROPOSAL.md §2.1`)
+    // Epoch key manager wiring (Task 2 — `docs/DESIGN.md §2.1`)
     // ----------------------------------------------------------------
 
     fn fresh_archive_root() -> KeyMaterial {
@@ -7432,7 +7423,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // ZKOF archive backend installation (Phase-3 Task 2).
+    // ZKOF archive backend installation (Task 2).
     // ----------------------------------------------------------------
 
     #[derive(Debug, Default)]
@@ -7540,7 +7531,7 @@ mod tests {
         );
     }
 
-    /// Phase 7 / Task 8 integration: when one bucket contains a
+    /// integration: when one bucket contains a
     /// `kchat_backend` row *and* a `zk_object_fabric` row,
     /// [`CoreImpl::rehydrate_timeline_skeletons`] (which delegates
     /// to the router variant via [`CoreImpl::build_archive_router`])
@@ -8093,7 +8084,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 3: run_incremental_backup wiring (`docs/PROPOSAL.md §6.2`).
+    // run_incremental_backup wiring (`docs/DESIGN.md §6.2`).
     // -----------------------------------------------------------------
 
     fn install_test_backup_keys(core: &CoreImpl) {
@@ -8236,7 +8227,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Task 5: compact_backup orchestration (`docs/PROPOSAL.md §6.6`).
+    // compact_backup orchestration (`docs/DESIGN.md §6.6`).
     // -----------------------------------------------------------------
 
     fn seed_backup_event_with_seq(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) -> i64 {
@@ -8396,7 +8387,7 @@ mod tests {
         )
         .unwrap();
         // The compacted segment should contain only M2, M3, M4
-        // — M1 and its tombstone are dropped.
+        // M1 and its tombstone are dropped.
         let surviving_messages: Vec<_> =
             payload.events.iter().filter_map(|e| e.message_id).collect();
         assert!(!surviving_messages.contains(&m1));
@@ -8415,7 +8406,7 @@ mod tests {
 
     #[test]
     fn backup_manifest_chain_and_segment_ledger_survive_restart() {
-        // Phase-5 hardening (Task 2): the manifest chain tail and
+        // hardening (Task 2): the manifest chain tail and
         // the tracked-segment ledger must round-trip through a
         // process restart so the next call to
         // `run_incremental_backup` chains under the previous
@@ -8424,7 +8415,7 @@ mod tests {
         let backup_root = [0x33u8; 32];
         let device_id = "test-device".to_string();
 
-        // ---- Phase 1: first "process" runs an incremental backup.
+        // ---- first "process" runs an incremental backup.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = KChatCoreConfig::new(tmp.path().to_path_buf(), Platform::MacOs, "tenant-test");
         let pre_generation = {
@@ -8485,7 +8476,7 @@ mod tests {
             pre_generation
         };
 
-        // ---- Phase 2: simulate a process restart by opening a fresh
+        // ---- simulate a process restart by opening a fresh
         // CoreImpl against the same on-disk DB. The manifest tail
         // must rehydrate from `backup_manifest_chain`; the segment
         // ledger must rehydrate from `backup_segment_ledger` once
@@ -8523,7 +8514,7 @@ mod tests {
         );
         assert_eq!(rehydrated[0].2, 2);
 
-        // ---- Phase 3: a second incremental run on the restored
+        // ---- a second incremental run on the restored
         // core must chain under generation N (not start a new
         // genesis chain at 0).
         let conv = Uuid::now_v7();
@@ -8554,7 +8545,7 @@ mod tests {
 
     #[test]
     fn run_incremental_backup_persist_failure_leaves_in_memory_state_unchanged() {
-        // Phase-5 hardening: if the persist step in
+        // hardening: if the persist step in
         // `run_incremental_backup_inner` fails, the in-memory
         // manifest and segment ledger must remain at the
         // pre-call values **and** the persisted
@@ -8624,7 +8615,7 @@ mod tests {
 
     #[test]
     fn compact_backup_persist_failure_leaves_in_memory_state_unchanged() {
-        // Phase-5 hardening: if the persist step in
+        // hardening: if the persist step in
         // `compact_backup` fails, the in-memory manifest and
         // segment ledger must remain at the pre-compaction
         // values. Otherwise subsequent operations in the same
@@ -8698,7 +8689,7 @@ mod tests {
 
     #[test]
     fn install_backup_keys_hydration_failure_leaves_no_keys_installed() {
-        // Phase-5 hardening: if
+        // hardening: if
         // `hydrate_tracked_backup_segments_from_db` fails (e.g.
         // because a `wrapped_k_segment` row has been corrupted on
         // disk and the AES-KW integrity check rejects the
@@ -8712,7 +8703,7 @@ mod tests {
         let backup_root = [0x33u8; 32];
         let device_id = "test-device".to_string();
 
-        // ---- Phase 1: seed a real ledger row on disk so a
+        // ---- seed a real ledger row on disk so a
         // subsequent `install_backup_keys` on a fresh core has
         // something to hydrate.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -8731,7 +8722,7 @@ mod tests {
                 .expect("seed incremental backup");
         }
 
-        // ---- Phase 2: simulate a process restart, then corrupt
+        // ---- simulate a process restart, then corrupt
         // the wrapped_k_segment BLOB before installing the keys.
         // AES-KW carries an 8-byte integrity prefix, so any
         // corruption of the wrapped bytes makes the unwrap
@@ -8756,7 +8747,7 @@ mod tests {
                 .expect("corrupt wrapped_k_segment");
         });
 
-        // ---- Phase 3: installing the keys must fail because
+        // ---- installing the keys must fail because
         // hydration can no longer unwrap the segment key. The
         // three key `Mutex` slots must remain unset so
         // `has_backup_keys()` returns `false`.
@@ -8782,7 +8773,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Archive compaction tests (Task 9 — `docs/PHASES.md §Phase 7`)
+    // Archive compaction tests (Task 9 — ` 7`)
     // ---------------------------------------------------------------
 
     /// Same as [`seal_and_seed_segment`] but seeds the row with
@@ -9084,7 +9075,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5, Task 2: upload_search_shards round-trip
+    // upload_search_shards round-trip
     // ----------------------------------------------------------------
 
     #[test]
@@ -9346,7 +9337,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5, Task 1: run_incremental_backup_with_search_shards
+    // run_incremental_backup_with_search_shards
     // ----------------------------------------------------------------
 
     /// Insert a `search_fts` + `search_fuzzy` row pair for a
@@ -9718,7 +9709,7 @@ mod tests {
                 );
                 // Tiny pause so the main thread's wrapper has a
                 // window to acquire the db mutex between writes
-                // — exercises the lock-release / re-acquire seam
+                // exercises the lock-release / re-acquire seam
                 // the original race lived in.
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
@@ -9800,7 +9791,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5, Task 2: fetch_and_restore_cold_shards
+    // fetch_and_restore_cold_shards
     // ----------------------------------------------------------------
 
     /// Stage one text + one fuzzy shard for `(conv, bucket)` on
@@ -10050,12 +10041,12 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 5, Task 3: hydrate_cold_search_results
+    // hydrate_cold_search_results
     // ----------------------------------------------------------------
 
     /// Build a `MessageReceived` event whose payload carries a
     /// real text body via [`crate::archive::body_payload::encode`]
-    /// — the production format the cold-hit hydration path
+    /// the production format the cold-hit hydration path
     /// decodes back via `try_decode_text`.
     fn body_event(
         conv: Uuid,
@@ -10308,7 +10299,7 @@ mod tests {
         let bucket = crate::archive::segment_builder::default_time_bucket_for_ms(ts);
         let transport = FixtureTransport::default();
         // Use the legacy `make_event` helper which writes opaque
-        // bytes (`[0xDE, 0xAD]`) as the payload — pre-Phase-5
+        // bytes (`[0xDE, 0xAD]`) as the payload — earlier
         // shape.
         seal_and_seed_segment(
             &core,
@@ -10359,14 +10350,14 @@ mod tests {
         assert_eq!(n, 0);
     }
 
-    /// Phase-5 cold-hit hydration with mixed-backend segments
+    /// cold-hit hydration with mixed-backend segments
     /// (PR-#33 review feedback). The cold-hydration write-back
     /// path must route through
     /// [`crate::archive::prefetch::batch_prefetch_bucket_with_router`]
     /// so a bucket whose `archive_segment_map` rows carry
     /// `storage_backend = 'zk_object_fabric'` lands the body
     /// via the installed S3 client instead of erroring with
-    /// `Error::Storage("ZKOF row encountered ...".into())` from the
+    /// `Error::Storage("ZKOF row encountered...".into())` from the
     /// KChat-only `batch_prefetch_bucket` variant.
     #[test]
     fn hydrate_cold_search_results_routes_zkof_segments_through_s3_client() {
@@ -10445,7 +10436,7 @@ mod tests {
         // The transport handed to `hydrate_cold_search_results`
         // is the KChat-side `FixtureTransport`. The bucket has
         // no `kchat_backend` rows, so it must never be touched
-        // — every fetch must dispatch to the in-memory S3.
+        // every fetch must dispatch to the in-memory S3.
         let transport = FixtureTransport::default();
         let results = vec![cold_hit(mid, conv, ts, "north star body")];
         let hydrated = core
@@ -10478,7 +10469,7 @@ mod tests {
         });
     }
 
-    // ----- Phase 6, Tasks 2 + 9: ingest embedding wiring ------------
+    // ----- Tasks 2 + 9: ingest embedding wiring ------------
 
     #[test]
     fn ingest_messages_writes_text_embedding_when_embedder_installed() {
@@ -10521,7 +10512,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search wiring.
+    // /6 desktop search wiring.
     // -----------------------------------------------------------------
 
     #[derive(Debug, Default)]
@@ -10775,7 +10766,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 6, Tasks 1-3 (2026-05-04 batch) — send_media fan-out
+    // Tasks 1-3 send_media fan-out
     // tests for video keyframe sampling, audio transcription,
     // and document text extraction. The trait-level coverage of
     // each seam lives in `crate::models::{video,whisper,document}`;
@@ -11141,7 +11132,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7, Task 8 (2026-05-04 batch) — perf-collector wiring
+    // perf-collector wiring
     // tests. The unit-level coverage of `PerfTrace` /
     // `InMemoryPerfCollector` lives in `crate::perf`. These two
     // tests pin the *integration* contract: an installed
@@ -11251,7 +11242,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 7 perf-dashboard tests.
+    // perf-dashboard tests.
     // ----------------------------------------------------------------
 
     #[test]
@@ -11394,7 +11385,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 9 media-migration
+    // media-migration
     // scheduling tests.
     // ----------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 //! FTS5 text search engine.
 //!
-//! `docs/PROPOSAL.md §3.3` mandates SQLite FTS5 with the
+//! `docs/DESIGN.md §3.3` mandates SQLite FTS5 with the
 //! [`tokenize = 'icu'`](crate::search::tokenizer::FTS5_TOKENIZE_ICU)
 //! tokenizer for multilingual full-text search; the schema bring-up
 //! in [`crate::local_store::db`] falls back to
@@ -51,7 +51,7 @@ pub struct FtsMatch {
     pub sender_id: String,
     /// Wall-clock millisecond timestamp set by the sender.
     pub created_at_ms: i64,
-    /// Highlighted snippet around the match (FTS5 `snippet()`).
+    /// Highlighted snippet around the match (FTS5 `snippet`).
     pub snippet: String,
     /// Raw `bm25(search_fts)` score. Lower (more negative) is more
     /// relevant.
@@ -65,7 +65,7 @@ pub struct FtsMatch {
 /// Returns the FTS5 `tokenize = '...'` clause that matches the
 /// schema this connection was created with.
 ///
-/// `docs/PROPOSAL.md §3.3`: see [`FallbackMode`] and the constants
+/// `docs/DESIGN.md §3.3`: see [`FallbackMode`] and the constants
 /// [`FTS5_TOKENIZE_ICU`] / [`FTS5_TOKENIZE_UNICODE61`].
 pub fn fallback_mode_for(icu_available: bool) -> FallbackMode {
     if icu_available {
@@ -101,8 +101,8 @@ impl<'a> TextSearchEngine<'a> {
     /// `icu_available` selects the FTS5 query path: the ICU
     /// tokenizer when `true`, the `unicode61` fallback when
     /// `false`. In production this is always sourced from
-    /// `LocalStoreDb::icu_available()` (writer) or
-    /// `LocalStoreReader::icu_available()` (pool reader).
+    /// `LocalStoreDb::icu_available` (writer) or
+    /// `LocalStoreReader::icu_available` (pool reader).
     pub fn new(conn: &'a Connection, icu_available: bool) -> Self {
         Self {
             conn,

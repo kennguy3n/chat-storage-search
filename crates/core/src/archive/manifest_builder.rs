@@ -1,4 +1,4 @@
-//! Phase-3 archive manifest chain builder.
+//! archive manifest chain builder.
 //!
 //! Pulls a list of [`crate::archive::segment_builder::BuiltSegment`]s
 //! and the previous manifest (if any), produces an
@@ -18,7 +18,7 @@
 //! `merkle_root` is the BLAKE3 of every segment's plaintext
 //! `merkle_root` concatenated in the order the orchestrator
 //! supplied — the field name is "merkle root" by convention but is
-//! computed as a flat hash, mirroring §6.3 of `docs/PROPOSAL.md`.
+//! computed as a flat hash, mirroring §6.3 of `docs/DESIGN.md`.
 //!
 //! The output is a [`SealedArchiveManifest`]: the signed manifest
 //! plus its AEAD ciphertext, ready to upload alongside the segment
@@ -72,7 +72,7 @@ pub struct ManifestBuildRequest<'a> {
     /// Sealed segments to commit under this manifest.
     pub segments: &'a [BuiltSegment],
     /// Search index shards committed under this manifest. Empty
-    /// today — Phase 3 wires shard-segment encoding in a later
+    /// today — wires shard-segment encoding in a later
     /// task.
     pub search_index_shards: Vec<ManifestShardRef>,
     /// Media object references committed under this manifest. The
@@ -83,7 +83,7 @@ pub struct ManifestBuildRequest<'a> {
     pub tombstones: Vec<Tombstone>,
     /// Wrapped prior epoch keys carried into this manifest.
     ///
-    /// `docs/PROPOSAL.md §2.1` (cross-epoch decryption): every
+    /// `docs/DESIGN.md §2.1` (cross-epoch decryption): every
     /// retired epoch's key bytes are wrapped under
     /// `K_archive_root` (AES-256-KW) and recorded in the next
     /// archive manifest so future restore paths can unwrap and

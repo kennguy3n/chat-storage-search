@@ -7,21 +7,31 @@ multilingual search for KChat.
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
-## Status
+## Capabilities
 
-| Phase | Name                                | Status        |
-| ----- | ----------------------------------- | ------------- |
-| 0     | Protocol and Test Vectors           | Complete      |
-| 1     | Local Store + Text Search + MLS     | In progress   |
-| 2     | Media Encryption and Blob Service   | In progress   |
-| 3     | Personal Archive and Offload        | In progress   |
-| 4     | Backup and Restore                  | In progress   |
-| 5     | Search (Fuzzy + Encrypted Shards)   | In progress   |
-| 6     | Media and Semantic Search           | In progress   |
-| 7     | Desktop + Optimization              | In progress   |
-| 8     | Multi-Scope, Multi-Tenant Search    | In progress   |
-
-See [docs/PROGRESS.md](docs/PROGRESS.md) for the per-phase tracker.
+- **End-to-end encrypted local storage** — SQLCipher database, encrypted
+  file cache, AEAD-sealed media originals and thumbnails. Plaintext never
+  leaves the device.
+- **Personal archive with lazy rehydration** — epoch-rotated
+  `K_archive_epoch` segments stored on the KChat backend or ZK Object
+  Fabric; skeleton-first scroll-back fetches the encrypted segment for a
+  conversation × time bucket on demand.
+- **Incremental backup and restore** — signed, chained manifests with
+  hybrid Ed25519 + ML-DSA-65 signatures. Sinks include iCloud, Android
+  Auto Backup, Android Large Backup, Storage Access Framework, and ZK
+  Object Fabric.
+- **Multilingual search** — SQLite FTS5 + ICU, script-aware trigram /
+  bigram fuzzy, and on-device semantic search using XLM-R for text and
+  MobileCLIP-S2 for image / video keyframe embeddings. No server search.
+- **Storage offload and tiered media routing** — budget-driven eviction
+  with skeleton retention; media originals optionally route to user
+  cloud storage through the `MediaBlobSink` trait.
+- **Cross-platform** — one Rust workspace ships to iOS (UniFFI / Swift
+  package), Android (JNI / Kotlin façade), macOS (native crate), and
+  Windows (native crate, CPU-only ONNX path).
+- **Cross-language Pattern C interop** — bit-identical convergent
+  encryption to the Go reference SDK at `kennguy3n/zk-object-fabric`,
+  locked by test vectors in CI.
 
 ## What it is
 
@@ -69,7 +79,7 @@ pair are fetched, coarsening the access-pattern signal. An optional
 real fetches with decoy requests. Archive keys are
 **epoch-rotated** (`K_archive_epoch`) so that a key compromise
 limits the blast radius to the current epoch rather than the full
-history. See [docs/PROPOSAL.md §2.1 and §5.6](docs/PROPOSAL.md).
+history. See [docs/DESIGN.md §2.1 and §5.6](docs/DESIGN.md).
 
 ## Four-store model
 
@@ -89,7 +99,7 @@ Media originals may optionally route to user cloud storage
 (iCloud / Google Drive / ZK Object Fabric) via the `MediaBlobSink`
 trait to reduce backend storage costs. Thumbnails, archive
 segments, and search index shards stay on the KChat backend or
-ZKOF. See [docs/PROPOSAL.md §5.7](docs/PROPOSAL.md).
+ZKOF. See [docs/DESIGN.md §5.7](docs/DESIGN.md).
 
 The four-store split is a hard architectural rule. Backup and
 archive serve different purposes and have different shapes: an
@@ -98,7 +108,7 @@ on a live device, while a backup only ever has to reproduce a
 working steady state on a fresh device. Conflating them is one of
 the standard ways multilingual chat clients end up with bad
 scroll-back UX or oversized platform backups. See
-[docs/PROPOSAL.md §5–§6](docs/PROPOSAL.md) and
+[docs/DESIGN.md §5–§6](docs/DESIGN.md) and
 [docs/ARCHITECTURE.md §3](docs/ARCHITECTURE.md) for the full
 treatment.
 
@@ -126,11 +136,8 @@ chat-storage-search/
   README.md
   LICENSE
   docs/
-    PROPOSAL.md
+    DESIGN.md
     ARCHITECTURE.md
-    PHASES.md
-    PROGRESS.md
-    BLOG_PRIVACY_ARCHITECTURE.md
     benchmarks/
   crates/
     core/                     # platform-agnostic Rust core
@@ -189,10 +196,10 @@ cargo test --test media_sink_stress -- --ignored
 ```
 
 Criterion benchmark suites live under `crates/core/benches/`. The
-Phase 1 suite covers local-store insert / search / structured-filter
-latency; the Phase 5 suite covers cold-shard fetch + decrypt + search
-latency against the 1.5 s p95 budget; the Phase 8 suite covers
-multi-scope search performance.
+`phase1_benchmarks` suite covers local-store insert / search /
+structured-filter latency; `phase5_benchmarks` covers cold-shard
+fetch + decrypt + search latency against the 1.5 s p95 budget;
+`phase8_benchmarks` covers multi-scope search performance.
 
 ```sh
 cargo bench -p kchat-core --bench phase1_benchmarks
@@ -275,7 +282,7 @@ ZKOF can additionally serve as a **personal archive backend** and
 as a **media blob sink** through the `MediaBlobSink` trait. Backup,
 archive, and media sinks are three independent ZKOF use cases; a
 deployment can use any subset. See
-[docs/PROPOSAL.md §5.7 and §10.2](docs/PROPOSAL.md).
+[docs/DESIGN.md §5.7 and §10.2](docs/DESIGN.md).
 
 ## Relationship to KChat
 
@@ -289,20 +296,18 @@ will preserve KChat's privacy boundary.
 
 The Rust core defines the **public API surface** that the Swift,
 Kotlin, and desktop apps embed. See
-[docs/PROPOSAL.md §12](docs/PROPOSAL.md) for the API trait.
+[docs/DESIGN.md §12](docs/DESIGN.md) for the API trait.
 
 ## Documentation
 
-- [docs/PROPOSAL.md](docs/PROPOSAL.md) — full technical design,
-  scope, key hierarchy, state machines, search architecture,
-  chunk and AEAD specs, performance targets, risk register.
+- [docs/DESIGN.md](docs/DESIGN.md) — technical design: privacy
+  boundary, key hierarchy, local storage layout, archive and backup
+  formats, search engine, chunking and encryption specs, restore
+  pipeline, public API surface, performance targets, risk register.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system diagrams,
   crate dependency graph, four-store data flow, schema, search
-  pipeline, crypto flows, backup/restore sequences.
-- [docs/PHASES.md](docs/PHASES.md) — phased delivery plan
-  (Phase 0 → Phase 8) with explicit decision gates.
-- [docs/PROGRESS.md](docs/PROGRESS.md) — phase-gated tracker.
-- [docs/BLOG_PRIVACY_ARCHITECTURE.md](docs/BLOG_PRIVACY_ARCHITECTURE.md) — privacy architecture overview.
+  pipeline, crypto flows, backup / restore sequences.
+- [docs/benchmarks/](docs/benchmarks/) — latency benchmark results.
 
 ## License
 

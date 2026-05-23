@@ -1,6 +1,6 @@
-//! Desktop search-index anchors — Phase 7 (2026-05-04 batch 10).
+//! Desktop search-index anchors.
 //!
-//! `docs/PROPOSAL.md §7.4` calls for kchat to feed redacted
+//! `docs/DESIGN.md §7.4` calls for kchat to feed redacted
 //! message metadata into the host OS's search index so the
 //! system-wide search bar can surface kchat results without
 //! breaking the E2EE invariant. macOS exposes this through

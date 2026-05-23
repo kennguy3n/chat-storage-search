@@ -1,6 +1,6 @@
-//! Transport-driven [`ColdShardSource`] adapter (Phase 5, Task 1).
+//! Transport-driven [`ColdShardSource`] adapter.
 //!
-//! `docs/PHASES.md §Phase 5` calls for cold-result hydration to
+//! calls for cold-result hydration to
 //! "fetch the encrypted shard, decrypt with the right
 //! `K_*_index_shard(shard_id)`, and replay into the in-process
 //! merge". The query engine already accepts a [`ColdShardSource`]
@@ -33,17 +33,17 @@
 //!   returned bytes as [`SearchIndexShard`] CBOR, and runs the
 //!   restore pipeline to recover the original FTS / fuzzy rows.
 //! * **It treats "no shard on backend" as "no rows".** An empty
-//!   transport response surfaces as `Ok(Vec::new())` per the
+//!   transport response surfaces as `Ok(Vec::new)` per the
 //!   contract on
 //!   [`ColdShardSource::fetch_text_rows`].
 //!
 //! When the orchestration layer needs graceful degradation
-//! (`docs/PHASES.md §Phase 7` failure suite — "search shard
+//! ( failure suite — "search shard
 //! missing from backend"), wrap this adapter in
 //! [`GracefulCold`]. That wrapper swallows transient
 //! `Error::Transport` / `Error::Storage` failures, logs them via
 //! a callback the caller supplies, and returns
-//! `Ok(Vec::new())` so the merge step still completes with
+//! `Ok(Vec::new)` so the merge step still completes with
 //! whatever local rows are available.
 
 use std::collections::HashMap;
@@ -246,10 +246,10 @@ use crate::util::base64_urlsafe_encode as base64_encode_urlsafe;
 /// `ColdShardSource` wrapper that swallows transient transport /
 /// storage failures and records them on a callback.
 ///
-/// Used by the Phase-7 "search shard missing from backend"
+/// Used by the "search shard missing from backend"
 /// scenario: the merge step still needs to return *something*
 /// (the local rows), so the wrapper short-circuits the failed
-/// fetch into `Ok(Vec::new())` instead of bubbling the error up.
+/// fetch into `Ok(Vec::new)` instead of bubbling the error up.
 ///
 /// The `on_failure` callback receives the
 /// `(conversation_id, time_bucket, error)` triple so the

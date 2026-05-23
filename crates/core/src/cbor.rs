@@ -182,14 +182,14 @@ mod tests {
     //
     // If this test ever fails after a `ciborium` bump:
     //
-    //   * VERIFY that the encoding change is intentional and harmless
-    //     (e.g. the bump fixes a real bug in encoding, not just a
-    //     stylistic reorder of fields).
-    //   * If so, regenerate `EXPECTED` with `to_vec(&ManifestShape::sample())`
-    //     and ship a one-time chain rewrite migration alongside the
-    //     ciborium upgrade — do NOT just update the constant blindly.
-    //   * If the change is unintentional / a regression, pin to the last
-    //     known-good ciborium version and file a ciborium issue.
+    // * VERIFY that the encoding change is intentional and harmless
+    // (e.g. the bump fixes a real bug in encoding, not just a
+    // stylistic reorder of fields).
+    // * If so, regenerate `EXPECTED` with `to_vec(&ManifestShape::sample)`
+    // and ship a one-time chain rewrite migration alongside the
+    // ciborium upgrade — do NOT just update the constant blindly.
+    // * If the change is unintentional / a regression, pin to the last
+    // known-good ciborium version and file a ciborium issue.
     // -----------------------------------------------------------------
 
     /// Shape that mirrors the production manifest fields exercised by
@@ -220,14 +220,14 @@ mod tests {
         // See module-level comment above for the regeneration protocol.
         //
         // Decoded:
-        //   A3                                  # map(3)
-        //     6B 61 6E 63 68 6F 72 5F 68 61 73  # text(11) "anchor_hash"
-        //     68
-        //     44 42 4C 4B 33                    # bytes(4) b"BLK3"
-        //     68 73 65 71 75 65 6E 63 65        # text(8) "sequence"
-        //     1A 01 02 03 04                    # unsigned(0x01020304)
-        //     69 64 65 76 69 63 65 5F 69 64     # text(9) "device_id"
-        //     68 64 65 76 69 63 65 2D 31        # text(8) "device-1"
+        // A3 # map(3)
+        // 6B 61 6E 63 68 6F 72 5F 68 61 73 # text(11) "anchor_hash"
+        // 68
+        // 44 42 4C 4B 33 # bytes(4) b"BLK3"
+        // 68 73 65 71 75 65 6E 63 65 # text(8) "sequence"
+        // 1A 01 02 03 04 # unsigned(0x01020304)
+        // 69 64 65 76 69 63 65 5F 69 64 # text(9) "device_id"
+        // 68 64 65 76 69 63 65 2D 31 # text(8) "device-1"
         const EXPECTED: &[u8] = &[
             0xa3, // map(3)
             0x6b, b'a', b'n', b'c', b'h', b'o', b'r', b'_', b'h', b'a', b's', b'h', //
@@ -255,31 +255,30 @@ mod tests {
     // Extended wire-format golden vector — covers the remaining serde
     // shape axes that production manifest / archive frames depend on
     // and which the simpler `ManifestShape` test above does not
-    // exercise. This is the recommendation from the Devin Review pass
-    // on PR #50 turned into defence-in-depth, while keeping the test
-    // struct *synthetic* (not the real `BackupManifest`) so the test
+    // exercise. Defence-in-depth coverage, with a *synthetic* test
+    // struct (not the real `BackupManifest`) so the test
     // does not break every time the manifest schema gains or renames
     // a field. The encoder axes — not the production schema — are
     // what we want to pin.
     //
     // Axes covered here that `ManifestShape` does not:
     //
-    //   1. `Uuid` — `uuid::serde` ships as a 16-byte CBOR byte string
-    //      (major type 2, len 16). A future uuid release that flipped
-    //      to a 36-byte text string would silently break every chain.
-    //   2. `Vec<NestedStruct>` — exercises array-of-map encoding,
-    //      which the manifest's `segments` / `shards` / `media_refs`
-    //      vectors rely on for verbatim hash equivalence.
-    //   3. `Option<T>` — both `Some` (encoded as the inner value
-    //      verbatim) and `None` (encoded as CBOR `null` = 0xF6).
-    //   4. `enum` unit variant — `ChildKind::Events` ↔ text string
-    //      "Events" (major type 3). Production: `SegmentType`,
-    //      `IndexType`.
-    //   5. `#[serde(default, with = "serde_bytes")]` empty `Vec<u8>` —
-    //      encoded as a zero-length byte string (`0x40`), not omitted
-    //      from the map. Matters for `pqc_signature` round-trip.
-    //   6. `u32` and `u64` width-specific integer encoding (short
-    //      unsigned vs 4-byte unsigned with 0x1A prefix).
+    // 1. `Uuid` — `uuid::serde` ships as a 16-byte CBOR byte string
+    // (major type 2, len 16). A future uuid release that flipped
+    // to a 36-byte text string would silently break every chain.
+    // 2. `Vec<NestedStruct>` — exercises array-of-map encoding,
+    // which the manifest's `segments` / `shards` / `media_refs`
+    // vectors rely on for verbatim hash equivalence.
+    // 3. `Option<T>` — both `Some` (encoded as the inner value
+    // verbatim) and `None` (encoded as CBOR `null` = 0xF6).
+    // 4. `enum` unit variant — `ChildKind::Events` ↔ text string
+    // "Events" (major type 3). Production: `SegmentType`,
+    // `IndexType`.
+    // 5. `#[serde(default, with = "serde_bytes")]` empty `Vec<u8>`
+    // encoded as a zero-length byte string (`0x40`), not omitted
+    // from the map. Matters for `pqc_signature` round-trip.
+    // 6. `u32` and `u64` width-specific integer encoding (short
+    // unsigned vs 4-byte unsigned with 0x1A prefix).
     //
     // The accompanying production-shape integration tests in
     // `crates/core/src/formats/manifest.rs` keep verifying that
@@ -325,7 +324,7 @@ mod tests {
                 magic: "BMAN".into(),
                 version: 1,
                 // Deterministic UUIDs so the golden vector stays
-                // stable. Production code uses `Uuid::now_v7()` —
+                // stable. Production code uses `Uuid::now_v7`
                 // which is also a 16-byte value — but a fixed
                 // value here is necessary for byte-equality.
                 manifest_id: uuid::Uuid::parse_str("01010101-0101-7101-8101-010101010101")
@@ -354,28 +353,28 @@ mod tests {
         // comment above `manifest_shape_encodes_to_golden_bytes`.
         // The annotated CBOR decode (one field per logical line):
         //
-        //   AA                                          # map(10)
-        //   65 magic                                    # text "magic"
-        //   64 BMAN                                     # text "BMAN"
-        //   67 version                                  # text "version"
-        //   01                                          # unsigned 1
-        //   6B manifest_id                              # text "manifest_id"
-        //   50 01..01                                   # bytes(16) UUID
-        //   6A generation                               # text "generation"
-        //   1A 01 02 03 04                              # unsigned 0x01020304
-        //   76 previous_manifest_hash                   # text(22)
-        //   44 AA BB CC DD                              # bytes(4)
-        //   68 children                                 # text "children"
-        //   81                                          # array(1)
-        //     A4                                        # map(4)
-        //     62 id    50 02..02                        # uuid bytes(16)
-        //     64 kind  66 Events                        # text(6) "Events"
-        //     64 hash  44 11 22 33 44                   # bytes(4)
-        //     64 size  19 10 00                         # unsigned 4096
-        //   64 note   62 hi                             # text(2) "hi"
-        //   6B note_absent  F6                          # null
-        //   69 signature   44 DE AD BE EF               # bytes(4)
-        //   6D pqc_signature  40                        # bytes(0)
+        // AA # map(10)
+        // 65 magic # text "magic"
+        // 64 BMAN # text "BMAN"
+        // 67 version # text "version"
+        // 01 # unsigned 1
+        // 6B manifest_id # text "manifest_id"
+        // 50 01..01 # bytes(16) UUID
+        // 6A generation # text "generation"
+        // 1A 01 02 03 04 # unsigned 0x01020304
+        // 76 previous_manifest_hash # text(22)
+        // 44 AA BB CC DD # bytes(4)
+        // 68 children # text "children"
+        // 81 # array(1)
+        // A4 # map(4)
+        // 62 id 50 02..02 # uuid bytes(16)
+        // 64 kind 66 Events # text(6) "Events"
+        // 64 hash 44 11 22 33 44 # bytes(4)
+        // 64 size 19 10 00 # unsigned 4096
+        // 64 note 62 hi # text(2) "hi"
+        // 6B note_absent F6 # null
+        // 69 signature 44 DE AD BE EF # bytes(4)
+        // 6D pqc_signature 40 # bytes(0)
         const EXPECTED: &[u8] = &[
             0xaa, 0x65, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x64, 0x42, 0x4d, 0x41, 0x4e, 0x67, 0x76,
             0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x6b, 0x6d, 0x61, 0x6e, 0x69, 0x66, 0x65,

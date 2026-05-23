@@ -1,6 +1,6 @@
 //! Privacy / dummy-request padding for the archive prefetch path.
 //!
-//! `docs/PROPOSAL.md §5.6` proposes optional **dummy request
+//! `docs/DESIGN.md §5.6` proposes optional **dummy request
 //! padding** to break the per-bucket access-pattern fingerprint
 //! that an honest-but-curious backend could otherwise build. With
 //! [`crate::config::PrivacyLevel::High`] the prefetch path mixes

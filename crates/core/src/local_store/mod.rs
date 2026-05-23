@@ -1,6 +1,6 @@
 //! `local_store` module — encrypted on-device storage surface.
 //!
-//! Phase 1 foundation lands here:
+//! Submodules:
 //!
 //! * [`schema`] — the SQLCipher CREATE TABLE statements
 //!   (`SCHEMA_SQL`) plus the typed Rust row structs that mirror them
@@ -10,10 +10,10 @@
 //! * [`state_machines`] — the `body_state` / `media_state` /
 //!   `archive_state` / `backup_state` / `restore_state` enums with
 //!   `try_transition`, `Display` / `FromStr`, and serde support.
-//!
-//! The actual `rusqlite::Connection` bindings, prepared-statement
-//! cache, migrations, and platform `K_local_db` wrap (Keychain /
-//! Keystore / DPAPI) land later in Phase 1 — see `docs/PHASES.md`.
+//! * [`db`] — the `rusqlite::Connection` bindings, prepared-statement
+//!   cache, migrations, and SQLCipher key plumbing. The platform
+//!   `K_local_db` wrap (Keychain / Keystore / DPAPI) is layered above
+//!   this module by the bridge crates.
 
 pub mod db;
 pub mod schema;
@@ -25,7 +25,7 @@ pub mod state_machines;
 /// parsing free-form text. The reader pool distinguishes
 /// [`StorageError::LockPoisoned`] from [`StorageError::Sqlite`], and
 /// tests assert on [`StorageError::SubsystemNotInstalled`] instead
-/// of `msg.to_string().contains("not installed")`.
+/// of `msg.to_string.contains("not installed")`.
 ///
 /// The [`StorageError::DatabaseLocked`] / [`StorageError::DiskFull`]
 /// variants exist for retry-loop callers that want to route on
@@ -177,7 +177,7 @@ pub enum StorageError {
 
     /// Free-form fallback for sites where the underlying error type
     /// does not (yet) merit a dedicated variant. Existing
-    /// `format!("... : {e}")` patterns map to this variant; new
+    /// `format!("...: {e}")` patterns map to this variant; new
     /// failure modes should prefer a typed variant instead.
     #[error("{0}")]
     Custom(String),
@@ -186,7 +186,7 @@ pub enum StorageError {
 impl StorageError {
     /// Construct a [`StorageError::Custom`] from anything that can be
     /// converted into a [`String`]. Equivalent to
-    /// `StorageError::Custom(msg.into())`; useful at call sites that
+    /// `StorageError::Custom(msg.into)`; useful at call sites that
     /// previously did `Error::Storage(msg)`.
     pub fn msg(msg: impl Into<String>) -> Self {
         StorageError::Custom(msg.into())

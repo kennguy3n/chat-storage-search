@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Desktop (macOS / Windows) consumer crate for kchat-core. Phase 0 placeholder."
+description = "Desktop (macOS / Windows) consumer crate for kchat-core."
 
 [lib]
 crate-type = ["lib"]
@@ -19,7 +19,7 @@ onnx-runtime = ["kchat-core/onnx-runtime"]
 [dependencies]
 kchat-core = { path = "../core" }
 # Structured logging — `kchat-core` emits tracing spans / events on
-# all hot paths (Phase A.3). The desktop crate installs a plain
+# all hot paths. The desktop crate installs a plain
 # stderr fmt subscriber so events surface in the dev console
 # without depending on platform-specific log frameworks.
 tracing = "0.1"

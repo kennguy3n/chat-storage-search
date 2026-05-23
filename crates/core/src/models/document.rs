@@ -1,7 +1,6 @@
-//! On-device document text extraction seam — Phase 6, Task 2 of
-//! the 2026-05-04 batch.
+//! On-device document text extraction seam.
 //!
-//! `docs/PROPOSAL.md §7.6` mandates page-level multilingual text
+//! `docs/DESIGN.md §7.6` mandates page-level multilingual text
 //! extraction for PDF and DOCX attachments so document bodies
 //! flow through the same media-search index as OCR captions and
 //! Whisper transcripts. The extraction itself runs in the
@@ -45,7 +44,7 @@ pub struct DocumentPage {
 }
 
 /// On-device document text-extraction seam used by media
-/// ingest (`docs/PROPOSAL.md §7.6`, Phase 6).
+/// ingest (`docs/DESIGN.md §7.6`).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash a real platform extractor inside
@@ -63,13 +62,13 @@ pub trait DocumentExtractor: std::fmt::Debug + Send + Sync {
     fn extract_text(&self, data: &[u8], mime_type: &str) -> Result<Vec<DocumentPage>>;
 }
 
-/// Alias matching the Phase 6 task-spec name. `PageText` and
+/// Alias matching the task-spec name. `PageText` and
 /// [`DocumentPage`] are the same struct — the alias lets call
 /// sites use either name interchangeably while the trait
 /// signature continues to return `Vec<DocumentPage>`.
 pub use DocumentPage as PageText;
 
-/// Wrapper helper matching the Phase 6 task-spec
+/// Wrapper helper matching the task-spec
 /// `DocumentExtractionResult { pages }` shape. Implementations
 /// of [`DocumentExtractor`] return `Vec<DocumentPage>` directly,
 /// but callers that prefer the wrapper can build one with
@@ -113,7 +112,7 @@ impl DocumentExtractor for NoopDocumentExtractor {
 /// reproducible per-page extraction from a BLAKE3 hash of
 /// `(mime_type, data)`.
 ///
-/// Used by the Phase 6 unit / integration tests to stand in for
+/// Used by the unit / integration tests to stand in for
 /// a real PDFKit / Apache-POI / Tesseract extractor. Same
 /// construction as [`crate::models::embeddings::MockTextEmbedder`]:
 /// the hash seeds the synthetic extraction so identical inputs

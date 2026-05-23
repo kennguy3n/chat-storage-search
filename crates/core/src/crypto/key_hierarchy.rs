@@ -1,20 +1,20 @@
 //! HKDF-SHA256 key derivation tree rooted at `K_user_master`.
 //!
-//! Layout (from `docs/PROPOSAL.md §2.1`):
+//! Layout (from `docs/DESIGN.md §2.1`):
 //!
 //! ```text
 //! K_user_master
-//!  ├── K_archive_root          (info = "kchat-archive-root-v1")
-//!  │     ├── K_archive_segment(segment_id)   (info = "kchat-archive-segment-v1" || segment_id)
-//!  │     └── K_archive_manifest(manifest_id) (info = "kchat-archive-manifest-v1" || manifest_id)
-//!  ├── K_backup_root           (info = "kchat-backup-root-v1")
-//!  │     ├── K_backup_segment(segment_id)    (info = "kchat-backup-segment-v1" || segment_id)
-//!  │     └── K_backup_manifest(manifest_id)  (info = "kchat-backup-manifest-v1" || manifest_id)
-//!  ├── K_search_root           (info = "kchat-search-root-v1")
-//!  │     ├── K_text_index_shard(shard_id)    (info = "kchat-text-index-shard-v1" || shard_id)
-//!  │     ├── K_vector_index_shard(shard_id)  (info = "kchat-vector-index-shard-v1" || shard_id)
-//!  │     └── K_media_index_shard(shard_id)   (info = "kchat-media-index-shard-v1" || shard_id)
-//!  └── K_profile_private_data  (info = "kchat-profile-private-data-v1")
+//! ├── K_archive_root (info = "kchat-archive-root-v1")
+//! │ ├── K_archive_segment(segment_id) (info = "kchat-archive-segment-v1" || segment_id)
+//! │ └── K_archive_manifest(manifest_id) (info = "kchat-archive-manifest-v1" || manifest_id)
+//! ├── K_backup_root (info = "kchat-backup-root-v1")
+//! │ ├── K_backup_segment(segment_id) (info = "kchat-backup-segment-v1" || segment_id)
+//! │ └── K_backup_manifest(manifest_id) (info = "kchat-backup-manifest-v1" || manifest_id)
+//! ├── K_search_root (info = "kchat-search-root-v1")
+//! │ ├── K_text_index_shard(shard_id) (info = "kchat-text-index-shard-v1" || shard_id)
+//! │ ├── K_vector_index_shard(shard_id) (info = "kchat-vector-index-shard-v1" || shard_id)
+//! │ └── K_media_index_shard(shard_id) (info = "kchat-media-index-shard-v1" || shard_id)
+//! └── K_profile_private_data (info = "kchat-profile-private-data-v1")
 //! ```
 //!
 //! All derivations are HKDF-SHA256 with `salt = None` and the
@@ -47,15 +47,15 @@ pub mod info {
     pub const TEXT_INDEX_SHARD: &[u8] = b"kchat-text-index-shard-v1";
     pub const VECTOR_INDEX_SHARD: &[u8] = b"kchat-vector-index-shard-v1";
     pub const MEDIA_INDEX_SHARD: &[u8] = b"kchat-media-index-shard-v1";
-    /// Phase 8 (2026-05-04 batch) — bloom-filter shard.
+    /// bloom-filter shard.
     pub const BLOOM_INDEX_SHARD: &[u8] = b"kchat-bloom-index-shard-v1";
 
-    /// Phase-3 epoch-rotated archive key. `info` =
+    /// epoch-rotated archive key. `info` =
     /// `b"kchat-archive-epoch-v1" || epoch_id`.
     pub const ARCHIVE_EPOCH: &[u8] = b"kchat-archive-epoch-v1";
 
     // -----------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+    // B2B per-tenant key isolation
     // -----------------------------------------------------------------
 
     /// Root for a single B2B tenant's key subtree. `info` =
@@ -227,7 +227,7 @@ pub fn derive_media_index_shard(
 }
 
 /// Derive `K_bloom_index_shard(shard_id)` from `K_search_root`.
-/// Phase 8 (2026-05-04 batch) — used to seal per-bucket bloom
+/// used to seal per-bucket bloom
 /// filter shards built by [`crate::search::shard_builder::build_bloom_shard`].
 pub fn derive_bloom_index_shard(
     search_root: &KeyMaterial,
@@ -237,7 +237,7 @@ pub fn derive_bloom_index_shard(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+// B2B per-tenant key isolation
 // ---------------------------------------------------------------------------
 
 fn derive_with_two_ids(
@@ -250,7 +250,7 @@ fn derive_with_two_ids(
     // variable-length ids is unambiguous. Without the prefix,
     // `("tenant-a", "shard-1")` and `("tenant-as", "hard-1")`
     // would collapse to identical info bytes and derive the
-    // same key, breaking per-tenant isolation. `id_a.len()` is
+    // same key, breaking per-tenant isolation. `id_a.len` is
     // bounded by `u32::MAX` in practice (we never feed it
     // strings approaching 4 GiB), so the cast is safe; we
     // still saturate to be defensive.
@@ -266,7 +266,7 @@ fn derive_with_two_ids(
 
 /// Derive `K_b2b_tenant_root(tenant_id)` from `K_user_master`.
 ///
-/// `info = info::B2B_TENANT_ROOT || tenant_id.as_bytes()`.
+/// `info = info::B2B_TENANT_ROOT || tenant_id.as_bytes`.
 ///
 /// Each B2B tenant gets a dedicated key subtree so the orchestration
 /// layer can hold encrypted segments / shards for tenant **A**
@@ -288,8 +288,8 @@ pub fn derive_b2b_tenant_root(
 /// Derive `K_b2b_archive_epoch(tenant_id, epoch_id)` from a
 /// per-tenant root produced by [`derive_b2b_tenant_root`].
 ///
-/// `info = info::B2B_ARCHIVE_EPOCH || u32_BE(tenant_id.len()) ||
-/// tenant_id.as_bytes() || epoch_id.as_bytes()`. The 4-byte
+/// `info = info::B2B_ARCHIVE_EPOCH || u32_BE(tenant_id.len) ||
+/// tenant_id.as_bytes || epoch_id.as_bytes`. The 4-byte
 /// big-endian length prefix on `tenant_id` keeps the boundary
 /// between the two variable-length ids unambiguous; without it,
 /// `("tenant-a", "epoch-1")` and `("tenant-ae", "poch-1")` would
@@ -310,8 +310,8 @@ pub fn derive_b2b_archive_epoch(
 /// Derive `K_b2b_text_index_shard(tenant_id, shard_id)` from a
 /// `K_search_root` (or any per-tenant search subtree).
 ///
-/// `info = info::B2B_TEXT_INDEX_SHARD || u32_BE(tenant_id.len()) ||
-/// tenant_id.as_bytes() || shard_id.as_bytes()`. The 4-byte
+/// `info = info::B2B_TEXT_INDEX_SHARD || u32_BE(tenant_id.len) ||
+/// tenant_id.as_bytes || shard_id.as_bytes`. The 4-byte
 /// big-endian length prefix on `tenant_id` keeps the boundary
 /// between the two variable-length ids unambiguous.
 ///
@@ -333,18 +333,18 @@ pub fn derive_b2b_text_index_shard(
 }
 
 // ---------------------------------------------------------------------------
-// Phase-3: epoch-rotated archive keys
+// Epoch-rotated archive keys
 // ---------------------------------------------------------------------------
 
 /// Derive `K_archive_epoch(epoch_id)` from `K_archive_root`.
 ///
-/// `docs/PHASES.md` Phase 3 calls for an extra epoch indirection
+/// The archive key hierarchy uses an extra epoch indirection
 /// between `K_archive_root` and the per-segment / per-manifest
 /// keys: each "epoch" gets its own subkey so the orchestration
 /// layer can rotate without re-deriving every leaf key.
 ///
 /// HKDF info = [`info::ARCHIVE_EPOCH`] concatenated with
-/// `epoch_id.as_bytes()`.
+/// `epoch_id.as_bytes`.
 pub fn derive_archive_epoch_key(
     k_archive_root: &KeyMaterial,
     epoch_id: &str,
@@ -488,7 +488,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Phase-3: epoch-rotated archive keys
+    // epoch-rotated archive keys
     // ---------------------------------------------------------------
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Phase 8 (2026-05-04 batch 6) — B2B per-tenant key isolation
+    // B2B per-tenant key isolation
     // ---------------------------------------------------------------
 
     #[test]

@@ -1,8 +1,8 @@
-//! Phase-4 backup compaction policy.
+//! backup compaction policy.
 //!
-//! Implements the **daily → weekly → monthly** strategy described
-//! in `docs/PHASES.md` Phase 4: as backup segments age, the
-//! orchestrator periodically merges adjacent same-tier segments
+//! Implements the **daily → weekly → monthly** tier-promotion
+//! strategy: as backup segments age, the orchestrator periodically
+//! merges adjacent same-tier segments
 //! into a single, denser segment. Merging applies tombstones so
 //! deleted-message events do not get carried forward — the
 //! compacted segment only contains the still-live events.
@@ -19,12 +19,12 @@
 //!    time → [`CompactionPlan`] describing which segments are
 //!    candidates for which target tier.
 //! 3. For each `CompactionGroup`:
-//!    - Decrypt the source segments (via
-//!      [`crate::backup::segment_builder::decrypt_backup_segment`]),
-//!    - Concatenate their event lists,
-//!    - Run [`apply_tombstones`] to drop deleted message rows,
-//!    - Re-emit a single sealed segment via
-//!      [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`].
+//! - Decrypt the source segments (via
+//!   [`crate::backup::segment_builder::decrypt_backup_segment`]),
+//! - Concatenate their event lists,
+//! - Run [`apply_tombstones`] to drop deleted message rows,
+//! - Re-emit a single sealed segment via
+//!   [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`].
 //! 4. Persist the new segment ids + the superseded segment ids
 //!    onto the next backup manifest.
 

@@ -1,6 +1,6 @@
-//! Background-task scheduler foundation (Phase 5/7, Task 9).
+//! Background-task scheduler foundation.
 //!
-//! `docs/PROPOSAL.md §6` calls out that the offload / backup /
+//! `docs/DESIGN.md §6` calls out that the offload / backup /
 //! index-maintenance / model-warmup pipelines must run on
 //! battery- and network-aware *background* schedules — not on
 //! the foreground UI thread. iOS surfaces this through
@@ -12,7 +12,7 @@
 //! **policy surface** the platform bridges fill in:
 //!
 //! * [`BackgroundScheduler`] — object-safe trait the
-//!   orchestration layer calls. One method per Phase-5/7
+//!   orchestration layer calls. One method per
 //!   recurring task: incremental backup, archive compaction,
 //!   index maintenance, plus blanket cancel / pending-check.
 //! * [`ScheduledTask`] — per-task descriptor returned to the
@@ -22,7 +22,7 @@
 //! * [`NoopScheduler`] — placeholder returning
 //!   `Error::NotImplemented("scheduler")` until a real bridge is
 //!   installed.
-//! * [`IosBgTaskBridge`] / [`AndroidWorkManagerBridge`] —
+//! * [`IosBgTaskBridge`] / [`AndroidWorkManagerBridge`]
 //!   platform-bridge traits implemented in Swift / Kotlin and
 //!   exposed back to Rust through the FFI layer.
 //!
@@ -46,29 +46,29 @@ pub use in_process::{
 
 /// Recurring background task kinds emitted by the core.
 ///
-/// Variants map 1:1 onto Phase 5 / Phase 7 maintenance loops in
-/// `docs/PROPOSAL.md §6`. The serde representation uses
+/// Variants map 1:1 onto maintenance loops in
+/// `docs/DESIGN.md §6`. The serde representation uses
 /// `snake_case` so the wire form matches the rest of the
 /// crate's CBOR / JSON conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
     /// Roll forward the incremental-backup manifest chain
-    /// (`docs/PROPOSAL.md §10`).
+    /// (`docs/DESIGN.md §10`).
     IncrementalBackup,
     /// Compact / merge personal-archive segments
-    /// (`docs/PROPOSAL.md §5`).
+    /// (`docs/DESIGN.md §5`).
     ArchiveCompaction,
     /// FTS / fuzzy / vector index housekeeping
-    /// (`docs/PROPOSAL.md §7`).
+    /// (`docs/DESIGN.md §7`).
     IndexMaintenance,
     /// Evict older media off-device per the storage budget
-    /// (`docs/PROPOSAL.md §6.4`).
+    /// (`docs/DESIGN.md §6.4`).
     MediaCacheEviction,
     /// Pre-warm on-device models so search-result-tap latency
     /// stays under the §12 budget.
     ModelWarmup,
-    /// Phase 8 (2026-05-04 batch 6) — pre-warm the on-device
+    /// pre-warm the on-device
     /// `ShardCache` with the cold shards belonging to the
     /// most-recently-searched conversations. Runs at idle
     /// priority (P5) on charging + Wi-Fi only so it never
@@ -104,7 +104,7 @@ impl TaskType {
 pub struct ScheduledTask {
     /// Identifier the bridge uses to look up / cancel the task.
     pub task_id: String,
-    /// Which Phase-5/7 maintenance loop this task drives.
+    /// Which maintenance loop this task drives.
     pub task_type: TaskType,
     /// Cadence in milliseconds (e.g. 86_400_000 for daily).
     /// `0` is disallowed; callers that want "run once and stop"
@@ -140,7 +140,7 @@ impl ScheduledTask {
 }
 
 // ---------------------------------------------------------------------------
-// OneOffTask — Phase 7 (2026-05-04 batch 10) one-shot work the
+// OneOffTask — one-shot work the
 // scheduler runs at idle-priority. Complements the recurring
 // `ScheduledTask` descriptor above. Tasks 5/8/9 fold their
 // background work through this surface.
@@ -152,7 +152,7 @@ impl ScheduledTask {
 /// *recurring* loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OneOffTask {
-    /// Phase 7 (Task 9) — drain a
+    /// (Task 9) — drain a
     /// [`crate::media::migration::MediaMigrationPlan`] one item
     /// at a time. The plan is captured by reference so the
     /// scheduler can re-run a subset on transient failure.
@@ -163,9 +163,8 @@ pub enum OneOffTask {
         /// holding live references.
         plan: MediaMigrationPlanSnapshot,
     },
-    /// Phase 7 (Task 8 of the previous batch) — pre-warm the
-    /// on-device shard cache for a list of conversations /
-    /// buckets so the next search hits the cache.
+    /// Pre-warm the on-device shard cache for a list of
+    /// conversations / buckets so the next search hits the cache.
     ShardWarming {
         /// Conversation ids to warm.
         conversations: Vec<String>,
@@ -205,7 +204,7 @@ impl MediaMigrationPlanSnapshot {
 }
 
 /// Resource constraints the scheduler must satisfy before
-/// running an [`OneOffTask`]. Phase 7 batch 10 — Task 9.
+/// running an [`OneOffTask`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskConstraints {
     /// `true` → only run when the device is on Wi-Fi (or
@@ -295,7 +294,7 @@ pub trait BackgroundScheduler: Send + Sync + std::fmt::Debug {
     /// platform already has the task in its queue.
     fn is_task_pending(&self, task_id: &str) -> Result<bool, Error>;
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 9: enqueue a
+    /// enqueue a
     /// one-off task with explicit resource constraints. The
     /// scheduler is free to defer execution until the
     /// [`TaskConstraints`] are met (Wi-Fi, charging, idle) and
@@ -320,7 +319,7 @@ pub trait BackgroundScheduler: Send + Sync + std::fmt::Debug {
 // NoopScheduler — placeholder
 // ---------------------------------------------------------------------------
 
-/// Phase-0 placeholder scheduler. Every method returns
+/// placeholder scheduler. Every method returns
 /// `Err(Error::NotImplemented("scheduler"))` so the orchestration
 /// layer never silently drops a schedule request when no real
 /// bridge is installed.
@@ -367,7 +366,7 @@ pub trait IosBgTaskBridge: Send + Sync + std::fmt::Debug {
     fn is_pending(&self, task_id: &str) -> Result<bool, Error>;
 }
 
-/// Phase-0 placeholder for `BGTaskScheduler` integration.
+/// placeholder for `BGTaskScheduler` integration.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopIosBgTaskBridge;
 
@@ -394,7 +393,7 @@ pub trait AndroidWorkManagerBridge: Send + Sync + std::fmt::Debug {
     fn is_enqueued(&self, task_id: &str) -> Result<bool, Error>;
 }
 
-/// Phase-0 placeholder for `WorkManager` integration.
+/// placeholder for `WorkManager` integration.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopAndroidWorkManagerBridge;
 

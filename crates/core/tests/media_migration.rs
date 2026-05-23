@@ -1,5 +1,5 @@
-//! Integration tests for cross-sink media migration —
-//! Phase 7, batch-5 (2026-05-04).
+//! Integration tests for cross-sink media migration
+//!
 //!
 //! Driven through [`crate::core_impl::CoreImpl::plan_media_migration`]
 //! / [`crate::core_impl::CoreImpl::migrate_media_sink`] so the

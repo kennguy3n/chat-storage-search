@@ -1,6 +1,6 @@
 //! Integration test for manifest signing, verification, and the
 //! `previous_manifest_hash` chain. Runs the public surface of
-//! `crate::formats::manifest` end-to-end so a future Phase-1 schema
+//! `crate::formats::manifest` end-to-end so a future schema
 //! change in `BackupManifest` / `ArchiveManifest` also breaks this
 //! test (rather than just the in-module unit tests).
 

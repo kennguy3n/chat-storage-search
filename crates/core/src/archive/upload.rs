@@ -1,14 +1,14 @@
-//! Phase-3 archive segment upload orchestration.
+//! archive segment upload orchestration.
 //!
 //! Wires
 //! [`crate::archive::segment_builder::ArchiveSegmentBuilder::build_segment`]'s
 //! output into the [`crate::transport::TransportClient`] surface:
 //!
-//! 1. `init_blob_upload(size, BlobClass::ArchiveSegment, root)` —
+//! 1. `init_blob_upload(size, BlobClass::ArchiveSegment, root)`
 //!    declare the upload up-front, committing to the **ciphertext**
 //!    Merkle root the server will verify against.
 //! 2. Single `upload_chunk` (archive segments today fit comfortably
-//!    under the 4 MiB chunk threshold from `docs/PROPOSAL.md §10`).
+//!    under the 4 MiB chunk threshold from `docs/DESIGN.md §10`).
 //! 3. `commit_blob` — finalise the blob; the server returns the
 //!    Merkle root it computed, which we cross-check against the
 //!    ciphertext root we declared.
@@ -47,7 +47,7 @@ pub const DEFAULT_STORAGE_BACKEND: &str = "kchat_backend";
 /// * Streams the ciphertext as a single
 ///   [`TransportClient::upload_chunk`] call.
 /// * Calls `commit_blob` and rejects the response if the
-///   server-returned root disagrees with the declared root —
+///   server-returned root disagrees with the declared root
 ///   any mismatch is a hard integrity failure.
 pub fn upload_archive_segment(
     transport: &dyn TransportClient,

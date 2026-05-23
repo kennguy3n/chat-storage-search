@@ -1,6 +1,6 @@
-//! Platform OCR bridge — Phase 6, Task 4.
+//! Platform OCR bridge.
 //!
-//! `docs/PROPOSAL.md §7.6` calls for on-device OCR routed through
+//! `docs/DESIGN.md §7.6` calls for on-device OCR routed through
 //! the platform-native vision stacks (Apple `VNRecognizeText`, ML
 //! Kit on Android, `Windows.Media.Ocr` / Tesseract on Windows).
 //! Those backends live outside the Rust core, so this module
@@ -13,7 +13,7 @@
 //! into the `media_search_index` table (see
 //! [`crate::local_store::db::LocalStoreDb::insert_media_search_index`]).
 //!
-//! Phase 7 adds resource gating in front of the bridge call (see
+//! Adds resource gating in front of the bridge call (see
 //! [`crate::models::resource_gate::ResourceGate::should_run_ocr`]).
 //! For now the gating decision is the orchestrator's
 //! responsibility.

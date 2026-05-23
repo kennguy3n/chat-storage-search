@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Android JNI bridge for kchat-core. Phase 1 scaffold — `Java_com_kchat_core_KChatBridge_*` entry points wired to CoreImpl."
+description = "Android JNI bridge for kchat-core. scaffold — `Java_com_kchat_core_KChatBridge_*` entry points wired to CoreImpl."
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -16,7 +16,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 serde_json = "1"
 thiserror = "2"
 # Structured logging — `kchat-core` emits tracing spans / events on
-# all hot paths (Phase A.3). The Android bridge installs a
+# all hot paths. The Android bridge installs a
 # `tracing-subscriber` once per process so those events surface in
 # logcat under the `kchat` tag.
 tracing = "0.1"

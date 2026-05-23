@@ -1,11 +1,11 @@
-//! Google Drive media blob sink — Phase 3 wiring.
+//! Google Drive media blob sink — wiring.
 //!
-//! `docs/PROPOSAL.md §5.7` (tiered media storage) routes media
-//! originals to user-cloud Tier 2; `docs/PROPOSAL.md §10.2` pins
+//! `docs/DESIGN.md §5.7` (tiered media storage) routes media
+//! originals to user-cloud Tier 2; `docs/DESIGN.md §10.2` pins
 //! the Android / desktop routing contract onto the Drive API.
 //! The actual Drive HTTP traffic lives on the Android (Java) /
 //! desktop bridge side, so the sink is a thin routing layer that
-//! delegates byte-level operations to a platform-bridge trait —
+//! delegates byte-level operations to a platform-bridge trait
 //! [`GoogleDriveBridge`] — that the bridge crates implement.
 //!
 //! Drive file id = the asset id at upload time; the bridge
@@ -16,7 +16,7 @@
 //! Byte-range computation for chunk fetch is identical to the
 //! KChat-backend transport
 //! ([`crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE`])
-//! — chunk `n` spans
+//! chunk `n` spans
 //! `[n * DEFAULT_CHUNK_CIPHERTEXT_SIZE, (n + 1) *
 //! DEFAULT_CHUNK_CIPHERTEXT_SIZE)`. The bridge is expected to
 //! clamp the trailing range against the committed object length
@@ -68,7 +68,7 @@ pub trait GoogleDriveBridge: Send + Sync + std::fmt::Debug {
 }
 
 /// Stub `GoogleDriveBridge` returning [`Error::NotImplemented`]
-/// from every method. Used as a Phase-3 placeholder until the
+/// from every method. Used as a placeholder until the
 /// Android / desktop bridges land.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopGoogleDriveBridge;

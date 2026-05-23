@@ -1,7 +1,6 @@
-//! Phase-3 archive event body payload (Phase 5 cold-hydration glue).
+//! Archive event body payload — cold-hydration glue.
 //!
-//! `docs/PHASES.md` Phase 5 calls out the cold-hit hydration path:
-//! a search hit that lives only in the personal archive must be
+//! A search hit that lives only in the personal archive must be
 //! pulled out of the encrypted segment and re-landed in the local
 //! store under
 //! [`crate::lib::BodyState::LocalPlainAvailable`]. The orchestration
@@ -106,8 +105,8 @@ mod tests {
 
     #[test]
     fn returns_none_for_legacy_4_tuple_payload() {
-        // The byte layout of `encode_event_payload` —
-        // `[message_id, conversation_id, sender_id, created_at_ms]` —
+        // The byte layout of `encode_event_payload`
+        // `[message_id, conversation_id, sender_id, created_at_ms]`
         // never contains the body magic, so the decoder must
         // fall through cleanly without raising an error.
         let legacy = vec![

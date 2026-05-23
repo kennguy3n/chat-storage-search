@@ -1,7 +1,7 @@
-//! Phase 8 (2026-05-04 batch 6) — end-to-end integration tests.
+//! end-to-end integration tests.
 //!
 //! Covers the new multi-scope search machinery introduced
-//! across `docs/PHASES.md §Phase 8` batch 6:
+//! across batch 6:
 //!
 //! 1. community-scoped target,
 //! 2. domain-scoped target,
@@ -14,7 +14,7 @@
 //! 9. B2B per-tenant key isolation,
 //! 10. scope-proportional padding scaling with target.
 //!
-//! These tests build directly on the public `kchat_core` API —
+//! These tests build directly on the public `kchat_core` API
 //! they intentionally avoid `CoreImpl` so the assertions stay
 //! focused on the search engine, the cold-source contract, and
 //! the cache / policy enforcement points.
@@ -225,7 +225,7 @@ fn global_search_returns_all_conversations() {
 // ---------------------------------------------------------------------------
 
 /// Counts every transport-shaped fetch the engine asks for.
-/// The Phase-8 cold path consults bloom shards first; only the
+/// The cold path consults bloom shards first; only the
 /// bucket(s) whose bloom advertises the query word should pay
 /// the text/fuzzy cost.
 #[derive(Default)]
@@ -533,7 +533,7 @@ fn b2b_tenant_key_isolation() {
 
 #[test]
 fn scope_proportional_padding_scales_with_target() {
-    // Phase 8 batch 6 — Task 6: dummy padding scales with the
+    // dummy padding scales with the
     // scope's privacy surface. Conversation = 1×, Global = 4×.
     // The unit-level test in `shard_prefetch::tests` exercises
     // the transport-recording path; here we lock the policy

@@ -1,7 +1,7 @@
-//! iCloud media blob sink — Phase 3 wiring.
+//! iCloud media blob sink — wiring.
 //!
-//! `docs/PROPOSAL.md §5.7` (tiered media storage) routes media
-//! originals to user-cloud Tier 2; `docs/PROPOSAL.md §10.2` pins
+//! `docs/DESIGN.md §5.7` (tiered media storage) routes media
+//! originals to user-cloud Tier 2; `docs/DESIGN.md §10.2` pins
 //! the iOS / macOS routing contract onto CloudKit's file-storage
 //! API. The actual CloudKit traffic lives on the Swift side
 //! (CloudKit is not available from Rust), so the sink is a thin
@@ -16,7 +16,7 @@
 //! Byte-range computation for chunk fetch is identical to the
 //! KChat-backend transport
 //! ([`crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE`])
-//! — chunk `n` spans
+//! chunk `n` spans
 //! `[n * DEFAULT_CHUNK_CIPHERTEXT_SIZE, (n + 1) *
 //! DEFAULT_CHUNK_CIPHERTEXT_SIZE)`. The bridge is expected to
 //! clamp the trailing range against the committed object length
@@ -70,7 +70,7 @@ pub trait ICloudBlobBridge: Send + Sync + std::fmt::Debug {
 }
 
 /// Stub `ICloudBlobBridge` returning [`Error::NotImplemented`]
-/// from every method. Used as a Phase-3 placeholder until the
+/// from every method. Used as a placeholder until the
 /// iOS / macOS bridge lands.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopICloudBridge;

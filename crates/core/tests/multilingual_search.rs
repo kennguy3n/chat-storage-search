@@ -1,6 +1,6 @@
-//! Phase 1 multilingual search integration tests.
+//! Multilingual search integration tests.
 //!
-//! `docs/PHASES.md §Phase 1` decision gate: "Text messages can be
+//! The decision gate: "Text messages can be
 //! stored, searched (multilingual)". This test exercises the full
 //! [`MessagePersister`] → `search_fts` → [`QueryEngine`] round-trip
 //! across eight scripts (Latin, Cyrillic, Han / CJK, mixed

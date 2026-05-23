@@ -1,8 +1,8 @@
-//! `restore` — Phase-4 restore pipeline.
+//! `restore` — restore pipeline.
 //!
 //! The module orchestrates the **skeleton-first** restore strategy
-//! described in `docs/PROPOSAL.md §11` and `docs/PHASES.md`
-//! Phase 4. It is split into three focused submodules:
+//! described in `docs/DESIGN.md §11` and
+//! It is split into three focused submodules:
 //!
 //! * [`state_machine`] — DB-backed
 //!   [`crate::local_store::state_machines::RestoreState`] persistence

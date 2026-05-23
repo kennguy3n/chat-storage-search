@@ -1,6 +1,6 @@
-//! Phase-5 smoke test for cold-shard search latency.
+//! smoke test for cold-shard search latency.
 //!
-//! `docs/PHASES.md §Phase 5` decision gate is "≤ 1.5 s p95 over
+//! The decision gate is "≤ 1.5 s p95 over
 //! Wi-Fi for a one-month bucket". The criterion benches in
 //! `phase5_benchmarks.rs` exercise the histogram; this test acts
 //! as a coarse, CI-friendly upper bound: the decrypt + search
@@ -146,7 +146,7 @@ fn phase5_cold_shard_decrypt_and_search_finishes_under_smoke_budget() {
 /// p95 budget gate: end-to-end shard fetch (in-memory mock) +
 /// AEAD decrypt + local FTS5 / fuzzy search across a one-month
 /// bucket of ~1 000 multilingual messages must stay under
-/// **1.5 s** at the 95th percentile (`docs/PHASES.md §Phase 5`).
+/// **1.5 s** at the 95th percentile.
 ///
 /// This complements the criterion benches in
 /// `crates/core/benches/phase5_benchmarks.rs` (which produce the
@@ -271,7 +271,7 @@ fn phase5_cold_shard_p95_latency_under_1_5s_budget() {
 
 /// Helper: build a multilingual `(text_blobs, fuzzy_blobs)` pair
 /// for a corpus of `rows` messages where ~1% match `needle`.
-/// Used by the new Phase-5 batch-10 latency smoke tests below.
+/// Used by the new batch-10 latency smoke tests below.
 #[allow(clippy::type_complexity)]
 fn build_multilingual_corpus(
     rows: usize,
@@ -341,7 +341,7 @@ fn build_multilingual_corpus(
 
 /// Helper: drive the cold-shard search path through `iterations`
 /// runs against an [`InMemoryCatalog`] and assert the p95 stays
-/// under `budget`. Phase 5 batch 10 — Task 4.
+/// under `budget`.
 fn assert_p95_under_budget(
     catalog: &InMemoryCatalog,
     iterations: usize,
@@ -382,12 +382,12 @@ fn assert_p95_under_budget(
     );
 }
 
-/// Phase 5, batch 10 — Task 4: multilingual p95 gate.
+/// Multilingual p95 gate.
 ///
 /// Same shape as the existing one-bucket gate but explicitly
 /// stresses the script-aware fuzzy path with a larger corpus
-/// (4 scripts interleaved). Must stay under the PROPOSAL §7.5
-/// 1.5 s headline budget.
+/// (4 scripts interleaved). Must stay under the
+/// `docs/DESIGN.md` §7.5 1.5 s headline budget.
 #[test]
 fn phase5_cold_shard_p95_multilingual_under_budget() {
     use std::time::Duration;
@@ -402,7 +402,7 @@ fn phase5_cold_shard_p95_multilingual_under_budget() {
     assert_p95_under_budget(&catalog, ITERATIONS, P95_BUDGET);
 }
 
-/// Phase 5, batch 10 — Task 4: large-bucket stress test.
+/// Large-bucket stress test.
 ///
 /// 5 000-row bucket — five times the headline corpus. The p95
 /// budget grows linearly with corpus size so a 5x bucket gets
@@ -424,7 +424,7 @@ fn phase5_cold_shard_p95_large_bucket_under_budget() {
     assert_p95_under_budget(&catalog, ITERATIONS, P95_BUDGET);
 }
 
-/// Phase 5, batch 10 — Task 4: multi-shard p95 gate.
+/// Multi-shard p95 gate.
 ///
 /// Splits the corpus across 3 buckets so the cold fan-out
 /// fetches 3 text + 3 fuzzy shards per search. The p95 must

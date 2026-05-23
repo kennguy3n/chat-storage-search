@@ -1,13 +1,13 @@
-//! Brute-force cosine semantic-search engine — Phase 6, Task 3.
+//! Brute-force cosine semantic-search engine.
 //!
-//! `docs/PROPOSAL.md §7.5 / §7.6` calls for a semantic-search
+//! `docs/DESIGN.md §7.5 / §7.6` calls for a semantic-search
 //! path that complements the FTS5 + fuzzy fan-out: queries are
 //! XLM-R-embedded and matched against per-message vectors stored
 //! in `search_vector`. The proposal mentions HNSW, but in
 //! practice the corpus per conversation is bounded — a brute-
 //! force cosine pass over the table is comfortably within the
 //! 200 ms p95 latency budget at the message counts the failure
-//! suite covers (`docs/PHASES.md` §5).
+//! suite covers.
 //!
 //! This module owns that brute-force pass. Storage:
 //!
@@ -18,9 +18,9 @@
 //! - Optional conversation filter joins through
 //!   `message_skeleton.conversation_id`.
 //!
-//! The HNSW upgrade is a Phase 6 follow-up — once it lands the
-//! engine will fan over the same `search_vector` rows but use
-//! the in-memory ANN graph instead of scanning every row. The
+//! The HNSW upgrade is a follow-up — once it lands, the engine
+//! will fan over the same `search_vector` rows but use the
+//! in-memory ANN graph instead of scanning every row. The
 //! [`SearchSemantic`] trait surface stays the same so the
 //! [`crate::search::query_engine`] reranking path doesn't need
 //! to change.
@@ -34,7 +34,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use crate::models::embeddings::dequantize_int8_for_search;
 use crate::Result;
 
-/// Phase 6, batch-5 (2026-05-04) — minimum corpus size that
+/// minimum corpus size that
 /// triggers the HNSW path. Below this threshold the brute-force
 /// cosine pass is faster than building an HNSW graph because
 /// `instant-distance` has a fixed per-build overhead. Above it,
@@ -249,7 +249,7 @@ impl<'a> SemanticSearchEngine<'a> {
         }
     }
 
-    /// Phase 6, batch-5 — choose between brute-force and HNSW
+    /// choose between brute-force and HNSW
     /// for the supplied slot, and run the search through that
     /// path. The HNSW path lazily builds the graph the first
     /// time it sees a slot, caches it, and re-uses it on
@@ -313,7 +313,7 @@ impl<'a> SemanticSearchEngine<'a> {
             return Ok(score_candidates_brute_force(query_embedding, raw, limit));
         };
         let idx = Arc::new(idx);
-        // Insert first, then run the search outside the lock —
+        // Insert first, then run the search outside the lock
         // same locking discipline as the hit path. A concurrent
         // miss would simply rebuild + overwrite, which is
         // wasted work but correctness-preserving.
@@ -728,7 +728,7 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    /// Regression for the cache-mutex contention finding —
+    /// Regression for the cache-mutex contention finding
     /// once the hit path has taken the lock long enough to
     /// `Arc::clone` the index, the lock must be released
     /// before the (potentially expensive) graph search runs.
@@ -749,7 +749,7 @@ mod tests {
             model_version: Some("v1".into()),
         };
         // Build a real index so the search call exercises the
-        // ANN path, not the early-return on `query.is_empty()`.
+        // ANN path, not the early-return on `query.is_empty`.
         let idx = HnswIndex::build(vec![
             ("m1".into(), vec![1.0, 0.0, 0.0]),
             ("m2".into(), vec![0.0, 1.0, 0.0]),
@@ -767,9 +767,9 @@ mod tests {
 
         // Mimic the hit path: clone under the lock, then drop
         // the guard, then search. After the clone the cache
-        // mutex must be free for any other thread to lock —
+        // mutex must be free for any other thread to lock
         // we verify by re-acquiring it from the same thread,
-        // which would deadlock if the previous `lock()` were
+        // which would deadlock if the previous `lock` were
         // still held.
         let cloned = {
             let guard = cache.inner.lock().unwrap();

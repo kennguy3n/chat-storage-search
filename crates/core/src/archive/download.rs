@@ -1,4 +1,4 @@
-//! Phase-3 archive segment download + decrypt pipeline.
+//! archive segment download + decrypt pipeline.
 //!
 //! The inverse of [`crate::archive::segment_builder`]:
 //!
@@ -13,7 +13,7 @@
 //! 4. [`fetch_and_decrypt_segment`] — convenience wrapper that
 //!    chains the first two steps.
 //!
-//! `docs/PROPOSAL.md §6.3` and §10.1 spell out the wire format the
+//! `docs/DESIGN.md §6.3` and §10.1 spell out the wire format the
 //! reverse pipeline must round-trip; the unit tests below build a
 //! segment with [`crate::archive::segment_builder::ArchiveSegmentBuilder`]
 //! and decrypt it end-to-end via this module so any drift in the
@@ -40,10 +40,10 @@ use super::segment_builder::{ArchiveSegmentPayload, ARCHIVE_SEGMENT_PAYLOAD_MAGI
 /// is:
 ///
 /// ```text
-///   [16 bytes]  segment_id        (UUID v7 raw bytes)
-///   [32 bytes]  merkle_root       (BLAKE3 over plaintext payload)
-///   [24 bytes]  nonce             (XChaCha20-Poly1305 nonce)
-///   [N  bytes]  ciphertext        (sealed zstd(cbor(...)))
+/// [16 bytes] segment_id (UUID v7 raw bytes)
+/// [32 bytes] merkle_root (BLAKE3 over plaintext payload)
+/// [24 bytes] nonce (XChaCha20-Poly1305 nonce)
+/// [N bytes] ciphertext (sealed zstd(cbor(...)))
 /// ```
 ///
 /// Distinguishing the framing from the raw ciphertext keeps the
@@ -122,7 +122,7 @@ pub fn decode_archive_segment_blob(bytes: &[u8]) -> Result<DecodedArchiveSegment
 /// Pull the encrypted bytes for `segment_id` from `transport`.
 ///
 /// This is a thin wrapper around
-/// [`crate::transport::TransportClient::fetch_archive_segment`] —
+/// [`crate::transport::TransportClient::fetch_archive_segment`]
 /// the decryption / decompression / decode happens in the
 /// follow-on functions in this module so the transport can be
 /// mocked in isolation.
@@ -203,7 +203,7 @@ pub fn decode_archive_segment_payload(
 
 /// Convenience wrapper: fetch the encrypted bytes for `segment_id`
 /// from `transport` and AEAD-open + zstd-decompress them under
-/// `k_archive_segment`. Returns the **plaintext CBOR bytes** —
+/// `k_archive_segment`. Returns the **plaintext CBOR bytes**
 /// pass them through [`decode_archive_segment_payload`] /
 /// [`decode_archive_segment`] to land a typed payload.
 pub fn fetch_and_decrypt_segment(
@@ -216,12 +216,12 @@ pub fn fetch_and_decrypt_segment(
 }
 
 // ---------------------------------------------------------------------------
-// Phase-4 (Task 8): storage_backend-aware fetch routing.
+// (Task 8): storage_backend-aware fetch routing.
 // ---------------------------------------------------------------------------
 
 /// Routing seam for archive-segment fetches.
 ///
-/// `archive_segment_map.storage_backend` (`docs/PROPOSAL.md §10.1`)
+/// `archive_segment_map.storage_backend` (`docs/DESIGN.md §10.1`)
 /// records which backend an archive segment was uploaded under.
 /// On the download path the orchestrator must route the fetch to
 /// the matching backend — the legacy KChat blob service via
@@ -467,7 +467,7 @@ mod tests {
                 //
                 // `Error::Storage(inner)` MUST take the inner
                 // `StorageError`'s Display text (not the outer
-                // `Error`'s) to avoid a doubled `"storage: storage: ..."`
+                // `Error`'s) to avoid a doubled `"storage: storage:..."`
                 // prefix on round-trip: `Error::Storage(...).to_string()`
                 // yields `"storage: <inner>"`, which if re-wrapped into
                 // another `Error::Storage(StorageError::Custom(...))`

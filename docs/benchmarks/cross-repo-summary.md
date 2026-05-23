@@ -76,10 +76,10 @@ fallback.
       not used.
 - [x] **`chat-storage-search`** — the criterion benches link
       against the production SQLCipher build with the ICU
-      tokenizer enabled. ML benches that depend on Phase 6
-      models are listed in
-      [`phase1-benchmark-results.md`](phase1-benchmark-results.md)
-      and tracked separately.
+      tokenizer enabled. ML-dependent benches that exercise
+      embedding and OCR/transcription bridges are tracked
+      separately from the local-store and text-search baseline
+      in [`phase1-benchmark-results.md`](phase1-benchmark-results.md).
 
 ## Per-repo highlights
 
@@ -117,7 +117,7 @@ codebase. The multilingual / FTS5 / fuzzy search integration
 tests run end-to-end against the bundled SQLCipher build.
 Criterion search-latency benches are 100–149 µs, three orders
 of magnitude under the §13 budgets in
-[PROPOSAL.md](../PROPOSAL.md).
+[DESIGN.md](../DESIGN.md).
 
 ## Cross-platform paths not measured here
 

@@ -1,6 +1,6 @@
-//! Phase 6 INT4 / INT8 quantization benchmarks.
+//! INT4 / INT8 quantization benchmarks.
 //!
-//! `docs/PROPOSAL.md §7.6` documents the per-tier model
+//! `docs/DESIGN.md §7.6` documents the per-tier model
 //! packaging story (INT4 for tight storage, INT8 for the
 //! default tier). This bench suite measures the encode /
 //! decode throughput of both codecs and the cosine-similarity
@@ -15,7 +15,7 @@
 //!   [`kchat_core::models::embeddings::LocalStoreEmbeddingCache`].
 //! * `int4_embedding_encode_decode_round_trip` — same shape
 //!   for INT4, exercising the new packed nibble codec added in
-//!   the 2026-05-04 batch.
+//!   this release.
 //! * `int8_vs_int4_cosine_fidelity` — across 128 fixture
 //!   vectors, compute the average cosine similarity between
 //!   the original and the round-tripped vector for both
@@ -69,7 +69,7 @@ fn fixture_embedding(seed: u64) -> Vec<f32> {
 /// Build a 128-vector multilingual corpus by interleaving
 /// distinct seed bands. The seed bands are picked to cover
 /// roughly the same magnitude / sign distribution as the
-/// production XLM-R `[CLS]` embeddings observed in the Phase 1
+/// production XLM-R `[CLS]` embeddings observed in the
 /// fixtures.
 fn fixture_corpus() -> Vec<Vec<f32>> {
     (0..128).map(|i| fixture_embedding(i as u64 * 7)).collect()

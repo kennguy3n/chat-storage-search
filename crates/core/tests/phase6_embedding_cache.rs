@@ -1,5 +1,5 @@
-//! Phase 6, Task 10 — cross-pipeline embedding cache integration
-//! test (`docs/PROPOSAL.md §7.6.1`).
+//! cross-pipeline embedding cache integration
+//! test (`docs/DESIGN.md §7.6.1`).
 //!
 //! [`EmbeddingCache`] is the on-disk seam shared between the
 //! search pipeline (xlm-r text embeddings) and the guardrail
@@ -15,7 +15,7 @@ use kchat_core::models::embeddings::{
     EmbeddingCache, LocalStoreEmbeddingCache, XLMR_EMBEDDING_DIM, XLMR_MODEL_VERSION,
 };
 
-/// Ten-byte fixture key — every Phase 4+ integration test uses
+/// Ten-byte fixture key — every + integration test uses
 /// the same `0xCD..` shape so failed CI logs are easy to grep.
 const FIXTURE_KEY: [u8; 32] = [0xCD; 32];
 

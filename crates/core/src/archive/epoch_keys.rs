@@ -1,6 +1,6 @@
 //! Epoch key lifecycle for the archive pipeline.
 //!
-//! `docs/PROPOSAL.md §2.1` and `docs/PHASES.md` Phase 3 call for
+//! `docs/DESIGN.md §2.1` calls for
 //! per-epoch indirection between `K_archive_root` and the
 //! per-segment / per-manifest keys: each rotation seals the prior
 //! epoch's key under `K_archive_root` (AES-256-KW) and records the
@@ -9,7 +9,7 @@
 //! by deleting the wrapped key from the manifest chain entirely.
 //!
 //! The HKDF derivation itself lives in
-//! [`crate::crypto::key_hierarchy::derive_archive_epoch_key`] —
+//! [`crate::crypto::key_hierarchy::derive_archive_epoch_key`]
 //! this module owns the **lifecycle**:
 //!
 //! * the *current* epoch key, held in a [`Zeroizing`] buffer;
@@ -39,7 +39,7 @@ pub type WrappedEpochKey = Vec<u8>;
 
 /// Lifecycle manager for the archive epoch keys.
 ///
-/// Contract — `docs/PROPOSAL.md §2.1`:
+/// Contract — `docs/DESIGN.md §2.1`:
 ///
 /// * Exactly **one** epoch key is "current" at any time. The bytes
 ///   are held in a [`Zeroizing`] buffer; the manager never `Clone`s
@@ -61,7 +61,7 @@ pub struct EpochKeyManager {
 impl EpochKeyManager {
     /// Bootstrap a fresh manager rooted at `epoch_id`. The current
     /// epoch key is derived from `k_archive_root` using HKDF-SHA256
-    /// (info = `b"kchat-archive-epoch-v1" || epoch_id.as_bytes()`).
+    /// (info = `b"kchat-archive-epoch-v1" || epoch_id.as_bytes`).
     pub fn new(k_archive_root: &KeyMaterial, epoch_id: &str) -> Result<Self, Error> {
         let derived = derive_archive_epoch_key(k_archive_root, epoch_id).map_err(Error::from)?;
         let mut bytes = [0u8; KEY_LEN];
@@ -95,7 +95,7 @@ impl EpochKeyManager {
 
     /// Rotate to a new epoch.
     ///
-    /// Steps `docs/PROPOSAL.md §2.1`:
+    /// Steps `docs/DESIGN.md §2.1`:
     ///
     /// 1. Wrap the *current* epoch key under `K_archive_root` using
     ///    AES-256-KW; insert the resulting [`WrappedEpochKey`] into
@@ -123,15 +123,15 @@ impl EpochKeyManager {
             ));
         }
         // 1) Wrap the outgoing key under K_archive_root and stash
-        //    it under the outgoing epoch id.
+        // it under the outgoing epoch id.
         let wrapped =
             wrap_key(k_archive_root.as_bytes(), &self.current_epoch_key).map_err(Error::from)?;
         self.prior_epoch_keys
             .insert(self.current_epoch_id.clone(), wrapped);
 
         // 2) Derive the new epoch key and replace the current one.
-        //    The Zeroizing buffer for the old key is dropped here
-        //    (the assignment moves a fresh Zeroizing into place).
+        // The Zeroizing buffer for the old key is dropped here
+        // (the assignment moves a fresh Zeroizing into place).
         let derived =
             derive_archive_epoch_key(k_archive_root, new_epoch_id).map_err(Error::from)?;
         let mut bytes = [0u8; KEY_LEN];
@@ -232,7 +232,7 @@ impl EpochKeyManager {
     ///
     /// The byte length is validated against the AES-256-KW
     /// wrapped-key length up front; an unexpected length surfaces
-    /// `Error::Storage(....into())` rather than waiting for the
+    /// `Error::Storage(....into)` rather than waiting for the
     /// downstream unwrap to fail. Re-ingesting an `epoch_id` that
     /// already exists is rejected — the manifest chain must be
     /// the canonical source of truth.

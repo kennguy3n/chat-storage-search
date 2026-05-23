@@ -1,11 +1,11 @@
-//! Phase B.9 archive coordinator — owns the per-`CoreImpl`
+//! archive coordinator — owns the per-`CoreImpl`
 //! epoch-key state and ZKOF backend wiring that previously lived
 //! directly on `CoreImpl` as `current_epoch` and `zkof_archive`
 //! fields.
 //!
 //! Scope:
 //! * `EpochKeyManager` (envelope encryption + rotation) lifecycle
-//!   — install / has / current id / borrow current key / rotate /
+//!   install / has / current id / borrow current key / rotate /
 //!   recover prior / delete prior / wrapped-prior-keys snapshot.
 //! * ZKOF archive backend (S3 client + gateway config) install +
 //!   `has` + builder for the per-call `ArchiveSegmentRouter`.
@@ -18,7 +18,7 @@
 //! `Mutex<Option<_>>` slots are intentionally re-installable
 //! (epoch managers rotate; backend credentials rotate on key /
 //! cred refresh) so they stay under `Mutex<Option>` rather than
-//! `OnceLock` (see Phase B.2 `CoreImpl` rustdoc).
+//! `OnceLock` (see `CoreImpl` rustdoc).
 
 use std::sync::Mutex;
 
@@ -31,12 +31,12 @@ use crate::local_store::StorageError;
 use crate::transport::TransportClient;
 use crate::{Error, Result};
 
-/// Phase-3 ZKOF archive backend (S3 client + gateway config).
+/// ZKOF archive backend (S3 client + gateway config).
+///
 /// Bundled into a single struct so install is atomic — `s3` and
-/// `config` must always be installed together (Phase B.2 atomic
-/// bundle, kept under `Mutex<Option>` because operators rotate
-/// the bucket credentials / gateway URL without spinning up a
-/// new core).
+/// `config` must always be installed together. Kept under
+/// `Mutex<Option>` because operators rotate the bucket credentials
+/// or gateway URL without spinning up a new core.
 #[derive(Clone)]
 pub(crate) struct ZkofArchiveBackend {
     pub(crate) s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
@@ -51,7 +51,7 @@ pub(crate) struct Coordinator {
     /// every rotation, so it stays in `Mutex<Option>` rather than
     /// `OnceLock`.
     current_epoch: Mutex<Option<EpochKeyManager>>,
-    /// Phase-3 ZKOF archive backend (S3 client + gateway config).
+    /// ZKOF archive backend (S3 client + gateway config).
     /// `Mutex<Option>` for credential rotation.
     zkof_archive: Mutex<Option<ZkofArchiveBackend>>,
     /// Snapshot of `KChatCoreConfig::archive_backend` (immutable
@@ -73,7 +73,7 @@ impl Coordinator {
     }
 
     // ----------------------------------------------------------------
-    // Phase 4 (`docs/PROPOSAL.md §6.3`) — epoch key manager lifecycle.
+    // (`docs/DESIGN.md §6.3`) — epoch key manager lifecycle.
     // ----------------------------------------------------------------
 
     /// Bootstrap a fresh [`EpochKeyManager`] for the supplied
@@ -196,10 +196,10 @@ impl Coordinator {
     }
 
     // ----------------------------------------------------------------
-    // Phase 3 — ZKOF archive backend lifecycle + router builder.
+    // ZKOF archive backend lifecycle + router builder.
     // ----------------------------------------------------------------
 
-    /// Install the Phase-3 ZKOF archive backend (S3 client +
+    /// Install the ZKOF archive backend (S3 client +
     /// gateway config). Required before
     /// `CoreImpl::rehydrate_timeline_skeletons` can route any
     /// `storage_backend = zk_object_fabric` rows.
@@ -227,7 +227,7 @@ impl Coordinator {
     /// the configured archive backend is
     /// [`ArchiveBackend::Zkof`]. Returns
     /// `Error::Storage(SubsystemNotInstalled("zkof_archive_backend"))`
-    /// when ZKOF is configured but the backend wasn't installed —
+    /// when ZKOF is configured but the backend wasn't installed
     /// the typed variant lets platform glue distinguish "never
     /// installed" from "wrong backend" without parsing message
     /// text.

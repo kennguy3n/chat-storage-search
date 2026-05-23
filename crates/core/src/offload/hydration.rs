@@ -1,6 +1,6 @@
-//! Phase-3 hydration priority queue.
+//! hydration priority queue.
 //!
-//! `docs/PROPOSAL.md §5.5` defines the P0..P5 hydration ladder
+//! `docs/DESIGN.md §5.5` defines the P0..P5 hydration ladder
 //! used by the rehydration pipeline. This module turns that
 //! ladder into an in-memory queue ordered by [`HydrationReason`]
 //! (priority) and FIFO insertion order within a priority.
@@ -32,7 +32,7 @@ pub struct HydrationRequest {
     /// Why the rehydration is happening.
     pub reason: HydrationReason,
     /// Wall-clock millisecond timestamp the request was queued
-    /// — used as the FIFO tiebreaker within a single priority
+    /// used as the FIFO tiebreaker within a single priority
     /// bucket.
     pub requested_at_ms: i64,
 }

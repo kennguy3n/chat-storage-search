@@ -1,9 +1,9 @@
 //! Comprehensive end-to-end demo for the KChat storage / search /
 //! archive / backup / restore pipeline.
 //!
-//! `docs/PROPOSAL.md §12` and `docs/PHASES.md` Phase 7 both call
+//! `docs/DESIGN.md §12` calls
 //! out the need for *one* integration test that exercises every
-//! Phase-0 through Phase-6 surface back-to-back against a single
+//! surface back-to-back against a single
 //! realistic dataset. The 24 existing test files cover individual
 //! pipelines in depth; this file is the single, narrative
 //! "everything works together" run-through that proves the
@@ -53,14 +53,14 @@
 //!
 //! ```text
 //! === E2E Demo Results ===
-//! Step  1: Initialize             OK   (   2 ms)
-//! Step  2: Seed conversations     OK   (   5 ms) [count=5]
-//! Step  3: Ingest messages        OK   (  45 ms) [new=200, dup=0]
+//! Step 1: Initialize OK ( 2 ms)
+//! Step 2: Seed conversations OK ( 5 ms) [count=5]
+//! Step 3: Ingest messages OK ( 45 ms) [new=200, dup=0]
 //! …
 //! ```
 //!
-//! Per `docs/PROGRESS.md`'s 2026-05-08 entry this file is the
-//! comprehensive demo dataset deliverable.
+//! This file is the comprehensive demo dataset deliverable for
+//! the storage / search / archive / backup / restore pipeline.
 
 use std::time::Instant;
 
@@ -353,7 +353,7 @@ fn run_demo(conversation_count: usize, message_count: usize, media_count: usize)
     let group_count = groups.len();
     // Derive an archive epoch + per-segment key fixture. The
     // production archive pipeline rotates these monthly per
-    // `docs/PHASES.md` Phase 3 — for the demo we exercise the
+    // for the demo we exercise the
     // single-epoch happy path to keep the recipe linear.
     let identity = KeyMaterial::from_bytes([0xA1; 32]);
     let archive_root = derive_archive_root(&identity).expect("archive root");

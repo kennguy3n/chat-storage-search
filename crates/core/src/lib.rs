@@ -1,7 +1,7 @@
 //! kchat-core — platform-agnostic core for the KChat storage and
 //! search engine.
 //!
-//! Phase 0 establishes the on-disk and on-wire crypto contract:
+//! Establishes the on-disk and on-wire crypto contract:
 //! BLAKE3 content hashing, the [`crypto::key_hierarchy`] HKDF-SHA256
 //! derivation tree, the AEAD constructions in [`crypto::aead`], the
 //! Pattern C convergent encryption in [`crypto::convergent`]
@@ -16,7 +16,7 @@
 //! search index shard — that travel between the device and the
 //! KChat backend / ZK Object Fabric backup sink.
 //!
-//! Phase 1 starts the on-device persistence layer:
+//! The on-device persistence layer is layered as:
 //!
 //! * [`local_store::schema`] — typed Rust row structs for every
 //!   SQLCipher table, plus the `SCHEMA_SQL` constant carrying the
@@ -27,13 +27,13 @@
 //!   `restore_state` enums with `try_transition`, `Display` /
 //!   `FromStr`, and serde support.
 //! * [`message::processor`] — `IngestedMessage`, `OutboxEntry`,
-//!   `IngestResult`, and the pure-Rust validators the Phase-1
-//!   SQLCipher integration will sit behind.
+//!   `IngestResult`, and the pure-Rust validators the SQLCipher
+//!   integration sits behind.
 //!
-//! The remaining higher-level modules (`media`, `archive`, `backup`,
-//! `offload`, `restore`, `models`, `transport`, `scheduler`) are
-//! stubbed in Phase 0 and filled in as later phases land. See
-//! `docs/PHASES.md` for the schedule.
+//! The higher-level modules (`media`, `archive`, `backup`,
+//! `offload`, `restore`, `models`, `transport`, `scheduler`)
+//! build on top of the persistence layer to implement the
+//! library's storage, search, and sync surfaces.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -81,11 +81,11 @@ use crate::message::processor::IngestResult;
 /// [`transport::TransportError::Auth`]) instead of parsing
 /// `Display` text.
 ///
-/// # Migration note (Phase B.3 / workstream B.8)
+/// # Migration note
 ///
 /// The string-typed variants (`Storage(String)`, `Search(String)`,
 /// `Message(String)`, `Transport(String)`, `Model(String)`) were
-/// replaced with typed sub-enum wrappers in workstream B.8 so the
+/// replaced with typed sub-enum wrappers so the
 /// reader pool / retry loops / tests can route on intent. Existing
 /// `format!("...: {e}")` call sites map to the `Custom(String)`
 /// variant on each sub-enum via the bridging `From<String>` impls
@@ -124,7 +124,7 @@ pub enum Error {
     /// An on-device ML model call failed. See [`models::ModelError`]
     /// for the structured failure modes (ONNX Runtime, tokenizer,
     /// image / video decode, EP-tuning cache, model-not-cached).
-    /// Phase 6 — `docs/PROPOSAL.md §7.6 / §7.7`.
+    /// `docs/DESIGN.md §7.6 / §7.7`.
     #[error("model: {0}")]
     Model(#[from] models::ModelError),
 
@@ -140,12 +140,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
-// Transitional ergonomics for the workstream-B.8 migration.
+// Transitional ergonomics for the typed-error migration.
 //
 // Most of the codebase still constructs the old string-typed
-// variants — `Error::Storage(format!("...").into())` etc. The
+// variants — `Error::Storage(format!("...").into)` etc. The
 // `From<&str>` / `From<String>` impls below let those call sites
-// keep compiling while wave-by-wave the typed
+// keep compiling while the typed
 // `StorageError::DatabaseLocked` / `SearchError::QueryParse` /
 // `MessageError::Validation` variants replace them. Once the
 // migration finishes and no string-typed constructions remain, these
@@ -202,7 +202,7 @@ impl From<&str> for models::ModelError {
 
 // `transport::TransportError` is reused as-is from the transport
 // module. Pre-B.8 call sites construct `Error::Transport(some_string)`
-// — until they migrate to `TransportError::Network` /
+// until they migrate to `TransportError::Network` /
 // `TransportError::Auth` / `TransportError::Server`, the bridging
 // `From<String>` / `From<&str>` impls below map the legacy string
 // form onto [`TransportError::Custom`], whose Display emits the
@@ -210,7 +210,7 @@ impl From<&str> for models::ModelError {
 // prefix). This mirrors the [`StorageError::Custom`] /
 // [`SearchError::Custom`] / [`MessageError::Custom`] /
 // [`ModelError::Custom`] pattern and preserves the exact pre-B.8
-// observable message through the bridge layer's `.to_string()` —
+// observable message through the bridge layer's `.to_string`
 // avoiding the doubled-prefix scenario
 // (`"transport: server: connection reset"`) the bridge comments
 // guard against.
@@ -227,12 +227,12 @@ impl From<&str> for transport::TransportError {
 }
 
 // ---------------------------------------------------------------------------
-// Public API types — `docs/PROPOSAL.md §12`
+// Public API types — `docs/DESIGN.md §12`
 // ---------------------------------------------------------------------------
 
 /// Top-level content-kind filter for [`SearchQuery`].
 ///
-/// `docs/PROPOSAL.md §12`. Maps to the `kind` column on
+/// `docs/DESIGN.md §12`. Maps to the `kind` column on
 /// `message_skeleton` and to the `kind` field on the media search
 /// rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -256,7 +256,7 @@ pub enum ContentKind {
 
 /// Search-fan-out scope.
 ///
-/// `docs/PROPOSAL.md §12` mandates [`SearchScope::IncludeCold`] as
+/// `docs/DESIGN.md §12` mandates [`SearchScope::IncludeCold`] as
 /// the default — the personal archive is always part of search. The
 /// `LocalOnly` variant exists for callers that must guarantee an
 /// offline result (no network calls into the archive client).
@@ -266,25 +266,25 @@ pub enum SearchScope {
     /// Search the local store only (no archive fan-out).
     LocalOnly,
     /// Search the local store **and** the personal archive.
-    /// Default — see `docs/PROPOSAL.md §12`.
+    /// Default — see `docs/DESIGN.md §12`.
     #[default]
     IncludeCold,
 }
 
-/// Search target. Phase 8 (2026-05-04 batch) — selects which
+/// Search target. — selects which
 /// slice of the conversation hierarchy a search query applies
 /// to. Variants:
 ///
 /// * [`SearchTarget::Conversation`] — single conversation, used
 ///   to back the legacy `conversation_filter` field.
 /// * [`SearchTarget::ConversationGroup`] — explicit list of
-///   conversation ids (Phase 8, batch-5 — 2026-05-04). The
+///   conversation ids. The
 ///   query engine treats the variant as the materialized set
 ///   directly and skips the resolver.
 /// * [`SearchTarget::Channel`] — single channel id; the
 ///   resolver is responsible for mapping it to a conversation
 ///   set.
-/// * [`SearchTarget::Community`] / [`SearchTarget::Domain`] —
+/// * [`SearchTarget::Community`] / [`SearchTarget::Domain`]
 ///   filter to the conversations attached to a community or a
 ///   domain (b2b hierarchy levels).
 /// * [`SearchTarget::Tenant`] — filter to every conversation
@@ -292,8 +292,7 @@ pub enum SearchScope {
 /// * [`SearchTarget::B2cAll`] — every conversation with
 ///   `scope = "b2c"`.
 /// * [`SearchTarget::Starred`] — every conversation the user
-///   has starred (Phase 8, batch-5 — 2026-05-04). Resolution
-///   is delegated to a
+///   has starred. Resolution is delegated to a
 ///   [`crate::search::search_target::ConversationGroupResolver`]
 ///   because the starred-state is held by the orchestration
 ///   layer rather than the local store schema.
@@ -303,15 +302,15 @@ pub enum SearchScope {
 /// * [`SearchTarget::Global`] (default) — no filter; the
 ///   query engine returns results from every conversation
 ///   visible to the local store. `AllConversations` is an
-///   alias used in the Phase-8 task spec.
+///   alias used in the task spec.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchTarget {
     /// Single-conversation filter.
     Conversation(Uuid),
-    /// Phase 8, batch-5 — explicit conversation-id list.
+    /// explicit conversation-id list.
     ConversationGroup(Vec<Uuid>),
-    /// Phase 8, batch-5 — channel-level filter. Resolution is
+    /// channel-level filter. Resolution is
     /// delegated to the registered
     /// [`crate::search::search_target::ConversationGroupResolver`].
     Channel(Uuid),
@@ -323,11 +322,11 @@ pub enum SearchTarget {
     Tenant(String),
     /// Every conversation with `scope = "b2c"`.
     B2cAll,
-    /// Phase 8, batch-5 — every conversation the user has
+    /// every conversation the user has
     /// starred. Resolution is delegated to the registered
     /// [`crate::search::search_target::ConversationGroupResolver`].
     Starred,
-    /// Phase 8, batch-5 — every conversation with unread
+    /// every conversation with unread
     /// messages. Same resolver-delegation contract as
     /// [`SearchTarget::Starred`].
     Unread,
@@ -337,7 +336,7 @@ pub enum SearchTarget {
 }
 
 impl SearchTarget {
-    /// Phase-8 task-spec alias: the spec uses the name
+    /// task-spec alias: the spec uses the name
     /// `AllConversations` for the global / no-filter variant.
     /// `Global` is the long-standing canonical name; this
     /// constant is provided so call sites that prefer the
@@ -349,21 +348,20 @@ impl SearchTarget {
 
 /// Top-level search query.
 ///
-/// `docs/PROPOSAL.md §12` defines the field shape; the unified
-/// query engine (`search/query_engine.rs`, lands in Phase 5)
-/// fans the query out to FTS5, fuzzy, vector, and media indexes.
+/// `docs/DESIGN.md §12` defines the field shape; the unified
+/// query engine in [`crate::search::query_engine`] fans the query
+/// out to FTS5, fuzzy, vector, and media indexes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// User-typed query string. May interleave scripts.
     pub query_string: String,
     /// Optional sender filter.
     pub sender_filter: Option<String>,
-    /// Optional conversation filter. Phase 8 (2026-05-04
-    /// batch) introduces [`SearchQuery::target`] as the
-    /// preferred filter; this field stays as a deprecated
-    /// alias that maps onto
-    /// [`SearchTarget::Conversation`] when [`Self::target`]
-    /// is [`SearchTarget::Global`].
+    /// Optional conversation filter. The richer
+    /// [`SearchQuery::target`] field is the preferred filter;
+    /// this field stays as a deprecated alias that maps onto
+    /// [`SearchTarget::Conversation`] when [`Self::target`] is
+    /// left at [`SearchTarget::Global`].
     pub conversation_filter: Option<Uuid>,
     /// Inclusive lower-bound `created_at_ms`.
     pub date_from: Option<i64>,
@@ -371,8 +369,8 @@ pub struct SearchQuery {
     pub date_to: Option<i64>,
     /// Content-kind filter.
     pub content_kind: Option<ContentKind>,
-    /// Phase 8 conversation-hierarchy target. `Global`
-    /// (default) when omitted from the wire payload —
+    /// Conversation-hierarchy target. `Global`
+    /// (default) when omitted from the wire payload
     /// `#[serde(default)]` keeps backward compat with v0
     /// callers that only sent `conversation_filter`.
     #[serde(default)]
@@ -380,10 +378,11 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
-    /// Resolve the effective target for this query. Phase 8
-    /// preserves the legacy `conversation_filter` field by
-    /// mapping it to [`SearchTarget::Conversation`] when the
-    /// new `target` is left at its default ([`SearchTarget::Global`]).
+    /// Resolve the effective target for this query.
+    ///
+    /// Preserves the legacy `conversation_filter` field by mapping
+    /// it to [`SearchTarget::Conversation`] when the new `target`
+    /// is left at its default ([`SearchTarget::Global`]).
     pub fn effective_target(&self) -> SearchTarget {
         if matches!(self.target, SearchTarget::Global) {
             if let Some(c) = self.conversation_filter {
@@ -397,8 +396,8 @@ impl SearchQuery {
 /// One result row from the unified search engine.
 ///
 /// `rank_score` is the merged (FTS / fuzzy / vector / recency /
-/// pinned) score; the ranking formula lands with the search engine
-/// implementation in Phase 5.
+/// pinned) score produced by the unified query engine in
+/// [`crate::search::query_engine`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Stable message identifier.
@@ -420,17 +419,16 @@ pub struct SearchResult {
     /// Raw cosine similarity between the query embedding and the
     /// row's stored embedding, when this hit went through the
     /// semantic-search engine. `None` for pure FTS / fuzzy hits.
-    /// Phase 6, Task 4 (2026-05-04 batch). The reranker
+    /// The reranker
     /// ([`crate::search::query_engine::QueryEngine::rerank_with_semantic`])
     /// reads this field for ordering decisions.
     #[serde(default)]
     pub semantic_score: Option<f64>,
 }
 
-/// Phase 8 (2026-05-04 batch 10) — Task 2: streaming search
-/// event surface.
+/// Streaming search event surface.
 ///
-/// `docs/PROPOSAL.md §7.5` calls for the search UX to render
+/// `docs/DESIGN.md §7.5` calls for the search UX to render
 /// the local FTS / fuzzy hits immediately while the cold-bucket
 /// fan-out completes in the background. The
 /// [`crate::search::query_engine::QueryEngine::execute_search_streaming`]
@@ -500,7 +498,7 @@ pub enum SearchEvent {
 /// Why the rehydration / restore path is loading a body or media
 /// asset.
 ///
-/// `docs/PROPOSAL.md §5.5` defines the priority ladder. Variants are
+/// `docs/DESIGN.md §5.5` defines the priority ladder. Variants are
 /// listed in priority order — declaration order matches `P0..P5`,
 /// which the [`PartialOrd`] / [`Ord`] derives use for comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -568,23 +566,22 @@ impl Default for ClientMessageId {
 pub struct DeliveryCursor(pub String);
 
 // ---------------------------------------------------------------------------
-// Phase-1 placeholder result / source types
+// Placeholder result / source types
 // ---------------------------------------------------------------------------
 //
-// `docs/PROPOSAL.md §12` specifies a richer return shape for each of
-// these APIs; until the matching Phase-2 / Phase-3 / Phase-4 engines
+// `docs/DESIGN.md §12` specifies a richer return shape for each of
+// these APIs; until the matching search / archive / restore engines
 // land, the trait carries zero-field placeholders that round-trip
 // through serde so bridge crates can already pin the types in their
 // FFI surface.
 
 /// Result of [`KChatCore::hydrate_message`].
 ///
-/// Phase 3 widens the placeholder to carry the rehydrated body
+/// Widens the placeholder to carry the rehydrated body
 /// (when one exists), the originating skeleton metadata, and a
 /// `is_cold` flag the renderer can use to decide whether to wait
-/// on a background fetch. Subsequent phases (3+ / Phase 4) will
-/// extend this with decrypted media descriptors and hydration
-/// provenance.
+/// on a background fetch. Future iterations will extend this with
+/// decrypted media descriptors and hydration provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HydratedMessage {
     /// Stable message identifier the request was for.
@@ -605,15 +602,14 @@ pub struct HydratedMessage {
     /// the archive fetch was skipped because the
     /// [`crate::transport::offline::OfflineDetector`] reported
     /// offline, and the renderer should display an offline cold
-    /// state until reconnection retriggers hydration. Phase 7,
-    /// Task 6 (2026-05-04 batch).
+    /// state until reconnection retriggers hydration.
     #[serde(default)]
     pub offline: bool,
 }
 
 /// Result of [`KChatCore::send_media`].
 ///
-/// Phase 2 carries the freshly-minted [`ClientMessageId`], the
+/// Carries the freshly-minted [`ClientMessageId`], the
 /// [`MediaDescriptor`] the rest of the system round-trips through
 /// CBOR, and the `asset_id` (UUID v7) that the local-store
 /// `media_asset` row keys on.
@@ -631,9 +627,8 @@ pub struct SendMediaResult {
 /// Result of [`KChatCore::run_incremental_backup`].
 ///
 /// Populated by [`crate::core_impl::CoreImpl::run_incremental_backup`]
-/// once the backup engine wiring is installed (Task 3 of the
-/// Phase 3/4 batch). Default is the no-events / no-keys-installed
-/// shape.
+/// once the backup engine wiring is installed. The default value
+/// represents the no-events / no-keys-installed shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupResult {
     /// Number of sealed [`crate::backup::segment_builder::BuiltBackupSegment`]
@@ -665,14 +660,13 @@ pub struct BackupResult {
     /// [`KChatCore::run_incremental_backup`] was called. The
     /// segments (if any) were sealed locally; the upload step
     /// was skipped and is expected to retry on reconnection.
-    /// Phase 7, Task 6 (2026-05-04 batch).
     #[serde(default)]
     pub deferred: bool,
 }
 
 /// Result of [`KChatCore::enforce_storage_budget`].
 ///
-/// Phase 3 carries the byte / row counts the eviction planner
+/// Carries the byte / row counts the eviction planner
 /// produced. The full offload contract (archive segment refs
 /// created, manifest deltas, …) lands as the archive upload path
 /// fills in.
@@ -689,26 +683,26 @@ pub struct OffloadResult {
 
 /// Result of [`KChatCore::restore_from_backup`].
 ///
-/// Phase-1 placeholder. The full restore contract (manifest chain
-/// verified, segments installed, deferred rehydration plan, …)
-/// lands with the restore engine in Phase 4.
+/// Placeholder result type. The full restore contract (manifest
+/// chain verified, segments installed, deferred rehydration plan,
+/// …) is filled in by the restore engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResult {}
 
 /// Source descriptor for [`KChatCore::restore_from_backup`].
 ///
-/// Phase-1 placeholder. The full source contract (backup root key
-/// reference, manifest chain head, transport handle for the backup
-/// sink, …) lands with the restore engine in Phase 4.
+/// Placeholder source type. The full source contract (backup root
+/// key reference, manifest chain head, transport handle for the
+/// backup sink, …) is filled in by the restore engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupSource {}
 
 /// Result of [`KChatCore::register_device`].
 ///
-/// Phase-1 placeholder. The full registration contract (MLS
+/// Placeholder result type. The full registration contract (MLS
 /// credential bundle, KeyPackage handle, server-assigned device
-/// id, attestation evidence, …) lands when the MLS / device-key
-/// layer arrives later in Phase 1 / Phase 2.
+/// id, attestation evidence, …) is filled in by the MLS /
+/// device-key layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRegistration {}
 
@@ -719,10 +713,10 @@ pub struct DeviceRegistration {}
 /// [`KChatCore::get_conversation_messages`]. It deliberately mirrors
 /// only the fields needed to render a chat bubble — sender, time,
 /// reply-to, edit / delete stamps, and the (optional) plaintext body
-/// — without leaking the internal `local_store::schema` types
-/// through the public API. Phase-2+ engines extend this with
-/// hydrated media descriptors, hydration provenance, and rich
-/// metadata.
+/// without leaking the internal `local_store::schema` types
+/// through the public API. Richer views can layer hydrated media
+/// descriptors, hydration provenance, and additional metadata on
+/// top.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageView {
     /// Stable message identifier.
@@ -753,14 +747,15 @@ pub struct MessageView {
 // KChatCore trait
 // ---------------------------------------------------------------------------
 
-/// Public core trait — `docs/PROPOSAL.md §12`.
+/// Public core trait — `docs/DESIGN.md §12`.
 ///
 /// **Async note.** The methods below are declared as synchronous
-/// `Result<_>`-returning functions for now. Phase 1 turns them into
-/// proper `async fn`s (or `Pin<Box<dyn Future>>`-returning functions
-/// behind `async_trait`) once the SQLCipher / transport plumbing
-/// exists for them to actually do I/O. Bridge crates are expected
-/// to track the Phase 1 iteration of this trait.
+/// `Result<_>`-returning functions for now. A follow-up iteration
+/// turns them into proper `async fn`s (or
+/// `Pin<Box<dyn Future>>`-returning functions behind `async_trait`)
+/// once the SQLCipher / transport plumbing exists for them to
+/// actually do I/O. Bridge crates are expected to track the
+/// iteration of this trait.
 pub trait KChatCore: Send + Sync {
     /// Returns the configuration this core was initialized with.
     fn config(&self) -> &KChatCoreConfig;
@@ -774,10 +769,9 @@ pub trait KChatCore: Send + Sync {
     /// `device_id`. Returns a [`DeviceRegistration`] handle the
     /// caller persists.
     ///
-    /// **Phase-1 stub.** The full MLS credential / KeyPackage
-    /// publication pipeline lands later in Phase 1 / Phase 2.
-    /// Until then this method returns
-    /// `Err(Error::NotImplemented("register_device"))`.
+    /// **Stub.** The full MLS credential / KeyPackage publication
+    /// pipeline is not yet implemented; until then this method
+    /// returns `Err(Error::NotImplemented("register_device"))`.
     fn register_device(&self, device_id: &str) -> Result<DeviceRegistration>;
 
     /// Create an outbox entry for an outbound text message and
@@ -825,7 +819,7 @@ pub trait KChatCore: Send + Sync {
     /// render a tombstone.
     fn delete_for_everyone(&self, message_id: Uuid) -> Result<()>;
 
-    /// Delete `conversation_id` along with every dependent row —
+    /// Delete `conversation_id` along with every dependent row
     /// message skeletons, message bodies, FTS rows, fuzzy tokens,
     /// and media-asset rows. Errors with [`Error::Storage`] when
     /// the conversation does not exist so callers can distinguish
@@ -862,13 +856,13 @@ pub trait KChatCore: Send + Sync {
     /// the in-process [`CoreImpl`] still mints fresh ids when the
     /// caller doesn't care.
     ///
-    /// Phase 2 wires this to
+    /// Internally this wires through
     /// [`crate::media::processor::process_media`] and the
     /// [`crate::media::thumbnail::ThumbnailGenerator`]. The actual
     /// upload to the configured [`TransportClient`] /
-    /// [`crate::media::sinks::MediaBlobSink`] is deferred —
-    /// [`SendMediaResult::descriptor`] is the wire form callers ship
-    /// through MLS.
+    /// [`crate::media::sinks::MediaBlobSink`] is deferred; the
+    /// [`SendMediaResult::descriptor`] is the wire form callers
+    /// ship through MLS.
     fn send_media(
         &self,
         conversation_id: Uuid,
@@ -883,33 +877,33 @@ pub trait KChatCore: Send + Sync {
     /// rate-limited offload eviction can take the most-recent reason
     /// into account.
     ///
-    /// **Phase-1 stub.** The rehydration pipeline lands in Phase 3.
-    /// Until then this method returns
+    /// **Stub.** The rehydration pipeline is not yet wired through
+    /// this entry point; until then this method returns
     /// `Err(Error::NotImplemented("hydrate_message"))`.
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage>;
 
     /// Walk the backup event journal, pack new segments, and push
     /// them to the configured backup sink.
     ///
-    /// **Phase-1 stub.** The backup engine lands in Phase 4. Until
-    /// then this method returns
+    /// **Stub.** The backup engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("run_incremental_backup"))`.
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult>;
 
-    /// Apply the storage budget defined by [`KChatCoreConfig`] —
+    /// Apply the storage budget defined by [`KChatCoreConfig`]
     /// demote message bodies to the offload tier, drop FTS / fuzzy
     /// rows on demoted messages, and rewrite the backup journal.
     ///
-    /// **Phase-1 stub.** The offload engine lands in Phase 3. Until
-    /// then this method returns
+    /// **Stub.** The offload engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("enforce_storage_budget"))`.
     fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult>;
 
     /// Verify the manifest chain pointed at by `source` and replay
     /// every journal segment back into the local store.
     ///
-    /// **Phase-1 stub.** The restore engine lands in Phase 4. Until
-    /// then this method returns
+    /// **Stub.** The restore engine is not wired through this entry
+    /// point yet; until then this method returns
     /// `Err(Error::NotImplemented("restore_from_backup"))`.
     fn restore_from_backup(&self, source: BackupSource) -> Result<RestoreResult>;
 }
@@ -973,8 +967,8 @@ mod tests {
 
     #[test]
     fn backward_compat_conversation_filter_maps_to_search_target() {
-        // Phase 8: when only `conversation_filter` is set (legacy
-        // wire payload, no `target`), `effective_target()` must
+        // when only `conversation_filter` is set (legacy
+        // wire payload, no `target`), `effective_target` must
         // surface as `SearchTarget::Conversation(c)`.
         let conv = Uuid::now_v7();
         let q = SearchQuery {
@@ -1004,7 +998,7 @@ mod tests {
 
     #[test]
     fn search_scope_default_is_include_cold() {
-        // PROPOSAL.md §12: default scope must be IncludeCold so that
+        // DESIGN.md §12: default scope must be IncludeCold so that
         // the personal archive is always part of search.
         assert_eq!(SearchScope::default(), SearchScope::IncludeCold);
     }
@@ -1118,7 +1112,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Phase-1 placeholder result / source types — Task 3
+    // placeholder result / source types — Task 3
     // ----------------------------------------------------------------
 
     #[test]

@@ -1,7 +1,7 @@
 //! `SpotlightAnchor` trait + `NoopSpotlightAnchor` implementation
-//! for macOS Spotlight integration (Phase 7, batch-5 — 2026-05-04).
+//! for macOS Spotlight integration.
 //!
-//! `docs/PROPOSAL.md §7.4` calls for app-internal Spotlight
+//! `docs/DESIGN.md §7.4` calls for app-internal Spotlight
 //! anchors so the macOS system-wide search bar can surface kchat
 //! messages without breaking the E2EE invariant: only metadata
 //! fields the user has consented to expose flow into Spotlight,
@@ -31,9 +31,9 @@
 
 use kchat_core::Error;
 
-/// Phase 7 (2026-05-04 batch 10) — Task 5: one Spotlight item.
+/// one Spotlight item.
 ///
-/// `docs/PROPOSAL.md §7.4` calls for the macOS system-wide
+/// `docs/DESIGN.md §7.4` calls for the macOS system-wide
 /// search bar to surface kchat messages. Each indexed message is
 /// represented as a [`SpotlightItem`] before it is handed to
 /// `CSSearchableItem` on the platform side.
@@ -97,7 +97,7 @@ pub trait SpotlightAnchor: Send + Sync + std::fmt::Debug {
     /// `message_id` verbatim.
     fn search_anchor(&self, message_id: &str) -> Result<String, Error>;
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 5: bulk indexing.
+    /// bulk indexing.
     ///
     /// Index every [`SpotlightItem`] in `items` in a single
     /// platform call. Production implementations issue one
@@ -112,7 +112,7 @@ pub trait SpotlightAnchor: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 5: bulk deindex.
+    /// bulk deindex.
     ///
     /// Remove every Spotlight item whose `uniqueIdentifier` is
     /// in `ids`. Idempotent in aggregate: missing ids are
@@ -125,13 +125,13 @@ pub trait SpotlightAnchor: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Phase 7 (2026-05-04 batch 10) — Task 5: nuke every
+    /// nuke every
     /// kchat-owned Spotlight item.
     ///
     /// Used during sign-out / account-deletion / "factory
     /// reset" flows so no kchat metadata leaks into Spotlight
     /// after the local store is wiped. The default
-    /// implementation returns [`Error::NotImplemented`] —
+    /// implementation returns [`Error::NotImplemented`]
     /// production implementations issue
     /// `CSSearchableIndex.deleteSearchableItemsWithDomainIdentifiers`
     /// for the kchat domain.
@@ -173,7 +173,7 @@ impl SpotlightAnchor for NoopSpotlightAnchor {
 
     // Override the default trait bodies so the noop stays
     // panic-free even when the underlying `index_message`
-    // returns `NotImplemented`. Phase 7 batch 10 — Task 5.
+    // returns `NotImplemented`.
     fn index_items(&self, _items: &[SpotlightItem]) -> Result<(), Error> {
         Ok(())
     }
@@ -213,7 +213,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------
-    // Phase 7 (2026-05-04 batch 10) — Task 5 bulk Spotlight API.
+    // bulk Spotlight API.
     // -----------------------------------------------------------
 
     /// Mock anchor that records every `index_items` /

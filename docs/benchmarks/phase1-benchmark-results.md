@@ -1,13 +1,13 @@
-# Phase-1 Benchmark Results
+# Local-store and text-search benchmark results
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../../LICENSE).
 
 Baseline run of `cargo bench -p kchat-core` and
-`cargo test --workspace` for the Phase-1 local-store + crypto +
-FTS5 + fuzzy-search hot paths. Phase 1 does not load any ML
-models — these benches validate that the SQLCipher-backed local
-store and the multilingual text-search pipeline meet the
-PROPOSAL §13 latency budgets.
+`cargo test --workspace` for the local-store + crypto + FTS5 +
+fuzzy-search hot paths. No ML models are loaded; these benches
+validate that the SQLCipher-backed local store and the
+multilingual text-search pipeline meet the
+[DESIGN.md §13](../DESIGN.md) latency budgets.
 
 ## Environment
 
@@ -51,7 +51,7 @@ manifest-signing, and pattern-C interop test runs.
 Source: `crates/core/benches/phase1_benchmarks.rs`. Criterion
 collected 100 samples per benchmark over a ~5–10 s window each.
 Targets are the latency budgets in
-[PROPOSAL.md §13](../PROPOSAL.md):
+[DESIGN.md §13](../DESIGN.md):
 
 * **Insert (single text message)** — < 20 ms p95.
 * **Search (recent messages, 1k-row corpus)** — < 150 ms p95.
@@ -103,9 +103,6 @@ cargo bench -p kchat-core
 
 * [`crates/core/benches/phase1_benchmarks.rs`](../../crates/core/benches/phase1_benchmarks.rs)
   — benchmark source.
-* [PROPOSAL.md §13](../PROPOSAL.md) — Phase-1 latency budget
-  definitions.
-* [PROGRESS.md](../PROGRESS.md) — phase-by-phase progress
-  tracker.
+* [DESIGN.md §13](../DESIGN.md) — latency budget definitions.
 * [cross-repo-summary.md](./cross-repo-summary.md) — consolidated
   performance table across all four KChat repos.

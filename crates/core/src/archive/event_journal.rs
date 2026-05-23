@@ -1,9 +1,8 @@
-//! Phase-3 archive event journal.
+//! Archive event journal.
 //!
-//! `docs/PHASES.md` Phase 3 lists the archive event journal as the
-//! first deliverable: every durable mutation that the local store
-//! commits (message arrived, edit applied, delete acknowledged,
-//! media asset created) writes a typed event into this journal. The
+//! Every durable mutation that the local store commits (message
+//! arrived, edit applied, delete acknowledged, media asset created)
+//! writes a typed event into this journal. The
 //! [`crate::archive::segment_builder::ArchiveSegmentBuilder`] consumes
 //! the unread tail in [`ArchiveEventType`] order, packs it into a
 //! per-conversation, per-time-bucket [`SegmentType::MessageDelta`]
@@ -38,7 +37,7 @@ use crate::Error;
 
 /// Type tag for an archive event.
 ///
-/// `docs/PROPOSAL.md §6.4` (archive event taxonomy) lists the
+/// `docs/DESIGN.md §6.4` (archive event taxonomy) lists the
 /// canonical set; new variants are a wire-format change because
 /// the segment builder dispatches on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,7 +112,7 @@ pub struct ArchiveEvent {
 /// AUTOINCREMENT `event_seq` the row was assigned.
 pub type ArchiveEventSeq = i64;
 
-/// Phase-3 archive event journal.
+/// archive event journal.
 ///
 /// Stateless reader / writer over an existing SQLCipher
 /// [`Connection`]. Borrowing the connection rather than owning it
@@ -240,7 +239,7 @@ impl ArchiveEventJournal {
     /// `event_seq`. Idempotent for a given value.
     ///
     /// A non-monotonic update (`new_cursor < current`) is rejected
-    /// — moving the cursor backwards would re-publish events the
+    /// moving the cursor backwards would re-publish events the
     /// segment builder already emitted.
     pub fn advance_cursor(
         &self,

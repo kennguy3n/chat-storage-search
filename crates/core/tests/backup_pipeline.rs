@@ -1,9 +1,9 @@
-//! End-to-end integration test for the Phase-4 backup → restore
+//! End-to-end integration test for the backup → restore
 //! round-trip. Builds a small chain of segments + manifests
 //! through the public surface of `kchat_core::backup` and replays
 //! them through the restore pipeline + manifest chain verifier.
 //!
-//! This is the cross-module contract test for Phase-4: any change
+//! This is the cross-module contract test for any change
 //! that breaks segment ↔ manifest ↔ verifier ↔ pipeline
 //! interoperability surfaces here.
 
@@ -287,11 +287,11 @@ fn search_shards_round_trip_through_pipeline() {
     assert_eq!(fuzzy_count, 2);
 }
 
-/// Phase 4, Task 8: end-to-end passphrase-recovery integration
+/// end-to-end passphrase-recovery integration
 /// test.
 ///
 /// 1. Generate `K_user_master` and derive the four sub-roots
-///    (`K_archive_root`, `K_backup_root`, `K_search_root` —
+///    (`K_archive_root`, `K_backup_root`, `K_search_root`
 ///    `K_profile_private_data` is out of scope for this test).
 /// 2. Wrap `K_user_master` with a user passphrase via
 ///    [`wrap_master_key_with_passphrase`].
@@ -487,7 +487,7 @@ fn passphrase_recovery_end_to_end_round_trip_across_three_scripts() {
     let recovered_identity = KeyMaterial::from_bytes(*recovered);
     let backup_root_dst = derive_backup_root(&recovered_identity).expect("backup_root on dst");
     let search_root_dst = derive_search_root(&recovered_identity).expect("search_root on dst");
-    // Sub-roots must be byte-equal across source and destination —
+    // Sub-roots must be byte-equal across source and destination
     // proving the recovery actually anchors the same hierarchy.
     assert_eq!(backup_root_dst.as_bytes(), backup_root_src.as_bytes());
     assert_eq!(search_root_dst.as_bytes(), search_root_src.as_bytes());

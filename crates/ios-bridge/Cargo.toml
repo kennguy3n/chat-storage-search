@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "iOS UniFFI bridge for kchat-core. Phase 1 scaffold — UDL + scaffolding for the public KChatCore API."
+description = "iOS UniFFI bridge for kchat-core — UDL + scaffolding for the public KChatCore API."
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -15,7 +15,7 @@ uniffi = { version = "0.28", features = ["cli"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
 # Structured logging — `kchat-core` emits tracing spans / events on
-# all hot paths (Phase A.3). The iOS bridge installs a
+# all hot paths. The iOS bridge installs a
 # `tracing-subscriber` so those events surface via Apple `os_log`
 # on device and via stderr on host-machine cargo tests.
 tracing = "0.1"
