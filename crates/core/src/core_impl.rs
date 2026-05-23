@@ -30,7 +30,7 @@
 //! * Async surface: the trait is currently synchronous; converting
 //!   to `async fn` is queued for once the I/O paths are in place.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -109,6 +109,49 @@ pub(crate) struct SealedBackupEventRef {
     pub(crate) created_at_ms: i64,
 }
 
+/// Atomically-installed backup key material.
+///
+/// All three fields (`K_backup_root`, the hybrid signing key, and
+/// the device id) are installed together by
+/// [`CoreImpl::install_backup_keys`] and read together by every
+/// backup operation that needs to seal a segment or sign a
+/// manifest. Bundling them into a single struct behind one
+/// [`Mutex`] makes the "installed atomically as a triple"
+/// invariant non-bypassable: callers cannot observe a
+/// partially-installed state where (for example) the root key is
+/// present but the signing key is still `None`. It also reduces
+/// the lock-acquisition count on backup hot paths from three to
+/// one.
+#[derive(Clone)]
+pub(crate) struct BackupKeys {
+    pub(crate) root_key: Zeroizing<[u8; KEY_LEN]>,
+    pub(crate) signing_key: crate::crypto::signing::HybridSigningKey,
+    pub(crate) device_id: String,
+}
+
+/// Atomically-installed ZKOF archive backend wiring.
+///
+/// The Phase-3 ZKOF archive router needs both an
+/// [`crate::media::sinks::zk_fabric::S3Client`] (to talk to the
+/// ZKOF gateway) and a
+/// [`crate::media::sinks::zk_fabric::ZkFabricSinkConfig`] (to
+/// know which bucket, endpoint, and content addressing scheme to
+/// use) before it can route any
+/// `archive_segment_map.storage_backend = zk_object_fabric` row.
+/// Both halves are installed together by
+/// [`CoreImpl::install_zkof_archive_backend`]; bundling them
+/// into a single struct behind one [`Mutex`] makes the
+/// "installed atomically as a pair" invariant non-bypassable
+/// and lets [`CoreImpl::build_archive_router`] take one lock
+/// instead of two. Re-installing replaces the whole pair (still
+/// supported so tests can swap in a fresh `InMemoryS3` /
+/// configuration without spinning up a new core).
+#[derive(Clone)]
+pub(crate) struct ZkofArchiveBackend {
+    pub(crate) s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
+    pub(crate) config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
+}
+
 // ---------------------------------------------------------------------------
 // CoreImpl
 // ---------------------------------------------------------------------------
@@ -142,6 +185,75 @@ pub(crate) struct SealedBackupEventRef {
 /// the first UI read does not pay for a fresh `Connection::open`
 /// on its critical path. See
 /// [`LocalStoreDb::open_reader_pool`] for the open semantics.
+///
+/// # Subsystem field organisation (Phase B.2)
+///
+/// The 24 originally-`Mutex<Option<_>>` "platform-bridge"
+/// subsystem fields have been split by their actual mutation
+/// shape:
+///
+///   * **16 bridges that are installed exactly once at boot**
+///     (`text_embedder`, `image_embedder`, `whisper_transcriber`,
+///     `document_extractor`, `video_keyframe_sampler`,
+///     `ocr_bridge`, `resource_probe`, `offline_detector`,
+///     `perf_collector`, `dedup_analytics`,
+///     `conversation_group_resolver`, `spotlight_anchor`,
+///     `windows_search_anchor`, `delivery_client`, `scheduler`,
+///     `ep_benchmark_runner`) live in
+///     [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are lock-free
+///     atomic loads; the corresponding `install_*` /
+///     `set_delivery_client` setters return
+///     [`Error::Storage`] on double-install.
+///   * **Two write-once atomic bundles** (`BackupKeys`,
+///     `ZkofArchiveBackend`) stay in
+///     [`Mutex`]`<`[`Option`]`<_>>` because the bundle is
+///     legitimately re-installable on key rotation /
+///     credentials refresh; the bundle struct itself makes the
+///     "all three pieces installed atomically" invariant
+///     non-bypassable.
+///   * **Genuinely-mutable in-flight state** (`current_epoch`,
+///     `previous_backup_manifest`, `tracked_backup_segments`,
+///     `hydration_queue`, `ep_benchmark_cache`) stays in
+///     [`Mutex`]`<T>` / [`Mutex`]`<Option<T>>` because each is
+///     mutated mid-flight (epoch rotation, manifest chain
+///     append, segment ledger append, queue enqueue/dequeue,
+///     cache update).
+///   * The DB connections are split into
+///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
+///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
+///     reads (Phase B.1).
+///
+/// # Lock ordering
+///
+/// To avoid deadlocks, locks are acquired in this strictly
+/// non-cyclic order. Methods that need multiple locks acquire
+/// them in this order; methods that only need a subset acquire
+/// only those:
+///
+///   1. **Subsystem lookup** — `OnceLock::get()` on the 16
+///      bridge fields. Lock-free, no ordering constraint with
+///      the locks below.
+///   2. **In-flight state** — `hydration_queue`, `current_epoch`,
+///      `ep_benchmark_cache` (each independent of the others;
+///      no method holds two of these simultaneously).
+///   3. **Backup bundles** — `backup_keys`, `zkof_archive`,
+///      `previous_backup_manifest`, `tracked_backup_segments`.
+///      `run_incremental_backup` acquires `backup_keys` first,
+///      then `previous_backup_manifest`, then
+///      `tracked_backup_segments`; releases each before taking
+///      the next where possible. Never holds two backup locks
+///      across an I/O call.
+///   4. **Database** — `db_writer` for writes,
+///      `db_readers.with_reader(...)` for reads. The DB lock is
+///      acquired *last* and released *first*; nothing inside a
+///      `db_writer.lock()` guard takes any of the locks above.
+///      The reader pool is independent of the writer mutex
+///      under WAL.
+///
+/// The OnceLock conversion in Phase B.2 means installer methods
+/// no longer participate in this ordering (they are install-time
+/// only, not steady-state), and hot-path reads of the 16 bridge
+/// subsystems no longer take any lock at all.
 pub struct CoreImpl {
     config: KChatCoreConfig,
     /// The single SQLCipher writer. Every mutating SQL statement
@@ -158,12 +270,21 @@ pub struct CoreImpl {
     /// can re-open the database at a different `data_dir` without
     /// requiring the caller to re-supply the key.
     key: Zeroizing<[u8; 32]>,
-    /// Optional MLS delivery-store client. When `None`,
+    /// Phase-2 MLS delivery-store client used by
+    /// [`KChatCore::ingest_remote_messages`] to pull staged
+    /// frames. Write-once via
+    /// [`CoreImpl::with_transport`] /
+    /// [`CoreImpl::set_delivery_client`]; when not installed,
     /// [`KChatCore::ingest_remote_messages`] returns
-    /// [`Error::Transport`] — see
-    /// [`CoreImpl::with_transport`] / [`CoreImpl::set_delivery_client`]
-    /// for how callers wire one in.
-    delivery_client: Mutex<Option<Box<dyn DeliveryClient>>>,
+    /// [`Error::Transport`]. The delivery client holds an MLS
+    /// group-state cursor that cannot be swapped live without
+    /// invalidating in-flight `ingest_remote_messages` calls.
+    /// Held in [`OnceLock`] so the lookup inside
+    /// `ingest_remote_messages` is a lock-free atomic load
+    /// instead of a mutex held across the (potentially
+    /// I/O-bound) `fetch_messages` call. Tests that need a
+    /// different client construct a fresh [`CoreImpl`].
+    delivery_client: OnceLock<Arc<dyn DeliveryClient>>,
     /// Phase-3 hydration priority queue. `hydrate_message`
     /// enqueues a request before serving from local storage so
     /// the orchestration layer can later pop pending fetches in
@@ -178,22 +299,16 @@ pub struct CoreImpl {
     /// every time a manifest is cut (to harvest the
     /// wrapped-prior-epoch-keys list).
     current_epoch: Mutex<Option<EpochKeyManager>>,
-    /// Phase-4 backup root key (`K_backup_root`,
-    /// `docs/PROPOSAL.md §6.2`). `None` until
-    /// [`CoreImpl::install_backup_keys`] is called. When unset,
-    /// [`KChatCore::run_incremental_backup`] short-circuits to a
-    /// noop result rather than failing — the device may not have
-    /// finished unlocking the backup root yet.
-    backup_root_key: Mutex<Option<Zeroizing<[u8; KEY_LEN]>>>,
-    /// Hybrid Ed25519 + ML-DSA-65 device signing key used to
-    /// sign backup manifests (see
-    /// [`crate::crypto::signing::HybridSigningKey`]). `None` until
-    /// [`CoreImpl::install_backup_keys`] is called.
-    backup_signing_key: Mutex<Option<crate::crypto::signing::HybridSigningKey>>,
-    /// Stable device id stamped into the backup manifest AAD so
-    /// the orchestrator can attribute manifests to the device that
-    /// produced them.
-    backup_device_id: Mutex<Option<String>>,
+    /// Phase-4 backup key material (`K_backup_root`, hybrid
+    /// signing key, stable device id — `docs/PROPOSAL.md §6.2`).
+    /// `None` until [`CoreImpl::install_backup_keys`] is called.
+    /// When unset, [`KChatCore::run_incremental_backup`]
+    /// short-circuits to a noop result rather than failing — the
+    /// device may not have finished unlocking the backup root
+    /// yet. The three pieces are bundled into a single
+    /// [`BackupKeys`] struct so install / read of the triple is
+    /// always atomic.
+    backup_keys: Mutex<Option<BackupKeys>>,
     /// In-memory tail of the backup manifest chain. The next
     /// manifest produced by
     /// [`KChatCore::run_incremental_backup`] chains under this one;
@@ -218,119 +333,162 @@ pub struct CoreImpl {
     /// stored AES-256-KW-wrapped under that root) and rewritten
     /// after each backup / compaction step.
     tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
-    /// Phase-3 ZKOF archive backend configuration. `None` until
+    /// Phase-3 ZKOF archive backend wiring (S3 client + gateway
+    /// config). `None` until
     /// [`CoreImpl::install_zkof_archive_backend`] is called. When
-    /// set together with [`Self::zkof_archive_s3`], the
-    /// archive-segment router routes
+    /// set, the archive-segment router routes
     /// `archive_segment_map.storage_backend = zk_object_fabric`
     /// rows through ZKOF instead of the legacy KChat transport.
-    zkof_archive_config: Mutex<Option<crate::media::sinks::zk_fabric::ZkFabricSinkConfig>>,
-    /// Shared `Arc<dyn S3Client>` used by the ZKOF archive router.
-    /// `None` until [`CoreImpl::install_zkof_archive_backend`] is
-    /// called. Wrapped in a `Mutex<Option<_>>` (rather than
+    /// Bundled into a single [`ZkofArchiveBackend`] struct so the
+    /// S3 client and the config are always installed and observed
+    /// atomically. Wrapped in `Mutex<Option<_>>` (rather than
     /// `OnceCell`) so tests can install / re-install in the same
     /// process without spinning up a fresh core.
-    zkof_archive_s3: Mutex<Option<std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>>>,
-    /// Phase-5 background scheduler bridge. `None` until
-    /// [`CoreImpl::install_scheduler`] is called by the platform
-    /// glue (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
-    /// orchestration layer treats `None` as "no scheduler
-    /// available — run maintenance loops on demand only".
-    scheduler: Mutex<Option<Box<dyn crate::scheduler::BackgroundScheduler>>>,
-    /// Phase-6 on-device text-embedding seam. `None` until
-    /// [`CoreImpl::install_text_embedder`] is called. When set,
-    /// the message-ingest path computes XLM-R embeddings on
-    /// every text body and writes them through the
+    zkof_archive: Mutex<Option<ZkofArchiveBackend>>,
+    /// Phase-5 background scheduler bridge. Write-once via
+    /// [`CoreImpl::install_scheduler`] by the platform glue
+    /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
+    /// orchestration layer treats "not installed" as "no
+    /// scheduler available — run maintenance loops on demand
+    /// only". Held in [`OnceLock`] because the platform task
+    /// scheduler is a process-singleton (only one
+    /// `BGTaskScheduler` instance exists per app on iOS, and
+    /// `WorkManager` is similarly process-scoped on Android);
+    /// swapping it live would leak the previous bridge's
+    /// submitted task identifiers. Lock-free reads on the
+    /// [`Self::submit_media_migration_plan`] /
+    /// `schedule_periodic_storage_budget_check` paths.
+    scheduler: OnceLock<Arc<dyn crate::scheduler::BackgroundScheduler>>,
+    /// Phase-6 on-device text-embedding seam. Write-once via
+    /// [`CoreImpl::install_text_embedder`]. When set, the
+    /// message-ingest path computes XLM-R embeddings on every
+    /// text body and writes them through the
     /// [`crate::models::embeddings::EmbeddingCache`] to
-    /// `search_vector`; when `None` the ingest path skips the
-    /// embedding step (text is still searchable via FTS5 +
-    /// fuzzy).
-    text_embedder: Mutex<Option<Box<dyn crate::models::embeddings::TextEmbedder>>>,
+    /// `search_vector`; when not installed the ingest path
+    /// skips the embedding step (text is still searchable via
+    /// FTS5 + fuzzy). Held in [`OnceLock`] so reads on the
+    /// text-ingest / audio-transcript / document-page hot paths
+    /// are lock-free atomic loads; the underlying ONNX session
+    /// is itself a per-process resource that cannot be replaced
+    /// without tearing down the model.
+    text_embedder: OnceLock<Arc<dyn crate::models::embeddings::TextEmbedder>>,
     /// Phase-6 on-device image-embedding seam (MobileCLIP-S2).
-    /// `None` until [`CoreImpl::install_image_embedder`] is
-    /// called. Mirrors the [`Self::text_embedder`] wiring.
-    image_embedder: Mutex<Option<Box<dyn crate::models::clip::ImageEmbedder>>>,
-    /// Phase-6 platform OCR bridge. `None` until
-    /// [`CoreImpl::install_ocr_bridge`] is called. Wrapped in
-    /// `Arc<dyn …>` so multiple async work items can fan out
-    /// against the same bridge without going through the
-    /// `Mutex` for every call.
-    ocr_bridge: Mutex<Option<std::sync::Arc<dyn crate::models::ocr::OcrBridge>>>,
+    /// Write-once via [`CoreImpl::install_image_embedder`].
+    /// Mirrors the [`Self::text_embedder`] wiring: [`OnceLock`]
+    /// makes ingest reads lock-free; the ONNX session is a
+    /// per-process resource that cannot be replaced live.
+    image_embedder: OnceLock<Arc<dyn crate::models::clip::ImageEmbedder>>,
+    /// Phase-6 platform OCR bridge. Write-once via
+    /// [`CoreImpl::install_ocr_bridge`]. Held in [`OnceLock`] so
+    /// reads on the media-ingest hot path are lock-free atomic
+    /// loads instead of mutex acquisitions, and the type system
+    /// enforces that any one core only ever sees a single OCR
+    /// bridge across its lifetime (matching the platform
+    /// reality — `Vision.framework` / Android `MlKit` register
+    /// once per process).
+    ocr_bridge: OnceLock<Arc<dyn crate::models::ocr::OcrBridge>>,
     /// Phase-6 resource-state probe (battery, charging, thermal,
-    /// network). `None` until
-    /// [`CoreImpl::install_resource_probe`] is called; the
-    /// resource-gated background workers treat `None` as
-    /// "always allowed" so unit tests don't need to install a
-    /// probe.
-    resource_probe: Mutex<Option<std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>>>,
-    /// Phase-6 on-device Whisper transcription seam. `None` until
-    /// [`CoreImpl::install_whisper_transcriber`] is called. When
-    /// set, audio media writes a transcript row into
-    /// `media_search_index` during `send_media`. Mirrors
-    /// [`Self::text_embedder`] / [`Self::image_embedder`] wiring.
-    whisper_transcriber: Mutex<Option<Box<dyn crate::models::whisper::WhisperTranscriber>>>,
-    /// Phase-6 on-device document text-extraction seam. `None`
-    /// until [`CoreImpl::install_document_extractor`] is called.
+    /// network). Write-once via
+    /// [`CoreImpl::install_resource_probe`]; the resource-gated
+    /// background workers treat "not installed" as "always
+    /// allowed" so unit tests don't need to install a probe.
+    /// Held in [`OnceLock`] so the resource-gate check inside
+    /// every Whisper / Vision / video-keyframe operation is a
+    /// lock-free atomic load.
+    resource_probe: OnceLock<Arc<dyn crate::models::resource_gate::ResourceProbe>>,
+    /// Phase-6 on-device Whisper transcription seam. Write-once
+    /// via [`CoreImpl::install_whisper_transcriber`]. When set,
+    /// audio media writes a transcript row into
+    /// `media_search_index` during `send_media`. Held in
+    /// [`OnceLock`] for the same reason as
+    /// [`Self::text_embedder`] (lock-free hot-path reads, ONNX
+    /// session is a per-process resource).
+    whisper_transcriber: OnceLock<Arc<dyn crate::models::whisper::WhisperTranscriber>>,
+    /// Phase-6 on-device document text-extraction seam.
+    /// Write-once via [`CoreImpl::install_document_extractor`].
     /// When set, PDF / DOCX media writes per-page text rows into
-    /// `media_search_index` (kind `"caption"`) during `send_media`.
-    document_extractor: Mutex<Option<Box<dyn crate::models::document::DocumentExtractor>>>,
-    /// Phase-6 on-device video keyframe-sampling seam. `None`
-    /// until [`CoreImpl::install_video_keyframe_sampler`] is
-    /// called. Combined with [`Self::image_embedder`] this drives
-    /// the video keyframe → MobileCLIP-S2 → `search_vector`
-    /// pipeline in `send_media`.
-    video_keyframe_sampler: Mutex<Option<Box<dyn crate::models::video::VideoKeyframeSampler>>>,
-    /// Phase-6 offline-detection seam. `None` until
-    /// [`CoreImpl::install_offline_detector`] is called; the
-    /// orchestration layer treats `None` as "always online" so
-    /// unit tests don't need to install a detector. When set,
-    /// [`KChatCore::run_incremental_backup`] defers upload while
-    /// offline and [`KChatCore::hydrate_message`] returns a
-    /// skeleton with `offline = true` for cold messages instead
-    /// of attempting an archive fetch.
-    offline_detector: Mutex<Option<std::sync::Arc<dyn crate::transport::offline::OfflineDetector>>>,
-    /// Phase-7 performance-trace collector. `None` until
-    /// [`CoreImpl::install_perf_collector`] is called; when set,
-    /// the hot paths (`ingest_messages`, `search`,
+    /// `media_search_index` (kind `"caption"`) during
+    /// `send_media`. Held in [`OnceLock`] for lock-free reads on
+    /// the document-ingest path.
+    document_extractor: OnceLock<Arc<dyn crate::models::document::DocumentExtractor>>,
+    /// Phase-6 on-device video keyframe-sampling seam.
+    /// Write-once via
+    /// [`CoreImpl::install_video_keyframe_sampler`]. Combined
+    /// with [`Self::image_embedder`] this drives the
+    /// video-keyframe → MobileCLIP-S2 → `search_vector` pipeline
+    /// in `send_media`. Held in [`OnceLock`] for lock-free reads
+    /// on the video-ingest path.
+    video_keyframe_sampler: OnceLock<Arc<dyn crate::models::video::VideoKeyframeSampler>>,
+    /// Phase-6 offline-detection seam. Write-once via
+    /// [`CoreImpl::install_offline_detector`]; the
+    /// orchestration layer treats "not installed" as "always
+    /// online" so unit tests don't need to install a detector.
+    /// When set, [`KChatCore::run_incremental_backup`] defers
+    /// upload while offline and [`KChatCore::hydrate_message`]
+    /// returns a skeleton with `offline = true` for cold
+    /// messages instead of attempting an archive fetch. Held in
+    /// [`OnceLock`] so [`Self::is_online`] (called inside every
+    /// hydrate / cold-read / backup-defer path) is a lock-free
+    /// atomic load.
+    offline_detector: OnceLock<Arc<dyn crate::transport::offline::OfflineDetector>>,
+    /// Phase-7 performance-trace collector. Write-once via
+    /// [`CoreImpl::install_perf_collector`]; when set, the hot
+    /// paths (`ingest_messages`, `search`,
     /// `run_incremental_backup`, `enforce_storage_budget`) emit
     /// [`crate::perf::PerfTrace`] records into the collector.
-    perf_collector: Mutex<Option<std::sync::Arc<dyn crate::perf::PerfCollector>>>,
+    /// Held in [`OnceLock`] so the per-hot-path emit is a
+    /// lock-free atomic load — the collector is installed once
+    /// at boot and the bridge crates never replace it.
+    perf_collector: OnceLock<Arc<dyn crate::perf::PerfCollector>>,
     /// Phase-7 dedup-analytics probe (read-only telemetry against
-    /// the upstream ZK Object Fabric ContentIndex). `None` until
-    /// [`CoreImpl::install_dedup_analytics`] is called; when set,
+    /// the upstream ZK Object Fabric ContentIndex). Write-once
+    /// via [`CoreImpl::install_dedup_analytics`]; when set,
     /// [`CoreImpl::query_dedup_stats`] /
     /// [`CoreImpl::query_storage_savings`] dispatch through it.
     /// See `crates/core/src/transport/dedup_analytics.rs` for the
-    /// privacy contract.
-    dedup_analytics:
-        Mutex<Option<std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>>,
-    /// Phase-8 multi-scope search resolver. `None` until
-    /// [`CoreImpl::install_conversation_group_resolver`] is
-    /// called; the query engine treats `None` as the default
+    /// privacy contract. Held in [`OnceLock`] for lock-free
+    /// dashboard / dedup-event reads.
+    dedup_analytics: OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
+    /// Phase-8 multi-scope search resolver. Write-once via
+    /// [`CoreImpl::install_conversation_group_resolver`]; the
+    /// query engine treats "not installed" as the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`]
     /// (Channel resolves to its singleton id, Starred / Unread
-    /// resolve to the empty set).
+    /// resolve to the empty set). Held in [`OnceLock`] so
+    /// `search_with_target` resolves the bridge with a lock-free
+    /// atomic load instead of contending on a mutex before each
+    /// reader-pool checkout.
     conversation_group_resolver:
-        Mutex<Option<std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>>>,
+        OnceLock<Arc<dyn crate::search::search_target::ConversationGroupResolver>>,
     /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
-    /// `None` until
-    /// [`CoreImpl::install_spotlight_anchor`] is called. The
+    /// Write-once via
+    /// [`CoreImpl::install_spotlight_anchor`]. The
     /// `ingest_messages` path forwards a redacted summary of
     /// every newly-ingested message to the installed anchor.
-    spotlight_anchor: Mutex<Option<std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>>>,
+    /// Held in [`OnceLock`] because
+    /// `CSSearchableIndex.default()` is itself a process-global
+    /// singleton on macOS — there is no production case for
+    /// swapping the anchor mid-process — and the fast-path check
+    /// in [`Self::maybe_index_in_desktop_search`] becomes a
+    /// lock-free atomic load.
+    spotlight_anchor: OnceLock<Arc<dyn crate::desktop_index::SpotlightAnchor>>,
     /// Phase-7 (2026-05-04 batch 10) Windows Search bridge.
-    /// `None` until
-    /// [`CoreImpl::install_windows_search_anchor`] is called.
-    windows_search_anchor:
-        Mutex<Option<std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>>>,
+    /// Write-once via
+    /// [`CoreImpl::install_windows_search_anchor`]. Held in
+    /// [`OnceLock`] for the same lock-free-read /
+    /// process-singleton reasons as [`Self::spotlight_anchor`].
+    windows_search_anchor: OnceLock<Arc<dyn crate::desktop_index::WindowsSearchAnchor>>,
     /// Phase-7 (2026-05-04 batch 10 — Task 8) on-device EP
-    /// benchmark runner. `None` until
-    /// [`CoreImpl::install_ep_benchmark_runner`] is called. When
-    /// set, [`CoreImpl::run_ep_benchmark`] forwards calls into
-    /// the installed runner so the platform bridge can supply a
-    /// real `ort::Session`-backed implementation.
-    ep_benchmark_runner:
-        Mutex<Option<std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>>,
+    /// benchmark runner. Write-once via
+    /// [`CoreImpl::install_ep_benchmark_runner`]. When set,
+    /// [`CoreImpl::run_ep_benchmark`] forwards calls into the
+    /// installed runner so the platform bridge can supply a real
+    /// `ort::Session`-backed implementation. Held in
+    /// [`OnceLock`] so [`Self::run_ep_benchmark`] dispatches
+    /// without acquiring a mutex on every benchmark call — the
+    /// platform bridge installs one runner at boot and the
+    /// underlying ONNX session is a per-process resource.
+    ep_benchmark_runner: OnceLock<Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>,
     /// Phase-7 (2026-05-04 batch 10 — Task 8) persistent EP
     /// benchmark cache. Defaults to an empty cache; the
     /// orchestration layer can swap a loaded cache via
@@ -476,31 +634,28 @@ impl CoreImpl {
             db_writer: Mutex::new(db),
             db_readers,
             key: Zeroizing::new(key),
-            delivery_client: Mutex::new(None),
+            delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
-            backup_root_key: Mutex::new(None),
-            backup_signing_key: Mutex::new(None),
-            backup_device_id: Mutex::new(None),
+            backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive_config: Mutex::new(None),
-            zkof_archive_s3: Mutex::new(None),
-            scheduler: Mutex::new(None),
-            text_embedder: Mutex::new(None),
-            image_embedder: Mutex::new(None),
-            ocr_bridge: Mutex::new(None),
-            resource_probe: Mutex::new(None),
-            whisper_transcriber: Mutex::new(None),
-            document_extractor: Mutex::new(None),
-            video_keyframe_sampler: Mutex::new(None),
-            offline_detector: Mutex::new(None),
-            perf_collector: Mutex::new(None),
-            dedup_analytics: Mutex::new(None),
-            conversation_group_resolver: Mutex::new(None),
-            spotlight_anchor: Mutex::new(None),
-            windows_search_anchor: Mutex::new(None),
-            ep_benchmark_runner: Mutex::new(None),
+            zkof_archive: Mutex::new(None),
+            scheduler: OnceLock::new(),
+            text_embedder: OnceLock::new(),
+            image_embedder: OnceLock::new(),
+            ocr_bridge: OnceLock::new(),
+            resource_probe: OnceLock::new(),
+            whisper_transcriber: OnceLock::new(),
+            document_extractor: OnceLock::new(),
+            video_keyframe_sampler: OnceLock::new(),
+            offline_detector: OnceLock::new(),
+            perf_collector: OnceLock::new(),
+            dedup_analytics: OnceLock::new(),
+            conversation_group_resolver: OnceLock::new(),
+            spotlight_anchor: OnceLock::new(),
+            windows_search_anchor: OnceLock::new(),
+            ep_benchmark_runner: OnceLock::new(),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
         core.hydrate_backup_manifest_from_db()?;
@@ -531,31 +686,28 @@ impl CoreImpl {
             db_writer: Mutex::new(db),
             db_readers,
             key: Zeroizing::new(key),
-            delivery_client: Mutex::new(None),
+            delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
-            backup_root_key: Mutex::new(None),
-            backup_signing_key: Mutex::new(None),
-            backup_device_id: Mutex::new(None),
+            backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive_config: Mutex::new(None),
-            zkof_archive_s3: Mutex::new(None),
-            scheduler: Mutex::new(None),
-            text_embedder: Mutex::new(None),
-            image_embedder: Mutex::new(None),
-            ocr_bridge: Mutex::new(None),
-            resource_probe: Mutex::new(None),
-            whisper_transcriber: Mutex::new(None),
-            document_extractor: Mutex::new(None),
-            video_keyframe_sampler: Mutex::new(None),
-            offline_detector: Mutex::new(None),
-            perf_collector: Mutex::new(None),
-            dedup_analytics: Mutex::new(None),
-            conversation_group_resolver: Mutex::new(None),
-            spotlight_anchor: Mutex::new(None),
-            windows_search_anchor: Mutex::new(None),
-            ep_benchmark_runner: Mutex::new(None),
+            zkof_archive: Mutex::new(None),
+            scheduler: OnceLock::new(),
+            text_embedder: OnceLock::new(),
+            image_embedder: OnceLock::new(),
+            ocr_bridge: OnceLock::new(),
+            resource_probe: OnceLock::new(),
+            whisper_transcriber: OnceLock::new(),
+            document_extractor: OnceLock::new(),
+            video_keyframe_sampler: OnceLock::new(),
+            offline_detector: OnceLock::new(),
+            perf_collector: OnceLock::new(),
+            dedup_analytics: OnceLock::new(),
+            conversation_group_resolver: OnceLock::new(),
+            spotlight_anchor: OnceLock::new(),
+            windows_search_anchor: OnceLock::new(),
+            ep_benchmark_runner: OnceLock::new(),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
         core.hydrate_backup_manifest_from_db()?;
@@ -569,20 +721,26 @@ impl CoreImpl {
     pub fn with_transport(
         config: KChatCoreConfig,
         key: [u8; 32],
-        client: Box<dyn DeliveryClient>,
+        client: Arc<dyn DeliveryClient>,
     ) -> Result<Self> {
         let core = Self::new(config, key)?;
-        core.set_delivery_client(client);
+        core.set_delivery_client(client)?;
         Ok(core)
     }
 
-    /// Install (or replace) the MLS delivery-store client used by
-    /// [`KChatCore::ingest_remote_messages`].
-    pub fn set_delivery_client(&self, client: Box<dyn DeliveryClient>) {
-        *self
-            .delivery_client
-            .lock()
-            .expect("delivery client mutex poisoned") = Some(client);
+    /// Install the MLS delivery-store client used by
+    /// [`KChatCore::ingest_remote_messages`]. Write-once: returns
+    /// [`Error::Storage`] if a client has already been installed.
+    /// The delivery client holds an MLS group-state cursor;
+    /// replacing it live would invalidate any in-flight
+    /// `ingest_remote_messages` call. Tests that need a different
+    /// client construct a fresh [`CoreImpl`] instead.
+    pub fn set_delivery_client(&self, client: Arc<dyn DeliveryClient>) -> Result<()> {
+        self.delivery_client.set(client).map_err(|_| {
+            Error::Storage(
+                "delivery_client already installed (set_delivery_client is write-once)".into(),
+            )
+        })
     }
 
     /// Number of pending hydration requests in the priority queue.
@@ -1290,29 +1448,23 @@ impl CoreImpl {
     ) -> Result<crate::archive::download::ArchiveSegmentRouter<'a>> {
         match self.config.archive_backend {
             crate::config::ArchiveBackend::Zkof => {
-                let s3 = self
-                    .zkof_archive_s3
+                let backend = self
+                    .zkof_archive
                     .lock()
                     .map_err(poisoned)?
                     .as_ref()
                     .cloned();
-                let cfg = self
-                    .zkof_archive_config
-                    .lock()
-                    .map_err(poisoned)?
-                    .as_ref()
-                    .cloned();
-                match (s3, cfg) {
-                    (Some(s3), Some(cfg)) => {
+                match backend {
+                    Some(ZkofArchiveBackend { s3, config }) => {
                         Ok(crate::archive::download::ArchiveSegmentRouter::with_zkof(
-                            transport, s3, cfg,
+                            transport, s3, config,
                         ))
                     }
                     // ZKOF is the configured backend but the
                     // wiring is missing — surface a structured
                     // error rather than silently falling through
                     // to KChat-only.
-                    _ => Err(Error::Storage(
+                    None => Err(Error::Storage(
                         "archive_backend = zkof but no ZKOF backend installed; \
                          call CoreImpl::install_zkof_archive_backend before \
                          calling rehydrate_timeline_skeletons"
@@ -1341,8 +1493,7 @@ impl CoreImpl {
         config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
     ) -> Result<()> {
         config.validate()?;
-        *self.zkof_archive_s3.lock().map_err(poisoned)? = Some(s3);
-        *self.zkof_archive_config.lock().map_err(poisoned)? = Some(config);
+        *self.zkof_archive.lock().map_err(poisoned)? = Some(ZkofArchiveBackend { s3, config });
         Ok(())
     }
 
@@ -1351,50 +1502,56 @@ impl CoreImpl {
     /// `WorkManager` on Android) that fills in the
     /// [`crate::scheduler::BackgroundScheduler`] trait.
     ///
-    /// Re-installing replaces the previous bridge — the
-    /// orchestration layer is responsible for cancelling any
-    /// outstanding tasks on the old bridge first via
-    /// [`crate::scheduler::BackgroundScheduler::cancel_all`].
+    /// Write-once: returns [`Error::Storage`] if a scheduler has
+    /// already been installed. The platform scheduler is a
+    /// process-singleton (only one `BGTaskScheduler` instance
+    /// exists per iOS app, and `WorkManager` is similarly
+    /// process-scoped); swapping it live would leak the previous
+    /// bridge's submitted task identifiers. Tests that need a
+    /// different scheduler construct a fresh [`CoreImpl`].
     pub fn install_scheduler(
         &self,
-        scheduler: Box<dyn crate::scheduler::BackgroundScheduler>,
+        scheduler: Arc<dyn crate::scheduler::BackgroundScheduler>,
     ) -> Result<()> {
-        *self.scheduler.lock().map_err(poisoned)? = Some(scheduler);
-        Ok(())
+        self.scheduler.set(scheduler).map_err(|_| {
+            Error::Storage("scheduler already installed (install_scheduler is write-once)".into())
+        })
     }
 
     /// Whether [`Self::install_scheduler`] has been called with a
     /// real bridge.
     pub fn has_scheduler(&self) -> bool {
-        self.scheduler
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.scheduler.get().is_some()
     }
 
     // ----------------------------------------------------------------
     // Phase 7 (2026-05-04 batch 10) — Task 5/6 desktop search anchors.
     // ----------------------------------------------------------------
 
-    /// Install (or replace) the macOS Spotlight bridge. The
+    /// Install the macOS Spotlight bridge. The
     /// [`crate::desktop_index::SpotlightAnchor`] surface lets the
     /// orchestration layer feed redacted message metadata into
-    /// `CSSearchableIndex`. Re-installing replaces the previous
-    /// bridge.
+    /// `CSSearchableIndex`. Write-once: returns
+    /// [`Error::Storage`] if a Spotlight bridge has already been
+    /// installed on this core (the underlying
+    /// `CSSearchableIndex.default()` is itself a process-global
+    /// singleton, so a second install would silently shadow the
+    /// first and produce confusing duplicate-index behaviour).
     pub fn install_spotlight_anchor(
         &self,
-        anchor: std::sync::Arc<dyn crate::desktop_index::SpotlightAnchor>,
+        anchor: Arc<dyn crate::desktop_index::SpotlightAnchor>,
     ) -> Result<()> {
-        *self.spotlight_anchor.lock().map_err(poisoned)? = Some(anchor);
-        Ok(())
+        self.spotlight_anchor.set(anchor).map_err(|_| {
+            Error::Storage(
+                "spotlight_anchor already installed (install_spotlight_anchor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_spotlight_anchor`] has been called.
     pub fn has_spotlight_anchor(&self) -> bool {
-        self.spotlight_anchor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.spotlight_anchor.get().is_some()
     }
 
     /// Push a batch of [`crate::desktop_index::SpotlightItem`]
@@ -1405,29 +1562,31 @@ impl CoreImpl {
         &self,
         items: &[crate::desktop_index::SpotlightItem],
     ) -> Result<()> {
-        let anchor = match self.spotlight_anchor.lock().map_err(poisoned)?.as_ref() {
-            Some(a) => std::sync::Arc::clone(a),
-            None => return Ok(()),
-        };
-        anchor.index_items(items)
+        match self.spotlight_anchor.get() {
+            Some(anchor) => anchor.index_items(items),
+            None => Ok(()),
+        }
     }
 
-    /// Install (or replace) the Windows Search bridge.
+    /// Install the Windows Search bridge. Write-once: returns
+    /// [`Error::Storage`] if a Windows Search bridge has already
+    /// been installed on this core.
     pub fn install_windows_search_anchor(
         &self,
-        anchor: std::sync::Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
+        anchor: Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
     ) -> Result<()> {
-        *self.windows_search_anchor.lock().map_err(poisoned)? = Some(anchor);
-        Ok(())
+        self.windows_search_anchor.set(anchor).map_err(|_| {
+            Error::Storage(
+                "windows_search_anchor already installed (install_windows_search_anchor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_windows_search_anchor`] has been
     /// called.
     pub fn has_windows_search_anchor(&self) -> bool {
-        self.windows_search_anchor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.windows_search_anchor.get().is_some()
     }
 
     /// Push a batch of
@@ -1438,16 +1597,10 @@ impl CoreImpl {
         &self,
         items: &[crate::desktop_index::WindowsSearchItem],
     ) -> Result<()> {
-        let anchor = match self
-            .windows_search_anchor
-            .lock()
-            .map_err(poisoned)?
-            .as_ref()
-        {
-            Some(a) => std::sync::Arc::clone(a),
-            None => return Ok(()),
-        };
-        anchor.index_items(items)
+        match self.windows_search_anchor.get() {
+            Some(anchor) => anchor.index_items(items),
+            None => Ok(()),
+        }
     }
 
     // ----------------------------------------------------------------
@@ -1462,19 +1615,20 @@ impl CoreImpl {
     /// [`crate::models::ep_tuning::MockEpBenchmarkRunner`].
     pub fn install_ep_benchmark_runner(
         &self,
-        runner: std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
+        runner: Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
     ) -> Result<()> {
-        *self.ep_benchmark_runner.lock().map_err(poisoned)? = Some(runner);
-        Ok(())
+        self.ep_benchmark_runner.set(runner).map_err(|_| {
+            Error::Storage(
+                "ep_benchmark_runner already installed (install_ep_benchmark_runner is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_ep_benchmark_runner`] has been
     /// called.
     pub fn has_ep_benchmark_runner(&self) -> bool {
-        self.ep_benchmark_runner
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.ep_benchmark_runner.get().is_some()
     }
 
     /// Run a benchmark for `(model, ep)` via the installed
@@ -1485,8 +1639,8 @@ impl CoreImpl {
         ep: crate::models::ep_tuning::ExecutionProvider,
         model: &crate::models::model_manager::ModelArtifact,
     ) -> Result<crate::models::ep_tuning::EpBenchmark> {
-        let runner = match self.ep_benchmark_runner.lock().map_err(poisoned)?.as_ref() {
-            Some(r) => std::sync::Arc::clone(r),
+        let runner = match self.ep_benchmark_runner.get() {
+            Some(r) => Arc::clone(r),
             None => return Err(Error::NotImplemented("ep_benchmark_runner")),
         };
         runner.run_benchmark(ep, model)
@@ -1546,8 +1700,8 @@ impl CoreImpl {
     // Phase-6 model bridges (Task 2 / 4 / 6 / 9)
     // ----------------------------------------------------------------
 
-    /// Install (or replace) the on-device text-embedding bridge
-    /// used by message ingest and the semantic-search query path
+    /// Install the on-device text-embedding bridge used by
+    /// message ingest and the semantic-search query path
     /// (`docs/PROPOSAL.md §7.6 / §7.6.1`, Phase 6, Task 2).
     ///
     /// When set, the message-ingest path computes an XLM-R
@@ -1555,194 +1709,217 @@ impl CoreImpl {
     /// [`crate::models::embeddings::EmbeddingCache`]. When unset
     /// (the default), the embedding step is skipped — text is
     /// still searchable via FTS5 + fuzzy.
+    ///
+    /// Write-once: returns [`Error::Storage`] if a text
+    /// embedder has already been installed on this core. The
+    /// underlying ONNX session is a per-process resource;
+    /// replacing it live would leak the previous session's GPU
+    /// allocations and racily change the embedding model under
+    /// in-flight ingest tasks.
     pub fn install_text_embedder(
         &self,
-        embedder: Box<dyn crate::models::embeddings::TextEmbedder>,
+        embedder: Arc<dyn crate::models::embeddings::TextEmbedder>,
     ) -> Result<()> {
-        *self.text_embedder.lock().map_err(poisoned)? = Some(embedder);
-        Ok(())
+        self.text_embedder.set(embedder).map_err(|_| {
+            Error::Storage(
+                "text_embedder already installed (install_text_embedder is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_text_embedder`] has been called
     /// with a real bridge.
     pub fn has_text_embedder(&self) -> bool {
-        self.text_embedder
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.text_embedder.get().is_some()
     }
 
-    /// Install (or replace) the on-device image-embedding bridge
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 9). When set, MobileCLIP-S2 embeddings are written to
+    /// Install the on-device image-embedding bridge used by
+    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
+    /// When set, MobileCLIP-S2 embeddings are written to
     /// `search_vector` for image-typed media on ingest.
+    /// Write-once — same per-process-ONNX-session rationale as
+    /// [`Self::install_text_embedder`].
     pub fn install_image_embedder(
         &self,
-        embedder: Box<dyn crate::models::clip::ImageEmbedder>,
+        embedder: Arc<dyn crate::models::clip::ImageEmbedder>,
     ) -> Result<()> {
-        *self.image_embedder.lock().map_err(poisoned)? = Some(embedder);
-        Ok(())
+        self.image_embedder.set(embedder).map_err(|_| {
+            Error::Storage(
+                "image_embedder already installed (install_image_embedder is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_image_embedder`] has been called.
     pub fn has_image_embedder(&self) -> bool {
-        self.image_embedder
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.image_embedder.get().is_some()
     }
 
-    /// Install (or replace) the platform OCR bridge used by media
-    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped
-    /// in `Arc` so multiple background workers can fan out
-    /// against the same bridge without serializing through the
-    /// mutex.
-    pub fn install_ocr_bridge(
-        &self,
-        bridge: std::sync::Arc<dyn crate::models::ocr::OcrBridge>,
-    ) -> Result<()> {
-        *self.ocr_bridge.lock().map_err(poisoned)? = Some(bridge);
-        Ok(())
+    /// Install the platform OCR bridge used by media ingest
+    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 4). Wrapped in
+    /// `Arc` so multiple background workers can fan out against
+    /// the same bridge with no serialisation. Write-once:
+    /// returns [`Error::Storage`] if an OCR bridge has already
+    /// been installed.
+    pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
+        self.ocr_bridge.set(bridge).map_err(|_| {
+            Error::Storage("ocr_bridge already installed (install_ocr_bridge is write-once)".into())
+        })
     }
 
     /// Whether [`Self::install_ocr_bridge`] has been called.
     pub fn has_ocr_bridge(&self) -> bool {
-        self.ocr_bridge
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.ocr_bridge.get().is_some()
     }
 
-    /// Install (or replace) the device-resource probe used by the
+    /// Install the device-resource probe used by the
     /// resource-gated background workers
     /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 6). When unset,
     /// the gate defaults to "all-clear" so unit tests don't need
-    /// to install a probe.
+    /// to install a probe. Write-once: returns
+    /// [`Error::Storage`] if a resource probe has already been
+    /// installed.
     pub fn install_resource_probe(
         &self,
-        probe: std::sync::Arc<dyn crate::models::resource_gate::ResourceProbe>,
+        probe: Arc<dyn crate::models::resource_gate::ResourceProbe>,
     ) -> Result<()> {
-        *self.resource_probe.lock().map_err(poisoned)? = Some(probe);
-        Ok(())
+        self.resource_probe.set(probe).map_err(|_| {
+            Error::Storage(
+                "resource_probe already installed (install_resource_probe is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_resource_probe`] has been called.
     pub fn has_resource_probe(&self) -> bool {
-        self.resource_probe
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.resource_probe.get().is_some()
     }
 
-    /// Install (or replace) the on-device Whisper transcriber
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 1 of the 2026-05-04 batch). When set, audio media
-    /// writes a transcript row into `media_search_index` during
-    /// `send_media`.
+    /// Install the on-device Whisper transcriber used by media
+    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 1 of the
+    /// 2026-05-04 batch). When set, audio media writes a
+    /// transcript row into `media_search_index` during
+    /// `send_media`. Write-once — the underlying Whisper ONNX
+    /// session cannot be replaced live without leaking GPU
+    /// allocations and racing in-flight transcription tasks.
     pub fn install_whisper_transcriber(
         &self,
-        transcriber: Box<dyn crate::models::whisper::WhisperTranscriber>,
+        transcriber: Arc<dyn crate::models::whisper::WhisperTranscriber>,
     ) -> Result<()> {
-        *self.whisper_transcriber.lock().map_err(poisoned)? = Some(transcriber);
-        Ok(())
+        self.whisper_transcriber.set(transcriber).map_err(|_| {
+            Error::Storage(
+                "whisper_transcriber already installed (install_whisper_transcriber is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_whisper_transcriber`] has been
     /// called with a real bridge.
     pub fn has_whisper_transcriber(&self) -> bool {
-        self.whisper_transcriber
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.whisper_transcriber.get().is_some()
     }
 
-    /// Install (or replace) the on-device document
-    /// text-extraction bridge used by media ingest
-    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 2 of the
-    /// 2026-05-04 batch). When set, PDF / DOCX media writes
-    /// per-page text rows into `media_search_index` during
-    /// `send_media`.
+    /// Install the on-device document text-extraction bridge
+    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
+    /// Task 2 of the 2026-05-04 batch). When set, PDF / DOCX
+    /// media writes per-page text rows into
+    /// `media_search_index` during `send_media`. Write-once —
+    /// the platform document parser (PDFKit / Apache Tika /
+    /// MlKit) is a per-process resource.
     pub fn install_document_extractor(
         &self,
-        extractor: Box<dyn crate::models::document::DocumentExtractor>,
+        extractor: Arc<dyn crate::models::document::DocumentExtractor>,
     ) -> Result<()> {
-        *self.document_extractor.lock().map_err(poisoned)? = Some(extractor);
-        Ok(())
+        self.document_extractor.set(extractor).map_err(|_| {
+            Error::Storage(
+                "document_extractor already installed (install_document_extractor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_document_extractor`] has been
     /// called with a real bridge.
     pub fn has_document_extractor(&self) -> bool {
-        self.document_extractor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.document_extractor.get().is_some()
     }
 
-    /// Install (or replace) the on-device video keyframe sampler
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 3 of the 2026-05-04 batch). When set together with
-    /// an [`crate::models::clip::ImageEmbedder`], video media
+    /// Install the on-device video keyframe sampler used by
+    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 3 of
+    /// the 2026-05-04 batch). When set together with an
+    /// [`crate::models::clip::ImageEmbedder`], video media
     /// embeds the first keyframe via MobileCLIP-S2 and writes
     /// the embedding to `search_vector` during `send_media`.
+    /// Write-once — platform video decoders (AVFoundation /
+    /// MediaCodec) hold per-process hardware decoder handles.
     pub fn install_video_keyframe_sampler(
         &self,
-        sampler: Box<dyn crate::models::video::VideoKeyframeSampler>,
+        sampler: Arc<dyn crate::models::video::VideoKeyframeSampler>,
     ) -> Result<()> {
-        *self.video_keyframe_sampler.lock().map_err(poisoned)? = Some(sampler);
-        Ok(())
+        self.video_keyframe_sampler.set(sampler).map_err(|_| {
+            Error::Storage(
+                "video_keyframe_sampler already installed (install_video_keyframe_sampler is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_video_keyframe_sampler`] has been
     /// called with a real bridge.
     pub fn has_video_keyframe_sampler(&self) -> bool {
-        self.video_keyframe_sampler
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.video_keyframe_sampler.get().is_some()
     }
 
-    /// Install (or replace) the offline-detection probe used by
-    /// the backup-defer / hydrate-offline paths (Phase 7,
-    /// Task 6 of the 2026-05-04 batch). Wrapped in `Arc` so
-    /// multiple workers can share one detector.
+    /// Install the offline-detection probe used by the
+    /// backup-defer / hydrate-offline paths (Phase 7, Task 6 of
+    /// the 2026-05-04 batch). Wrapped in `Arc` so multiple
+    /// workers can share one detector. Write-once: returns
+    /// [`Error::Storage`] if an offline detector has already
+    /// been installed.
     pub fn install_offline_detector(
         &self,
-        detector: std::sync::Arc<dyn crate::transport::offline::OfflineDetector>,
+        detector: Arc<dyn crate::transport::offline::OfflineDetector>,
     ) -> Result<()> {
-        *self.offline_detector.lock().map_err(poisoned)? = Some(detector);
-        Ok(())
+        self.offline_detector.set(detector).map_err(|_| {
+            Error::Storage(
+                "offline_detector already installed (install_offline_detector is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Current online state. `true` when no detector is installed
-    /// (the orchestration layer treats `None` as "always
-    /// online"); otherwise delegates to the installed detector.
+    /// (the orchestration layer treats "not installed" as
+    /// "always online"); otherwise delegates to the installed
+    /// detector. The probe lookup is a lock-free atomic load.
     pub fn is_online(&self) -> bool {
-        match self.offline_detector.lock() {
-            Ok(slot) => slot.as_ref().map(|d| d.is_online()).unwrap_or(true),
-            Err(_) => true,
-        }
+        self.offline_detector
+            .get()
+            .map(|d| d.is_online())
+            .unwrap_or(true)
     }
 
-    /// Install (or replace) the performance-trace collector
-    /// (Phase 7, Task 8 of the 2026-05-04 batch). Wrapped in
-    /// `Arc` so callers can share one collector across the
-    /// lifetime of the process and read out traces with
-    /// [`Self::collect_perf_stats`].
+    /// Install the performance-trace collector (Phase 7, Task 8
+    /// of the 2026-05-04 batch). Wrapped in `Arc` so callers can
+    /// share one collector across the lifetime of the process
+    /// and read out traces with [`Self::collect_perf_stats`].
+    /// Write-once: returns [`Error::Storage`] if a collector has
+    /// already been installed.
     pub fn install_perf_collector(
         &self,
-        collector: std::sync::Arc<dyn crate::perf::PerfCollector>,
+        collector: Arc<dyn crate::perf::PerfCollector>,
     ) -> Result<()> {
-        *self.perf_collector.lock().map_err(poisoned)? = Some(collector);
-        Ok(())
+        self.perf_collector.set(collector).map_err(|_| {
+            Error::Storage(
+                "perf_collector already installed (install_perf_collector is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_perf_collector`] has been called.
     pub fn has_perf_collector(&self) -> bool {
-        self.perf_collector
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.perf_collector.get().is_some()
     }
 
     /// Snapshot of all [`crate::perf::PerfTrace`] records
@@ -1751,10 +1928,7 @@ impl CoreImpl {
     /// installed collector does not buffer traces (e.g.
     /// [`crate::perf::NoopPerfCollector`]).
     pub fn collect_perf_stats(&self) -> Vec<crate::perf::PerfTrace> {
-        let Ok(slot) = self.perf_collector.lock() else {
-            return Vec::new();
-        };
-        match slot.as_ref() {
+        match self.perf_collector.get() {
             Some(c) => c.snapshot(),
             None => Vec::new(),
         }
@@ -1803,35 +1977,34 @@ impl CoreImpl {
     /// into the installed collector. No-op when no collector is
     /// installed.
     fn record_perf_trace(&self, trace: crate::perf::PerfTrace) {
-        if let Ok(slot) = self.perf_collector.lock() {
-            if let Some(collector) = slot.as_ref() {
-                collector.record(trace);
-            }
+        if let Some(collector) = self.perf_collector.get() {
+            collector.record(trace);
         }
     }
 
-    /// Install (or replace) the read-only dedup-analytics probe
-    /// (Phase 7, batch-5 — 2026-05-04). Wrapped in `Arc` so
-    /// multiple workers can share one probe. See
+    /// Install the read-only dedup-analytics probe (Phase 7,
+    /// batch-5 — 2026-05-04). Wrapped in `Arc` so multiple
+    /// workers can share one probe. See
     /// `crates/core/src/transport/dedup_analytics.rs` for the
     /// privacy contract — the probe MUST NOT receive plaintext,
     /// derived plaintext (FTS tokens, embeddings), or media
-    /// bytes.
+    /// bytes. Write-once: returns [`Error::Storage`] if a
+    /// dedup-analytics probe has already been installed.
     pub fn install_dedup_analytics(
         &self,
-        probe: std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+        probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
     ) -> Result<()> {
-        *self.dedup_analytics.lock().map_err(poisoned)? = Some(probe);
-        Ok(())
+        self.dedup_analytics.set(probe).map_err(|_| {
+            Error::Storage(
+                "dedup_analytics already installed (install_dedup_analytics is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_dedup_analytics`] has been called
     /// with a real probe.
     pub fn has_dedup_analytics(&self) -> bool {
-        self.dedup_analytics
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.dedup_analytics.get().is_some()
     }
 
     /// Read the current dedup-ratio snapshot for `tenant_id`.
@@ -1843,8 +2016,7 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::DedupStats> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.query_dedup_ratio(tenant_id),
             None => Err(crate::Error::NotImplemented("dedup_analytics")),
         }
@@ -1859,8 +2031,7 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::StorageSavings> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.query_storage_savings(tenant_id),
             None => Err(crate::Error::NotImplemented("dedup_analytics")),
         }
@@ -1874,8 +2045,7 @@ impl CoreImpl {
         &self,
         event: crate::transport::dedup_analytics::DedupEvent,
     ) -> Result<()> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.record_event(event),
             None => Ok(()),
         }
@@ -1890,8 +2060,8 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::DedupDashboard> {
-        let probe = match self.dedup_analytics.lock().map_err(poisoned)?.as_ref() {
-            Some(p) => std::sync::Arc::clone(p),
+        let probe = match self.dedup_analytics.get() {
+            Some(p) => Arc::clone(p),
             None => return Err(crate::Error::NotImplemented("dedup_analytics")),
         };
         Ok(crate::transport::dedup_analytics::DedupDashboard {
@@ -1901,27 +2071,29 @@ impl CoreImpl {
         })
     }
 
-    /// Install (or replace) the multi-scope search resolver
-    /// (Phase 8, batch-5 — 2026-05-04). Wrapped in `Arc` so the
-    /// orchestration layer can share one resolver across worker
-    /// threads. When no resolver is installed, the query engine
-    /// uses the default
+    /// Install the multi-scope search resolver (Phase 8, batch-5
+    /// — 2026-05-04). Wrapped in `Arc` so the orchestration layer
+    /// can share one resolver across worker threads. When no
+    /// resolver is installed, the query engine uses the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`].
+    /// Write-once: returns [`Error::Storage`] if a resolver has
+    /// already been installed.
     pub fn install_conversation_group_resolver(
         &self,
-        resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>,
+        resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver>,
     ) -> Result<()> {
-        *self.conversation_group_resolver.lock().map_err(poisoned)? = Some(resolver);
-        Ok(())
+        self.conversation_group_resolver.set(resolver).map_err(|_| {
+            Error::Storage(
+                "conversation_group_resolver already installed (install_conversation_group_resolver is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_conversation_group_resolver`] has
     /// been called.
     pub fn has_conversation_group_resolver(&self) -> bool {
-        self.conversation_group_resolver
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.conversation_group_resolver.get().is_some()
     }
 
     /// Phase 7, batch-5 — build a media-migration plan that
@@ -1993,11 +2165,10 @@ impl CoreImpl {
         if plan.items.is_empty() {
             return Ok(false);
         }
-        let scheduler_guard = self.scheduler.lock().map_err(poisoned)?;
-        let scheduler = match scheduler_guard.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::NotImplemented("scheduler")),
-        };
+        let scheduler = self
+            .scheduler
+            .get()
+            .ok_or(Error::NotImplemented("scheduler"))?;
         let snapshot = crate::scheduler::MediaMigrationPlanSnapshot::from_plan(plan);
         scheduler
             .schedule_one_off_task(
@@ -2037,22 +2208,18 @@ impl CoreImpl {
         target: &crate::SearchTarget,
         limit: usize,
     ) -> Result<Vec<crate::SearchResult>> {
-        // Resolve the installed `ConversationGroupResolver` outside
-        // the reader-pool checkout so we don't hold a pool reader
-        // while contending on the resolver mutex. The resolver itself
-        // does not touch the DB — it only translates a `SearchTarget`
-        // into a conversation-id set inside `execute_search_with_target`.
-        let installed = self
+        // Resolve the installed `ConversationGroupResolver` via a
+        // lock-free atomic load — the resolver is installed once
+        // at boot. The resolver itself does not touch the DB; it
+        // only translates a `SearchTarget` into a conversation-id
+        // set inside `execute_search_with_target`.
+        let resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver> = match self
             .conversation_group_resolver
-            .lock()
-            .map_err(poisoned)?
-            .clone();
-        let resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver> =
-            installed.unwrap_or_else(|| {
-                std::sync::Arc::new(
-                    crate::search::search_target::NoopConversationGroupResolver::new(),
-                )
-            });
+            .get()
+        {
+            Some(r) => Arc::clone(r),
+            None => Arc::new(crate::search::search_target::NoopConversationGroupResolver::new()),
+        };
         // SELECT-only path — route through the reader pool so we
         // match the other search entry points (`search`,
         // `search_and_prefetch_cold`, `search_with_cold_source`,
@@ -2203,15 +2370,10 @@ impl CoreImpl {
     /// Whether [`Self::install_zkof_archive_backend`] has been
     /// called.
     pub fn has_zkof_archive_backend(&self) -> bool {
-        self.zkof_archive_s3
+        self.zkof_archive
             .lock()
             .map(|slot| slot.is_some())
             .unwrap_or(false)
-            && self
-                .zkof_archive_config
-                .lock()
-                .map(|slot| slot.is_some())
-                .unwrap_or(false)
     }
 
     /// Cold-result hydration write-back (Phase 5, Task 3).
@@ -2643,10 +2805,7 @@ impl CoreImpl {
         let Some(text) = msg.text_content.as_deref() else {
             return false;
         };
-        let Ok(slot) = self.text_embedder.lock() else {
-            return false;
-        };
-        let Some(embedder) = slot.as_ref() else {
+        let Some(embedder) = self.text_embedder.get() else {
             // No embedder installed — semantic search still works for
             // messages embedded by a previous run, but new rows will
             // not contribute vectors until `install_text_embedder` is
@@ -2693,16 +2852,8 @@ impl CoreImpl {
         if messages.is_empty() {
             return;
         }
-        let has_spotlight = self
-            .spotlight_anchor
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false);
-        let has_windows = self
-            .windows_search_anchor
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false);
+        let has_spotlight = self.spotlight_anchor.get().is_some();
+        let has_windows = self.windows_search_anchor.get().is_some();
         if !has_spotlight && !has_windows {
             return;
         }
@@ -2768,10 +2919,7 @@ impl CoreImpl {
         if !mime_type.starts_with("image/") {
             return;
         }
-        let Ok(slot) = self.image_embedder.lock() else {
-            return;
-        };
-        let Some(embedder) = slot.as_ref() else {
+        let Some(embedder) = self.image_embedder.get() else {
             // Same rationale as `maybe_embed_text_message`: cold-start
             // before the bridge installs MobileCLIP-S2 is normal; a
             // warn-level event would flood logs. Stay at debug.
@@ -2846,20 +2994,16 @@ impl CoreImpl {
         }
         // Resource-gate transcription work. Whisper is the
         // strictest gate (`should_run_transcription`); skip
-        // entirely when the gate refuses.
-        if let Ok(slot) = self.resource_probe.lock() {
-            if let Some(probe) = slot.as_ref() {
-                let gate = ResourceGate::default();
-                if !gate.should_run_transcription(&probe.current_resources()) {
-                    return;
-                }
+        // entirely when the gate refuses. Lock-free atomic load
+        // — the resource probe is installed once at boot.
+        if let Some(probe) = self.resource_probe.get() {
+            let gate = ResourceGate::default();
+            if !gate.should_run_transcription(&probe.current_resources()) {
+                return;
             }
         }
 
-        let Ok(slot) = self.whisper_transcriber.lock() else {
-            return;
-        };
-        let Some(transcriber) = slot.as_ref() else {
+        let Some(transcriber) = self.whisper_transcriber.get() else {
             return;
         };
         let result = match transcriber.transcribe(plaintext, mime_type) {
@@ -2899,14 +3043,13 @@ impl CoreImpl {
         let _ = FuzzyIndexWriter::new(db).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
-        //     up the audio body.
-        if let Ok(embedder_slot) = self.text_embedder.lock() {
-            if let Some(embedder) = embedder_slot.as_ref() {
-                let cache = LocalStoreEmbeddingCache::new(db.connection());
-                if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
-                    if let Ok(vec) = embedder.embed(transcript) {
-                        let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
-                    }
+        //     up the audio body. Lock-free atomic load — the
+        //     text embedder is installed once at boot.
+        if let Some(embedder) = self.text_embedder.get() {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                if let Ok(vec) = embedder.embed(transcript) {
+                    let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
                 }
             }
         }
@@ -2957,10 +3100,7 @@ impl CoreImpl {
         if !is_supported_document_mime(mime_type) {
             return;
         }
-        let Ok(slot) = self.document_extractor.lock() else {
-            return;
-        };
-        let Some(extractor) = slot.as_ref() else {
+        let Some(extractor) = self.document_extractor.get() else {
             return;
         };
         let pages = match extractor.extract_text(plaintext, mime_type) {
@@ -2997,14 +3137,14 @@ impl CoreImpl {
             );
             let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, trimmed);
 
-            // (3) Optional XLM-R embedding per page.
-            if let Ok(embedder_slot) = self.text_embedder.lock() {
-                if let Some(embedder) = embedder_slot.as_ref() {
-                    let cache = LocalStoreEmbeddingCache::new(db.connection());
-                    if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
-                        if let Ok(vec) = embedder.embed(trimmed) {
-                            let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
-                        }
+            // (3) Optional XLM-R embedding per page. Lock-free
+            //     atomic load — the text embedder is installed
+            //     once at boot.
+            if let Some(embedder) = self.text_embedder.get() {
+                let cache = LocalStoreEmbeddingCache::new(db.connection());
+                if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
+                    if let Ok(vec) = embedder.embed(trimmed) {
+                        let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
                     }
                 }
             }
@@ -3039,16 +3179,10 @@ impl CoreImpl {
         if !mime_type.starts_with("video/") {
             return;
         }
-        let Ok(sampler_slot) = self.video_keyframe_sampler.lock() else {
+        let Some(sampler) = self.video_keyframe_sampler.get() else {
             return;
         };
-        let Some(sampler) = sampler_slot.as_ref() else {
-            return;
-        };
-        let Ok(embedder_slot) = self.image_embedder.lock() else {
-            return;
-        };
-        let Some(embedder) = embedder_slot.as_ref() else {
+        let Some(embedder) = self.image_embedder.get() else {
             return;
         };
 
@@ -3353,16 +3487,18 @@ impl CoreImpl {
         // compaction would then drop every pre-existing segment.
         self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
 
-        // Hydration succeeded — commit the keys.
-        *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
-        *self.backup_signing_key.lock().map_err(poisoned)? = Some(signing_key);
-        *self.backup_device_id.lock().map_err(poisoned)? = Some(device_id);
+        // Hydration succeeded — commit the keys atomically.
+        *self.backup_keys.lock().map_err(poisoned)? = Some(BackupKeys {
+            root_key: Zeroizing::new(backup_root),
+            signing_key,
+            device_id,
+        });
         Ok(())
     }
 
     /// Whether [`Self::install_backup_keys`] has been called.
     pub fn has_backup_keys(&self) -> bool {
-        self.backup_root_key
+        self.backup_keys
             .lock()
             .map(|s| s.is_some())
             .unwrap_or(false)
@@ -3687,32 +3823,22 @@ impl CoreImpl {
             .expect("non-empty events implies a max");
 
         // Phase 2 — seal the segment outside the db lock.
-        let backup_root = {
-            let slot = self.backup_root_key.lock().map_err(poisoned)?;
-            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
-                Error::Storage(
-                    "run_incremental_backup: K_backup_root not installed (call install_backup_keys first)".into(),
-                )
-            })?;
-            KeyMaterial::from_bytes(bytes)
-        };
-        let signing_key = self
-            .backup_signing_key
+        let BackupKeys {
+            root_key,
+            signing_key,
+            device_id,
+        } = self
+            .backup_keys
             .lock()
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
                 Error::Storage(
-                    "run_incremental_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                    "run_incremental_backup: backup keys not installed (call install_backup_keys first)".into(),
                 )
             })?
             .clone();
-        let device_id = self
-            .backup_device_id
-            .lock()
-            .map_err(poisoned)?
-            .clone()
-            .unwrap_or_else(|| "unknown-device".to_string());
+        let backup_root = KeyMaterial::from_bytes(*root_key);
 
         let segment_id = uuid::Uuid::now_v7();
         let k_segment =
@@ -3839,33 +3965,23 @@ impl CoreImpl {
         use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
         use crate::formats::SegmentType;
 
-        let backup_root = {
-            let slot = self.backup_root_key.lock().map_err(poisoned)?;
-            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
-                Error::Storage(
-                    "compact_backup: K_backup_root not installed (call install_backup_keys first)"
-                        .into(),
-                )
-            })?;
-            KeyMaterial::from_bytes(bytes)
-        };
-        let signing_key = self
-            .backup_signing_key
+        let BackupKeys {
+            root_key,
+            signing_key,
+            device_id,
+        } = self
+            .backup_keys
             .lock()
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
                 Error::Storage(
-                    "compact_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                    "compact_backup: backup keys not installed (call install_backup_keys first)"
+                        .into(),
                 )
             })?
             .clone();
-        let device_id = self
-            .backup_device_id
-            .lock()
-            .map_err(poisoned)?
-            .clone()
-            .unwrap_or_else(|| "unknown-device".to_string());
+        let backup_root = KeyMaterial::from_bytes(*root_key);
 
         // Snapshot the ledger and build a plan.
         let snapshot = self
@@ -4439,17 +4555,12 @@ impl KChatCore for CoreImpl {
         after_cursor: Option<DeliveryCursor>,
     ) -> Result<IngestResult> {
         let span = tracing::Span::current();
-        // Snapshot the configured delivery client. We hold the
-        // mutex only for the duration of the fetch dispatch so the
-        // database mutex below can be acquired without nesting.
+        // Snapshot the configured delivery client via a lock-free
+        // atomic load on the [`OnceLock`]. The fetch dispatch
+        // happens outside any subsystem lock so the database
+        // mutex below can be acquired without nesting.
         let fetch = {
-            let guard = self.delivery_client.lock().map_err(|e| {
-                let err = poisoned(e);
-                let err_str = err.to_string();
-                span.record("error", err_str.as_str());
-                err
-            })?;
-            let client = guard.as_ref().ok_or_else(|| {
+            let client = self.delivery_client.get().ok_or_else(|| {
                 let err = Error::Transport("no delivery client configured".to_string());
                 let err_str = err.to_string();
                 span.record("error", err_str.as_str());
@@ -6291,7 +6402,8 @@ mod tests {
             next_cursor: Some("after-3".into()),
         };
         let mock = crate::transport::MockDeliveryClient::new().with_response(None, Ok(staged));
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -6334,7 +6446,8 @@ mod tests {
                     next_cursor: None,
                 }),
             );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r1 = core.ingest_remote_messages(conv, None).unwrap();
         assert_eq!(r1.new_messages, 2);
@@ -6365,7 +6478,8 @@ mod tests {
             Some("cursor-from-caller"),
             Ok(crate::transport::FetchResult::default()),
         );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let cursor = DeliveryCursor("cursor-from-caller".to_string());
         let r = core
@@ -6391,7 +6505,8 @@ mod tests {
             next_cursor: Some("cursor-abc".into()),
         };
         let mock = crate::transport::MockDeliveryClient::new().with_response(None, Ok(staged));
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -6413,7 +6528,8 @@ mod tests {
                 next_cursor: None,
             }),
         );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -8285,7 +8401,7 @@ mod tests {
             .expect_err("must fail without keys");
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("K_backup_root not installed"), "{msg}")
+                assert!(msg.contains("backup keys not installed"), "{msg}")
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -10542,7 +10658,7 @@ mod tests {
         };
 
         let core = fresh_core();
-        core.install_text_embedder(Box::new(MockTextEmbedder::default()))
+        core.install_text_embedder(Arc::new(MockTextEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10773,7 +10889,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10799,7 +10915,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10845,9 +10961,9 @@ mod tests {
         use crate::models::video::MockVideoKeyframeSampler;
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
-        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+        core.install_video_keyframe_sampler(Arc::new(MockVideoKeyframeSampler))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10884,9 +11000,9 @@ mod tests {
         use crate::models::video::MockVideoKeyframeSampler;
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
-        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+        core.install_video_keyframe_sampler(Arc::new(MockVideoKeyframeSampler))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10910,7 +11026,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
         // Note: no sampler installed.
 
@@ -10933,7 +11049,7 @@ mod tests {
         use crate::models::whisper::MockWhisperTranscriber;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10966,7 +11082,7 @@ mod tests {
         use crate::search::fuzzy_search::FuzzySearchEngine;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11012,7 +11128,7 @@ mod tests {
         use crate::models::whisper::MockWhisperTranscriber;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11060,7 +11176,7 @@ mod tests {
         }
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
         core.install_resource_probe(std::sync::Arc::new(CriticalProbe))
             .unwrap();
@@ -11092,7 +11208,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11131,7 +11247,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11169,7 +11285,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11455,7 +11571,7 @@ mod tests {
     #[test]
     fn schedule_media_migration_returns_false_for_empty_plan() {
         let core = fresh_core();
-        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        let scheduler = Arc::new(crate::scheduler::InProcessScheduler::new());
         core.install_scheduler(scheduler)
             .expect("install scheduler");
 
@@ -11537,7 +11653,7 @@ mod tests {
         }
 
         let shared = SharedScheduler(scheduler.clone());
-        core.install_scheduler(Box::new(shared))
+        core.install_scheduler(Arc::new(shared))
             .expect("install scheduler");
 
         let plan = crate::media::migration::MediaMigrationPlan {
@@ -11618,7 +11734,7 @@ mod tests {
     #[test]
     fn enforce_storage_budget_skips_migration_when_not_configured() {
         let core = fresh_core();
-        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        let scheduler = Arc::new(crate::scheduler::InProcessScheduler::new());
         core.install_scheduler(scheduler)
             .expect("install scheduler");
 

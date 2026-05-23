@@ -1382,9 +1382,7 @@ use kchat_core::local_store::schema::{
     MessageSkeleton as DbMessageSkeleton,
 };
 use kchat_core::local_store::state_machines::{ArchiveState, BackupState, BodyState};
-use kchat_core::transport::offline::{
-    AlwaysOfflineDetector, NoopOfflineDetector, ToggleOfflineDetector,
-};
+use kchat_core::transport::offline::ToggleOfflineDetector;
 use kchat_core::{CoreImpl, KChatCore, KChatCoreConfig};
 
 const OFFLINE_TEST_KEY: [u8; 32] = [0x53; 32];
@@ -1478,7 +1476,12 @@ fn offline_during_hydration_returns_cold_with_offline_flag() {
         db.insert_message_skeleton(&skel).expect("insert skel");
     });
 
-    core.install_offline_detector(Arc::new(AlwaysOfflineDetector))
+    // Install a single detector whose `is_online()` flips between
+    // the two halves of this test; matches the production pattern
+    // where a real detector reflects live device state rather than
+    // being swapped wholesale.
+    let detector = Arc::new(ToggleOfflineDetector::new(false));
+    core.install_offline_detector(detector.clone())
         .expect("install detector");
     assert!(!core.is_online());
     let h = core
@@ -1494,12 +1497,10 @@ fn offline_during_hydration_returns_cold_with_offline_flag() {
         "offline cold hit must not leak any text content",
     );
 
-    // Sanity check: with no detector (or with a noop detector
-    // whose `is_online()` returns true) the same message
-    // hydrates as cold but `offline = false`, so the flag is
-    // genuinely gated on the detector.
-    core.install_offline_detector(Arc::new(NoopOfflineDetector))
-        .expect("swap to noop detector");
+    // Sanity check: when the detector flips to online the same
+    // message hydrates as cold but `offline = false`, so the
+    // flag is genuinely gated on the detector's runtime state.
+    detector.set_online(true);
     let h2 = core
         .hydrate_message(msg_id, "search_result_tap")
         .expect("hydrate returns");
