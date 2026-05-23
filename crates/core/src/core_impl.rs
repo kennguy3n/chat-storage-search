@@ -4295,12 +4295,14 @@ impl KChatCore for CoreImpl {
         let fetch = {
             let guard = self.delivery_client.lock().map_err(|e| {
                 let err = poisoned(e);
-                span.record("error", err.to_string().as_str());
+                let err_str = err.to_string();
+                span.record("error", err_str.as_str());
                 err
             })?;
             let client = guard.as_ref().ok_or_else(|| {
                 let err = Error::Transport("no delivery client configured".to_string());
-                span.record("error", err.to_string().as_str());
+                let err_str = err.to_string();
+                span.record("error", err_str.as_str());
                 err
             })?;
             let cursor_owned = after_cursor.as_ref().map(|c| c.0.clone());
@@ -4308,7 +4310,8 @@ impl KChatCore for CoreImpl {
         };
         let fetched = fetch.map_err(|e| {
             let err = Error::Transport(e.to_string());
-            span.record("error", err.to_string().as_str());
+            let err_str = err.to_string();
+            span.record("error", err_str.as_str());
             err
         })?;
         span.record("messages_fetched", fetched.messages.len());
@@ -4320,11 +4323,13 @@ impl KChatCore for CoreImpl {
         let mut converted: Vec<IngestedMessage> = Vec::with_capacity(fetched.messages.len());
         for raw in &fetched.messages {
             converted.push(raw_delivery_to_ingested(raw).inspect_err(|e| {
-                span.record("error", e.to_string().as_str());
+                let err_str = e.to_string();
+                span.record("error", err_str.as_str());
             })?);
         }
         let mut result = self.ingest_messages(&converted).inspect_err(|e| {
-            span.record("error", e.to_string().as_str());
+            let err_str = e.to_string();
+            span.record("error", err_str.as_str());
         })?;
         span.record("new_messages", result.new_messages);
         span.record("duplicate_count", result.duplicate_count);
@@ -4911,9 +4916,9 @@ impl KChatCore for CoreImpl {
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
     // below (`reason`, `pressure_level`, `freed_bytes`,
-    // `evicted_count`, `error`). Deferred fields are filled in
-    // via `Span::current().record` next to the matching
-    // `trace.insert_metadata` calls below.
+    // `evicted_count`, `migration_scheduled`, `error`). Deferred
+    // fields are filled in via `Span::current().record` next to
+    // the matching `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self, reason),
         fields(
@@ -4921,6 +4926,7 @@ impl KChatCore for CoreImpl {
             pressure_level = tracing::field::Empty,
             evicted_count = tracing::field::Empty,
             freed_bytes = tracing::field::Empty,
+            migration_scheduled = tracing::field::Empty,
             error = tracing::field::Empty,
         ),
     )]
@@ -5012,12 +5018,16 @@ impl KChatCore for CoreImpl {
                         match self.plan_and_schedule_media_migration(&src, &tgt) {
                             Ok(true) => {
                                 trace.insert_metadata("migration_scheduled", "true".to_string());
+                                span.record("migration_scheduled", "true");
                             }
                             Ok(false) => {
                                 trace.insert_metadata("migration_scheduled", "empty".to_string());
+                                span.record("migration_scheduled", "empty");
                             }
                             Err(e) => {
-                                trace.insert_metadata("migration_scheduled", format!("error:{e}"));
+                                let label = format!("error:{e}");
+                                trace.insert_metadata("migration_scheduled", label.clone());
+                                span.record("migration_scheduled", label.as_str());
                             }
                         }
                     }
