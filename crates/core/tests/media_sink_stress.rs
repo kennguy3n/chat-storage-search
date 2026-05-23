@@ -91,10 +91,9 @@ impl MediaBlobSink for InMemorySink {
             .get(&(blob_ref.blob_id.clone(), chunk_idx))
             .cloned()
             .ok_or_else(|| {
-                kchat_core::Error::Storage(format!(
-                    "missing chunk {}/{chunk_idx}",
-                    blob_ref.blob_id
-                ).into())
+                kchat_core::Error::Storage(
+                    format!("missing chunk {}/{chunk_idx}", blob_ref.blob_id).into(),
+                )
             })
     }
     fn delete_media_blob(&self, blob_ref: &MediaBlobReference) -> kchat_core::Result<()> {

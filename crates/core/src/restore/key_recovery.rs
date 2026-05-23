@@ -274,10 +274,12 @@ pub fn prepare_device_transfer(
         k_backup_root: keys.k_backup_root.to_vec(),
         k_search_root: keys.k_search_root.to_vec(),
     };
-    let plaintext = Zeroizing::new(
-        crate::cbor::to_vec(&envelope)
-            .map_err(|e| Error::Storage(format!("device-transfer: cbor encode failed: {e}").into()))?,
-    );
+    let plaintext = Zeroizing::new(crate::cbor::to_vec(&envelope).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "device-transfer:",
+            source: e,
+        })
+    })?);
     let ciphertext = aead_seal(&key, &nonce, &plaintext, DEVICE_TRANSFER_DOMAIN)?;
     Ok(DeviceTransferPayload {
         nonce: nonce.to_vec(),
@@ -308,8 +310,12 @@ pub fn accept_device_transfer(
         &payload.ciphertext,
         DEVICE_TRANSFER_DOMAIN,
     )?);
-    let envelope: DeviceTransferEnvelope = crate::cbor::from_slice(&plaintext)
-        .map_err(|e| Error::Storage(format!("device-transfer: cbor decode failed: {e}").into()))?;
+    let envelope: DeviceTransferEnvelope = crate::cbor::from_slice(&plaintext).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "device-transfer:",
+            source: e,
+        })
+    })?;
     fn to_arr(v: &[u8]) -> Result<[u8; KEY_LEN], Error> {
         if v.len() != KEY_LEN {
             return Err(Error::Crypto(CryptoError::InvalidInput(

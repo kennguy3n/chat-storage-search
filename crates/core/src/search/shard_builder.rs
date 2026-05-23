@@ -287,8 +287,12 @@ fn seal_shard(
     doc_count: u64,
     k_shard: &KeyMaterial,
 ) -> Result<SearchIndexShard, Error> {
-    let compressed = zstd::stream::encode_all(&rows_cbor[..], SHARD_ZSTD_LEVEL)
-        .map_err(|e| Error::Storage(format!("search shard zstd encode: {e}").into()))?;
+    let compressed = zstd::stream::encode_all(&rows_cbor[..], SHARD_ZSTD_LEVEL).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::Zstd {
+            context: "search shard encode",
+            source: e,
+        })
+    })?;
     let shard_id = Uuid::now_v7();
     let nonce = random_nonce();
     let aad = build_shard_aad(&shard_id, index_type, &conversation_id_hash, &time_bucket);
@@ -342,8 +346,12 @@ pub fn build_text_search_shard(
         magic: TEXT_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("text shard cbor encode: {e}").into()))?;
+    let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "text shard",
+            source: e,
+        })
+    })?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
         cbor,
@@ -371,8 +379,12 @@ pub fn build_fuzzy_search_shard(
         magic: FUZZY_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("fuzzy shard cbor encode: {e}").into()))?;
+    let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "fuzzy shard",
+            source: e,
+        })
+    })?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
         cbor,
@@ -395,14 +407,21 @@ pub fn restore_text_search_shard(
     k_text_index_shard: &KeyMaterial,
 ) -> Result<Vec<FtsRow>, Error> {
     if shard.index_type != IndexType::Text {
-        return Err(Error::Storage(format!(
-            "restore_text_search_shard: index_type {:?} != Text",
-            shard.index_type
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "restore_text_search_shard: index_type {:?} != Text",
+                shard.index_type
+            )
+            .into(),
+        ));
     }
     let cbor = open_shard(shard, k_text_index_shard)?;
-    let payload: FtsShardPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("text shard cbor decode: {e}").into()))?;
+    let payload: FtsShardPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "text shard",
+            source: e,
+        })
+    })?;
     if payload.magic != TEXT_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("text shard payload magic mismatch".into()));
     }
@@ -416,14 +435,21 @@ pub fn restore_fuzzy_search_shard(
     k_fuzzy_index_shard: &KeyMaterial,
 ) -> Result<Vec<FuzzyRow>, Error> {
     if shard.index_type != IndexType::Fuzzy {
-        return Err(Error::Storage(format!(
-            "restore_fuzzy_search_shard: index_type {:?} != Fuzzy",
-            shard.index_type
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "restore_fuzzy_search_shard: index_type {:?} != Fuzzy",
+                shard.index_type
+            )
+            .into(),
+        ));
     }
     let cbor = open_shard(shard, k_fuzzy_index_shard)?;
-    let payload: FuzzyShardPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("fuzzy shard cbor decode: {e}").into()))?;
+    let payload: FuzzyShardPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "fuzzy shard",
+            source: e,
+        })
+    })?;
     if payload.magic != FUZZY_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("fuzzy shard payload magic mismatch".into()));
     }
@@ -450,8 +476,12 @@ pub fn build_vector_search_shard(
         magic: VECTOR_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("vector shard cbor encode: {e}").into()))?;
+    let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "vector shard",
+            source: e,
+        })
+    })?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
         cbor,
@@ -474,14 +504,21 @@ pub fn restore_vector_search_shard(
     k_vector_index_shard: &KeyMaterial,
 ) -> Result<Vec<VectorRow>, Error> {
     if shard.index_type != IndexType::Vector {
-        return Err(Error::Storage(format!(
-            "restore_vector_search_shard: index_type {:?} != Vector",
-            shard.index_type
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "restore_vector_search_shard: index_type {:?} != Vector",
+                shard.index_type
+            )
+            .into(),
+        ));
     }
     let cbor = open_shard(shard, k_vector_index_shard)?;
-    let payload: VectorShardPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("vector shard cbor decode: {e}").into()))?;
+    let payload: VectorShardPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "vector shard",
+            source: e,
+        })
+    })?;
     if payload.magic != VECTOR_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("vector shard payload magic mismatch".into()));
     }
@@ -501,8 +538,12 @@ pub fn build_media_search_shard(
         magic: MEDIA_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("media shard cbor encode: {e}").into()))?;
+    let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "media shard",
+            source: e,
+        })
+    })?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
         cbor,
@@ -525,14 +566,21 @@ pub fn restore_media_search_shard(
     k_media_index_shard: &KeyMaterial,
 ) -> Result<Vec<MediaIndexRow>, Error> {
     if shard.index_type != IndexType::Media {
-        return Err(Error::Storage(format!(
-            "restore_media_search_shard: index_type {:?} != Media",
-            shard.index_type
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "restore_media_search_shard: index_type {:?} != Media",
+                shard.index_type
+            )
+            .into(),
+        ));
     }
     let cbor = open_shard(shard, k_media_index_shard)?;
-    let payload: MediaShardPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("media shard cbor decode: {e}").into()))?;
+    let payload: MediaShardPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "media shard",
+            source: e,
+        })
+    })?;
     if payload.magic != MEDIA_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("media shard payload magic mismatch".into()));
     }
@@ -680,8 +728,12 @@ pub fn build_bloom_shard(
         hash_count: filter.hash_count,
         bits: filter.bits.clone(),
     };
-    let cbor = crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("bloom shard cbor encode: {e}").into()))?;
+    let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "bloom shard",
+            source: e,
+        })
+    })?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
         cbor,
@@ -704,14 +756,21 @@ pub fn restore_bloom_shard(
     k_bloom_index_shard: &KeyMaterial,
 ) -> Result<BloomFilter, Error> {
     if shard.index_type != IndexType::Bloom {
-        return Err(Error::Storage(format!(
-            "restore_bloom_shard: index_type {:?} != Bloom",
-            shard.index_type
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "restore_bloom_shard: index_type {:?} != Bloom",
+                shard.index_type
+            )
+            .into(),
+        ));
     }
     let cbor = open_shard(shard, k_bloom_index_shard)?;
-    let payload: BloomShardPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("bloom shard cbor decode: {e}").into()))?;
+    let payload: BloomShardPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "bloom shard",
+            source: e,
+        })
+    })?;
     if payload.magic != BLOOM_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("bloom shard payload magic mismatch".into()));
     }
@@ -740,8 +799,12 @@ fn open_shard(shard: &SearchIndexShard, k: &KeyMaterial) -> Result<Vec<u8>, Erro
     }
     let compressed =
         open(k.as_bytes(), &shard.nonce, &shard.ciphertext, &aad).map_err(Error::Crypto)?;
-    let cbor = zstd::stream::decode_all(&compressed[..])
-        .map_err(|e| Error::Storage(format!("search shard zstd decode: {e}").into()))?;
+    let cbor = zstd::stream::decode_all(&compressed[..]).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::Zstd {
+            context: "search shard decode",
+            source: e,
+        })
+    })?;
     Ok(cbor)
 }
 

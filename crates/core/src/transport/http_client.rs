@@ -214,11 +214,14 @@ impl HttpTransportClient {
     }
 
     fn map_status(label: &str, status: reqwest::StatusCode, body: &str) -> crate::Error {
-        crate::Error::Transport(format!(
-            "{label}: HTTP {} — {}",
-            status.as_u16(),
-            body.chars().take(256).collect::<String>()
-        ).into())
+        crate::Error::Transport(
+            format!(
+                "{label}: HTTP {} — {}",
+                status.as_u16(),
+                body.chars().take(256).collect::<String>()
+            )
+            .into(),
+        )
     }
 }
 
@@ -432,10 +435,12 @@ impl TransportClient for HttpTransportClient {
         let mut out = Vec::with_capacity(wires.len());
         for w in wires {
             let mut hash = [0u8; 32];
-            hex_decode_into(&w.previous_manifest_hash_hex, &mut hash)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}").into()))?;
-            let payload = base64_decode(&w.payload_b64)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}").into()))?;
+            hex_decode_into(&w.previous_manifest_hash_hex, &mut hash).map_err(|e| {
+                crate::Error::Transport(format!("fetch_archive_manifests: {e}").into())
+            })?;
+            let payload = base64_decode(&w.payload_b64).map_err(|e| {
+                crate::Error::Transport(format!("fetch_archive_manifests: {e}").into())
+            })?;
             out.push(EncryptedManifest {
                 generation: w.generation,
                 previous_manifest_hash: hash,

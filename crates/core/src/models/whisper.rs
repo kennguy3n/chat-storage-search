@@ -386,9 +386,9 @@ pub struct MockWhisperTranscriber;
 impl WhisperTranscriber for MockWhisperTranscriber {
     fn transcribe(&self, audio_data: &[u8], mime_type: &str) -> Result<TranscriptionResult> {
         if !mime_type.starts_with("audio/") {
-            return Err(crate::Error::Model(format!(
-                "MockWhisperTranscriber rejects non-audio mime_type: {mime_type}"
-            ).into()));
+            return Err(crate::Error::Model(
+                format!("MockWhisperTranscriber rejects non-audio mime_type: {mime_type}").into(),
+            ));
         }
         let mut hasher = blake3::Hasher::new();
         hasher.update(mime_type.as_bytes());

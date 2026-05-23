@@ -72,9 +72,9 @@ impl BackupEventType {
             "conversation_created" => Self::ConversationCreated,
             "conversation_deleted" => Self::ConversationDeleted,
             other => {
-                return Err(Error::Storage(format!(
-                    "unknown backup event_type {other:?}"
-                ).into()))
+                return Err(Error::Storage(
+                    format!("unknown backup event_type {other:?}").into(),
+                ))
             }
         })
     }
@@ -194,14 +194,22 @@ impl BackupEventJournal {
             };
             let conversation_id = conv_str
                 .map(|s| {
-                    Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}").into()))
+                    Uuid::parse_str(&s).map_err(|e| {
+                        Error::Storage(crate::local_store::StorageError::InvalidId {
+                            kind: "conversation_id",
+                            source: e,
+                        })
+                    })
                 })
                 .transpose()?;
             let message_id = mid_str
                 .map(|s| {
-                    Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("invalid message_id: {e}").into()))
+                    Uuid::parse_str(&s).map_err(|e| {
+                        Error::Storage(crate::local_store::StorageError::InvalidId {
+                            kind: "message_id",
+                            source: e,
+                        })
+                    })
                 })
                 .transpose()?;
             out.push((
@@ -244,9 +252,12 @@ impl BackupEventJournal {
     ) -> Result<(), Error> {
         let current = self.read_cursor(conn)?;
         if new_cursor < current {
-            return Err(Error::Storage(format!(
-                "backup cursor cannot go backwards (current={current}, requested={new_cursor})"
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "backup cursor cannot go backwards (current={current}, requested={new_cursor})"
+                )
+                .into(),
+            ));
         }
         conn.execute(
             "INSERT INTO backup_event_cursor(id, cursor_seq) VALUES (1, ?1)

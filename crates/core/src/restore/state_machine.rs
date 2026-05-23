@@ -72,10 +72,13 @@ pub fn transition(
     match current {
         None => {
             if to != RestoreState::IdentityRestored {
-                return Err(Error::Storage(format!(
-                    "restore_state row missing — initial state must be \
+                return Err(Error::Storage(
+                    format!(
+                        "restore_state row missing — initial state must be \
                      identity_restored, got {to}"
-                ).into()));
+                    )
+                    .into(),
+                ));
             }
             save(conn, to, notes)?;
             Ok(to)

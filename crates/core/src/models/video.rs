@@ -124,9 +124,9 @@ impl VideoKeyframeSampler for MockVideoKeyframeSampler {
         max_frames: usize,
     ) -> Result<Vec<Keyframe>> {
         if !mime_type.starts_with("video/") {
-            return Err(crate::Error::Model(format!(
-                "MockVideoKeyframeSampler rejects non-video mime_type: {mime_type}"
-            ).into()));
+            return Err(crate::Error::Model(
+                format!("MockVideoKeyframeSampler rejects non-video mime_type: {mime_type}").into(),
+            ));
         }
         if max_frames == 0 {
             return Ok(Vec::new());

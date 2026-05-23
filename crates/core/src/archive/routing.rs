@@ -180,8 +180,9 @@ impl S3ZkofArchiveAdapter {
         let hash = content_hash(plaintext);
         let dek = derive_convergent_dek(&hash, &self.tenant_id)
             .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}").into()))?;
-        encrypt_object_pattern_c(plaintext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C seal: {e}").into()))
+        encrypt_object_pattern_c(plaintext, dek.as_bytes(), DEFAULT_CHUNK_SIZE).map_err(|e| {
+            Error::Storage(format!("S3ZkofArchiveAdapter: pattern C seal: {e}").into())
+        })
     }
 
     /// Pattern C `open` — inverse of [`Self::pattern_c_seal`].
@@ -195,8 +196,9 @@ impl S3ZkofArchiveAdapter {
     ) -> Result<Vec<u8>, Error> {
         let dek = derive_convergent_dek(plaintext_hash, &self.tenant_id)
             .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}").into()))?;
-        decrypt_object_pattern_c(ciphertext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C open: {e}").into()))
+        decrypt_object_pattern_c(ciphertext, dek.as_bytes(), DEFAULT_CHUNK_SIZE).map_err(|e| {
+            Error::Storage(format!("S3ZkofArchiveAdapter: pattern C open: {e}").into())
+        })
     }
 }
 
@@ -264,8 +266,12 @@ pub(crate) fn encode_sealed_archive_manifest(
         nonce: manifest.nonce.to_vec(),
         ciphertext: manifest.ciphertext.clone(),
     };
-    crate::cbor::to_vec(&wire)
-        .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: cbor encode manifest: {e}").into()))
+    crate::cbor::to_vec(&wire).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborEncode {
+            context: "S3ZkofArchiveAdapter:",
+            source: e,
+        })
+    })
 }
 
 /// Route an archive segment upload to the configured backend.

@@ -109,10 +109,13 @@ pub fn route_media_download(
     chunk_idx: u32,
 ) -> Result<Vec<u8>, Error> {
     if blob_ref.storage_sink != storage_sink {
-        return Err(Error::Storage(format!(
-            "route_media_download: blob_ref.storage_sink {:?} does not match {:?}",
-            blob_ref.storage_sink, storage_sink
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "route_media_download: blob_ref.storage_sink {:?} does not match {:?}",
+                blob_ref.storage_sink, storage_sink
+            )
+            .into(),
+        ));
     }
     if storage_sink == KCHAT_BACKEND_SINK {
         let start = (chunk_idx as u64) * (DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64);

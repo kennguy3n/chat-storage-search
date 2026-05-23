@@ -66,13 +66,16 @@ pub fn upload_archive_segment(
 
     let commit = transport.commit_blob(&handle.blob_id)?;
     if commit.merkle_root != ciphertext_root {
-        return Err(Error::Storage(format!(
-            "archive upload: server merkle_root mismatch (segment_id={}): \
+        return Err(Error::Storage(
+            format!(
+                "archive upload: server merkle_root mismatch (segment_id={}): \
              declared {} vs server {}",
-            segment.segment_id,
-            hex_encode_root(&ciphertext_root),
-            hex_encode_root(&commit.merkle_root),
-        ).into()));
+                segment.segment_id,
+                hex_encode_root(&ciphertext_root),
+                hex_encode_root(&commit.merkle_root),
+            )
+            .into(),
+        ));
     }
 
     Ok(handle.blob_id)

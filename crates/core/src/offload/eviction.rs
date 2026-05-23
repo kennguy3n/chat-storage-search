@@ -377,12 +377,24 @@ pub fn collect_eviction_candidates(
             created_at_ms,
             storage_sink,
         ) = row.map_err(|e| Error::Storage(e.to_string().into()))?;
-        let asset_id = Uuid::parse_str(&asset_id)
-            .map_err(|e| Error::Storage(format!("invalid asset_id: {e}").into()))?;
-        let message_id = Uuid::parse_str(&message_id)
-            .map_err(|e| Error::Storage(format!("invalid message_id: {e}").into()))?;
-        let conversation_id = Uuid::parse_str(&conversation_id)
-            .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}").into()))?;
+        let asset_id = Uuid::parse_str(&asset_id).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::InvalidId {
+                kind: "asset_id",
+                source: e,
+            })
+        })?;
+        let message_id = Uuid::parse_str(&message_id).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::InvalidId {
+                kind: "message_id",
+                source: e,
+            })
+        })?;
+        let conversation_id = Uuid::parse_str(&conversation_id).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::InvalidId {
+                kind: "conversation_id",
+                source: e,
+            })
+        })?;
         let bytes = u64::try_from(bytes_local.max(0)).unwrap_or(0);
         out.push(EvictionCandidate {
             asset_id,

@@ -677,7 +677,8 @@ impl CoreImpl {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
-        let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string().into()))?;
+        let db =
+            LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string().into()))?;
         let db_readers = db
             .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
             .map_err(|e| Error::Storage(e.to_string().into()))?;
@@ -737,9 +738,9 @@ impl CoreImpl {
     /// client construct a fresh [`CoreImpl`] instead.
     pub fn set_delivery_client(&self, client: Arc<dyn DeliveryClient>) -> Result<()> {
         self.delivery_client.set(client).map_err(|_| {
-            Error::Storage(
-                "delivery_client already installed (set_delivery_client is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "delivery_client",
+            ))
         })
     }
 
@@ -1514,7 +1515,9 @@ impl CoreImpl {
         scheduler: Arc<dyn crate::scheduler::BackgroundScheduler>,
     ) -> Result<()> {
         self.scheduler.set(scheduler).map_err(|_| {
-            Error::Storage("scheduler already installed (install_scheduler is write-once)".into())
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "scheduler",
+            ))
         })
     }
 
@@ -1542,10 +1545,9 @@ impl CoreImpl {
         anchor: Arc<dyn crate::desktop_index::SpotlightAnchor>,
     ) -> Result<()> {
         self.spotlight_anchor.set(anchor).map_err(|_| {
-            Error::Storage(
-                "spotlight_anchor already installed (install_spotlight_anchor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "spotlight_anchor",
+            ))
         })
     }
 
@@ -1576,10 +1578,9 @@ impl CoreImpl {
         anchor: Arc<dyn crate::desktop_index::WindowsSearchAnchor>,
     ) -> Result<()> {
         self.windows_search_anchor.set(anchor).map_err(|_| {
-            Error::Storage(
-                "windows_search_anchor already installed (install_windows_search_anchor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "windows_search_anchor",
+            ))
         })
     }
 
@@ -1618,10 +1619,9 @@ impl CoreImpl {
         runner: Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
     ) -> Result<()> {
         self.ep_benchmark_runner.set(runner).map_err(|_| {
-            Error::Storage(
-                "ep_benchmark_runner already installed (install_ep_benchmark_runner is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "ep_benchmark_runner",
+            ))
         })
     }
 
@@ -1721,9 +1721,9 @@ impl CoreImpl {
         embedder: Arc<dyn crate::models::embeddings::TextEmbedder>,
     ) -> Result<()> {
         self.text_embedder.set(embedder).map_err(|_| {
-            Error::Storage(
-                "text_embedder already installed (install_text_embedder is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "text_embedder",
+            ))
         })
     }
 
@@ -1744,9 +1744,9 @@ impl CoreImpl {
         embedder: Arc<dyn crate::models::clip::ImageEmbedder>,
     ) -> Result<()> {
         self.image_embedder.set(embedder).map_err(|_| {
-            Error::Storage(
-                "image_embedder already installed (install_image_embedder is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "image_embedder",
+            ))
         })
     }
 
@@ -1763,7 +1763,9 @@ impl CoreImpl {
     /// been installed.
     pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
         self.ocr_bridge.set(bridge).map_err(|_| {
-            Error::Storage("ocr_bridge already installed (install_ocr_bridge is write-once)".into())
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "ocr_bridge",
+            ))
         })
     }
 
@@ -1784,9 +1786,9 @@ impl CoreImpl {
         probe: Arc<dyn crate::models::resource_gate::ResourceProbe>,
     ) -> Result<()> {
         self.resource_probe.set(probe).map_err(|_| {
-            Error::Storage(
-                "resource_probe already installed (install_resource_probe is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "resource_probe",
+            ))
         })
     }
 
@@ -1807,10 +1809,9 @@ impl CoreImpl {
         transcriber: Arc<dyn crate::models::whisper::WhisperTranscriber>,
     ) -> Result<()> {
         self.whisper_transcriber.set(transcriber).map_err(|_| {
-            Error::Storage(
-                "whisper_transcriber already installed (install_whisper_transcriber is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "whisper_transcriber",
+            ))
         })
     }
 
@@ -1832,10 +1833,9 @@ impl CoreImpl {
         extractor: Arc<dyn crate::models::document::DocumentExtractor>,
     ) -> Result<()> {
         self.document_extractor.set(extractor).map_err(|_| {
-            Error::Storage(
-                "document_extractor already installed (install_document_extractor is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "document_extractor",
+            ))
         })
     }
 
@@ -1858,10 +1858,9 @@ impl CoreImpl {
         sampler: Arc<dyn crate::models::video::VideoKeyframeSampler>,
     ) -> Result<()> {
         self.video_keyframe_sampler.set(sampler).map_err(|_| {
-            Error::Storage(
-                "video_keyframe_sampler already installed (install_video_keyframe_sampler is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "video_keyframe_sampler",
+            ))
         })
     }
 
@@ -1882,10 +1881,9 @@ impl CoreImpl {
         detector: Arc<dyn crate::transport::offline::OfflineDetector>,
     ) -> Result<()> {
         self.offline_detector.set(detector).map_err(|_| {
-            Error::Storage(
-                "offline_detector already installed (install_offline_detector is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "offline_detector",
+            ))
         })
     }
 
@@ -1911,9 +1909,9 @@ impl CoreImpl {
         collector: Arc<dyn crate::perf::PerfCollector>,
     ) -> Result<()> {
         self.perf_collector.set(collector).map_err(|_| {
-            Error::Storage(
-                "perf_collector already installed (install_perf_collector is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "perf_collector",
+            ))
         })
     }
 
@@ -1995,9 +1993,9 @@ impl CoreImpl {
         probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
     ) -> Result<()> {
         self.dedup_analytics.set(probe).map_err(|_| {
-            Error::Storage(
-                "dedup_analytics already installed (install_dedup_analytics is write-once)".into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "dedup_analytics",
+            ))
         })
     }
 
@@ -2083,10 +2081,9 @@ impl CoreImpl {
         resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver>,
     ) -> Result<()> {
         self.conversation_group_resolver.set(resolver).map_err(|_| {
-            Error::Storage(
-                "conversation_group_resolver already installed (install_conversation_group_resolver is write-once)"
-                    .into(),
-            )
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "conversation_group_resolver",
+            ))
         })
     }
 
@@ -3312,9 +3309,9 @@ impl CoreImpl {
             .update_conversation_pin(&conversation_id.to_string(), pinned)
             .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            ).into()));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -3327,9 +3324,9 @@ impl CoreImpl {
             .update_conversation_mute(&conversation_id.to_string(), muted)
             .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            ).into()));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -3524,9 +3521,12 @@ impl CoreImpl {
         if let Some(bytes) = manifest_cbor {
             let manifest: crate::formats::manifest::BackupManifest =
                 crate::cbor::from_slice(&bytes).map_err(|e| {
-                    Error::Storage(format!(
-                        "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
-                    ).into())
+                    Error::Storage(
+                        format!(
+                            "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
+                        )
+                        .into(),
+                    )
                 })?;
             *self.previous_backup_manifest.lock().map_err(poisoned)? = Some(manifest);
         }
@@ -3557,33 +3557,42 @@ impl CoreImpl {
         let mut materialised = Vec::with_capacity(rows.len());
         for row in rows {
             let segment_id = uuid::Uuid::parse_str(&row.segment_id).map_err(|e| {
-                Error::Storage(format!(
-                    "backup_segment_ledger: malformed segment_id={}: {e}",
-                    row.segment_id
-                ).into())
+                Error::Storage(
+                    format!(
+                        "backup_segment_ledger: malformed segment_id={}: {e}",
+                        row.segment_id
+                    )
+                    .into(),
+                )
             })?;
             if row.nonce.len() != NONCE_LEN {
-                return Err(Error::Storage(format!(
-                    "backup_segment_ledger: nonce length {} != {NONCE_LEN}",
-                    row.nonce.len()
-                ).into()));
+                return Err(Error::Storage(
+                    format!(
+                        "backup_segment_ledger: nonce length {} != {NONCE_LEN}",
+                        row.nonce.len()
+                    )
+                    .into(),
+                ));
             }
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(&row.nonce);
             if row.merkle_root.len() != 32 {
-                return Err(Error::Storage(format!(
-                    "backup_segment_ledger: merkle_root length {} != 32",
-                    row.merkle_root.len()
-                ).into()));
+                return Err(Error::Storage(
+                    format!(
+                        "backup_segment_ledger: merkle_root length {} != 32",
+                        row.merkle_root.len()
+                    )
+                    .into(),
+                ));
             }
             let mut merkle_root = [0u8; 32];
             merkle_root.copy_from_slice(&row.merkle_root);
             let segment_type = match row.segment_type.as_str() {
                 "events" => SegmentType::Events,
                 other => {
-                    return Err(Error::Storage(format!(
-                        "backup_segment_ledger: unknown segment_type={other}"
-                    ).into()))
+                    return Err(Error::Storage(
+                        format!("backup_segment_ledger: unknown segment_type={other}").into(),
+                    ))
                 }
             };
             let tier = match row.tier.as_str() {
@@ -3591,9 +3600,9 @@ impl CoreImpl {
                 "weekly" => CompactionTier::Weekly,
                 "monthly" => CompactionTier::Monthly,
                 other => {
-                    return Err(Error::Storage(format!(
-                        "backup_segment_ledger: unknown tier={other}"
-                    ).into()))
+                    return Err(Error::Storage(
+                        format!("backup_segment_ledger: unknown tier={other}").into(),
+                    ))
                 }
             };
             let k_segment_bytes =
@@ -3624,9 +3633,9 @@ impl CoreImpl {
         manifest: &crate::formats::manifest::BackupManifest,
     ) -> Result<Vec<u8>> {
         crate::cbor::to_vec(manifest).map_err(|e| {
-            Error::Storage(format!(
-                "backup_manifest_chain: CBOR encode of manifest failed: {e}"
-            ).into())
+            Error::Storage(
+                format!("backup_manifest_chain: CBOR encode of manifest failed: {e}").into(),
+            )
         })
     }
 
@@ -3644,9 +3653,12 @@ impl CoreImpl {
         let segment_type = match seg.built.segment_type {
             crate::formats::SegmentType::Events => "events",
             other => {
-                return Err(Error::Storage(format!(
+                return Err(Error::Storage(
+                    format!(
                 "backup_segment_ledger: backup segment carried unexpected segment_type={other:?}"
-            ).into()))
+            )
+                    .into(),
+                ))
             }
         };
         let tier = match seg.tier {
@@ -3833,9 +3845,9 @@ impl CoreImpl {
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
-                Error::Storage(
-                    "run_incremental_backup: backup keys not installed (call install_backup_keys first)".into(),
-                )
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "backup_keys",
+                ))
             })?
             .clone();
         let backup_root = KeyMaterial::from_bytes(*root_key);
@@ -3975,10 +3987,9 @@ impl CoreImpl {
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
-                Error::Storage(
-                    "compact_backup: backup keys not installed (call install_backup_keys first)"
-                        .into(),
-                )
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "backup_keys",
+                ))
             })?
             .clone();
         let backup_root = KeyMaterial::from_bytes(*root_key);
@@ -4026,10 +4037,13 @@ impl CoreImpl {
                     .iter()
                     .find(|s| s.built.segment_id == member.segment_id)
                     .ok_or_else(|| {
-                        Error::Storage(format!(
-                            "compact_backup: superseded segment {} missing from ledger",
-                            member.segment_id
-                        ).into())
+                        Error::Storage(
+                            format!(
+                                "compact_backup: superseded segment {} missing from ledger",
+                                member.segment_id
+                            )
+                            .into(),
+                        )
                     })?;
                 bytes_before += tracked.built.ciphertext.len() as u64;
                 group_min_ms = group_min_ms.min(tracked.min_event_ms);
@@ -4706,9 +4720,9 @@ impl KChatCore for CoreImpl {
             .delete_conversation(&conversation_id.to_string())
             .map_err(|e| Error::Storage(e.to_string().into()))?;
         if n == 0 {
-            return Err(Error::Storage(format!(
-                "no conversation with id={conversation_id}"
-            ).into()));
+            return Err(Error::Storage(
+                format!("no conversation with id={conversation_id}").into(),
+            ));
         }
         Ok(())
     }
@@ -5077,7 +5091,9 @@ impl KChatCore for CoreImpl {
             };
             if skeleton.body_state == BodyState::DeletedForEveryone {
                 return Err(Error::Message(
-                    "hydrate_message: message has been deleted for everyone".to_string().into(),
+                    "hydrate_message: message has been deleted for everyone"
+                        .to_string()
+                        .into(),
                 ));
             }
             let conversation_id = Uuid::parse_str(&skeleton.conversation_id).ok();
@@ -5394,7 +5410,9 @@ impl KChatCore for CoreImpl {
 }
 
 fn poisoned<T>(_e: std::sync::PoisonError<T>) -> Error {
-    Error::Storage("local store mutex poisoned".to_string().into())
+    Error::Storage(crate::local_store::StorageError::LockPoisoned(
+        "local_store",
+    ))
 }
 
 /// Map a UI-supplied reason string to a [`HydrationReason`].
@@ -5440,7 +5458,8 @@ fn raw_delivery_to_ingested(raw: &RawDeliveryMessage) -> Result<IngestedMessage>
     let reply_to = match &raw.reply_to {
         None => None,
         Some(s) => Some(
-            Uuid::parse_str(s).map_err(|e| Error::Transport(format!("invalid reply_to: {e}").into()))?,
+            Uuid::parse_str(s)
+                .map_err(|e| Error::Transport(format!("invalid reply_to: {e}").into()))?,
         ),
     };
     Ok(IngestedMessage {
@@ -5463,16 +5482,26 @@ fn skeleton_and_body_to_view(
     skel: MessageSkeleton,
     body: Option<MessageBody>,
 ) -> Result<MessageView> {
-    let message_id = Uuid::parse_str(&skel.message_id)
-        .map_err(|e| Error::Storage(format!("invalid message_id in store: {e}").into()))?;
-    let conversation_id = Uuid::parse_str(&skel.conversation_id)
-        .map_err(|e| Error::Storage(format!("invalid conversation_id in store: {e}").into()))?;
+    let message_id = Uuid::parse_str(&skel.message_id).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::InvalidId {
+            kind: "message_id",
+            source: e,
+        })
+    })?;
+    let conversation_id = Uuid::parse_str(&skel.conversation_id).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::InvalidId {
+            kind: "conversation_id",
+            source: e,
+        })
+    })?;
     let reply_to = match &skel.reply_to {
         None => None,
-        Some(s) => Some(
-            Uuid::parse_str(s)
-                .map_err(|e| Error::Storage(format!("invalid reply_to in store: {e}").into()))?,
-        ),
+        Some(s) => Some(Uuid::parse_str(s).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::InvalidId {
+                kind: "reply_to",
+                source: e,
+            })
+        })?),
     };
     let text_content = body.and_then(|b| b.text_content);
     Ok(MessageView {
@@ -7378,9 +7407,9 @@ mod tests {
                 .get(segment_id)
                 .cloned()
                 .ok_or_else(|| {
-                    Error::Storage(format!(
-                        "FixtureTransport: no canned response for {segment_id}"
-                    ).into())
+                    Error::Storage(
+                        format!("FixtureTransport: no canned response for {segment_id}").into(),
+                    )
                 })
         }
 
@@ -7969,20 +7998,24 @@ mod tests {
             // the same formula the download path uses to compute it.
             let stride = crate::media::download::DEFAULT_CHUNK_CIPHERTEXT_SIZE as u64;
             if !range.start.is_multiple_of(stride) {
-                return Err(Error::Storage(format!(
-                    "GatedTransport: range start {} is not chunk-aligned",
-                    range.start
-                ).into()));
+                return Err(Error::Storage(
+                    format!(
+                        "GatedTransport: range start {} is not chunk-aligned",
+                        range.start
+                    )
+                    .into(),
+                ));
             }
             let chunk_idx = (range.start / stride) as usize;
             let chunks = self.chunks.lock().unwrap();
-            let entries = chunks
-                .get(blob_id)
-                .ok_or_else(|| Error::Storage(format!("GatedTransport: no blob {blob_id}").into()))?;
+            let entries = chunks.get(blob_id).ok_or_else(|| {
+                Error::Storage(format!("GatedTransport: no blob {blob_id}").into())
+            })?;
             let chunk = entries.get(chunk_idx).cloned().ok_or_else(|| {
-                Error::Storage(format!(
-                    "GatedTransport: chunk {chunk_idx} out of range for blob {blob_id}"
-                ).into())
+                Error::Storage(
+                    format!("GatedTransport: chunk {chunk_idx} out of range for blob {blob_id}")
+                        .into(),
+                )
             })?;
             Ok(chunk)
         }
@@ -8400,8 +8433,8 @@ mod tests {
             .run_incremental_backup("scheduled")
             .expect_err("must fail without keys");
         match err {
-            Error::Storage(msg) => {
-                assert!(msg.to_string().contains("backup keys not installed"), "{msg}")
+            Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(name)) => {
+                assert_eq!(name, "backup_keys", "unexpected subsystem name")
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -10178,7 +10211,9 @@ mod tests {
             .expect_err("wrong key must surface as Err");
         let msg = err.to_string();
         assert!(
-            msg.to_string().contains("aead") || msg.to_string().contains("AEAD") || msg.to_string().contains("decrypt"),
+            msg.to_string().contains("aead")
+                || msg.to_string().contains("AEAD")
+                || msg.to_string().contains("decrypt"),
             "expected AEAD-style error, got {msg}"
         );
 

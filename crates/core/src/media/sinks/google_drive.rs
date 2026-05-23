@@ -156,10 +156,13 @@ impl MediaBlobSink for GoogleDriveMediaBlobSink {
         expected_merkle_root: [u8; 32],
     ) -> crate::Result<MediaBlobReference> {
         let chunk_count = u32::try_from(chunks.len()).map_err(|_| {
-            Error::Storage(format!(
-                "GoogleDriveMediaBlobSink::upload_media_chunks: too many chunks ({})",
-                chunks.len()
-            ).into())
+            Error::Storage(
+                format!(
+                    "GoogleDriveMediaBlobSink::upload_media_chunks: too many chunks ({})",
+                    chunks.len()
+                )
+                .into(),
+            )
         })?;
 
         let total_size: usize = chunks.iter().map(|c| c.len()).sum();
@@ -187,10 +190,13 @@ impl MediaBlobSink for GoogleDriveMediaBlobSink {
         chunk_idx: u32,
     ) -> crate::Result<Vec<u8>> {
         if blob_ref.storage_sink != GOOGLE_DRIVE_SINK_TAG {
-            return Err(Error::Storage(format!(
-                "GoogleDriveMediaBlobSink::fetch_media_chunk: storage_sink mismatch {:?}",
-                blob_ref.storage_sink
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "GoogleDriveMediaBlobSink::fetch_media_chunk: storage_sink mismatch {:?}",
+                    blob_ref.storage_sink
+                )
+                .into(),
+            ));
         }
         let drive_file_id = match &blob_ref.sink_metadata {
             Some(meta) => decode_metadata(meta)?.0,
@@ -202,10 +208,13 @@ impl MediaBlobSink for GoogleDriveMediaBlobSink {
 
     fn delete_media_blob(&self, blob_ref: &MediaBlobReference) -> crate::Result<()> {
         if blob_ref.storage_sink != GOOGLE_DRIVE_SINK_TAG {
-            return Err(Error::Storage(format!(
-                "GoogleDriveMediaBlobSink::delete_media_blob: storage_sink mismatch {:?}",
-                blob_ref.storage_sink
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "GoogleDriveMediaBlobSink::delete_media_blob: storage_sink mismatch {:?}",
+                    blob_ref.storage_sink
+                )
+                .into(),
+            ));
         }
         let drive_file_id = match &blob_ref.sink_metadata {
             Some(meta) => decode_metadata(meta)?.0,
@@ -255,9 +264,9 @@ mod tests {
         fn download_file_range(&self, file_id: &str, range: Range<u64>) -> Result<Vec<u8>, Error> {
             *self.downloads.lock().unwrap() += 1;
             let objects = self.objects.lock().unwrap();
-            let bytes = objects
-                .get(file_id)
-                .ok_or_else(|| Error::Storage(format!("InMemoryBridge: no file {file_id}").into()))?;
+            let bytes = objects.get(file_id).ok_or_else(|| {
+                Error::Storage(format!("InMemoryBridge: no file {file_id}").into())
+            })?;
             let start = range.start as usize;
             let end = (range.end as usize).min(bytes.len());
             if start > end {
@@ -380,7 +389,10 @@ mod tests {
         };
         let err = sink.fetch_media_chunk(&blob_ref, 0).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("storage_sink mismatch"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("storage_sink mismatch"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage, got {other:?}"),
         }
     }
@@ -395,7 +407,10 @@ mod tests {
         };
         let err = sink.delete_media_blob(&blob_ref).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("storage_sink mismatch"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("storage_sink mismatch"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage, got {other:?}"),
         }
     }
@@ -439,7 +454,10 @@ mod tests {
             .upload_media_chunks("asset", BlobClass::Media, &[&[1, 2, 3]], [0u8; 32])
             .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("simulated Drive outage"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("simulated Drive outage"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage, got {other:?}"),
         }
     }

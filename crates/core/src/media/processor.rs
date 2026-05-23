@@ -180,23 +180,28 @@ pub fn transition_media_state(
         .get_media_asset(asset_id)
         .map_err(|e| Error::Storage(format!("media_state lookup: {e}").into()))?
         .ok_or_else(|| {
-            Error::Storage(format!(
-                "transition_media_state: no media_asset row for asset_id {asset_id:?}"
-            ).into())
+            Error::Storage(
+                format!("transition_media_state: no media_asset row for asset_id {asset_id:?}")
+                    .into(),
+            )
         })?;
     if asset.media_state != from {
-        return Err(Error::Storage(format!(
-            "transition_media_state: expected media_state = {from} for {asset_id:?}, found {}",
-            asset.media_state
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "transition_media_state: expected media_state = {from} for {asset_id:?}, found {}",
+                asset.media_state
+            )
+            .into(),
+        ));
     }
     let rows = db
         .update_media_state(asset_id, to)
         .map_err(|e| Error::Storage(format!("media_state update: {e}").into()))?;
     if rows == 0 {
-        return Err(Error::Storage(format!(
-            "transition_media_state: update affected 0 rows for asset_id {asset_id:?}"
-        ).into()));
+        return Err(Error::Storage(
+            format!("transition_media_state: update affected 0 rows for asset_id {asset_id:?}")
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -466,7 +471,9 @@ mod tests {
             transition_media_state(&db, "a-5", MediaState::OriginalLocal, MediaState::Evicted)
                 .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("expected media_state"), "{msg}"),
+            Error::Storage(msg) => {
+                assert!(msg.to_string().contains("expected media_state"), "{msg}")
+            }
             other => panic!("expected Storage error, got {other:?}"),
         }
     }

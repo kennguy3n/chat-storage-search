@@ -262,7 +262,9 @@ fn chunk_upload_interrupted_then_resumed_succeeds() {
     )
     .expect_err("must fail with connection reset after 2 chunks");
     match err {
-        Error::Transport(msg) => assert!(msg.to_string().contains("connection reset"), "got: {msg}"),
+        Error::Transport(msg) => {
+            assert!(msg.to_string().contains("connection reset"), "got: {msg}")
+        }
         other => panic!("expected Error::Transport, got {other:?}"),
     }
 

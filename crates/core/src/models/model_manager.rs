@@ -413,7 +413,9 @@ impl ModelManager {
             .find(|((id, _), _)| id == model_id)
             .map(|(_, a)| a.clone())
             .ok_or_else(|| {
-                crate::Error::Model(format!("benchmark_ep: model_id {model_id} not registered").into())
+                crate::Error::Model(
+                    format!("benchmark_ep: model_id {model_id} not registered").into(),
+                )
             })?;
         drop(guard);
         runner.run_benchmark(ep, &artifact)

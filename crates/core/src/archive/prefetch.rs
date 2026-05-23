@@ -43,12 +43,15 @@ fn ensure_all_kchat_backend(rows: &[(String, String, String)]) -> Result<(), Err
         let backend =
             StorageBackend::from_str(storage_backend).unwrap_or(StorageBackend::KChatBackend);
         if backend != StorageBackend::KChatBackend {
-            return Err(Error::Storage(format!(
-                "batch_prefetch_bucket: segment {segment_id} uses storage_backend \
+            return Err(Error::Storage(
+                format!(
+                    "batch_prefetch_bucket: segment {segment_id} uses storage_backend \
                  '{storage_backend}'; the legacy KChat-only entry point cannot route \
                  it. Use batch_prefetch_bucket_with_router with an ArchiveSegmentRouter \
                  built via ArchiveSegmentRouter::with_zkof(...)."
-            ).into()));
+                )
+                .into(),
+            ));
         }
     }
     Ok(())
@@ -358,9 +361,9 @@ mod tests {
                 .get(segment_id)
                 .cloned()
                 .ok_or_else(|| {
-                    Error::Storage(format!(
-                        "FixtureTransport: no canned response for {segment_id}"
-                    ).into())
+                    Error::Storage(
+                        format!("FixtureTransport: no canned response for {segment_id}").into(),
+                    )
                 })
         }
 
@@ -747,7 +750,8 @@ mod tests {
                 assert!(msg.to_string().contains("seg-Z"), "got: {msg}");
                 assert!(msg.to_string().contains("zk_object_fabric"), "got: {msg}");
                 assert!(
-                    msg.to_string().contains("batch_prefetch_bucket_with_router"),
+                    msg.to_string()
+                        .contains("batch_prefetch_bucket_with_router"),
                     "got: {msg}"
                 );
             }
@@ -781,7 +785,8 @@ mod tests {
             Error::Storage(msg) => {
                 assert!(msg.to_string().contains("zk_object_fabric"), "got: {msg}");
                 assert!(
-                    msg.to_string().contains("batch_prefetch_bucket_with_router"),
+                    msg.to_string()
+                        .contains("batch_prefetch_bucket_with_router"),
                     "got: {msg}"
                 );
             }

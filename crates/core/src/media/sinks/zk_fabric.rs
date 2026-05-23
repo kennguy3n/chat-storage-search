@@ -82,10 +82,13 @@ impl ZkFabricSinkConfig {
             ));
         }
         if !self.endpoint_url.starts_with("http://") && !self.endpoint_url.starts_with("https://") {
-            return Err(Error::Storage(format!(
+            return Err(Error::Storage(
+                format!(
                 "ZkFabricSinkConfig: endpoint_url must start with http:// or https:// (got {:?})",
                 self.endpoint_url
-            ).into()));
+            )
+                .into(),
+            ));
         }
         if self.access_key.is_empty() {
             return Err(Error::Storage(
@@ -98,20 +101,26 @@ impl ZkFabricSinkConfig {
             ));
         }
         if self.bucket.len() < 3 || self.bucket.len() > 63 {
-            return Err(Error::Storage(format!(
-                "ZkFabricSinkConfig: bucket must be 3..=63 chars (got {})",
-                self.bucket.len()
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "ZkFabricSinkConfig: bucket must be 3..=63 chars (got {})",
+                    self.bucket.len()
+                )
+                .into(),
+            ));
         }
         if !self
             .bucket
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         {
-            return Err(Error::Storage(format!(
-                "ZkFabricSinkConfig: bucket {:?} contains characters outside [a-z0-9-]",
-                self.bucket
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "ZkFabricSinkConfig: bucket {:?} contains characters outside [a-z0-9-]",
+                    self.bucket
+                )
+                .into(),
+            ));
         }
         Ok(())
     }
@@ -323,10 +332,13 @@ impl MediaBlobSink for ZkObjectFabricSink {
         expected_merkle_root: [u8; 32],
     ) -> crate::Result<MediaBlobReference> {
         let chunk_count = u32::try_from(chunks.len()).map_err(|_| {
-            Error::Storage(format!(
-                "ZkObjectFabricSink::upload_media_chunks: too many chunks ({})",
-                chunks.len()
-            ).into())
+            Error::Storage(
+                format!(
+                    "ZkObjectFabricSink::upload_media_chunks: too many chunks ({})",
+                    chunks.len()
+                )
+                .into(),
+            )
         })?;
 
         // Concatenate every chunk in order. The chunks are already
@@ -366,10 +378,13 @@ impl MediaBlobSink for ZkObjectFabricSink {
         chunk_idx: u32,
     ) -> crate::Result<Vec<u8>> {
         if blob_ref.storage_sink != ZK_OBJECT_FABRIC_SINK_TAG {
-            return Err(Error::Storage(format!(
-                "ZkObjectFabricSink::fetch_media_chunk: storage_sink mismatch {:?}",
-                blob_ref.storage_sink
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "ZkObjectFabricSink::fetch_media_chunk: storage_sink mismatch {:?}",
+                    blob_ref.storage_sink
+                )
+                .into(),
+            ));
         }
         // Prefer the metadata-encoded asset id when present so
         // rehydration is a pure local-key derivation; fall back
@@ -385,10 +400,13 @@ impl MediaBlobSink for ZkObjectFabricSink {
 
     fn delete_media_blob(&self, blob_ref: &MediaBlobReference) -> crate::Result<()> {
         if blob_ref.storage_sink != ZK_OBJECT_FABRIC_SINK_TAG {
-            return Err(Error::Storage(format!(
-                "ZkObjectFabricSink::delete_media_blob: storage_sink mismatch {:?}",
-                blob_ref.storage_sink
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "ZkObjectFabricSink::delete_media_blob: storage_sink mismatch {:?}",
+                    blob_ref.storage_sink
+                )
+                .into(),
+            ));
         }
         // Decode the metadata once: it carries both the asset id
         // (for the S3 key) and the chunk_count we use as a
@@ -688,7 +706,10 @@ mod tests {
         };
         let err = sink.fetch_media_chunk(&blob_ref, 0).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("storage_sink mismatch"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("storage_sink mismatch"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage, got {other:?}"),
         }
     }
@@ -703,7 +724,10 @@ mod tests {
         };
         let err = sink.delete_media_blob(&blob_ref).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("storage_sink mismatch"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("storage_sink mismatch"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage, got {other:?}"),
         }
     }
@@ -747,7 +771,9 @@ mod tests {
             .upload_media_chunks("asset", BlobClass::Media, &[&[1, 2, 3]], [0u8; 32])
             .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("simulated S3 outage"), "got {msg}"),
+            Error::Storage(msg) => {
+                assert!(msg.to_string().contains("simulated S3 outage"), "got {msg}")
+            }
             other => panic!("expected Storage, got {other:?}"),
         }
     }

@@ -77,7 +77,8 @@ pub trait MigrationDbHandle {
 
 impl MigrationDbHandle for LocalStoreDb {
     fn get_media_asset(&self, asset_id: &str) -> Result<Option<MediaAsset>, Error> {
-        LocalStoreDb::get_media_asset(self, asset_id).map_err(|e| Error::Storage(e.to_string().into()))
+        LocalStoreDb::get_media_asset(self, asset_id)
+            .map_err(|e| Error::Storage(e.to_string().into()))
     }
 
     fn update_media_storage_sink(
@@ -126,7 +127,8 @@ impl<'a> MigrationDbHandle for LockingDbHandle<'a> {
             .db
             .lock()
             .map_err(|_| Error::Storage("LocalStoreDb mutex poisoned".into()))?;
-        LocalStoreDb::get_media_asset(&guard, asset_id).map_err(|e| Error::Storage(e.to_string().into()))
+        LocalStoreDb::get_media_asset(&guard, asset_id)
+            .map_err(|e| Error::Storage(e.to_string().into()))
         // `guard` drops at end of scope — lock is released here.
     }
 

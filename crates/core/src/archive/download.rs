@@ -91,11 +91,14 @@ pub struct DecodedArchiveSegmentBlob<'a> {
 /// [`encode_archive_segment_blob`].
 pub fn decode_archive_segment_blob(bytes: &[u8]) -> Result<DecodedArchiveSegmentBlob<'_>, Error> {
     if bytes.len() < ARCHIVE_SEGMENT_BLOB_HEADER_LEN {
-        return Err(Error::Storage(format!(
-            "archive segment blob is {} bytes (expected at least {})",
-            bytes.len(),
-            ARCHIVE_SEGMENT_BLOB_HEADER_LEN
-        ).into()));
+        return Err(Error::Storage(
+            format!(
+                "archive segment blob is {} bytes (expected at least {})",
+                bytes.len(),
+                ARCHIVE_SEGMENT_BLOB_HEADER_LEN
+            )
+            .into(),
+        ));
     }
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&bytes[0..16]);
@@ -149,8 +152,12 @@ pub fn decrypt_archive_segment(
     let aad = build_segment_aad(&decoded.segment_id, &decoded.merkle_root);
     let compressed =
         open(k_archive_segment, &decoded.nonce, decoded.ciphertext, &aad).map_err(Error::Crypto)?;
-    let cbor = zstd::stream::decode_all(&compressed[..])
-        .map_err(|e| Error::Storage(format!("archive segment zstd decode: {e}").into()))?;
+    let cbor = zstd::stream::decode_all(&compressed[..]).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::Zstd {
+            context: "archive segment decode",
+            source: e,
+        })
+    })?;
     if content_hash(&cbor) != decoded.merkle_root {
         return Err(Error::Storage(
             "archive segment plaintext merkle_root mismatch".into(),
@@ -169,8 +176,12 @@ pub fn decrypt_archive_segment(
 /// alternative payload shapes (skeleton-only segments, search
 /// shard segments, etc.) once those land.
 pub fn decode_archive_segment<T: DeserializeOwned>(plaintext_cbor: &[u8]) -> Result<T, Error> {
-    let payload: T = crate::cbor::from_slice(plaintext_cbor)
-        .map_err(|e| Error::Storage(format!("archive segment cbor decode: {e}").into()))?;
+    let payload: T = crate::cbor::from_slice(plaintext_cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "archive segment",
+            source: e,
+        })
+    })?;
     Ok(payload)
 }
 
@@ -612,7 +623,10 @@ mod tests {
 
         let err = fetch_and_decrypt_segment(&transport, &segment_id.to_string(), &k).unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.to_string().contains("transport unavailable"), "got {msg}"),
+            Error::Storage(msg) => assert!(
+                msg.to_string().contains("transport unavailable"),
+                "got {msg}"
+            ),
             other => panic!("expected Storage error, got {other:?}"),
         }
         assert_eq!(transport.call_count(), 1);

@@ -307,10 +307,13 @@ impl ArchiveSegmentBuilder {
         // archive segment frame can only carry the seven
         // archive payload variants from `docs/PROPOSAL.md §5.1`.
         if !request.segment_type.is_archive_segment() {
-            return Err(Error::Storage(format!(
-                "ArchiveSegmentBuilder::build_segment: {:?} is not an archive segment type",
-                request.segment_type,
-            ).into()));
+            return Err(Error::Storage(
+                format!(
+                    "ArchiveSegmentBuilder::build_segment: {:?} is not an archive segment type",
+                    request.segment_type,
+                )
+                .into(),
+            ));
         }
 
         // 1) CBOR-encode the payload.
@@ -320,8 +323,12 @@ impl ArchiveSegmentBuilder {
             time_bucket: request.time_bucket.clone(),
             events: request.events.clone(),
         };
-        let cbor = crate::cbor::to_vec(&payload)
-            .map_err(|e| Error::Storage(format!("archive segment cbor encode: {e}").into()))?;
+        let cbor = crate::cbor::to_vec(&payload).map_err(|e| {
+            Error::Storage(crate::local_store::StorageError::CborEncode {
+                context: "archive segment",
+                source: e,
+            })
+        })?;
 
         // 2) Compute the integrity root over the CBOR payload —
         //    *not* the compressed bytes, so segments are
@@ -330,8 +337,13 @@ impl ArchiveSegmentBuilder {
 
         // 3) zstd-compress the CBOR. `decode_all` on the read side
         //    is symmetric.
-        let compressed = zstd::stream::encode_all(&cbor[..], ZSTD_COMPRESSION_LEVEL)
-            .map_err(|e| Error::Storage(format!("archive segment zstd encode: {e}").into()))?;
+        let compressed =
+            zstd::stream::encode_all(&cbor[..], ZSTD_COMPRESSION_LEVEL).map_err(|e| {
+                Error::Storage(crate::local_store::StorageError::Zstd {
+                    context: "archive segment encode",
+                    source: e,
+                })
+            })?;
 
         // 4) Allocate a fresh segment_id and AEAD-seal the
         //    compressed payload. AAD ties the segment_id and
@@ -411,10 +423,18 @@ pub fn decrypt_segment(
     let aad = build_segment_aad(&segment.segment_id, &segment.merkle_root);
     let compressed = open(k_archive_segment, &segment.nonce, &segment.ciphertext, &aad)
         .map_err(Error::Crypto)?;
-    let cbor = zstd::stream::decode_all(&compressed[..])
-        .map_err(|e| Error::Storage(format!("archive segment zstd decode: {e}").into()))?;
-    let payload: ArchiveSegmentPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("archive segment cbor decode: {e}").into()))?;
+    let cbor = zstd::stream::decode_all(&compressed[..]).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::Zstd {
+            context: "archive segment decode",
+            source: e,
+        })
+    })?;
+    let payload: ArchiveSegmentPayload = crate::cbor::from_slice(&cbor).map_err(|e| {
+        Error::Storage(crate::local_store::StorageError::CborDecode {
+            context: "archive segment",
+            source: e,
+        })
+    })?;
     if payload.magic != ARCHIVE_SEGMENT_PAYLOAD_MAGIC {
         return Err(Error::Storage(
             "archive segment payload magic mismatch".into(),
