@@ -32,8 +32,8 @@
 //! cargo test --test large_scale -- --ignored
 //! ```
 //!
-//! `docs/PROGRESS.md` tracks the closure of each one against
-//! Acceptance.
+//! Each scenario corresponds to an acceptance gate for the
+//! production-scale workloads described in `docs/ARCHITECTURE.md`.
 
 use std::collections::BTreeSet;
 
@@ -780,8 +780,8 @@ fn large_scale_concurrent_operations() {
 // 12-month cross-epoch search, and 5k-asset media migration.
 //
 // All shapes are deliberately bounded so each #[ignore] run completes
-// within minutes; the test names match the gating items in
-// `docs/PROGRESS.md`
+// within minutes; the test names match the production-scale
+// acceptance items in `docs/ARCHITECTURE.md`.
 // ===========================================================================
 
 #[test]

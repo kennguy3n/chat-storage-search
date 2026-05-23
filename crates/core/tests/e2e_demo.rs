@@ -59,8 +59,8 @@
 //! …
 //! ```
 //!
-//! Per `docs/PROGRESS.md`'s 2026-05-08 entry this file is the
-//! comprehensive demo dataset deliverable.
+//! This file is the comprehensive demo dataset deliverable for
+//! the storage / search / archive / backup / restore pipeline.
 
 use std::time::Instant;
 

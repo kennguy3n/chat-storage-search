@@ -32,11 +32,11 @@ use crate::transport::TransportClient;
 use crate::{Error, Result};
 
 /// ZKOF archive backend (S3 client + gateway config).
+///
 /// Bundled into a single struct so install is atomic — `s3` and
-/// `config` must always be installed together ( atomic
-/// bundle, kept under `Mutex<Option>` because operators rotate
-/// the bucket credentials / gateway URL without spinning up a
-/// new core).
+/// `config` must always be installed together. Kept under
+/// `Mutex<Option>` because operators rotate the bucket credentials
+/// or gateway URL without spinning up a new core.
 #[derive(Clone)]
 pub(crate) struct ZkofArchiveBackend {
     pub(crate) s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,

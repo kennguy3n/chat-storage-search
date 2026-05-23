@@ -1,10 +1,9 @@
 //! Benchmark baseline for the KChat storage / search / archive /
 //! backup / restore pipeline.
 //!
-//! `docs/PROGRESS.md` 2026-05-08 changelog calls this file out as
-//! the committed baseline that pairs with [`e2e_demo`]. It runs a
-//! focused micro-benchmark sweep over the same dataset shape used
-//! by the demo and writes the results to
+//! This is the committed baseline that pairs with [`e2e_demo`]:
+//! it runs a focused micro-benchmark sweep over the same dataset
+//! shape used by the demo and writes the results to
 //! `tests/benchmark_results.json` so future PRs can diff against
 //! a known-good snapshot.
 //!
@@ -324,7 +323,7 @@ fn synthetic_archive_events(conversations: &[Uuid], count: usize) -> Vec<Archive
 
 fn default_output_path() -> PathBuf {
     // crates/core/tests/benchmark_results.json — committed to the
-    // repo per docs/PROGRESS.md 2026-05-08.
+    // repo as the durable baseline snapshot.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("benchmark_results.json")

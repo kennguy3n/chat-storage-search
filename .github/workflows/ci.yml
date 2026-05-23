@@ -68,7 +68,7 @@ jobs:
   # (ingest → FTS / fuzzy / structured search → archive → backup → manifest
   # verification → skeleton-first restore → search-after-restore →
   # storage-budget enforcement) against a 200-message multilingual corpus.
-  # See `docs/PROGRESS.md`'s 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  # See `crates/core/tests/e2e_demo.rs` for the demo dataset and assertions.
   # -------------------------------------------------------------------------
   e2e-demo:
     name: E2E Demo
