@@ -3,8 +3,9 @@
 # Run locally with:
 #   cargo deny check
 #
-# CI runs `cargo deny check advisories` and `cargo deny check licenses`
-# as part of the `audit` job (.github/workflows/ci.yml).
+# CI runs `cargo deny check` (all four sections: advisories, licenses,
+# bans, sources) as part of the `audit` job in
+# `.github/workflows/ci.yml`.
 #
 # Documentation: https://embarkstudios.github.io/cargo-deny/
 
