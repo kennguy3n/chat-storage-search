@@ -345,29 +345,36 @@ pub struct CoreImpl {
     /// hydrate / cold-read / backup-defer path) is a lock-free
     /// atomic load.
     offline_detector: OnceLock<Arc<dyn crate::transport::offline::OfflineDetector>>,
-    /// Phase-7 performance-trace collector. `None` until
-    /// [`CoreImpl::install_perf_collector`] is called; when set,
-    /// the hot paths (`ingest_messages`, `search`,
+    /// Phase-7 performance-trace collector. Write-once via
+    /// [`CoreImpl::install_perf_collector`]; when set, the hot
+    /// paths (`ingest_messages`, `search`,
     /// `run_incremental_backup`, `enforce_storage_budget`) emit
     /// [`crate::perf::PerfTrace`] records into the collector.
-    perf_collector: Mutex<Option<std::sync::Arc<dyn crate::perf::PerfCollector>>>,
+    /// Held in [`OnceLock`] so the per-hot-path emit is a
+    /// lock-free atomic load — the collector is installed once
+    /// at boot and the bridge crates never replace it.
+    perf_collector: OnceLock<Arc<dyn crate::perf::PerfCollector>>,
     /// Phase-7 dedup-analytics probe (read-only telemetry against
-    /// the upstream ZK Object Fabric ContentIndex). `None` until
-    /// [`CoreImpl::install_dedup_analytics`] is called; when set,
+    /// the upstream ZK Object Fabric ContentIndex). Write-once
+    /// via [`CoreImpl::install_dedup_analytics`]; when set,
     /// [`CoreImpl::query_dedup_stats`] /
     /// [`CoreImpl::query_storage_savings`] dispatch through it.
     /// See `crates/core/src/transport/dedup_analytics.rs` for the
-    /// privacy contract.
+    /// privacy contract. Held in [`OnceLock`] for lock-free
+    /// dashboard / dedup-event reads.
     dedup_analytics:
-        Mutex<Option<std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>>,
-    /// Phase-8 multi-scope search resolver. `None` until
-    /// [`CoreImpl::install_conversation_group_resolver`] is
-    /// called; the query engine treats `None` as the default
+        OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
+    /// Phase-8 multi-scope search resolver. Write-once via
+    /// [`CoreImpl::install_conversation_group_resolver`]; the
+    /// query engine treats "not installed" as the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`]
     /// (Channel resolves to its singleton id, Starred / Unread
-    /// resolve to the empty set).
+    /// resolve to the empty set). Held in [`OnceLock`] so
+    /// `search_with_target` resolves the bridge with a lock-free
+    /// atomic load instead of contending on a mutex before each
+    /// reader-pool checkout.
     conversation_group_resolver:
-        Mutex<Option<std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>>>,
+        OnceLock<Arc<dyn crate::search::search_target::ConversationGroupResolver>>,
     /// Phase-7 (2026-05-04 batch 10) macOS Spotlight bridge.
     /// Write-once via
     /// [`CoreImpl::install_spotlight_anchor`]. The
@@ -555,9 +562,9 @@ impl CoreImpl {
             document_extractor: OnceLock::new(),
             video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
-            perf_collector: Mutex::new(None),
-            dedup_analytics: Mutex::new(None),
-            conversation_group_resolver: Mutex::new(None),
+            perf_collector: OnceLock::new(),
+            dedup_analytics: OnceLock::new(),
+            conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: Mutex::new(None),
@@ -607,9 +614,9 @@ impl CoreImpl {
             document_extractor: OnceLock::new(),
             video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
-            perf_collector: Mutex::new(None),
-            dedup_analytics: Mutex::new(None),
-            conversation_group_resolver: Mutex::new(None),
+            perf_collector: OnceLock::new(),
+            dedup_analytics: OnceLock::new(),
+            conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
             ep_benchmark_runner: Mutex::new(None),
@@ -1803,25 +1810,26 @@ impl CoreImpl {
             .unwrap_or(true)
     }
 
-    /// Install (or replace) the performance-trace collector
-    /// (Phase 7, Task 8 of the 2026-05-04 batch). Wrapped in
-    /// `Arc` so callers can share one collector across the
-    /// lifetime of the process and read out traces with
-    /// [`Self::collect_perf_stats`].
+    /// Install the performance-trace collector (Phase 7, Task 8
+    /// of the 2026-05-04 batch). Wrapped in `Arc` so callers can
+    /// share one collector across the lifetime of the process
+    /// and read out traces with [`Self::collect_perf_stats`].
+    /// Write-once: returns [`Error::Storage`] if a collector has
+    /// already been installed.
     pub fn install_perf_collector(
         &self,
-        collector: std::sync::Arc<dyn crate::perf::PerfCollector>,
+        collector: Arc<dyn crate::perf::PerfCollector>,
     ) -> Result<()> {
-        *self.perf_collector.lock().map_err(poisoned)? = Some(collector);
-        Ok(())
+        self.perf_collector.set(collector).map_err(|_| {
+            Error::Storage(
+                "perf_collector already installed (install_perf_collector is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_perf_collector`] has been called.
     pub fn has_perf_collector(&self) -> bool {
-        self.perf_collector
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.perf_collector.get().is_some()
     }
 
     /// Snapshot of all [`crate::perf::PerfTrace`] records
@@ -1830,10 +1838,7 @@ impl CoreImpl {
     /// installed collector does not buffer traces (e.g.
     /// [`crate::perf::NoopPerfCollector`]).
     pub fn collect_perf_stats(&self) -> Vec<crate::perf::PerfTrace> {
-        let Ok(slot) = self.perf_collector.lock() else {
-            return Vec::new();
-        };
-        match slot.as_ref() {
+        match self.perf_collector.get() {
             Some(c) => c.snapshot(),
             None => Vec::new(),
         }
@@ -1882,35 +1887,34 @@ impl CoreImpl {
     /// into the installed collector. No-op when no collector is
     /// installed.
     fn record_perf_trace(&self, trace: crate::perf::PerfTrace) {
-        if let Ok(slot) = self.perf_collector.lock() {
-            if let Some(collector) = slot.as_ref() {
-                collector.record(trace);
-            }
+        if let Some(collector) = self.perf_collector.get() {
+            collector.record(trace);
         }
     }
 
-    /// Install (or replace) the read-only dedup-analytics probe
-    /// (Phase 7, batch-5 — 2026-05-04). Wrapped in `Arc` so
-    /// multiple workers can share one probe. See
+    /// Install the read-only dedup-analytics probe (Phase 7,
+    /// batch-5 — 2026-05-04). Wrapped in `Arc` so multiple
+    /// workers can share one probe. See
     /// `crates/core/src/transport/dedup_analytics.rs` for the
     /// privacy contract — the probe MUST NOT receive plaintext,
     /// derived plaintext (FTS tokens, embeddings), or media
-    /// bytes.
+    /// bytes. Write-once: returns [`Error::Storage`] if a
+    /// dedup-analytics probe has already been installed.
     pub fn install_dedup_analytics(
         &self,
-        probe: std::sync::Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
+        probe: Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>,
     ) -> Result<()> {
-        *self.dedup_analytics.lock().map_err(poisoned)? = Some(probe);
-        Ok(())
+        self.dedup_analytics.set(probe).map_err(|_| {
+            Error::Storage(
+                "dedup_analytics already installed (install_dedup_analytics is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_dedup_analytics`] has been called
     /// with a real probe.
     pub fn has_dedup_analytics(&self) -> bool {
-        self.dedup_analytics
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.dedup_analytics.get().is_some()
     }
 
     /// Read the current dedup-ratio snapshot for `tenant_id`.
@@ -1922,8 +1926,7 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::DedupStats> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.query_dedup_ratio(tenant_id),
             None => Err(crate::Error::NotImplemented("dedup_analytics")),
         }
@@ -1938,8 +1941,7 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::StorageSavings> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.query_storage_savings(tenant_id),
             None => Err(crate::Error::NotImplemented("dedup_analytics")),
         }
@@ -1953,8 +1955,7 @@ impl CoreImpl {
         &self,
         event: crate::transport::dedup_analytics::DedupEvent,
     ) -> Result<()> {
-        let slot = self.dedup_analytics.lock().map_err(poisoned)?;
-        match slot.as_ref() {
+        match self.dedup_analytics.get() {
             Some(p) => p.record_event(event),
             None => Ok(()),
         }
@@ -1969,8 +1970,8 @@ impl CoreImpl {
         &self,
         tenant_id: &str,
     ) -> Result<crate::transport::dedup_analytics::DedupDashboard> {
-        let probe = match self.dedup_analytics.lock().map_err(poisoned)?.as_ref() {
-            Some(p) => std::sync::Arc::clone(p),
+        let probe = match self.dedup_analytics.get() {
+            Some(p) => Arc::clone(p),
             None => return Err(crate::Error::NotImplemented("dedup_analytics")),
         };
         Ok(crate::transport::dedup_analytics::DedupDashboard {
@@ -1980,27 +1981,29 @@ impl CoreImpl {
         })
     }
 
-    /// Install (or replace) the multi-scope search resolver
-    /// (Phase 8, batch-5 — 2026-05-04). Wrapped in `Arc` so the
-    /// orchestration layer can share one resolver across worker
-    /// threads. When no resolver is installed, the query engine
-    /// uses the default
+    /// Install the multi-scope search resolver (Phase 8, batch-5
+    /// — 2026-05-04). Wrapped in `Arc` so the orchestration layer
+    /// can share one resolver across worker threads. When no
+    /// resolver is installed, the query engine uses the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`].
+    /// Write-once: returns [`Error::Storage`] if a resolver has
+    /// already been installed.
     pub fn install_conversation_group_resolver(
         &self,
-        resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver>,
+        resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver>,
     ) -> Result<()> {
-        *self.conversation_group_resolver.lock().map_err(poisoned)? = Some(resolver);
-        Ok(())
+        self.conversation_group_resolver.set(resolver).map_err(|_| {
+            Error::Storage(
+                "conversation_group_resolver already installed (install_conversation_group_resolver is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_conversation_group_resolver`] has
     /// been called.
     pub fn has_conversation_group_resolver(&self) -> bool {
-        self.conversation_group_resolver
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.conversation_group_resolver.get().is_some()
     }
 
     /// Phase 7, batch-5 — build a media-migration plan that
@@ -2116,22 +2119,18 @@ impl CoreImpl {
         target: &crate::SearchTarget,
         limit: usize,
     ) -> Result<Vec<crate::SearchResult>> {
-        // Resolve the installed `ConversationGroupResolver` outside
-        // the reader-pool checkout so we don't hold a pool reader
-        // while contending on the resolver mutex. The resolver itself
-        // does not touch the DB — it only translates a `SearchTarget`
-        // into a conversation-id set inside `execute_search_with_target`.
-        let installed = self
-            .conversation_group_resolver
-            .lock()
-            .map_err(poisoned)?
-            .clone();
-        let resolver: std::sync::Arc<dyn crate::search::search_target::ConversationGroupResolver> =
-            installed.unwrap_or_else(|| {
-                std::sync::Arc::new(
+        // Resolve the installed `ConversationGroupResolver` via a
+        // lock-free atomic load — the resolver is installed once
+        // at boot. The resolver itself does not touch the DB; it
+        // only translates a `SearchTarget` into a conversation-id
+        // set inside `execute_search_with_target`.
+        let resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver> =
+            match self.conversation_group_resolver.get() {
+                Some(r) => Arc::clone(r),
+                None => Arc::new(
                     crate::search::search_target::NoopConversationGroupResolver::new(),
-                )
-            });
+                ),
+            };
         // SELECT-only path — route through the reader pool so we
         // match the other search entry points (`search`,
         // `search_and_prefetch_cold`, `search_with_cold_source`,
