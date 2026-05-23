@@ -79,10 +79,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: E2E Demo
         # E2E demo lives in `crates/core/tests/e2e_demo.rs` and pulls
-        # `CoreImpl::new_in_memory`, which is `cfg`-gated behind
-        # `test-support` (see `crates/core/Cargo.toml`). Run it under
-        # `-p kchat-core --features test-support` so the symbol is
-        # linked in.
+        # `LocalStoreDb::open_in_memory` (and, transitively via
+        # other test helpers, `CoreImpl::new_in_memory`). Both are
+        # `cfg`-gated behind `test-support` (see
+        # `crates/core/Cargo.toml`), so we run with
+        # `-p kchat-core --features test-support` to link them in.
         run: cargo test -p kchat-core --features test-support --test e2e_demo --verbose
 
   # -------------------------------------------------------------------------
@@ -111,6 +112,13 @@ jobs:
   # (Linux x86_64, macOS Apple Silicon, Android arm64, Windows x86_64). Runs
   # `cargo check` rather than a full build so the job stays under ~3 min;
   # the bridges' real binary builds happen in the iOS / Android repo CI.
+  #
+  # NOTE: this job intentionally uses default features (NOT `--all-features`)
+  # so it validates the *production* build shape on every target. With
+  # `--all-features` the `test-support` gate from Phase A.4 would be turned
+  # on and a cross-target break in production-only code paths could slip
+  # through. The lint job above runs `--all-features` so the full feature
+  # surface still gets cross-target compile coverage via clippy on Linux.
   # -------------------------------------------------------------------------
   cross-compile:
     name: Cross-compile (${{ matrix.label }})
@@ -162,10 +170,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - name: cargo check (rustup)
+      - name: cargo check (rustup, default features)
         if: matrix.tool == 'rustup'
-        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }} --all-features
-      - name: cargo check (cross)
+        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }}
+      - name: cargo check (cross, default features)
         if: matrix.tool == 'cross'
         run: cross check ${{ matrix.packages }} --target ${{ matrix.target }}
 
