@@ -264,7 +264,7 @@ pub(crate) fn encode_sealed_archive_manifest(
         nonce: manifest.nonce.to_vec(),
         ciphertext: manifest.ciphertext.clone(),
     };
-    serde_cbor::to_vec(&wire)
+    crate::cbor::to_vec(&wire)
         .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: cbor encode manifest: {e}")))
 }
 

@@ -898,7 +898,7 @@ impl CoreImpl {
                 k_text_index_shard,
                 conversation_hash_key,
             )?;
-            let bytes = serde_cbor::to_vec(&built.shard).map_err(|e| {
+            let bytes = crate::cbor::to_vec(&built.shard).map_err(|e| {
                 Error::Storage(format!("upload_search_shards: text shard cbor: {e}"))
             })?;
             match transport.upload_index_shard(&conv_hash_b64, time_bucket, "text", &bytes) {
@@ -925,7 +925,7 @@ impl CoreImpl {
                 k_fuzzy_index_shard,
                 conversation_hash_key,
             )?;
-            let bytes = serde_cbor::to_vec(&built.shard).map_err(|e| {
+            let bytes = crate::cbor::to_vec(&built.shard).map_err(|e| {
                 Error::Storage(format!("upload_search_shards: fuzzy shard cbor: {e}"))
             })?;
             match transport.upload_index_shard(&conv_hash_b64, time_bucket, "fuzzy", &bytes) {
@@ -2061,7 +2061,7 @@ impl CoreImpl {
             crate::crypto::key_hierarchy::KeyMaterial,
         )> = Vec::with_capacity(prefetched.len());
         for ps in prefetched {
-            let shard: SearchIndexShard = serde_cbor::from_slice(&ps.ciphertext).map_err(|e| {
+            let shard: SearchIndexShard = crate::cbor::from_slice(&ps.ciphertext).map_err(|e| {
                 Error::Storage(format!(
                     "fetch_and_restore_cold_shards: shard cbor decode failed for ({conversation_id}, {time_bucket}, {:?}): {e}",
                     ps.shard_type,
@@ -3190,8 +3190,8 @@ impl CoreImpl {
                 .map_err(|e| Error::Storage(e.to_string()))?
         };
         if let Some(bytes) = manifest_cbor {
-            let manifest: crate::formats::manifest::BackupManifest = serde_cbor::from_slice(&bytes)
-                .map_err(|e| {
+            let manifest: crate::formats::manifest::BackupManifest =
+                crate::cbor::from_slice(&bytes).map_err(|e| {
                     Error::Storage(format!(
                         "backup_manifest_chain: failed to CBOR-decode persisted manifest: {e}"
                     ))
@@ -3291,7 +3291,7 @@ impl CoreImpl {
     fn encode_manifest_cbor(
         manifest: &crate::formats::manifest::BackupManifest,
     ) -> Result<Vec<u8>> {
-        serde_cbor::to_vec(manifest).map_err(|e| {
+        crate::cbor::to_vec(manifest).map_err(|e| {
             Error::Storage(format!(
                 "backup_manifest_chain: CBOR encode of manifest failed: {e}"
             ))
@@ -9362,14 +9362,14 @@ mod tests {
         // the message_ids — they must equal the seeded set. The
         // mock's `upload_calls()` returns
         // `(conv_hash, bucket, shard_type, ciphertext)`; the
-        // ciphertext is `serde_cbor::to_vec(&SearchIndexShard)`
+        // ciphertext is `crate::cbor::to_vec(&SearchIndexShard)`
         // (see `CoreImpl::upload_search_shards`).
         let mut covered: BTreeSet<String> = BTreeSet::new();
         for (_conv_hash, _bucket, shard_type, bytes) in transport.upload_calls() {
             if shard_type != "text" {
                 continue;
             }
-            let shard: SearchIndexShard = serde_cbor::from_slice(&bytes).expect("decode shard");
+            let shard: SearchIndexShard = crate::cbor::from_slice(&bytes).expect("decode shard");
             let rows = restore_text_search_shard(&shard, &k_text).expect("open text shard");
             for r in rows {
                 covered.insert(r.message_id);
@@ -9461,13 +9461,13 @@ mod tests {
             &conv_hash_b64,
             bucket,
             "text",
-            serde_cbor::to_vec(&text_built.shard).unwrap(),
+            crate::cbor::to_vec(&text_built.shard).unwrap(),
         );
         transport.stage_index_shard(
             &conv_hash_b64,
             bucket,
             "fuzzy",
-            serde_cbor::to_vec(&fuzzy_built.shard).unwrap(),
+            crate::cbor::to_vec(&fuzzy_built.shard).unwrap(),
         );
         (k_text, k_fuzzy, fts_rows, fuzzy_rows)
     }

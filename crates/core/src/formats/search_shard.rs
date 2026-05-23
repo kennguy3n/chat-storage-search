@@ -165,8 +165,8 @@ mod tests {
     fn shard_round_trips_for_every_index_type() {
         for &it in IndexType::all() {
             let shard = sample_shard(it);
-            let bytes = serde_cbor::to_vec(&shard).expect("encode");
-            let decoded: SearchIndexShard = serde_cbor::from_slice(&bytes).expect("decode");
+            let bytes = crate::cbor::to_vec(&shard).expect("encode");
+            let decoded: SearchIndexShard = crate::cbor::from_slice(&bytes).expect("decode");
             assert_eq!(decoded, shard, "round-trip failed for {it:?}");
         }
     }
@@ -195,11 +195,11 @@ mod tests {
 
     #[test]
     fn distinct_index_types_produce_distinct_cbor() {
-        let bloom = serde_cbor::to_vec(&sample_shard(IndexType::Bloom)).unwrap();
-        let text = serde_cbor::to_vec(&sample_shard(IndexType::Text)).unwrap();
-        let fuzzy = serde_cbor::to_vec(&sample_shard(IndexType::Fuzzy)).unwrap();
-        let vector = serde_cbor::to_vec(&sample_shard(IndexType::Vector)).unwrap();
-        let media = serde_cbor::to_vec(&sample_shard(IndexType::Media)).unwrap();
+        let bloom = crate::cbor::to_vec(&sample_shard(IndexType::Bloom)).unwrap();
+        let text = crate::cbor::to_vec(&sample_shard(IndexType::Text)).unwrap();
+        let fuzzy = crate::cbor::to_vec(&sample_shard(IndexType::Fuzzy)).unwrap();
+        let vector = crate::cbor::to_vec(&sample_shard(IndexType::Vector)).unwrap();
+        let media = crate::cbor::to_vec(&sample_shard(IndexType::Media)).unwrap();
         // No two encodings should match — the discriminant alone is
         // enough to disambiguate, and the seed-derived bytes
         // reinforce the split.
@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn index_type_round_trips_via_lowercase_string() {
         for &it in IndexType::all() {
-            let bytes = serde_cbor::to_vec(&it).expect("encode");
-            let decoded: IndexType = serde_cbor::from_slice(&bytes).expect("decode");
+            let bytes = crate::cbor::to_vec(&it).expect("encode");
+            let decoded: IndexType = crate::cbor::from_slice(&bytes).expect("decode");
             assert_eq!(decoded, it);
         }
     }

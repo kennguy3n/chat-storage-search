@@ -169,7 +169,7 @@ pub fn decrypt_archive_segment(
 /// alternative payload shapes (skeleton-only segments, search
 /// shard segments, etc.) once those land.
 pub fn decode_archive_segment<T: DeserializeOwned>(plaintext_cbor: &[u8]) -> Result<T, Error> {
-    let payload: T = serde_cbor::from_slice(plaintext_cbor)
+    let payload: T = crate::cbor::from_slice(plaintext_cbor)
         .map_err(|e| Error::Storage(format!("archive segment cbor decode: {e}")))?;
     Ok(payload)
 }
@@ -633,7 +633,7 @@ mod tests {
             events: payload.events.clone(),
         };
         tampered.events.clear();
-        let cbor = serde_cbor::to_vec(&tampered).unwrap();
+        let cbor = crate::cbor::to_vec(&tampered).unwrap();
         let err = decode_archive_segment_payload(&cbor).unwrap_err();
         match err {
             Error::Storage(msg) => assert!(msg.contains("magic mismatch"), "got {msg}"),
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_archive_segment_generic_round_trips_through_serde_cbor() {
+    fn decode_archive_segment_generic_round_trips_through_canonical_cbor() {
         let k = [0x99u8; 32];
         let (_segment_id, blob, expected_payload) = build_blob(&k);
         let plaintext = decrypt_archive_segment(&blob, &k).unwrap();

@@ -410,7 +410,7 @@ mod tests {
             ),
         ];
         for (variant, tag) in pinned {
-            // Use serde_cbor's diagnostic-shaped representation: the
+            // Use the canonical CBOR diagnostic-shaped representation: the
             // top-level CBOR map for an externally-tagged variant is
             // `{ "<tag>": <inner> }` for variants with payload, and a
             // bare string for unit variants. We only need to confirm

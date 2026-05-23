@@ -106,8 +106,8 @@ mod tests {
     #[test]
     fn media_descriptor_round_trips_through_cbor() {
         let desc = sample(0x07);
-        let bytes = serde_cbor::to_vec(&desc).expect("encode");
-        let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = crate::cbor::to_vec(&desc).expect("encode");
+        let decoded: MediaDescriptor = crate::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, desc);
     }
 
@@ -115,8 +115,8 @@ mod tests {
     fn distinct_descriptors_produce_distinct_cbor() {
         let a = sample(0x01);
         let b = sample(0x02);
-        let bytes_a = serde_cbor::to_vec(&a).unwrap();
-        let bytes_b = serde_cbor::to_vec(&b).unwrap();
+        let bytes_a = crate::cbor::to_vec(&a).unwrap();
+        let bytes_b = crate::cbor::to_vec(&b).unwrap();
         assert_ne!(bytes_a, bytes_b);
     }
 
@@ -138,8 +138,8 @@ mod tests {
             wrapped_k_asset: (0..40u8).collect(),
             storage_sink: Some("icloud".to_string()),
         };
-        let bytes = serde_cbor::to_vec(&desc).unwrap();
-        let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).unwrap();
+        let bytes = crate::cbor::to_vec(&desc).unwrap();
+        let decoded: MediaDescriptor = crate::cbor::from_slice(&bytes).unwrap();
         assert_eq!(decoded.asset_id, desc.asset_id);
         assert_eq!(decoded.mime_type, desc.mime_type);
         assert_eq!(decoded.bytes_total, desc.bytes_total);
@@ -177,8 +177,8 @@ mod tests {
             blob_id: Uuid::now_v7(),
             wrapped_k_asset: vec![0x99; 40],
         };
-        let bytes = serde_cbor::to_vec(&legacy).unwrap();
-        let decoded: MediaDescriptor = serde_cbor::from_slice(&bytes).unwrap();
+        let bytes = crate::cbor::to_vec(&legacy).unwrap();
+        let decoded: MediaDescriptor = crate::cbor::from_slice(&bytes).unwrap();
         assert!(decoded.storage_sink.is_none());
         assert_eq!(decoded.asset_id, legacy.asset_id);
         assert_eq!(decoded.bytes_total, legacy.bytes_total);
@@ -189,7 +189,7 @@ mod tests {
         // Same probe as the BackupSegmentFrame test: a 32-byte
         // byte-string is `0x58 0x20 …` in CBOR.
         let desc = sample(0xAA);
-        let bytes = serde_cbor::to_vec(&desc).unwrap();
+        let bytes = crate::cbor::to_vec(&desc).unwrap();
         assert!(
             bytes.windows(2).any(|w| w == [0x58, 0x20]),
             "expected CBOR byte-string header for the 32-byte Merkle root, got {:02x?}",

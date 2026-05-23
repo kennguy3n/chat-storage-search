@@ -437,7 +437,7 @@ impl ZkofDedupAnalytics {
     }
 
     fn parse_stats(bytes: &[u8]) -> Result<DedupStats> {
-        let parsed: DedupStats = serde_cbor::from_slice(bytes)
+        let parsed: DedupStats = crate::cbor::from_slice(bytes)
             .map_err(|e| crate::Error::Storage(format!("dedup snapshot parse: {e}")))?;
         Ok(parsed)
     }
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn zkof_dedup_analytics_query_stats_parses_cbor_snapshot() {
         let upstream = DedupStats::from_counts(100, 60, 1024, 614);
-        let bytes = serde_cbor::to_vec(&upstream).unwrap();
+        let bytes = crate::cbor::to_vec(&upstream).unwrap();
         let s3 = Arc::new(MockSnapshotS3 { snapshot: bytes });
         let probe = ZkofDedupAnalytics::new(s3, "tenant-bucket".into());
         let got = probe.query_dedup_ratio("tenant-1").unwrap();
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn zkof_dedup_analytics_query_savings_computes_savings() {
         let upstream = DedupStats::from_counts(100, 60, 1024, 614);
-        let bytes = serde_cbor::to_vec(&upstream).unwrap();
+        let bytes = crate::cbor::to_vec(&upstream).unwrap();
         let s3 = Arc::new(MockSnapshotS3 { snapshot: bytes });
         let probe = ZkofDedupAnalytics::new(s3, "tenant-bucket".into());
         let savings = probe.query_storage_savings("tenant-1").unwrap();

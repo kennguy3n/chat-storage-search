@@ -256,7 +256,7 @@ pub const MIGRATION_V2_SQL: &str = r#"
 -- via `BackupManifestBuildRequest::previous`; a missing row is
 -- the explicit "genesis manifest" signal.
 --
--- `manifest_cbor` is the canonical `serde_cbor` encoding of
+-- `manifest_cbor` is the canonical CBOR encoding (via `ciborium`) of
 -- `kchat_core::formats::manifest::BackupManifest`. Stored as a
 -- BLOB so it round-trips losslessly across version upgrades —
 -- the encoder is pinned in `crate::formats::manifest`.

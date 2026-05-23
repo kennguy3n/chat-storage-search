@@ -177,12 +177,12 @@ fn backup_restore_multilingual_corpus_round_trip() {
             event_type: BackupEventType::MessageReceived,
             conversation_id: Some(conv_id),
             message_id: Some(mid),
-            payload: serde_cbor::to_vec(&serde_cbor::value::Value::Array(vec![
-                serde_cbor::value::Value::Text(mid.to_string()),
-                serde_cbor::value::Value::Text(conv_id.to_string()),
-                serde_cbor::value::Value::Text(entry.sender.into()),
-                serde_cbor::value::Value::Integer(ts_ms as i128),
-                serde_cbor::value::Value::Text(entry.text.into()),
+            payload: kchat_core::cbor::to_vec(&kchat_core::cbor::Value::Array(vec![
+                kchat_core::cbor::Value::Text(mid.to_string()),
+                kchat_core::cbor::Value::Text(conv_id.to_string()),
+                kchat_core::cbor::Value::Text(entry.sender.into()),
+                kchat_core::cbor::Value::Integer(kchat_core::cbor::Integer::from(ts_ms)),
+                kchat_core::cbor::Value::Text(entry.text.into()),
             ]))
             .expect("cbor"),
             created_at_ms: ts_ms,
@@ -306,10 +306,10 @@ fn backup_restore_multilingual_corpus_round_trip() {
     // CBOR payloads round-trip through `recent_bodies`.
     assert_eq!(summary.recent_bodies.len(), 8);
     for body in &summary.recent_bodies {
-        let value: serde_cbor::value::Value =
-            serde_cbor::from_slice(&body.payload).expect("cbor decode");
+        let value: kchat_core::cbor::Value =
+            kchat_core::cbor::from_slice(&body.payload).expect("cbor decode");
         match value {
-            serde_cbor::value::Value::Array(parts) => {
+            kchat_core::cbor::Value::Array(parts) => {
                 assert_eq!(parts.len(), 5, "expected 5-element CBOR array");
             }
             other => panic!("unexpected payload shape: {other:?}"),

@@ -1003,8 +1003,9 @@ pub(crate) fn encode_event_payload(
     created_at_ms: i64,
 ) -> Vec<u8> {
     // Hand-rolled, dependency-free CBOR encoder for the small fixed
-    // shape used here. Avoids leaning on `serde_cbor` for one writer
-    // path and is exercised by the persister tests below.
+    // shape used here. Avoids leaning on the generic CBOR codec
+    // (`crate::cbor`) for one writer path and is exercised by the
+    // persister tests below.
     let mut out = Vec::with_capacity(64);
     // Array of 4
     out.push(0x84);

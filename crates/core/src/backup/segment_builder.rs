@@ -123,7 +123,7 @@ impl BackupSegmentBuilder {
             magic: BACKUP_SEGMENT_PAYLOAD_MAGIC.to_vec(),
             events: request.events.clone(),
         };
-        let cbor = serde_cbor::to_vec(&payload)
+        let cbor = crate::cbor::to_vec(&payload)
             .map_err(|e| Error::Storage(format!("backup segment cbor encode: {e}")))?;
 
         // 2) Compute the integrity root over the CBOR payload —
@@ -187,7 +187,7 @@ pub fn decrypt_backup_segment(
     .map_err(Error::Crypto)?;
     let cbor = zstd::stream::decode_all(&compressed[..])
         .map_err(|e| Error::Storage(format!("backup segment zstd decode: {e}")))?;
-    let payload: BackupSegmentPayload = serde_cbor::from_slice(&cbor)
+    let payload: BackupSegmentPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("backup segment cbor decode: {e}")))?;
     if payload.magic != BACKUP_SEGMENT_PAYLOAD_MAGIC {
         return Err(Error::Storage(
@@ -361,8 +361,8 @@ mod tests {
             magic: BACKUP_SEGMENT_PAYLOAD_MAGIC.to_vec(),
             events: sample_events(4),
         };
-        let bytes = serde_cbor::to_vec(&payload).unwrap();
-        let back: BackupSegmentPayload = serde_cbor::from_slice(&bytes).unwrap();
+        let bytes = crate::cbor::to_vec(&payload).unwrap();
+        let back: BackupSegmentPayload = crate::cbor::from_slice(&bytes).unwrap();
         assert_eq!(back, payload);
     }
 }
