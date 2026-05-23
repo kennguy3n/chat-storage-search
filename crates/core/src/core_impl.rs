@@ -2424,11 +2424,19 @@ impl CoreImpl {
     //   new_messages      new_messages       result.new_messages
     //   duplicate_count   duplicate_count    result.duplicate_count
     //   embeddings_computed embeddings_computed running counter
+    //   error             error              `Err(_).to_string()` on the
+    //                                        early-return path
     //
     // Keeping the two surfaces aligned means a dashboard consumer
     // can read the same value off either source without a rename
     // table, and saves a maintainer from chasing two different
-    // names for the same thing.
+    // names for the same thing. The `error` field is declared
+    // `tracing::field::Empty` so the success path leaves it
+    // unset; on error we `Span::current().record("error", ...)`
+    // immediately before propagating the failure, mirroring the
+    // PerfTrace `error` metadata so logcat / os_log / stderr
+    // subscribers see the same diagnostic the in-app perf
+    // collector does.
     #[tracing::instrument(
         skip(self, messages),
         fields(
@@ -2436,6 +2444,7 @@ impl CoreImpl {
             new_messages = tracing::field::Empty,
             duplicate_count = tracing::field::Empty,
             embeddings_computed = tracing::field::Empty,
+            error = tracing::field::Empty,
         ),
     )]
     pub fn ingest_messages(&self, messages: &[IngestedMessage]) -> Result<IngestResult> {
@@ -2462,7 +2471,9 @@ impl CoreImpl {
         let db = match self.db.lock().map_err(poisoned) {
             Ok(db) => db,
             Err(e) => {
-                trace.insert_metadata("error", e.to_string());
+                let err_str = e.to_string();
+                trace.insert_metadata("error", err_str.clone());
+                span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 return Err(e);
@@ -2491,7 +2502,9 @@ impl CoreImpl {
                 }
                 Err(ProcessorError::DuplicateMessage) => result.duplicate_count += 1,
                 Err(e) => {
-                    trace.insert_metadata("error", e.to_string());
+                    let err_str = e.to_string();
+                    trace.insert_metadata("error", err_str.clone());
+                    span.record("error", err_str.as_str());
                     trace.finish();
                     self.record_perf_trace(trace);
                     return Err(Error::Message(e.to_string()));
@@ -4285,16 +4298,18 @@ impl KChatCore for CoreImpl {
     }
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
-    // below (`query_len`, `scope`, `result_count`) so dashboards
-    // can read either surface interchangeably. The deferred
-    // `result_count` is recorded via `Span::current().record` at
-    // the same point the PerfTrace metadata is written.
+    // below (`query_len`, `scope`, `result_count`, `error`) so
+    // dashboards can read either surface interchangeably. The
+    // deferred `result_count` / `error` are recorded via
+    // `Span::current().record` at the same point the PerfTrace
+    // metadata is written.
     #[tracing::instrument(
         skip(self, query),
         fields(
             query_len = query.query_string.len(),
             scope = ?scope,
             result_count = tracing::field::Empty,
+            error = tracing::field::Empty,
         ),
     )]
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
@@ -4303,6 +4318,7 @@ impl KChatCore for CoreImpl {
         // (input characters), `scope`, and the resulting hit
         // count. The trace ends after the cold-hit enqueue so a
         // collector sees the wall-clock that the UI sees.
+        let span = tracing::Span::current();
         let mut trace = crate::perf::PerfTrace::new("search");
         trace.insert_metadata("query_len", query.query_string.len().to_string());
         trace.insert_metadata(
@@ -4316,7 +4332,9 @@ impl KChatCore for CoreImpl {
         let db = match self.db.lock().map_err(poisoned) {
             Ok(db) => db,
             Err(e) => {
-                trace.insert_metadata("error", e.to_string());
+                let err_str = e.to_string();
+                trace.insert_metadata("error", err_str.clone());
+                span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 return Err(e);
@@ -4326,7 +4344,9 @@ impl KChatCore for CoreImpl {
         let results = match engine.execute_search(&query, &scope) {
             Ok(r) => r,
             Err(e) => {
-                trace.insert_metadata("error", e.to_string());
+                let err_str = e.to_string();
+                trace.insert_metadata("error", err_str.clone());
+                span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 return Err(Error::Search(e.to_string()));
@@ -4661,9 +4681,9 @@ impl KChatCore for CoreImpl {
     }
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
-    // below (`reason`, `is_cold`, `offline`). Deferred fields are
-    // filled in via `Span::current().record` next to the matching
-    // `trace.insert_metadata` calls below.
+    // below (`reason`, `is_cold`, `offline`, `error`). Deferred
+    // fields are filled in via `Span::current().record` next to
+    // the matching `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
         fields(
@@ -4671,6 +4691,7 @@ impl KChatCore for CoreImpl {
             reason,
             is_cold = tracing::field::Empty,
             offline = tracing::field::Empty,
+            error = tracing::field::Empty,
         ),
     )]
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage> {
@@ -4772,7 +4793,9 @@ impl KChatCore for CoreImpl {
             })
         })();
         if let Err(e) = result.as_ref() {
-            trace.insert_metadata("error", e.to_string());
+            let err_str = e.to_string();
+            trace.insert_metadata("error", err_str.clone());
+            tracing::Span::current().record("error", err_str.as_str());
         }
         trace.finish();
         self.record_perf_trace(trace);
@@ -4781,8 +4804,8 @@ impl KChatCore for CoreImpl {
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
     // below (`reason`, `deferred`, `segments_built`,
-    // `events_segmented`). Deferred fields are filled in via
-    // `Span::current().record` next to the matching
+    // `events_segmented`, `error`). Deferred fields are filled
+    // in via `Span::current().record` next to the matching
     // `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
@@ -4791,6 +4814,7 @@ impl KChatCore for CoreImpl {
             deferred = tracing::field::Empty,
             segments_built = tracing::field::Empty,
             events_segmented = tracing::field::Empty,
+            error = tracing::field::Empty,
         ),
     )]
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
@@ -4821,7 +4845,9 @@ impl KChatCore for CoreImpl {
         let (mut result, _sealed) = match self.run_incremental_backup_inner(reason) {
             Ok(pair) => pair,
             Err(e) => {
-                trace.insert_metadata("error", e.to_string());
+                let err_str = e.to_string();
+                trace.insert_metadata("error", err_str.clone());
+                tracing::Span::current().record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 return Err(e);
@@ -4841,8 +4867,8 @@ impl KChatCore for CoreImpl {
 
     // Field names mirror the `PerfTrace::insert_metadata` keys
     // below (`reason`, `pressure_level`, `freed_bytes`,
-    // `evicted_count`). Deferred fields are filled in via
-    // `Span::current().record` next to the matching
+    // `evicted_count`, `error`). Deferred fields are filled in
+    // via `Span::current().record` next to the matching
     // `trace.insert_metadata` calls below.
     #[tracing::instrument(
         skip(self),
@@ -4851,6 +4877,7 @@ impl KChatCore for CoreImpl {
             pressure_level = tracing::field::Empty,
             evicted_count = tracing::field::Empty,
             freed_bytes = tracing::field::Empty,
+            error = tracing::field::Empty,
         ),
     )]
     fn enforce_storage_budget(&self, reason: &str) -> Result<OffloadResult> {
@@ -4956,7 +4983,9 @@ impl KChatCore for CoreImpl {
                 Ok(out)
             }
             Err(e) => {
-                trace.insert_metadata("error", e.to_string());
+                let err_str = e.to_string();
+                trace.insert_metadata("error", err_str.clone());
+                tracing::Span::current().record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 Err(e)
