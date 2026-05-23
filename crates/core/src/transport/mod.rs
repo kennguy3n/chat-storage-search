@@ -111,7 +111,7 @@ pub struct FetchResult {
 /// Transport-layer abstraction over the MLS delivery store.
 ///
 /// **Object-safe.** The trait carries no generic methods and no
-/// `Self`-typed return values, so `Box<dyn DeliveryClient>` is a
+/// `Self`-typed return values, so `Arc<dyn DeliveryClient>` is a
 /// valid type — that's exactly how
 /// [`crate::core_impl::CoreImpl::with_transport`] receives the
 /// implementation.
@@ -251,8 +251,8 @@ mod tests {
     fn delivery_client_is_object_safe() {
         // Compile-time check: trait must support dynamic dispatch
         // for `CoreImpl::with_transport` to take a
-        // `Box<dyn DeliveryClient>`.
-        let _b: Box<dyn DeliveryClient> = Box::new(MockDeliveryClient::new());
+        // `Arc<dyn DeliveryClient>`.
+        let _a: std::sync::Arc<dyn DeliveryClient> = std::sync::Arc::new(MockDeliveryClient::new());
     }
 
     #[test]
@@ -428,7 +428,7 @@ pub type TransportResult<T> = crate::Result<T>;
 /// HTTP / gRPC / MLS-blob clients land.
 ///
 /// **Object-safe.** No generic methods, no `Self`-typed return
-/// values, so `Box<dyn TransportClient>` is a valid type. Callers
+/// values, so `Arc<dyn TransportClient>` is a valid type. Callers
 /// are expected to inject the trait object the same way
 /// [`crate::core_impl::CoreImpl::with_transport`] receives the
 /// narrow [`DeliveryClient`].

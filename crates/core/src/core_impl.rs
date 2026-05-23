@@ -201,12 +201,21 @@ pub struct CoreImpl {
     /// can re-open the database at a different `data_dir` without
     /// requiring the caller to re-supply the key.
     key: Zeroizing<[u8; 32]>,
-    /// Optional MLS delivery-store client. When `None`,
+    /// Phase-2 MLS delivery-store client used by
+    /// [`KChatCore::ingest_remote_messages`] to pull staged
+    /// frames. Write-once via
+    /// [`CoreImpl::with_transport`] /
+    /// [`CoreImpl::set_delivery_client`]; when not installed,
     /// [`KChatCore::ingest_remote_messages`] returns
-    /// [`Error::Transport`] — see
-    /// [`CoreImpl::with_transport`] / [`CoreImpl::set_delivery_client`]
-    /// for how callers wire one in.
-    delivery_client: Mutex<Option<Box<dyn DeliveryClient>>>,
+    /// [`Error::Transport`]. The delivery client holds an MLS
+    /// group-state cursor that cannot be swapped live without
+    /// invalidating in-flight `ingest_remote_messages` calls.
+    /// Held in [`OnceLock`] so the lookup inside
+    /// `ingest_remote_messages` is a lock-free atomic load
+    /// instead of a mutex held across the (potentially
+    /// I/O-bound) `fetch_messages` call. Tests that need a
+    /// different client construct a fresh [`CoreImpl`].
+    delivery_client: OnceLock<Arc<dyn DeliveryClient>>,
     /// Phase-3 hydration priority queue. `hydrate_message`
     /// enqueues a request before serving from local storage so
     /// the orchestration layer can later pop pending fetches in
@@ -267,12 +276,20 @@ pub struct CoreImpl {
     /// `OnceCell`) so tests can install / re-install in the same
     /// process without spinning up a fresh core.
     zkof_archive: Mutex<Option<ZkofArchiveBackend>>,
-    /// Phase-5 background scheduler bridge. `None` until
-    /// [`CoreImpl::install_scheduler`] is called by the platform
-    /// glue (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
-    /// orchestration layer treats `None` as "no scheduler
-    /// available — run maintenance loops on demand only".
-    scheduler: Mutex<Option<Box<dyn crate::scheduler::BackgroundScheduler>>>,
+    /// Phase-5 background scheduler bridge. Write-once via
+    /// [`CoreImpl::install_scheduler`] by the platform glue
+    /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
+    /// orchestration layer treats "not installed" as "no
+    /// scheduler available — run maintenance loops on demand
+    /// only". Held in [`OnceLock`] because the platform task
+    /// scheduler is a process-singleton (only one
+    /// `BGTaskScheduler` instance exists per app on iOS, and
+    /// `WorkManager` is similarly process-scoped on Android);
+    /// swapping it live would leak the previous bridge's
+    /// submitted task identifiers. Lock-free reads on the
+    /// [`Self::submit_media_migration_plan`] /
+    /// `schedule_periodic_storage_budget_check` paths.
+    scheduler: OnceLock<Arc<dyn crate::scheduler::BackgroundScheduler>>,
     /// Phase-6 on-device text-embedding seam. Write-once via
     /// [`CoreImpl::install_text_embedder`]. When set, the
     /// message-ingest path computes XLM-R embeddings on every
@@ -362,8 +379,7 @@ pub struct CoreImpl {
     /// See `crates/core/src/transport/dedup_analytics.rs` for the
     /// privacy contract. Held in [`OnceLock`] for lock-free
     /// dashboard / dedup-event reads.
-    dedup_analytics:
-        OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
+    dedup_analytics: OnceLock<Arc<dyn crate::transport::dedup_analytics::DedupAnalytics>>,
     /// Phase-8 multi-scope search resolver. Write-once via
     /// [`CoreImpl::install_conversation_group_resolver`]; the
     /// query engine treats "not installed" as the default
@@ -394,13 +410,16 @@ pub struct CoreImpl {
     /// process-singleton reasons as [`Self::spotlight_anchor`].
     windows_search_anchor: OnceLock<Arc<dyn crate::desktop_index::WindowsSearchAnchor>>,
     /// Phase-7 (2026-05-04 batch 10 — Task 8) on-device EP
-    /// benchmark runner. `None` until
-    /// [`CoreImpl::install_ep_benchmark_runner`] is called. When
-    /// set, [`CoreImpl::run_ep_benchmark`] forwards calls into
-    /// the installed runner so the platform bridge can supply a
-    /// real `ort::Session`-backed implementation.
-    ep_benchmark_runner:
-        Mutex<Option<std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>>,
+    /// benchmark runner. Write-once via
+    /// [`CoreImpl::install_ep_benchmark_runner`]. When set,
+    /// [`CoreImpl::run_ep_benchmark`] forwards calls into the
+    /// installed runner so the platform bridge can supply a real
+    /// `ort::Session`-backed implementation. Held in
+    /// [`OnceLock`] so [`Self::run_ep_benchmark`] dispatches
+    /// without acquiring a mutex on every benchmark call — the
+    /// platform bridge installs one runner at boot and the
+    /// underlying ONNX session is a per-process resource.
+    ep_benchmark_runner: OnceLock<Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>>,
     /// Phase-7 (2026-05-04 batch 10 — Task 8) persistent EP
     /// benchmark cache. Defaults to an empty cache; the
     /// orchestration layer can swap a loaded cache via
@@ -546,14 +565,14 @@ impl CoreImpl {
             db_writer: Mutex::new(db),
             db_readers,
             key: Zeroizing::new(key),
-            delivery_client: Mutex::new(None),
+            delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive: Mutex::new(None),
-            scheduler: Mutex::new(None),
+            scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
             ocr_bridge: OnceLock::new(),
@@ -567,7 +586,7 @@ impl CoreImpl {
             conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
-            ep_benchmark_runner: Mutex::new(None),
+            ep_benchmark_runner: OnceLock::new(),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
         core.hydrate_backup_manifest_from_db()?;
@@ -598,14 +617,14 @@ impl CoreImpl {
             db_writer: Mutex::new(db),
             db_readers,
             key: Zeroizing::new(key),
-            delivery_client: Mutex::new(None),
+            delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive: Mutex::new(None),
-            scheduler: Mutex::new(None),
+            scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
             ocr_bridge: OnceLock::new(),
@@ -619,7 +638,7 @@ impl CoreImpl {
             conversation_group_resolver: OnceLock::new(),
             spotlight_anchor: OnceLock::new(),
             windows_search_anchor: OnceLock::new(),
-            ep_benchmark_runner: Mutex::new(None),
+            ep_benchmark_runner: OnceLock::new(),
             ep_benchmark_cache: Mutex::new(crate::models::ep_tuning::EpBenchmarkCache::new()),
         };
         core.hydrate_backup_manifest_from_db()?;
@@ -633,20 +652,26 @@ impl CoreImpl {
     pub fn with_transport(
         config: KChatCoreConfig,
         key: [u8; 32],
-        client: Box<dyn DeliveryClient>,
+        client: Arc<dyn DeliveryClient>,
     ) -> Result<Self> {
         let core = Self::new(config, key)?;
-        core.set_delivery_client(client);
+        core.set_delivery_client(client)?;
         Ok(core)
     }
 
-    /// Install (or replace) the MLS delivery-store client used by
-    /// [`KChatCore::ingest_remote_messages`].
-    pub fn set_delivery_client(&self, client: Box<dyn DeliveryClient>) {
-        *self
-            .delivery_client
-            .lock()
-            .expect("delivery client mutex poisoned") = Some(client);
+    /// Install the MLS delivery-store client used by
+    /// [`KChatCore::ingest_remote_messages`]. Write-once: returns
+    /// [`Error::Storage`] if a client has already been installed.
+    /// The delivery client holds an MLS group-state cursor;
+    /// replacing it live would invalidate any in-flight
+    /// `ingest_remote_messages` call. Tests that need a different
+    /// client construct a fresh [`CoreImpl`] instead.
+    pub fn set_delivery_client(&self, client: Arc<dyn DeliveryClient>) -> Result<()> {
+        self.delivery_client.set(client).map_err(|_| {
+            Error::Storage(
+                "delivery_client already installed (set_delivery_client is write-once)".into(),
+            )
+        })
     }
 
     /// Number of pending hydration requests in the priority queue.
@@ -1399,8 +1424,7 @@ impl CoreImpl {
         config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
     ) -> Result<()> {
         config.validate()?;
-        *self.zkof_archive.lock().map_err(poisoned)? =
-            Some(ZkofArchiveBackend { s3, config });
+        *self.zkof_archive.lock().map_err(poisoned)? = Some(ZkofArchiveBackend { s3, config });
         Ok(())
     }
 
@@ -1409,25 +1433,26 @@ impl CoreImpl {
     /// `WorkManager` on Android) that fills in the
     /// [`crate::scheduler::BackgroundScheduler`] trait.
     ///
-    /// Re-installing replaces the previous bridge — the
-    /// orchestration layer is responsible for cancelling any
-    /// outstanding tasks on the old bridge first via
-    /// [`crate::scheduler::BackgroundScheduler::cancel_all`].
+    /// Write-once: returns [`Error::Storage`] if a scheduler has
+    /// already been installed. The platform scheduler is a
+    /// process-singleton (only one `BGTaskScheduler` instance
+    /// exists per iOS app, and `WorkManager` is similarly
+    /// process-scoped); swapping it live would leak the previous
+    /// bridge's submitted task identifiers. Tests that need a
+    /// different scheduler construct a fresh [`CoreImpl`].
     pub fn install_scheduler(
         &self,
-        scheduler: Box<dyn crate::scheduler::BackgroundScheduler>,
+        scheduler: Arc<dyn crate::scheduler::BackgroundScheduler>,
     ) -> Result<()> {
-        *self.scheduler.lock().map_err(poisoned)? = Some(scheduler);
-        Ok(())
+        self.scheduler.set(scheduler).map_err(|_| {
+            Error::Storage("scheduler already installed (install_scheduler is write-once)".into())
+        })
     }
 
     /// Whether [`Self::install_scheduler`] has been called with a
     /// real bridge.
     pub fn has_scheduler(&self) -> bool {
-        self.scheduler
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.scheduler.get().is_some()
     }
 
     // ----------------------------------------------------------------
@@ -1521,19 +1546,20 @@ impl CoreImpl {
     /// [`crate::models::ep_tuning::MockEpBenchmarkRunner`].
     pub fn install_ep_benchmark_runner(
         &self,
-        runner: std::sync::Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
+        runner: Arc<dyn crate::models::ep_tuning::EpBenchmarkRunner>,
     ) -> Result<()> {
-        *self.ep_benchmark_runner.lock().map_err(poisoned)? = Some(runner);
-        Ok(())
+        self.ep_benchmark_runner.set(runner).map_err(|_| {
+            Error::Storage(
+                "ep_benchmark_runner already installed (install_ep_benchmark_runner is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_ep_benchmark_runner`] has been
     /// called.
     pub fn has_ep_benchmark_runner(&self) -> bool {
-        self.ep_benchmark_runner
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.ep_benchmark_runner.get().is_some()
     }
 
     /// Run a benchmark for `(model, ep)` via the installed
@@ -1544,8 +1570,8 @@ impl CoreImpl {
         ep: crate::models::ep_tuning::ExecutionProvider,
         model: &crate::models::model_manager::ModelArtifact,
     ) -> Result<crate::models::ep_tuning::EpBenchmark> {
-        let runner = match self.ep_benchmark_runner.lock().map_err(poisoned)?.as_ref() {
-            Some(r) => std::sync::Arc::clone(r),
+        let runner = match self.ep_benchmark_runner.get() {
+            Some(r) => Arc::clone(r),
             None => return Err(Error::NotImplemented("ep_benchmark_runner")),
         };
         runner.run_benchmark(ep, model)
@@ -1666,14 +1692,9 @@ impl CoreImpl {
     /// the same bridge with no serialisation. Write-once:
     /// returns [`Error::Storage`] if an OCR bridge has already
     /// been installed.
-    pub fn install_ocr_bridge(
-        &self,
-        bridge: Arc<dyn crate::models::ocr::OcrBridge>,
-    ) -> Result<()> {
+    pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
         self.ocr_bridge.set(bridge).map_err(|_| {
-            Error::Storage(
-                "ocr_bridge already installed (install_ocr_bridge is write-once)".into(),
-            )
+            Error::Storage("ocr_bridge already installed (install_ocr_bridge is write-once)".into())
         })
     }
 
@@ -2075,11 +2096,10 @@ impl CoreImpl {
         if plan.items.is_empty() {
             return Ok(false);
         }
-        let scheduler_guard = self.scheduler.lock().map_err(poisoned)?;
-        let scheduler = match scheduler_guard.as_ref() {
-            Some(s) => s,
-            None => return Err(Error::NotImplemented("scheduler")),
-        };
+        let scheduler = self
+            .scheduler
+            .get()
+            .ok_or(Error::NotImplemented("scheduler"))?;
         let snapshot = crate::scheduler::MediaMigrationPlanSnapshot::from_plan(plan);
         scheduler
             .schedule_one_off_task(
@@ -2124,13 +2144,13 @@ impl CoreImpl {
         // at boot. The resolver itself does not touch the DB; it
         // only translates a `SearchTarget` into a conversation-id
         // set inside `execute_search_with_target`.
-        let resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver> =
-            match self.conversation_group_resolver.get() {
-                Some(r) => Arc::clone(r),
-                None => Arc::new(
-                    crate::search::search_target::NoopConversationGroupResolver::new(),
-                ),
-            };
+        let resolver: Arc<dyn crate::search::search_target::ConversationGroupResolver> = match self
+            .conversation_group_resolver
+            .get()
+        {
+            Some(r) => Arc::clone(r),
+            None => Arc::new(crate::search::search_target::NoopConversationGroupResolver::new()),
+        };
         // SELECT-only path — route through the reader pool so we
         // match the other search entry points (`search`,
         // `search_and_prefetch_cold`, `search_with_cold_source`,
@@ -4466,17 +4486,12 @@ impl KChatCore for CoreImpl {
         after_cursor: Option<DeliveryCursor>,
     ) -> Result<IngestResult> {
         let span = tracing::Span::current();
-        // Snapshot the configured delivery client. We hold the
-        // mutex only for the duration of the fetch dispatch so the
-        // database mutex below can be acquired without nesting.
+        // Snapshot the configured delivery client via a lock-free
+        // atomic load on the [`OnceLock`]. The fetch dispatch
+        // happens outside any subsystem lock so the database
+        // mutex below can be acquired without nesting.
         let fetch = {
-            let guard = self.delivery_client.lock().map_err(|e| {
-                let err = poisoned(e);
-                let err_str = err.to_string();
-                span.record("error", err_str.as_str());
-                err
-            })?;
-            let client = guard.as_ref().ok_or_else(|| {
+            let client = self.delivery_client.get().ok_or_else(|| {
                 let err = Error::Transport("no delivery client configured".to_string());
                 let err_str = err.to_string();
                 span.record("error", err_str.as_str());
@@ -6318,7 +6333,8 @@ mod tests {
             next_cursor: Some("after-3".into()),
         };
         let mock = crate::transport::MockDeliveryClient::new().with_response(None, Ok(staged));
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -6361,7 +6377,8 @@ mod tests {
                     next_cursor: None,
                 }),
             );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r1 = core.ingest_remote_messages(conv, None).unwrap();
         assert_eq!(r1.new_messages, 2);
@@ -6392,7 +6409,8 @@ mod tests {
             Some("cursor-from-caller"),
             Ok(crate::transport::FetchResult::default()),
         );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let cursor = DeliveryCursor("cursor-from-caller".to_string());
         let r = core
@@ -6418,7 +6436,8 @@ mod tests {
             next_cursor: Some("cursor-abc".into()),
         };
         let mock = crate::transport::MockDeliveryClient::new().with_response(None, Ok(staged));
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -6440,7 +6459,8 @@ mod tests {
                 next_cursor: None,
             }),
         );
-        core.set_delivery_client(Box::new(mock));
+        core.set_delivery_client(Arc::new(mock))
+            .expect("install delivery client");
 
         let r = core
             .ingest_remote_messages(conv, None)
@@ -11482,7 +11502,7 @@ mod tests {
     #[test]
     fn schedule_media_migration_returns_false_for_empty_plan() {
         let core = fresh_core();
-        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        let scheduler = Arc::new(crate::scheduler::InProcessScheduler::new());
         core.install_scheduler(scheduler)
             .expect("install scheduler");
 
@@ -11564,7 +11584,7 @@ mod tests {
         }
 
         let shared = SharedScheduler(scheduler.clone());
-        core.install_scheduler(Box::new(shared))
+        core.install_scheduler(Arc::new(shared))
             .expect("install scheduler");
 
         let plan = crate::media::migration::MediaMigrationPlan {
@@ -11645,7 +11665,7 @@ mod tests {
     #[test]
     fn enforce_storage_budget_skips_migration_when_not_configured() {
         let core = fresh_core();
-        let scheduler = Box::new(crate::scheduler::InProcessScheduler::new());
+        let scheduler = Arc::new(crate::scheduler::InProcessScheduler::new());
         core.install_scheduler(scheduler)
             .expect("install scheduler");
 
