@@ -29,7 +29,7 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo bench -p kchat-core --bench phase8_benchmarks
+//! cargo bench -p kchat-core --features test-support --bench phase8_benchmarks
 //! ```
 
 use std::collections::HashMap;
