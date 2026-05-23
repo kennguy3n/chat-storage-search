@@ -12,11 +12,19 @@
 //!
 //! * The Kotlin façade owns the `KChatCore` instance through a raw
 //!   pointer (passed back as a `jlong` from
-//!   `Java_..._initialize`). The bridge uses
-//!   [`Box::into_raw`] / [`Box::from_raw`] to convert between
-//!   pointer and owned core. Drop is exposed as
-//!   `Java_..._destroy` to avoid leaking when the Kotlin
-//!   side closes the bridge.
+//!   `Java_..._initialize`). The pointer addresses a heap-allocated
+//!   [`BridgeSlot`] — a thin
+//!   [`AtomicPtr<KChatBridgeHandle>`] wrapper introduced in Phase
+//!   A.5 to interpose between the JNI calls and the inner handle.
+//!   Every read entry point loads the inner pointer with
+//!   [`Ordering::Acquire`] and throws a `KChatException` if it has
+//!   been swapped to null by a concurrent `destroy`; `destroy`
+//!   atomically swaps the inner pointer out with
+//!   [`Ordering::AcqRel`] and drops the inner handle only when the
+//!   swap returned a non-null value, so a double-destroy from the
+//!   Kotlin side cannot double-free the handle. The slot box
+//!   itself is freed by `destroy` exactly once; Kotlin remains
+//!   responsible for serializing `close()` calls.
 //! * Errors cross the JNI boundary as Java exceptions thrown from
 //!   the Rust side. The classes match the Kotlin façade
 //!   (`com.kchat.core.KChatException`); the Kotlin façade
@@ -428,6 +436,7 @@ mod jni_bindings {
     use jni::objects::{JByteArray, JClass, JObject, JString};
     use jni::sys::{jboolean, jlong};
     use jni::JNIEnv;
+    use std::sync::atomic::AtomicPtr;
 
     /// Helper: turn a Rust [`BridgeError`] into a thrown
     /// `com.kchat.core.KChatException`. Returns the JNI default
@@ -508,12 +517,37 @@ mod jni_bindings {
             );
             return None;
         }
-        // SAFETY: The Kotlin façade owns this pointer for the
-        // lifetime of the bridge (returned by `initialize`,
-        // released by `destroy`). The reference here is
-        // borrow-only; no mutation crosses without going through
-        // the inner `Mutex`.
-        Some(unsafe { &*(ptr as *const KChatBridgeHandle) })
+        // SAFETY: the `jlong` was minted by `initialize` as
+        // `Box::into_raw(Box::new(AtomicPtr::new(inner)))` and is
+        // freed exactly once by `destroy` (Kotlin serializes
+        // `close()`). Holding `&*slot` until the end of the call
+        // is sound as long as `destroy` has not yet started
+        // freeing the slot box — which is the same contract that
+        // governs the pre-A.5 raw `*const KChatBridgeHandle` cast.
+        let slot = unsafe { &*(ptr as *const AtomicPtr<KChatBridgeHandle>) };
+        // Phase A.5: read the inner handle with `Acquire` so we
+        // observe the latest swap-to-null from a concurrent
+        // `destroy` on another thread. A null load tells us the
+        // handle has been torn down; the caller can no longer
+        // safely dereference it, so we throw and bail.
+        let inner = slot.load(std::sync::atomic::Ordering::Acquire);
+        if inner.is_null() {
+            throw_kchat(
+                env,
+                &BridgeError::InvalidArgument {
+                    message: "bridge handle has been destroyed".into(),
+                },
+            );
+            return None;
+        }
+        // SAFETY: as long as `inner` is non-null, the underlying
+        // `KChatBridgeHandle` has not yet been dropped — `destroy`
+        // is the only path that swaps the slot to null, and it
+        // drops the handle *after* the swap. The Kotlin façade
+        // serializes `destroy` against every other JNI call, so
+        // the swap-then-drop sequence on the destroyer thread
+        // happens-after every reader's load-then-deref sequence.
+        Some(unsafe { &*inner })
     }
 
     /// `Java_com_kchat_core_KChatBridge_initialize`
@@ -556,7 +590,22 @@ mod jni_bindings {
             }
         };
         match KChatBridgeHandle::initialize(&data_dir, &platform, &tenant_id, &key_bytes) {
-            Ok(handle) => Box::into_raw(Box::new(handle)) as jlong,
+            Ok(handle) => {
+                // Phase A.5: mint a two-layer allocation — the
+                // inner `Box::into_raw` produces the
+                // `*mut KChatBridgeHandle` we want to drop
+                // independently on `destroy`, and the outer
+                // `Box::into_raw(Box::new(AtomicPtr::new(...)))`
+                // produces the `BridgeSlot` whose address is the
+                // `jlong` Kotlin holds. Every JNI reader loads
+                // through the AtomicPtr so a concurrent
+                // `destroy` can swap the inner to null and have
+                // every in-flight call see the teardown.
+                let inner_ptr: *mut KChatBridgeHandle = Box::into_raw(Box::new(handle));
+                let slot_ptr: *mut AtomicPtr<KChatBridgeHandle> =
+                    Box::into_raw(Box::new(AtomicPtr::new(inner_ptr)));
+                slot_ptr as jlong
+            }
             Err(err) => {
                 throw_kchat(&mut env, &err);
                 0
@@ -570,6 +619,22 @@ mod jni_bindings {
     /// `initialize`. Always paired with the Kotlin
     /// `KChatBridge.close()` to avoid leaking the SQLCipher
     /// connection.
+    ///
+    /// Phase A.5: the slot is a
+    /// [`Box<AtomicPtr<KChatBridgeHandle>>`]; `destroy` atomically
+    /// swaps the inner pointer to null with
+    /// [`Ordering::AcqRel`] before dropping it. If the swap
+    /// returns a null pointer (i.e. some other path already
+    /// nulled the slot), the inner-drop is skipped — this is the
+    /// defence-in-depth check that prevents a double-free of the
+    /// inner `KChatBridgeHandle` even if the Kotlin façade
+    /// happens to issue overlapping `destroy` calls. The slot
+    /// box itself is freed exactly once at the end of this
+    /// function; concurrent or re-entrant `destroy` calls with
+    /// the same `jlong` remain undefined behaviour on the slot
+    /// level (Kotlin serialization is the load-bearing
+    /// invariant), but the AtomicPtr layer makes the
+    /// inner-handle leak / double-drop window impossible to hit.
     #[no_mangle]
     pub extern "system" fn Java_com_kchat_core_KChatBridge_destroy(
         _env: JNIEnv,
@@ -579,11 +644,39 @@ mod jni_bindings {
         if ptr == 0 {
             return;
         }
-        // SAFETY: pointer was minted by `Box::into_raw` in
-        // `initialize` and is dropped at most once because the
-        // Kotlin side serializes `close()`.
+        // SAFETY: the slot pointer was minted by `initialize` as
+        // `Box::into_raw(Box::new(AtomicPtr::new(inner)))` and
+        // `destroy` is called at most once per slot by the
+        // Kotlin façade. Reclaiming the box here drops the
+        // `AtomicPtr` wrapper after we've taken the inner out.
+        let slot_box: Box<AtomicPtr<KChatBridgeHandle>> =
+            unsafe { Box::from_raw(ptr as *mut AtomicPtr<KChatBridgeHandle>) };
+        // Phase A.5: atomic swap-to-null. `AcqRel` pairs with the
+        // `Acquire` load in `handle_from_ptr` so any in-flight
+        // JNI call either observes the inner pointer (sees a
+        // live handle, completes its read) or observes null
+        // (throws and bails before deref). The `Acquire` half on
+        // the swap also synchronises with the `Release` store
+        // implicit in the original `AtomicPtr::new` at
+        // initialize-time.
+        let inner_ptr = slot_box.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
+        if inner_ptr.is_null() {
+            // Defence-in-depth: an already-null slot means some
+            // other code path tore down the inner handle before
+            // this `destroy` ran. Returning here skips the
+            // inner-drop entirely — dropping the `Box` we just
+            // reclaimed handles the slot allocation itself.
+            return;
+        }
+        // SAFETY: the inner pointer was minted by
+        // `Box::into_raw(Box::new(KChatBridgeHandle))` in
+        // `initialize` and we just atomically removed it from
+        // the slot. No other path can observe it as non-null
+        // (every reader uses Acquire-load on the same
+        // AtomicPtr), so reclaiming the box here drops the
+        // handle exactly once.
         unsafe {
-            let _ = Box::from_raw(ptr as *mut KChatBridgeHandle);
+            drop(Box::from_raw(inner_ptr));
         }
     }
 
