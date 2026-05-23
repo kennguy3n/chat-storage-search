@@ -316,12 +316,40 @@ fn response_status_is_retryable(status: reqwest::StatusCode) -> bool {
 }
 
 /// Whether a transport-level [`reqwest::Error`] should trigger a
-/// retry: timeouts and connect errors only. Status-code-bearing
-/// errors (from `error_for_status`) are not produced by our call
-/// sites, so we deliberately do not classify on `e.status()`.
+/// retry by the inner [`HttpTransportClient::with_retry`] loop.
+///
+/// Kept in sync with the categorisation in
+/// [`HttpTransportClient::map_err`]: any `reqwest::Error` that
+/// `map_err` would classify as [`crate::transport::TransportError::Network`]
+/// (retryable at the caller layer) is also retried at the inner
+/// short-backoff layer (1 s / 2 s / 4 s). The semantics are:
+///
+/// * `is_timeout()`  — server did not reply before our timeout
+///                    fired (transient).
+/// * `is_connect()`  — TCP / TLS handshake failure (transient).
+/// * `is_request()`  — `Kind::Request`: generic request-sending
+///                    failure, e.g. HTTP/2 framing issue or an
+///                    interrupted body upload. Our request bodies
+///                    are owned byte vectors, so retrying is safe;
+///                    we don't ship streaming bodies through this
+///                    transport.
+/// * `is_body()`     — `Kind::Body`: connection drop while we are
+///                    reading the response body. The partial payload
+///                    is unusable but the server is healthy; a quick
+///                    retry typically recovers the whole response.
+///
+/// Status-code-bearing errors (from `error_for_status`) are not
+/// produced by our call sites, so we deliberately do not classify
+/// on `e.status()`. HTTP retryability is decided separately on the
+/// `Response` path via [`response_status_is_retryable`].
+///
+/// Must be kept in sync with [`HttpTransportClient::map_err`]: if
+/// you teach `map_err` about a new retryable `reqwest::Kind`, teach
+/// this predicate too, otherwise the inner loop will surface the
+/// error to the caller layer without ever attempting a retry.
 #[cfg(feature = "http-transport")]
 fn err_is_retryable(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
+    e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
 }
 
 #[cfg(feature = "http-transport")]
