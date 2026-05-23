@@ -4349,7 +4349,7 @@ impl KChatCore for CoreImpl {
                 span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
-                return Err(Error::Search(e.to_string()));
+                return Err(Error::Search(err_str));
             }
         };
         drop(db);
