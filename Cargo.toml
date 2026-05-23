@@ -10,7 +10,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+# `LicenseRef-Proprietary` is the SPDX-3.x syntax for a custom (non-SPDX)
+# license identifier. Using a valid SPDX expression here means tools that
+# parse `Cargo.toml` (cargo-deny, cargo-about, dependency-license bots)
+# don't have to special-case the workspace — they treat it like any other
+# allow-listed expression. The literal text `Proprietary` would NOT parse
+# under SPDX 2.x or 3.x.
+license = "LicenseRef-Proprietary"
 
 [workspace.dependencies]
 # ONNX Runtime — optional, off by default. Phase 6 wires this into

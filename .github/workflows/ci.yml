@@ -11,30 +11,60 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check + Test
+  # -------------------------------------------------------------------------
+  # Format check — fast (< 5 s on a warm cache). Runs in its own job so a
+  # failed `cargo fmt` is obvious in the PR status check list and does not
+  # block visibility of later failures (lint, test).
+  # -------------------------------------------------------------------------
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # -------------------------------------------------------------------------
+  # Lint — clippy with `-D warnings` over all targets and all features. Kept
+  # separate from `test` so a lint failure does not invalidate the test
+  # cache and vice versa.
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Build
-        run: cargo build --workspace
+
+  # -------------------------------------------------------------------------
+  # Unit + integration tests — full workspace, default features. The
+  # `--all-features` matrix is covered by clippy in the `lint` job.
+  # -------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --verbose
 
+  # -------------------------------------------------------------------------
   # Comprehensive end-to-end demo — exercises the full pipeline
-  # (ingest → FTS / fuzzy / structured search → archive →
-  # backup → manifest verification → skeleton-first restore →
-  # search-after-restore → storage-budget enforcement) against a
-  # 200-message multilingual corpus. See `docs/PROGRESS.md`'s
-  # 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  # (ingest → FTS / fuzzy / structured search → archive → backup → manifest
+  # verification → skeleton-first restore → search-after-restore →
+  # storage-budget enforcement) against a 200-message multilingual corpus.
+  # See `docs/PROGRESS.md`'s 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  # -------------------------------------------------------------------------
   e2e-demo:
     name: E2E Demo
     runs-on: ubuntu-latest
@@ -45,11 +75,138 @@ jobs:
       - name: E2E Demo
         run: cargo test --test e2e_demo --verbose
 
-  # Phase 0+ : cross-language interop check via the Go vector
-  # generator. Uses a local replace to the zk-object-fabric SDK on
-  # CI nodes that have the sibling repo available; on a fresh
-  # GitHub Actions runner the generator falls back to the public
-  # module path. Disabled by default until both repos are CI-linked.
+  # -------------------------------------------------------------------------
+  # Supply-chain audit — `cargo-deny check` runs all four sections
+  # (advisories, licenses, bans, sources) from `deny.toml` at the workspace
+  # root. The advisories section reads the same RustSec advisory database
+  # that `cargo-audit` does, so we don't need to run both — a single
+  # `deny.toml` is the single source of truth for the ignore list.
+  # -------------------------------------------------------------------------
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
+  # -------------------------------------------------------------------------
+  # Cross-compile sanity check — the four release targets KChat ships to
+  # (Linux x86_64, macOS Apple Silicon, Android arm64, Windows x86_64). Runs
+  # `cargo check` rather than a full build so the job stays under ~3 min;
+  # the bridges' real binary builds happen in the iOS / Android repo CI.
+  # -------------------------------------------------------------------------
+  cross-compile:
+    name: Cross-compile (${{ matrix.label }})
+    needs: [fmt, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            # `runner` (NOT `runs-on`) is the matrix key because GitHub
+            # Actions expressions treat `-` as the subtraction operator,
+            # so `${{ matrix.runs-on }}` is parsed as `matrix.runs - on`
+            # (both undefined → 0) rather than as a property lookup. The
+            # bracket-notation alternative `${{ matrix['runs-on'] }}` works
+            # but is easier to break on rename; an unhyphenated key is
+            # the cleaner long-term shape.
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            packages: --workspace
+            tool: rustup
+          - label: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            packages: --workspace
+            tool: rustup
+          - label: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            packages: --workspace
+            tool: rustup
+          - label: android-aarch64
+            runner: ubuntu-latest
+            target: aarch64-linux-android
+            # ios-bridge (uniffi) and desktop need host-only deps; on Android
+            # we only ship `kchat-core` + `kchat-android-bridge`.
+            packages: -p kchat-core -p kchat-android-bridge
+            tool: cross
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross (Android only)
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: cargo check (rustup)
+        if: matrix.tool == 'rustup'
+        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }} --all-features
+      - name: cargo check (cross)
+        if: matrix.tool == 'cross'
+        run: cross check ${{ matrix.packages }} --target ${{ matrix.target }}
+
+  # -------------------------------------------------------------------------
+  # Aggregate gate — the single required status check used by branch
+  # protection. The upstream jobs run in parallel so individual failures stay
+  # visible side-by-side; this job collapses them into one signal so the
+  # GitHub branch-protection rule only needs to list `CI Success` rather
+  # than tracking every leaf job by name (which would drift as we add or
+  # rename jobs). The job exits non-zero if any required dependency was
+  # skipped or failed, mirroring the all-green-or-nothing semantics that
+  # `needs:` would have given a single monolithic job.
+  # -------------------------------------------------------------------------
+  ci-success:
+    name: CI Success
+    if: always()
+    needs:
+      - fmt
+      - lint
+      - test
+      - e2e-demo
+      - audit
+      - cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify upstream jobs all succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "Upstream job results:"
+          echo "${NEEDS_JSON}"
+          # `needs.<job>.result` is one of: success | failure | cancelled | skipped.
+          # `jq` (preinstalled on ubuntu-latest runners) gives us a robust
+          # JSON parse that won't be fooled by future GitHub Actions output
+          # changes — e.g. a sibling field that happens to contain the word
+          # `"result"`. The expression asserts every `.result` value equals
+          # "success"; any other state (failure / cancelled / skipped) fails
+          # the gate.
+          if ! echo "${NEEDS_JSON}" | jq -e 'to_entries | map(.value.result) | all(. == "success")' > /dev/null; then
+            echo "::error::At least one required CI job failed, was cancelled, or was skipped."
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."
+
+  # -------------------------------------------------------------------------
+  # Phase 0+ : cross-language interop check via the Go vector generator.
+  # Uses a local replace to the zk-object-fabric SDK on CI nodes that have
+  # the sibling repo available; on a fresh GitHub Actions runner the
+  # generator falls back to the public module path. Disabled by default
+  # until both repos are CI-linked.
   # interop-vectors:
   #   name: Pattern C Interop Vectors
   #   runs-on: ubuntu-latest

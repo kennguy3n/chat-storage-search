@@ -3,6 +3,7 @@ name = "kchat-android-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Android JNI bridge for kchat-core. Phase 1 scaffold — `Java_com_kchat_core_KChatBridge_*` entry points wired to CoreImpl."
 
 [lib]

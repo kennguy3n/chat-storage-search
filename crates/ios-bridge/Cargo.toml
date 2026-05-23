@@ -3,6 +3,7 @@ name = "kchat-ios-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "iOS UniFFI bridge for kchat-core. Phase 1 scaffold — UDL + scaffolding for the public KChatCore API."
 
 [lib]
