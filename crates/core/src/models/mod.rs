@@ -104,6 +104,22 @@ pub enum ModelError {
     #[error("model `{0}` not cached")]
     NotCached(&'static str),
 
+    /// A `Mutex` / `RwLock` guarding a model-subsystem resource was
+    /// poisoned by a panicking thread. Carries the resource name so
+    /// callers can route on it (`"model_manager_registry"`,
+    /// `"ep_benchmark_runner"`, `"clip_session"`, \u2026).
+    ///
+    /// This mirrors [`crate::local_store::StorageError::LockPoisoned`]
+    /// but keeps model-subsystem lock failures on the `model`
+    /// category at the bridge layer (`Error::Model`) rather than
+    /// silently re-categorising them onto `storage`. Bridge consumers
+    /// (Android / iOS) route the JSON `category` field; a
+    /// `ModelManager` registry lock poisoning is a model-subsystem
+    /// invariant violation, not a storage-driver failure, so the
+    /// category must stay `"model"`.
+    #[error("`{0}` lock poisoned")]
+    LockPoisoned(&'static str),
+
     /// Free-form fallback. New failure modes should prefer a typed
     /// variant.
     #[error("{0}")]

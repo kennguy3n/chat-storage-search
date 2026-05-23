@@ -242,7 +242,7 @@ impl ModelManager {
     /// downloader returned an actual transport error".
     pub fn ensure_model(&self, model_id: &str, model_version: &str) -> Result<ModelArtifact> {
         let guard = self.artifacts.read().map_err(|_| {
-            crate::Error::Storage(crate::local_store::StorageError::LockPoisoned(
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
                 "model_manager_registry",
             ))
         })?;
@@ -259,7 +259,7 @@ impl ModelManager {
     /// [`Self::verify_integrity`] before registering.
     pub fn register_model(&self, artifact: ModelArtifact) -> Result<()> {
         let mut guard = self.artifacts.write().map_err(|_| {
-            crate::Error::Storage(crate::local_store::StorageError::LockPoisoned(
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
                 "model_manager_registry",
             ))
         })?;
@@ -301,7 +301,7 @@ impl ModelManager {
     /// idempotent.
     pub fn delete_model(&self, model_id: &str, model_version: &str) -> Result<()> {
         let mut guard = self.artifacts.write().map_err(|_| {
-            crate::Error::Storage(crate::local_store::StorageError::LockPoisoned(
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
                 "model_manager_registry",
             ))
         })?;
@@ -408,7 +408,7 @@ impl ModelManager {
         // present any one is acceptable for the benchmark
         // (latency depends on the EP, not the artifact version).
         let guard = self.artifacts.read().map_err(|_| {
-            crate::Error::Storage(crate::local_store::StorageError::LockPoisoned(
+            crate::Error::Model(crate::models::ModelError::LockPoisoned(
                 "model_manager_registry",
             ))
         })?;

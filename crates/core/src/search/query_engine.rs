@@ -2251,7 +2251,12 @@ pub fn resolve_target_to_conversation_set_with_resolver(
                 ConversationFilterColumn::Community,
                 &community.to_string(),
             )
-            .map_err(|e| Error::Search(crate::search::SearchError::from(e)))?;
+            .map_err(|e| {
+                Error::Search(crate::search::SearchError::from_db_with_context(
+                    e,
+                    "list community convs",
+                ))
+            })?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Domain(domain) => {
@@ -2260,19 +2265,34 @@ pub fn resolve_target_to_conversation_set_with_resolver(
                 ConversationFilterColumn::Domain,
                 &domain.to_string(),
             )
-            .map_err(|e| Error::Search(crate::search::SearchError::from(e)))?;
+            .map_err(|e| {
+                Error::Search(crate::search::SearchError::from_db_with_context(
+                    e,
+                    "list domain convs",
+                ))
+            })?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Tenant(tenant) => {
             let convs =
                 read_list_conversations_by_column(conn, ConversationFilterColumn::Tenant, tenant)
-                    .map_err(|e| Error::Search(crate::search::SearchError::from(e)))?;
+                    .map_err(|e| {
+                    Error::Search(crate::search::SearchError::from_db_with_context(
+                        e,
+                        "list tenant convs",
+                    ))
+                })?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::B2cAll => {
             let convs =
                 read_list_conversations_by_column(conn, ConversationFilterColumn::Scope, "b2c")
-                    .map_err(|e| Error::Search(crate::search::SearchError::from(e)))?;
+                    .map_err(|e| {
+                        Error::Search(crate::search::SearchError::from_db_with_context(
+                            e,
+                            "list b2c convs",
+                        ))
+                    })?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Starred => Ok(Some(resolver.resolve_starred()?)),

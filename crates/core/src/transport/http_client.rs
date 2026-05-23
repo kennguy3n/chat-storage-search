@@ -373,8 +373,12 @@ impl TransportClient for HttpTransportClient {
             .json::<ChunkReceiptWire>()
             .map_err(|e| Self::map_err("upload_chunk decode", e))?;
         let mut bytes = [0u8; 32];
+        // Response-payload decode failure: the server returned a 200
+        // but the hex string in the body is malformed. Retrying will
+        // produce the same result — surface as `Server`
+        // (non-retryable) rather than `Network`.
         hex_decode_into(&wire.sha256_hex, &mut bytes).map_err(|e| {
-            crate::Error::Transport(crate::transport::TransportError::Network(format!(
+            crate::Error::Transport(crate::transport::TransportError::Server(format!(
                 "upload_chunk: {e}"
             )))
         })?;
@@ -404,8 +408,9 @@ impl TransportClient for HttpTransportClient {
             .json::<CommitBlobWire>()
             .map_err(|e| Self::map_err("commit_blob decode", e))?;
         let mut root = [0u8; 32];
+        // Response-payload decode failure: see note in `upload_chunk`.
         hex_decode_into(&wire.merkle_root_hex, &mut root).map_err(|e| {
-            crate::Error::Transport(crate::transport::TransportError::Network(format!(
+            crate::Error::Transport(crate::transport::TransportError::Server(format!(
                 "commit_blob: {e}"
             )))
         })?;
@@ -468,13 +473,15 @@ impl TransportClient for HttpTransportClient {
         let mut out = Vec::with_capacity(wires.len());
         for w in wires {
             let mut hash = [0u8; 32];
+            // Response-payload decode failure: see note in
+            // `upload_chunk`.
             hex_decode_into(&w.previous_manifest_hash_hex, &mut hash).map_err(|e| {
-                crate::Error::Transport(crate::transport::TransportError::Network(format!(
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
                     "fetch_archive_manifests: {e}"
                 )))
             })?;
             let payload = base64_decode(&w.payload_b64).map_err(|e| {
-                crate::Error::Transport(crate::transport::TransportError::Network(format!(
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
                     "fetch_archive_manifests: {e}"
                 )))
             })?;

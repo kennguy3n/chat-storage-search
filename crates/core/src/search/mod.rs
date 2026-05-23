@@ -74,11 +74,42 @@ impl SearchError {
 /// keep working through the search lane; the remaining `DbError`
 /// variants are free-form and lower to [`SearchError::Custom`] with
 /// their [`std::fmt::Display`] text preserved.
+///
+/// Callers that want to retain an operation-context label (e.g.
+/// `"list community convs"`) should use
+/// [`SearchError::from_db_with_context`] instead so the context
+/// survives into telemetry and log output.
 impl From<crate::local_store::db::DbError> for SearchError {
     fn from(e: crate::local_store::db::DbError) -> Self {
         match e {
             crate::local_store::db::DbError::Rusqlite(s) => SearchError::Sqlite(s),
             other => SearchError::Custom(other.to_string()),
         }
+    }
+}
+
+impl SearchError {
+    /// Lift a [`crate::local_store::db::DbError`] into a
+    /// [`SearchError`] while attaching an operation-context label.
+    ///
+    /// The context is folded into the `Display` text of the
+    /// resulting [`SearchError::Custom`] so logs / telemetry identify
+    /// *which* search-side DB call failed (`"list community convs"`,
+    /// `"list domain convs"`, …) — solving the loss-of-context
+    /// regression that flat `SearchError::from(DbError)` would
+    /// otherwise produce on free-form call sites.
+    ///
+    /// Note that this constructor flattens [`DbError::Rusqlite`] into
+    /// [`SearchError::Custom`] (stringifying the inner
+    /// `rusqlite::Error`). Use the bare
+    /// `impl From<DbError> for SearchError` (`?`-friendly) for
+    /// callers that need the structural [`SearchError::Sqlite`] path
+    /// — for example, a future retry loop pattern-matching on
+    /// `rusqlite::Error::sqlite_error_code()`. The four
+    /// `read_list_conversations_by_column` call sites in
+    /// `query_engine` are not retry hot-paths, so observability wins
+    /// over typed routing for them.
+    pub fn from_db_with_context(e: crate::local_store::db::DbError, context: &str) -> Self {
+        SearchError::Custom(format!("{context}: {e}"))
     }
 }
