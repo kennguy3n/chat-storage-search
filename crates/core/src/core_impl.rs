@@ -2414,6 +2414,14 @@ impl CoreImpl {
     /// short-circuits inference — the cross-pipeline cache is
     /// shared with `kennguy3n/slm-guardrail`, so a guardrail-
     /// computed vector is not re-encoded by the search pipeline.
+    #[tracing::instrument(
+        skip(self, messages),
+        fields(
+            messages_in = messages.len(),
+            messages_persisted = tracing::field::Empty,
+            embeddings_computed = tracing::field::Empty,
+        ),
+    )]
     pub fn ingest_messages(&self, messages: &[IngestedMessage]) -> Result<IngestResult> {
         // Phase 7, Task 8 (2026-05-04 batch): wrap the ingest hot
         // path with a [`crate::perf::PerfTrace`] so an installed
@@ -2422,6 +2430,12 @@ impl CoreImpl {
         // counters once they're known. Failures still record so
         // the trace surface includes both successful and failed
         // bursts.
+        //
+        // The `#[tracing::instrument]` above mirrors the PerfTrace
+        // surface into the OS log stream so the same hot path is
+        // visible to both the in-app perf collector (PerfTrace)
+        // and to a platform-native log subscriber (e.g. os_log /
+        // logcat) without duplicate plumbing.
         let mut trace = crate::perf::PerfTrace::new("ingest_messages");
         trace.insert_metadata("messages_in", messages.len().to_string());
 
@@ -2492,6 +2506,17 @@ impl CoreImpl {
             return;
         };
         let Some(embedder) = slot.as_ref() else {
+            // No embedder installed — semantic search still works for
+            // messages embedded by a previous run, but new rows will
+            // not contribute vectors until `install_text_embedder` is
+            // called. Trace at debug level (not warn) because the
+            // unbound state is normal on cold start before the bridge
+            // wires up ONNX; warning on every ingest would flood logs.
+            tracing::debug!(
+                target: "kchat_core::embeddings",
+                model = "xlmr",
+                "text_embedder not installed; skipping embedding"
+            );
             return;
         };
 
@@ -2607,6 +2632,14 @@ impl CoreImpl {
             return;
         };
         let Some(embedder) = slot.as_ref() else {
+            // Same rationale as `maybe_embed_text_message`: cold-start
+            // before the bridge installs MobileCLIP-S2 is normal; a
+            // warn-level event would flood logs. Stay at debug.
+            tracing::debug!(
+                target: "kchat_core::embeddings",
+                model = "mobileclip_s2",
+                "image_embedder not installed; skipping embedding"
+            );
             return;
         };
 
@@ -4215,6 +4248,14 @@ impl KChatCore for CoreImpl {
         Ok(result)
     }
 
+    #[tracing::instrument(
+        skip(self, query),
+        fields(
+            query_len = query.query_string.len(),
+            scope = ?scope,
+            hits = tracing::field::Empty,
+        ),
+    )]
     fn search(&self, query: SearchQuery, scope: SearchScope) -> Result<Vec<SearchResult>> {
         // Phase 7, Task 8 (2026-05-04 batch): emit a `search`
         // [`crate::perf::PerfTrace`]. We capture `query_len`
@@ -4577,6 +4618,15 @@ impl KChatCore for CoreImpl {
         result
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            message_id = %message_id,
+            reason,
+            is_cold = tracing::field::Empty,
+            offline = tracing::field::Empty,
+        ),
+    )]
     fn hydrate_message(&self, message_id: Uuid, reason: &str) -> Result<HydratedMessage> {
         // Phase 7 (2026-05-04 batch 10) — Task 7: instrument the
         // hydrate hot path with a [`PerfTrace`] so an installed
@@ -4681,6 +4731,15 @@ impl KChatCore for CoreImpl {
         result
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            reason,
+            deferred = tracing::field::Empty,
+            segments_built = tracing::field::Empty,
+            events_segmented = tracing::field::Empty,
+        ),
+    )]
     fn run_incremental_backup(&self, reason: &str) -> Result<BackupResult> {
         // Phase 7, Task 8 (2026-05-04 batch): instrument the
         // backup hot path. `start_ns` is captured up front so
@@ -4722,6 +4781,15 @@ impl KChatCore for CoreImpl {
         Ok(result)
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            reason = _reason,
+            pressure_level = tracing::field::Empty,
+            evicted_count = tracing::field::Empty,
+            freed_bytes = tracing::field::Empty,
+        ),
+    )]
     fn enforce_storage_budget(&self, _reason: &str) -> Result<OffloadResult> {
         // Phase 7, Task 8 (2026-05-04 batch): wrap the eviction
         // hot path with [`crate::perf::PerfTrace`]. We capture

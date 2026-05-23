@@ -15,3 +15,17 @@ jni = "0.21"
 uuid = { version = "1", features = ["v7", "serde"] }
 serde_json = "1"
 thiserror = "2"
+# Structured logging — `kchat-core` emits tracing spans / events on
+# all hot paths (Phase A.3). The Android bridge installs a
+# `tracing-subscriber` once per process so those events surface in
+# logcat under the `kchat` tag.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `paranoid-android` is the actively-maintained `tracing` Layer that
+# writes through `__android_log_write` so events appear in `adb
+# logcat -s kchat:*`. Keeping the Android-only dep gated to
+# `cfg(target_os = "android")` so a host-machine `cargo test`
+# (which is how the pure-Rust bridge layer is unit-tested) does not
+# pull the NDK linker.
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"

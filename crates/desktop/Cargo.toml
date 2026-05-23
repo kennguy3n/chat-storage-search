@@ -18,3 +18,9 @@ onnx-runtime = ["kchat-core/onnx-runtime"]
 
 [dependencies]
 kchat-core = { path = "../core" }
+# Structured logging — `kchat-core` emits tracing spans / events on
+# all hot paths (Phase A.3). The desktop crate installs a plain
+# stderr fmt subscriber so events surface in the dev console
+# without depending on platform-specific log frameworks.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
