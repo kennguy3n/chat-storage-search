@@ -2507,7 +2507,7 @@ impl CoreImpl {
                     span.record("error", err_str.as_str());
                     trace.finish();
                     self.record_perf_trace(trace);
-                    return Err(Error::Message(e.to_string()));
+                    return Err(Error::Message(err_str));
                 }
             }
         }
