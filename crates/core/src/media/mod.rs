@@ -37,6 +37,7 @@
 pub mod cache;
 pub mod caption;
 pub mod chunker;
+pub(crate) mod coordinator;
 pub mod download;
 pub mod migration;
 pub mod processor;

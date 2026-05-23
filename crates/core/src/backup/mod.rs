@@ -15,6 +15,7 @@
 //!   that re-emits compact segments and supersedes older ones.
 
 pub mod compaction;
+pub(crate) mod coordinator;
 pub mod event_journal;
 pub mod manifest_builder;
 pub mod segment_builder;
