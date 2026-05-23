@@ -351,21 +351,17 @@ pub struct CoreImpl {
     /// is itself a per-process resource that cannot be replaced
     /// without tearing down the model.
     text_embedder: OnceLock<Arc<dyn crate::models::embeddings::TextEmbedder>>,
-    /// Phase-6 on-device image-embedding seam (MobileCLIP-S2).
-    /// Write-once via [`CoreImpl::install_image_embedder`].
-    /// Mirrors the [`Self::text_embedder`] wiring: [`OnceLock`]
-    /// makes ingest reads lock-free; the ONNX session is a
-    /// per-process resource that cannot be replaced live.
-    image_embedder: OnceLock<Arc<dyn crate::models::clip::ImageEmbedder>>,
-    /// Phase-6 platform OCR bridge. Write-once via
-    /// [`CoreImpl::install_ocr_bridge`]. Held in [`OnceLock`] so
-    /// reads on the media-ingest hot path are lock-free atomic
-    /// loads instead of mutex acquisitions, and the type system
-    /// enforces that any one core only ever sees a single OCR
-    /// bridge across its lifetime (matching the platform
-    /// reality — `Vision.framework` / Android `MlKit` register
-    /// once per process).
-    ocr_bridge: OnceLock<Arc<dyn crate::models::ocr::OcrBridge>>,
+    /// Phase-B.9 media coordinator — owns the five Phase-6
+    /// on-device media-model bridge `OnceLock` slots previously
+    /// held directly on `CoreImpl` as the `image_embedder`,
+    /// `ocr_bridge`, `whisper_transcriber`, `document_extractor`
+    /// and `video_keyframe_sampler` fields. The
+    /// install / has / lookup accessors delegate through this
+    /// coordinator; each bridge keeps the same write-once
+    /// `OnceLock`-backed semantics behind a typed accessor
+    /// surface. See `crate::media::coordinator` for the
+    /// per-method documentation.
+    media: crate::media::coordinator::Coordinator,
     /// Phase-6 resource-state probe (battery, charging, thermal,
     /// network). Write-once via
     /// [`CoreImpl::install_resource_probe`]; the resource-gated
@@ -375,29 +371,6 @@ pub struct CoreImpl {
     /// every Whisper / Vision / video-keyframe operation is a
     /// lock-free atomic load.
     resource_probe: OnceLock<Arc<dyn crate::models::resource_gate::ResourceProbe>>,
-    /// Phase-6 on-device Whisper transcription seam. Write-once
-    /// via [`CoreImpl::install_whisper_transcriber`]. When set,
-    /// audio media writes a transcript row into
-    /// `media_search_index` during `send_media`. Held in
-    /// [`OnceLock`] for the same reason as
-    /// [`Self::text_embedder`] (lock-free hot-path reads, ONNX
-    /// session is a per-process resource).
-    whisper_transcriber: OnceLock<Arc<dyn crate::models::whisper::WhisperTranscriber>>,
-    /// Phase-6 on-device document text-extraction seam.
-    /// Write-once via [`CoreImpl::install_document_extractor`].
-    /// When set, PDF / DOCX media writes per-page text rows into
-    /// `media_search_index` (kind `"caption"`) during
-    /// `send_media`. Held in [`OnceLock`] for lock-free reads on
-    /// the document-ingest path.
-    document_extractor: OnceLock<Arc<dyn crate::models::document::DocumentExtractor>>,
-    /// Phase-6 on-device video keyframe-sampling seam.
-    /// Write-once via
-    /// [`CoreImpl::install_video_keyframe_sampler`]. Combined
-    /// with [`Self::image_embedder`] this drives the
-    /// video-keyframe → MobileCLIP-S2 → `search_vector` pipeline
-    /// in `send_media`. Held in [`OnceLock`] for lock-free reads
-    /// on the video-ingest path.
-    video_keyframe_sampler: OnceLock<Arc<dyn crate::models::video::VideoKeyframeSampler>>,
     /// Phase-6 offline-detection seam. Write-once via
     /// [`CoreImpl::install_offline_detector`]; the
     /// orchestration layer treats "not installed" as "always
@@ -584,12 +557,8 @@ impl CoreImpl {
             backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
-            image_embedder: OnceLock::new(),
-            ocr_bridge: OnceLock::new(),
+            media: crate::media::coordinator::Coordinator::new(),
             resource_probe: OnceLock::new(),
-            whisper_transcriber: OnceLock::new(),
-            document_extractor: OnceLock::new(),
-            video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
             perf_collector: OnceLock::new(),
             dedup_analytics: OnceLock::new(),
@@ -634,12 +603,8 @@ impl CoreImpl {
             backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
-            image_embedder: OnceLock::new(),
-            ocr_bridge: OnceLock::new(),
+            media: crate::media::coordinator::Coordinator::new(),
             resource_probe: OnceLock::new(),
-            whisper_transcriber: OnceLock::new(),
-            document_extractor: OnceLock::new(),
-            video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
             perf_collector: OnceLock::new(),
             dedup_analytics: OnceLock::new(),
@@ -1615,16 +1580,14 @@ impl CoreImpl {
         &self,
         embedder: Arc<dyn crate::models::clip::ImageEmbedder>,
     ) -> Result<()> {
-        self.image_embedder.set(embedder).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "image_embedder",
-            ))
-        })
+        self.media.install_image_embedder(embedder)
     }
 
     /// Whether [`Self::install_image_embedder`] has been called.
+    /// Delegates to
+    /// [`crate::media::coordinator::Coordinator::has_image_embedder`].
     pub fn has_image_embedder(&self) -> bool {
-        self.image_embedder.get().is_some()
+        self.media.has_image_embedder()
     }
 
     /// Install the platform OCR bridge used by media ingest
@@ -1634,16 +1597,14 @@ impl CoreImpl {
     /// returns [`Error::Storage`] if an OCR bridge has already
     /// been installed.
     pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
-        self.ocr_bridge.set(bridge).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "ocr_bridge",
-            ))
-        })
+        self.media.install_ocr_bridge(bridge)
     }
 
     /// Whether [`Self::install_ocr_bridge`] has been called.
+    /// Delegates to
+    /// [`crate::media::coordinator::Coordinator::has_ocr_bridge`].
     pub fn has_ocr_bridge(&self) -> bool {
-        self.ocr_bridge.get().is_some()
+        self.media.has_ocr_bridge()
     }
 
     /// Install the device-resource probe used by the
@@ -1680,17 +1641,14 @@ impl CoreImpl {
         &self,
         transcriber: Arc<dyn crate::models::whisper::WhisperTranscriber>,
     ) -> Result<()> {
-        self.whisper_transcriber.set(transcriber).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "whisper_transcriber",
-            ))
-        })
+        self.media.install_whisper_transcriber(transcriber)
     }
 
     /// Whether [`Self::install_whisper_transcriber`] has been
-    /// called with a real bridge.
+    /// called with a real bridge. Delegates to
+    /// [`crate::media::coordinator::Coordinator::has_whisper_transcriber`].
     pub fn has_whisper_transcriber(&self) -> bool {
-        self.whisper_transcriber.get().is_some()
+        self.media.has_whisper_transcriber()
     }
 
     /// Install the on-device document text-extraction bridge
@@ -1704,17 +1662,14 @@ impl CoreImpl {
         &self,
         extractor: Arc<dyn crate::models::document::DocumentExtractor>,
     ) -> Result<()> {
-        self.document_extractor.set(extractor).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "document_extractor",
-            ))
-        })
+        self.media.install_document_extractor(extractor)
     }
 
     /// Whether [`Self::install_document_extractor`] has been
-    /// called with a real bridge.
+    /// called with a real bridge. Delegates to
+    /// [`crate::media::coordinator::Coordinator::has_document_extractor`].
     pub fn has_document_extractor(&self) -> bool {
-        self.document_extractor.get().is_some()
+        self.media.has_document_extractor()
     }
 
     /// Install the on-device video keyframe sampler used by
@@ -1729,17 +1684,14 @@ impl CoreImpl {
         &self,
         sampler: Arc<dyn crate::models::video::VideoKeyframeSampler>,
     ) -> Result<()> {
-        self.video_keyframe_sampler.set(sampler).map_err(|_| {
-            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
-                "video_keyframe_sampler",
-            ))
-        })
+        self.media.install_video_keyframe_sampler(sampler)
     }
 
     /// Whether [`Self::install_video_keyframe_sampler`] has been
-    /// called with a real bridge.
+    /// called with a real bridge. Delegates to
+    /// [`crate::media::coordinator::Coordinator::has_video_keyframe_sampler`].
     pub fn has_video_keyframe_sampler(&self) -> bool {
-        self.video_keyframe_sampler.get().is_some()
+        self.media.has_video_keyframe_sampler()
     }
 
     /// Install the offline-detection probe used by the
@@ -2783,7 +2735,7 @@ impl CoreImpl {
         if !mime_type.starts_with("image/") {
             return;
         }
-        let Some(embedder) = self.image_embedder.get() else {
+        let Some(embedder) = self.media.image_embedder() else {
             // Same rationale as `maybe_embed_text_message`: cold-start
             // before the bridge installs MobileCLIP-S2 is normal; a
             // warn-level event would flood logs. Stay at debug.
@@ -2867,7 +2819,7 @@ impl CoreImpl {
             }
         }
 
-        let Some(transcriber) = self.whisper_transcriber.get() else {
+        let Some(transcriber) = self.media.whisper_transcriber() else {
             return;
         };
         let result = match transcriber.transcribe(plaintext, mime_type) {
@@ -2964,7 +2916,7 @@ impl CoreImpl {
         if !is_supported_document_mime(mime_type) {
             return;
         }
-        let Some(extractor) = self.document_extractor.get() else {
+        let Some(extractor) = self.media.document_extractor() else {
             return;
         };
         let pages = match extractor.extract_text(plaintext, mime_type) {
@@ -3043,10 +2995,10 @@ impl CoreImpl {
         if !mime_type.starts_with("video/") {
             return;
         }
-        let Some(sampler) = self.video_keyframe_sampler.get() else {
+        let Some(sampler) = self.media.video_keyframe_sampler() else {
             return;
         };
-        let Some(embedder) = self.image_embedder.get() else {
+        let Some(embedder) = self.media.image_embedder() else {
             return;
         };
 

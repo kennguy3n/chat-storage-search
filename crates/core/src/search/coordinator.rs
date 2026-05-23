@@ -62,7 +62,7 @@
 //! drops the lock after enqueueing or returns a cheap `Arc` clone
 //! and releases the `OnceLock` atomic load immediately.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use uuid::Uuid;
 
@@ -71,6 +71,18 @@ use crate::local_store::StorageError;
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
 use crate::search::search_target::{ConversationGroupResolver, NoopConversationGroupResolver};
 use crate::{Error, HydrationReason, Result, SearchResult};
+
+/// Process-wide fallback [`NoopConversationGroupResolver`] used
+/// by [`Coordinator::resolver_or_default`] when no resolver has
+/// been installed. Held in a [`LazyLock`] so the noop resolver
+/// is allocated **once per process** and every fallback path
+/// returns a cheap `Arc` clone (one atomic increment) instead
+/// of allocating a fresh `NoopConversationGroupResolver` on
+/// every `search_with_target` call — see PR #57 review feedback.
+/// The resolver is stateless so a shared instance is
+/// observationally identical to per-call construction.
+static NOOP_RESOLVER: LazyLock<Arc<dyn ConversationGroupResolver>> =
+    LazyLock::new(|| Arc::new(NoopConversationGroupResolver::new()));
 
 /// Phase-B.9 search coordinator — owns the
 /// [`HydrationQueue`] mutex and the
@@ -215,19 +227,22 @@ impl Coordinator {
     }
 
     /// Resolve the installed [`ConversationGroupResolver`] or
-    /// fall back to a fresh
-    /// [`NoopConversationGroupResolver`] when nothing has been
+    /// fall back to the process-wide
+    /// [`NOOP_RESOLVER`] singleton when nothing has been
     /// installed yet.
     ///
     /// Returns an owned `Arc` rather than a borrow because the
     /// caller hands the bridge to
     /// [`crate::search::query_engine::QueryEngine::execute_search_with_target`]
     /// across a reader-pool checkout that lives in a separate
-    /// closure scope.
+    /// closure scope. The fallback path is a cheap `Arc::clone`
+    /// (one atomic increment) against the process-wide
+    /// [`NoopConversationGroupResolver`] — no heap allocation
+    /// happens on the cold path either.
     pub(crate) fn resolver_or_default(&self) -> Arc<dyn ConversationGroupResolver> {
         match self.conversation_group_resolver.get() {
             Some(r) => Arc::clone(r),
-            None => Arc::new(NoopConversationGroupResolver::new()),
+            None => Arc::clone(&NOOP_RESOLVER),
         }
     }
 }
