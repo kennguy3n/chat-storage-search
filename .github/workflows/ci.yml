@@ -76,9 +76,11 @@ jobs:
         run: cargo test --test e2e_demo --verbose
 
   # -------------------------------------------------------------------------
-  # Supply-chain audit — `cargo-deny` (license allowlist + advisory-db) and
-  # `cargo-audit` (RustSec advisory database). Configuration lives in
-  # `deny.toml` at the workspace root.
+  # Supply-chain audit — `cargo-deny check` runs all four sections
+  # (advisories, licenses, bans, sources) from `deny.toml` at the workspace
+  # root. The advisories section reads the same RustSec advisory database
+  # that `cargo-audit` does, so we don't need to run both — a single
+  # `deny.toml` is the single source of truth for the ignore list.
   # -------------------------------------------------------------------------
   audit:
     name: Audit
@@ -91,23 +93,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
       - name: cargo deny check
         run: cargo deny check
-      - name: cargo audit
-        # The `deny.toml` ignore list documents preexisting advisories that
-        # cannot be fixed without breaking downstream pinning (see comments
-        # in that file). `cargo audit` reads its own ignore list; mirror the
-        # set here so the two tools agree.
-        run: |
-          cargo audit \
-            --ignore RUSTSEC-2021-0127 \
-            --ignore RUSTSEC-2025-0141 \
-            --ignore RUSTSEC-2024-0436 \
-            --ignore RUSTSEC-2025-0144
 
   # -------------------------------------------------------------------------
   # Cross-compile sanity check — the four release targets KChat ships to
@@ -164,6 +151,43 @@ jobs:
       - name: cargo check (cross)
         if: matrix.tool == 'cross'
         run: cross check ${{ matrix.packages }} --target ${{ matrix.target }}
+
+  # -------------------------------------------------------------------------
+  # Aggregate gate — the single required status check used by branch
+  # protection. The upstream jobs run in parallel so individual failures stay
+  # visible side-by-side; this job collapses them into one signal so the
+  # GitHub branch-protection rule only needs to list `CI Success` rather
+  # than tracking every leaf job by name (which would drift as we add or
+  # rename jobs). The job exits non-zero if any required dependency was
+  # skipped or failed, mirroring the all-green-or-nothing semantics that
+  # `needs:` would have given a single monolithic job.
+  # -------------------------------------------------------------------------
+  ci-success:
+    name: CI Success
+    if: always()
+    needs:
+      - fmt
+      - lint
+      - test
+      - e2e-demo
+      - audit
+      - cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify upstream jobs all succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "Upstream job results:"
+          echo "${NEEDS_JSON}"
+          # `needs.<job>.result` is one of: success | failure | cancelled | skipped.
+          # Anything other than `success` is treated as a gate failure.
+          if echo "${NEEDS_JSON}" | grep -E '"result"[[:space:]]*:[[:space:]]*"(failure|cancelled|skipped)"' > /dev/null; then
+            echo "::error::At least one required CI job failed, was cancelled, or was skipped."
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."
 
   # -------------------------------------------------------------------------
   # Phase 0+ : cross-language interop check via the Go vector generator.
