@@ -91,12 +91,22 @@ impl Coordinator {
     }
 
     /// Whether an epoch key manager is currently installed.
+    ///
+    /// A poisoned mutex degrades to `false` so this matches the
+    /// behaviour of the other "is this subsystem installed?"
+    /// probes ([`Self::has_zkof_archive_backend`] and
+    /// [`crate::backup::coordinator::Coordinator::has_keys`]). A
+    /// poisoned `current_epoch` mutex means a previous writer
+    /// panicked while installing or rotating the manager — the
+    /// safest answer for downstream probes is "not installed",
+    /// which causes installers / hot paths to surface the
+    /// `SubsystemNotInstalled` error rather than crashing the
+    /// process on every subsequent check.
     pub(crate) fn has_epoch_key_manager(&self) -> bool {
-        let slot = self
-            .current_epoch
+        self.current_epoch
             .lock()
-            .expect("current_epoch mutex poisoned");
-        slot.is_some()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 
     /// Snapshot of the currently active epoch identifier (if any).
