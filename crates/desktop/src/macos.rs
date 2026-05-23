@@ -69,7 +69,7 @@ pub trait SpotlightBridge: Send + Sync + std::fmt::Debug {
 
 /// placeholder Spotlight bridge.
 ///
-/// Every method silently succeeds (`Ok()`) — the desktop
+/// Every method silently succeeds (`Ok(())`) — the desktop
 /// orchestration layer can install it on Linux CI runners
 /// (where Spotlight isn't available) and on dev builds that
 /// don't link the real platform bridge yet, without impacting

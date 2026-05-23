@@ -149,10 +149,9 @@ impl Coordinator {
     // ----------------------------------------------------------------
 
     /// Install the on-device image-embedding bridge used by
-    /// media ingest (`docs/DESIGN.md §7.6`, ).
-    /// When set, MobileCLIP-S2 embeddings are written to
-    /// `search_vector` for image-typed media on ingest.
-    /// Write-once: returns
+    /// media ingest (`docs/DESIGN.md §7.6`). When set,
+    /// MobileCLIP-S2 embeddings are written to `search_vector`
+    /// for image-typed media on ingest. Write-once: returns
     /// [`StorageError::SubsystemAlreadyInstalled`] if an image
     /// embedder has already been installed.
     pub(crate) fn install_image_embedder(&self, embedder: Arc<dyn ImageEmbedder>) -> Result<()> {
@@ -180,7 +179,7 @@ impl Coordinator {
     // ----------------------------------------------------------------
 
     /// Install the platform OCR bridge used by media ingest
-    /// (`docs/DESIGN.md §7.6`, ). Write-once.
+    /// (`docs/DESIGN.md §7.6`). Write-once.
     pub(crate) fn install_ocr_bridge(&self, bridge: Arc<dyn OcrBridge>) -> Result<()> {
         self.ocr_bridge
             .set(bridge)

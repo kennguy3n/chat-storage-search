@@ -1,5 +1,4 @@
-//! On-device document text extraction seam — of
-//! this release.
+//! On-device document text extraction seam.
 //!
 //! `docs/DESIGN.md §7.6` mandates page-level multilingual text
 //! extraction for PDF and DOCX attachments so document bodies
@@ -45,7 +44,7 @@ pub struct DocumentPage {
 }
 
 /// On-device document text-extraction seam used by media
-/// ingest (`docs/DESIGN.md §7.6`, ).
+/// ingest (`docs/DESIGN.md §7.6`).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash a real platform extractor inside

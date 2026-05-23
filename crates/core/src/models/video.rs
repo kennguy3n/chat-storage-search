@@ -1,5 +1,4 @@
-//! On-device video keyframe-sampling seam — of
-//! this release.
+//! On-device video keyframe-sampling seam.
 //!
 //! `docs/DESIGN.md §7.6` describes the video-search pipeline:
 //! decode a video attachment into a small set of representative
@@ -57,7 +56,7 @@ pub struct Keyframe {
 pub use Keyframe as KeyframeData;
 
 /// On-device video keyframe-sampling seam used by media ingest
-/// (`docs/DESIGN.md §7.6`, ).
+/// (`docs/DESIGN.md §7.6`).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash a real platform sampler inside

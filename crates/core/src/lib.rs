@@ -81,11 +81,11 @@ use crate::message::processor::IngestResult;
 /// [`transport::TransportError::Auth`]) instead of parsing
 /// `Display` text.
 ///
-/// # Migration note ( / )
+/// # Migration note
 ///
 /// The string-typed variants (`Storage(String)`, `Search(String)`,
 /// `Message(String)`, `Transport(String)`, `Model(String)`) were
-/// replaced with typed sub-enum wrappers in so the
+/// replaced with typed sub-enum wrappers so the
 /// reader pool / retry loops / tests can route on intent. Existing
 /// `format!("...: {e}")` call sites map to the `Custom(String)`
 /// variant on each sub-enum via the bridging `From<String>` impls
@@ -567,11 +567,11 @@ impl Default for ClientMessageId {
 pub struct DeliveryCursor(pub String);
 
 // ---------------------------------------------------------------------------
-// placeholder result / source types
+// Placeholder result / source types
 // ---------------------------------------------------------------------------
 //
 // `docs/DESIGN.md §12` specifies a richer return shape for each of
-// these APIs; until the matching / / engines
+// these APIs; until the matching search / archive / restore engines
 // land, the trait carries zero-field placeholders that round-trip
 // through serde so bridge crates can already pin the types in their
 // FFI surface.

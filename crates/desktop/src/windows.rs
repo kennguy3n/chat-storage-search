@@ -62,7 +62,7 @@ pub trait WindowsSearchBridge: Send + Sync + std::fmt::Debug {
 
 /// placeholder Windows Search bridge.
 ///
-/// Every method silently succeeds (`Ok()`).
+/// Every method silently succeeds (`Ok(())`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWindowsSearchBridge;
 

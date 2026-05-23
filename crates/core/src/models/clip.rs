@@ -47,9 +47,9 @@ pub const MOBILECLIP_S2_MODEL_VERSION: &str = "mobileclip_s2@v1";
 pub const MOBILECLIP_S2_EMBEDDING_DIM: usize = 512;
 
 /// Canonical on-disk filename for the INT8 MobileCLIP-S2
-/// artifact.. The trailing
-/// `.onnx` suffix lets `ModelManager::resolve_destination` work
-/// uniformly across encoders.
+/// artifact. The trailing `.onnx` suffix lets
+/// `ModelManager::resolve_destination` work uniformly across
+/// encoders.
 pub const MOBILECLIP_S2_INT8_FILENAME: &str = "mobileclip_s2-v1-int8.onnx";
 
 /// Canonical on-disk filename for the INT4 (`MatMulNBits`)
@@ -216,7 +216,7 @@ pub fn create_mobileclip_session_with_ep(
 use crate::Result;
 
 /// On-device image-embedding seam used by the media-ingest
-/// pipeline (`docs/DESIGN.md §7.6`, ).
+/// pipeline (`docs/DESIGN.md §7.6`).
 ///
 /// Object-safe + `Send + Sync` so [`crate::core_impl::CoreImpl`]
 /// can stash it inside `Mutex<Option<Box<dyn ImageEmbedder>>>`.

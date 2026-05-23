@@ -59,11 +59,11 @@ pub struct ThumbnailResult {
     /// Pixel height of the encoded thumbnail.
     pub height: u32,
     /// MIME type of [`Self::thumbnail_bytes`]. Always
-    /// [`THUMBNAIL_MIME_TYPE`] for
+    /// [`THUMBNAIL_MIME_TYPE`] today.
     pub mime_type: String,
 }
 
-/// thumbnail generator.
+/// Thumbnail generator.
 ///
 /// The generator is currently stateless — it carries no
 /// configuration of its own — but the type is kept around so the

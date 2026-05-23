@@ -178,7 +178,7 @@ pub struct InProcessScheduler {
 /// one-off task handler.
 ///
 /// Invoked from `run_pending_one_off_tasks` for each task whose
-/// constraints are currently satisfied. Returns `Ok()` on
+/// constraints are currently satisfied. Returns `Ok(())` on
 /// success or an [`Error`] on failure (the scheduler logs and
 /// drops the task — retry-on-failure is the platform bridge's
 /// responsibility).

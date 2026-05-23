@@ -1,4 +1,4 @@
-//! iCloud (CloudKit) backup sink ().
+//! iCloud (CloudKit) backup sink.
 //!
 //! Mirrors [`crate::media::sinks::icloud::ICloudMediaBlobSink`]
 //! for the **backup** pipeline: routes sealed segment / manifest

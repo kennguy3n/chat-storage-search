@@ -88,7 +88,7 @@ pub enum VerificationError {
 }
 
 /// Walk the manifest chain from `manifests[0]` (genesis) to
-/// `manifests.last`. Returns `Ok()` only if every check
+/// `manifests.last`. Returns `Ok(())` only if every check
 /// passes — including both the Ed25519 and ML-DSA-65 signature
 /// legs on every generation.
 pub fn verify_manifest_chain(

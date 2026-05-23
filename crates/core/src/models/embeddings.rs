@@ -382,7 +382,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// On-device text-embedding seam used by the semantic-search and
 /// message-ingest pipelines.
 ///
-/// `docs/DESIGN.md §7.6 / §7.6.1` and. The trait
+/// `docs/DESIGN.md §7.6 / §7.6.1`. The trait
 /// is intentionally tiny so any encoder (XLM-R, a future
 /// multilingual replacement, a deterministic mock, …) can plug in.
 /// Implementations MUST return an L2-normalized vector of length

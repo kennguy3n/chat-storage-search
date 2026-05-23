@@ -194,7 +194,7 @@ impl HybridVerifyingKey {
     }
 
     /// Verify **both** signatures over the same payload. Returns
-    /// `Ok()` only if both verify; otherwise reports which leg
+    /// `Ok(())` only if both verify; otherwise reports which leg
     /// failed via [`HybridSignatureFailure`].
     pub fn verify_payload(
         &self,

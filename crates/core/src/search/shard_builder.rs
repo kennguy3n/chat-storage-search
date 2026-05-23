@@ -81,7 +81,7 @@ pub struct FuzzyRow {
 }
 
 /// One row of `search_vector` ready to seal into a vector
-/// shard..
+/// shard.
 ///
 /// `embedding` is the raw INT8-quantized blob — *not* the
 /// dequantized `Vec<f32>`. Keeping the wire format identical to
@@ -106,7 +106,7 @@ pub struct VectorRow {
 }
 
 /// One row of `media_search_index` ready to seal into a media
-/// shard..
+/// shard.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaIndexRow {
     /// `media_asset.asset_id` for the row.
@@ -133,10 +133,10 @@ pub const FUZZY_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_FUZZY_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`VectorShardPayload`].
 ///
-///. Distinct from the text / fuzzy magics so a
-/// malicious sealer cannot retag a vector shard as text (and
-/// vice-versa) — the restore path checks the magic against the
-/// expected discriminator before deserializing.
+/// Distinct from the text / fuzzy magics so a malicious sealer
+/// cannot retag a vector shard as text (and vice-versa) — the
+/// restore path checks the magic against the expected
+/// discriminator before deserializing.
 pub const VECTOR_SHARD_PAYLOAD_MAGIC: &[u8] = b"KCHAT_VECTOR_SHARD_PAYLOAD_V1";
 
 /// Domain-separation magic for [`MediaShardPayload`].
@@ -185,9 +185,9 @@ pub struct MediaShardPayload {
     pub rows: Vec<MediaIndexRow>,
 }
 
-/// CBOR-sealed plaintext of a bloom-filter [`SearchIndexShard`]
-///. The payload encodes the
-/// in-memory [`BloomFilter`] as `(bit_count, hash_count, bits)`.
+/// CBOR-sealed plaintext of a bloom-filter [`SearchIndexShard`].
+/// The payload encodes the in-memory [`BloomFilter`] as
+/// `(bit_count, hash_count, bits)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BloomShardPayload {
     /// Always [`BLOOM_SHARD_PAYLOAD_MAGIC`].

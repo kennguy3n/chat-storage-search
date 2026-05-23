@@ -289,8 +289,8 @@ impl KChatCoreConfig {
         }
     }
 
-    /// Override the cold-shard parallel fetch concurrency
-    ///. Builder-style mirror of
+    /// Override the cold-shard parallel fetch concurrency.
+    /// Builder-style mirror of
     /// [`KChatCoreConfig::with_tenant_search_policy`].
     #[must_use]
     pub fn with_max_cold_fetch_concurrency(mut self, n: usize) -> Self {

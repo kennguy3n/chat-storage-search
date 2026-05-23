@@ -296,7 +296,7 @@ impl ModelManager {
     }
 
     /// Remove the artifact for `(model_id, model_version)`.
-    /// Returns `Ok()` whether or not the row existed
+    /// Returns `Ok(())` whether or not the row existed —
     /// idempotent.
     pub fn delete_model(&self, model_id: &str, model_version: &str) -> Result<()> {
         let mut guard = self.artifacts.write().map_err(|_| {

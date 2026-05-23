@@ -1534,12 +1534,12 @@ impl CoreImpl {
     }
 
     // ----------------------------------------------------------------
-    // model bridges (Task 2 / 4 / 6 / 9)
+    // On-device model bridges
     // ----------------------------------------------------------------
 
     /// Install the on-device text-embedding bridge used by
     /// message ingest and the semantic-search query path
-    /// (`docs/DESIGN.md §7.6 / §7.6.1`, ).
+    /// (`docs/DESIGN.md §7.6 / §7.6.1`).
     ///
     /// When set, the message-ingest path computes an XLM-R
     /// embedding for every text body and writes it through
@@ -1571,10 +1571,10 @@ impl CoreImpl {
     }
 
     /// Install the on-device image-embedding bridge used by
-    /// media ingest (`docs/DESIGN.md §7.6`, ).
-    /// When set, MobileCLIP-S2 embeddings are written to
-    /// `search_vector` for image-typed media on ingest.
-    /// Write-once — same per-process-ONNX-session rationale as
+    /// media ingest (`docs/DESIGN.md §7.6`). When set,
+    /// MobileCLIP-S2 embeddings are written to `search_vector`
+    /// for image-typed media on ingest. Write-once — same
+    /// per-process-ONNX-session rationale as
     /// [`Self::install_text_embedder`].
     pub fn install_image_embedder(
         &self,
@@ -1591,11 +1591,11 @@ impl CoreImpl {
     }
 
     /// Install the platform OCR bridge used by media ingest
-    /// (`docs/DESIGN.md §7.6`, ). Wrapped in
-    /// `Arc` so multiple background workers can fan out against
-    /// the same bridge with no serialisation. Write-once:
-    /// returns [`Error::Storage`] if an OCR bridge has already
-    /// been installed.
+    /// (`docs/DESIGN.md §7.6`). Wrapped in `Arc` so multiple
+    /// background workers can fan out against the same bridge
+    /// with no serialisation. Write-once: returns
+    /// [`Error::Storage`] if an OCR bridge has already been
+    /// installed.
     pub fn install_ocr_bridge(&self, bridge: Arc<dyn crate::models::ocr::OcrBridge>) -> Result<()> {
         self.media.install_ocr_bridge(bridge)
     }
@@ -1608,10 +1608,9 @@ impl CoreImpl {
     }
 
     /// Install the device-resource probe used by the
-    /// resource-gated background workers
-    /// (`docs/DESIGN.md §7.6`, ). When unset,
-    /// the gate defaults to "all-clear" so unit tests don't need
-    /// to install a probe. Write-once: returns
+    /// resource-gated background workers (`docs/DESIGN.md §7.6`).
+    /// When unset, the gate defaults to "all-clear" so unit
+    /// tests don't need to install a probe. Write-once: returns
     /// [`Error::Storage`] if a resource probe has already been
     /// installed.
     pub fn install_resource_probe(
@@ -1889,10 +1888,10 @@ impl CoreImpl {
         })
     }
 
-    /// Install the multi-scope search resolver (
-    ///. Wrapped in `Arc` so the orchestration layer
-    /// can share one resolver across worker threads. When no
-    /// resolver is installed, the query engine uses the default
+    /// Install the multi-scope search resolver. Wrapped in
+    /// `Arc` so the orchestration layer can share one resolver
+    /// across worker threads. When no resolver is installed,
+    /// the query engine uses the default
     /// [`crate::search::search_target::NoopConversationGroupResolver`].
     /// Write-once: returns [`Error::Storage`] if a resolver has
     /// already been installed.

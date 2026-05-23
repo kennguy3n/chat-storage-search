@@ -11,11 +11,10 @@
 //!   by `docs/DESIGN.md §10` and `docs/ARCHITECTURE.md §10`,
 //!   covering MLS message fetch, chunked blob upload (init / chunk
 //!   / commit), blob range fetch, archive manifest / segment fetch,
-//!   and search-index shard fetch. It is locked in so the
-//!   media engine, the archive engine, and the
+//!   and search-index shard fetch. The trait surface is locked
+//!   so the media engine, the archive engine, and the
 //!   backup / restore engines can already type their inputs
-//!   against the final shape; production HTTP / gRPC / MLS-blob
-//!   implementations land in those phases. [`NoopTransportClient`]
+//!   against the final shape. [`NoopTransportClient`]
 //!   is the placeholder — every method returns
 //!   `Err(crate::Error::NotImplemented("transport"))`.
 //!
