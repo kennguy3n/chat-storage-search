@@ -250,4 +250,166 @@ mod tests {
         let decoded: ManifestShape = from_slice(EXPECTED).expect("decode golden");
         assert_eq!(decoded, ManifestShape::sample());
     }
+
+    // -----------------------------------------------------------------
+    // Extended wire-format golden vector — covers the remaining serde
+    // shape axes that production manifest / archive frames depend on
+    // and which the simpler `ManifestShape` test above does not
+    // exercise. This is the recommendation from the Devin Review pass
+    // on PR #50 turned into defence-in-depth, while keeping the test
+    // struct *synthetic* (not the real `BackupManifest`) so the test
+    // does not break every time the manifest schema gains or renames
+    // a field. The encoder axes — not the production schema — are
+    // what we want to pin.
+    //
+    // Axes covered here that `ManifestShape` does not:
+    //
+    //   1. `Uuid` — `uuid::serde` ships as a 16-byte CBOR byte string
+    //      (major type 2, len 16). A future uuid release that flipped
+    //      to a 36-byte text string would silently break every chain.
+    //   2. `Vec<NestedStruct>` — exercises array-of-map encoding,
+    //      which the manifest's `segments` / `shards` / `media_refs`
+    //      vectors rely on for verbatim hash equivalence.
+    //   3. `Option<T>` — both `Some` (encoded as the inner value
+    //      verbatim) and `None` (encoded as CBOR `null` = 0xF6).
+    //   4. `enum` unit variant — `ChildKind::Events` ↔ text string
+    //      "Events" (major type 3). Production: `SegmentType`,
+    //      `IndexType`.
+    //   5. `#[serde(default, with = "serde_bytes")]` empty `Vec<u8>` —
+    //      encoded as a zero-length byte string (`0x40`), not omitted
+    //      from the map. Matters for `pqc_signature` round-trip.
+    //   6. `u32` and `u64` width-specific integer encoding (short
+    //      unsigned vs 4-byte unsigned with 0x1A prefix).
+    //
+    // The accompanying production-shape integration tests in
+    // `crates/core/src/formats/manifest.rs` keep verifying that
+    // *decoded* manifests round-trip — together they form the full
+    // cross-library wire-format invariant.
+    // -----------------------------------------------------------------
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    enum ChildKind {
+        Events,
+        MessageDelta,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct ChildRef {
+        id: uuid::Uuid,
+        kind: ChildKind,
+        #[serde(with = "serde_bytes")]
+        hash: [u8; 4],
+        size: u64,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct ExtendedShape {
+        magic: String,
+        version: u32,
+        manifest_id: uuid::Uuid,
+        generation: u64,
+        #[serde(with = "serde_bytes")]
+        previous_manifest_hash: [u8; 4],
+        children: Vec<ChildRef>,
+        note: Option<String>,
+        note_absent: Option<String>,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+        #[serde(default, with = "serde_bytes")]
+        pqc_signature: Vec<u8>,
+    }
+
+    impl ExtendedShape {
+        fn sample() -> Self {
+            Self {
+                magic: "BMAN".into(),
+                version: 1,
+                // Deterministic UUIDs so the golden vector stays
+                // stable. Production code uses `Uuid::now_v7()` —
+                // which is also a 16-byte value — but a fixed
+                // value here is necessary for byte-equality.
+                manifest_id: uuid::Uuid::parse_str("01010101-0101-7101-8101-010101010101")
+                    .expect("static uuid"),
+                generation: 0x0102_0304,
+                previous_manifest_hash: [0xAA, 0xBB, 0xCC, 0xDD],
+                children: vec![ChildRef {
+                    id: uuid::Uuid::parse_str("02020202-0202-7202-8202-020202020202")
+                        .expect("static uuid"),
+                    kind: ChildKind::Events,
+                    hash: [0x11, 0x22, 0x33, 0x44],
+                    size: 4096,
+                }],
+                note: Some("hi".into()),
+                note_absent: None,
+                signature: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                pqc_signature: vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn extended_shape_encodes_to_golden_bytes() {
+        // Captured from ciborium 0.2.2 + uuid 1.x on 2026-05-23.
+        // Regeneration protocol: see the module-level wire-format
+        // comment above `manifest_shape_encodes_to_golden_bytes`.
+        // The annotated CBOR decode (one field per logical line):
+        //
+        //   AA                                          # map(10)
+        //   65 magic                                    # text "magic"
+        //   64 BMAN                                     # text "BMAN"
+        //   67 version                                  # text "version"
+        //   01                                          # unsigned 1
+        //   6B manifest_id                              # text "manifest_id"
+        //   50 01..01                                   # bytes(16) UUID
+        //   6A generation                               # text "generation"
+        //   1A 01 02 03 04                              # unsigned 0x01020304
+        //   76 previous_manifest_hash                   # text(22)
+        //   44 AA BB CC DD                              # bytes(4)
+        //   68 children                                 # text "children"
+        //   81                                          # array(1)
+        //     A4                                        # map(4)
+        //     62 id    50 02..02                        # uuid bytes(16)
+        //     64 kind  66 Events                        # text(6) "Events"
+        //     64 hash  44 11 22 33 44                   # bytes(4)
+        //     64 size  19 10 00                         # unsigned 4096
+        //   64 note   62 hi                             # text(2) "hi"
+        //   6B note_absent  F6                          # null
+        //   69 signature   44 DE AD BE EF               # bytes(4)
+        //   6D pqc_signature  40                        # bytes(0)
+        const EXPECTED: &[u8] = &[
+            0xaa, 0x65, 0x6d, 0x61, 0x67, 0x69, 0x63, 0x64, 0x42, 0x4d, 0x41, 0x4e, 0x67, 0x76,
+            0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x01, 0x6b, 0x6d, 0x61, 0x6e, 0x69, 0x66, 0x65,
+            0x73, 0x74, 0x5f, 0x69, 0x64, 0x50, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x71, 0x01,
+            0x81, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x6a, 0x67, 0x65, 0x6e, 0x65, 0x72,
+            0x61, 0x74, 0x69, 0x6f, 0x6e, 0x1a, 0x01, 0x02, 0x03, 0x04, 0x76, 0x70, 0x72, 0x65,
+            0x76, 0x69, 0x6f, 0x75, 0x73, 0x5f, 0x6d, 0x61, 0x6e, 0x69, 0x66, 0x65, 0x73, 0x74,
+            0x5f, 0x68, 0x61, 0x73, 0x68, 0x44, 0xaa, 0xbb, 0xcc, 0xdd, 0x68, 0x63, 0x68, 0x69,
+            0x6c, 0x64, 0x72, 0x65, 0x6e, 0x81, 0xa4, 0x62, 0x69, 0x64, 0x50, 0x02, 0x02, 0x02,
+            0x02, 0x02, 0x02, 0x72, 0x02, 0x82, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x64,
+            0x6b, 0x69, 0x6e, 0x64, 0x66, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x64, 0x68, 0x61,
+            0x73, 0x68, 0x44, 0x11, 0x22, 0x33, 0x44, 0x64, 0x73, 0x69, 0x7a, 0x65, 0x19, 0x10,
+            0x00, 0x64, 0x6e, 0x6f, 0x74, 0x65, 0x62, 0x68, 0x69, 0x6b, 0x6e, 0x6f, 0x74, 0x65,
+            0x5f, 0x61, 0x62, 0x73, 0x65, 0x6e, 0x74, 0xf6, 0x69, 0x73, 0x69, 0x67, 0x6e, 0x61,
+            0x74, 0x75, 0x72, 0x65, 0x44, 0xde, 0xad, 0xbe, 0xef, 0x6d, 0x70, 0x71, 0x63, 0x5f,
+            0x73, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x40,
+        ];
+
+        let actual = to_vec(&ExtendedShape::sample()).expect("encode");
+        assert_eq!(
+            actual, EXPECTED,
+            "ciborium encoding drifted for one of: Uuid (uuid 1.x serde \
+             feature ⇒ 16-byte CBOR byte string), Vec<NestedStruct> \
+             (array-of-map), Option<T> (Some inline / None ⇒ 0xF6), enum \
+             unit variant (text string), or `#[serde(default, with = \
+             \"serde_bytes\")]` empty Vec<u8> (zero-length byte string). \
+             See module-level wire-format comment before regenerating."
+        );
+
+        // Round-trip the golden vector back through `from_slice` so a
+        // future ciborium that *encodes* identically but *decodes*
+        // differently (e.g. a bug in field discovery on `default`
+        // fields) is caught here too.
+        let decoded: ExtendedShape = from_slice(EXPECTED).expect("decode golden");
+        assert_eq!(decoded, ExtendedShape::sample());
+    }
 }
