@@ -451,7 +451,7 @@ pub struct SearchResult {
 /// 3. [`SearchEvent::SearchComplete`] — emitted exactly once
 ///    per search, after every cold bucket has been processed
 ///    or skipped. The payload contains the final fully-merged
-///   + reranked list plus the bucket-fan-out counters.
+///    + reranked list plus the bucket-fan-out counters.
 ///
 /// `SearchScope::LocalOnly` searches emit only
 /// [`SearchEvent::LocalResults`] followed by

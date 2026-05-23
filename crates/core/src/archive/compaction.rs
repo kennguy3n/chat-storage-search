@@ -18,7 +18,7 @@
 //!
 //! * Backup compaction merges by tier (Daily → Weekly → Monthly)
 //!   over a *global* segment ledger.
-//! * Archive compaction merges by `(conversation_id, time_bucket)`
+//! * Archive compaction merges by `(conversation_id, time_bucket)`:
 //!   every segment in a bucket collapses into one compact
 //!   segment, regardless of age — once the bucket is "closed"
 //!   (all events past the bucket's right-edge have been
