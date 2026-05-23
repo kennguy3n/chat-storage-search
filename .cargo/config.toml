@@ -12,7 +12,6 @@
 #
 # Usage:
 #   cargo t          # = cargo test --workspace --features kchat-core/test-support
-#   cargo tw         # = cargo test --workspace --features kchat-core/test-support
 #   cargo bw         # = cargo bench -p kchat-core --features test-support
 #   cargo lw         # = cargo clippy --workspace --all-targets --all-features -- -D warnings
 #
@@ -23,6 +22,5 @@
 # rationale.
 [alias]
 t  = "test --workspace --features kchat-core/test-support"
-tw = "test --workspace --features kchat-core/test-support"
 bw = "bench -p kchat-core --features test-support"
 lw = "clippy --workspace --all-targets --all-features -- -D warnings"
