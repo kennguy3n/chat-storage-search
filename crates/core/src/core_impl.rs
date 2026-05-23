@@ -109,6 +109,26 @@ pub(crate) struct SealedBackupEventRef {
     pub(crate) created_at_ms: i64,
 }
 
+/// Atomically-installed backup key material.
+///
+/// All three fields (`K_backup_root`, the hybrid signing key, and
+/// the device id) are installed together by
+/// [`CoreImpl::install_backup_keys`] and read together by every
+/// backup operation that needs to seal a segment or sign a
+/// manifest. Bundling them into a single struct behind one
+/// [`Mutex`] makes the "installed atomically as a triple"
+/// invariant non-bypassable: callers cannot observe a
+/// partially-installed state where (for example) the root key is
+/// present but the signing key is still `None`. It also reduces
+/// the lock-acquisition count on backup hot paths from three to
+/// one.
+#[derive(Clone)]
+pub(crate) struct BackupKeys {
+    pub(crate) root_key: Zeroizing<[u8; KEY_LEN]>,
+    pub(crate) signing_key: crate::crypto::signing::HybridSigningKey,
+    pub(crate) device_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // CoreImpl
 // ---------------------------------------------------------------------------
@@ -178,22 +198,16 @@ pub struct CoreImpl {
     /// every time a manifest is cut (to harvest the
     /// wrapped-prior-epoch-keys list).
     current_epoch: Mutex<Option<EpochKeyManager>>,
-    /// Phase-4 backup root key (`K_backup_root`,
-    /// `docs/PROPOSAL.md §6.2`). `None` until
-    /// [`CoreImpl::install_backup_keys`] is called. When unset,
-    /// [`KChatCore::run_incremental_backup`] short-circuits to a
-    /// noop result rather than failing — the device may not have
-    /// finished unlocking the backup root yet.
-    backup_root_key: Mutex<Option<Zeroizing<[u8; KEY_LEN]>>>,
-    /// Hybrid Ed25519 + ML-DSA-65 device signing key used to
-    /// sign backup manifests (see
-    /// [`crate::crypto::signing::HybridSigningKey`]). `None` until
-    /// [`CoreImpl::install_backup_keys`] is called.
-    backup_signing_key: Mutex<Option<crate::crypto::signing::HybridSigningKey>>,
-    /// Stable device id stamped into the backup manifest AAD so
-    /// the orchestrator can attribute manifests to the device that
-    /// produced them.
-    backup_device_id: Mutex<Option<String>>,
+    /// Phase-4 backup key material (`K_backup_root`, hybrid
+    /// signing key, stable device id — `docs/PROPOSAL.md §6.2`).
+    /// `None` until [`CoreImpl::install_backup_keys`] is called.
+    /// When unset, [`KChatCore::run_incremental_backup`]
+    /// short-circuits to a noop result rather than failing — the
+    /// device may not have finished unlocking the backup root
+    /// yet. The three pieces are bundled into a single
+    /// [`BackupKeys`] struct so install / read of the triple is
+    /// always atomic.
+    backup_keys: Mutex<Option<BackupKeys>>,
     /// In-memory tail of the backup manifest chain. The next
     /// manifest produced by
     /// [`KChatCore::run_incremental_backup`] chains under this one;
@@ -479,9 +493,7 @@ impl CoreImpl {
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
-            backup_root_key: Mutex::new(None),
-            backup_signing_key: Mutex::new(None),
-            backup_device_id: Mutex::new(None),
+            backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive_config: Mutex::new(None),
@@ -534,9 +546,7 @@ impl CoreImpl {
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             current_epoch: Mutex::new(None),
-            backup_root_key: Mutex::new(None),
-            backup_signing_key: Mutex::new(None),
-            backup_device_id: Mutex::new(None),
+            backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive_config: Mutex::new(None),
@@ -3353,16 +3363,18 @@ impl CoreImpl {
         // compaction would then drop every pre-existing segment.
         self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
 
-        // Hydration succeeded — commit the keys.
-        *self.backup_root_key.lock().map_err(poisoned)? = Some(Zeroizing::new(backup_root));
-        *self.backup_signing_key.lock().map_err(poisoned)? = Some(signing_key);
-        *self.backup_device_id.lock().map_err(poisoned)? = Some(device_id);
+        // Hydration succeeded — commit the keys atomically.
+        *self.backup_keys.lock().map_err(poisoned)? = Some(BackupKeys {
+            root_key: Zeroizing::new(backup_root),
+            signing_key,
+            device_id,
+        });
         Ok(())
     }
 
     /// Whether [`Self::install_backup_keys`] has been called.
     pub fn has_backup_keys(&self) -> bool {
-        self.backup_root_key
+        self.backup_keys
             .lock()
             .map(|s| s.is_some())
             .unwrap_or(false)
@@ -3687,32 +3699,22 @@ impl CoreImpl {
             .expect("non-empty events implies a max");
 
         // Phase 2 — seal the segment outside the db lock.
-        let backup_root = {
-            let slot = self.backup_root_key.lock().map_err(poisoned)?;
-            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
-                Error::Storage(
-                    "run_incremental_backup: K_backup_root not installed (call install_backup_keys first)".into(),
-                )
-            })?;
-            KeyMaterial::from_bytes(bytes)
-        };
-        let signing_key = self
-            .backup_signing_key
+        let BackupKeys {
+            root_key,
+            signing_key,
+            device_id,
+        } = self
+            .backup_keys
             .lock()
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
                 Error::Storage(
-                    "run_incremental_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                    "run_incremental_backup: backup keys not installed (call install_backup_keys first)".into(),
                 )
             })?
             .clone();
-        let device_id = self
-            .backup_device_id
-            .lock()
-            .map_err(poisoned)?
-            .clone()
-            .unwrap_or_else(|| "unknown-device".to_string());
+        let backup_root = KeyMaterial::from_bytes(*root_key);
 
         let segment_id = uuid::Uuid::now_v7();
         let k_segment =
@@ -3839,33 +3841,23 @@ impl CoreImpl {
         use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
         use crate::formats::SegmentType;
 
-        let backup_root = {
-            let slot = self.backup_root_key.lock().map_err(poisoned)?;
-            let bytes = slot.as_ref().map(|z| **z).ok_or_else(|| {
-                Error::Storage(
-                    "compact_backup: K_backup_root not installed (call install_backup_keys first)"
-                        .into(),
-                )
-            })?;
-            KeyMaterial::from_bytes(bytes)
-        };
-        let signing_key = self
-            .backup_signing_key
+        let BackupKeys {
+            root_key,
+            signing_key,
+            device_id,
+        } = self
+            .backup_keys
             .lock()
             .map_err(poisoned)?
             .as_ref()
             .ok_or_else(|| {
                 Error::Storage(
-                    "compact_backup: backup signing key not installed (call install_backup_keys first)".into(),
+                    "compact_backup: backup keys not installed (call install_backup_keys first)"
+                        .into(),
                 )
             })?
             .clone();
-        let device_id = self
-            .backup_device_id
-            .lock()
-            .map_err(poisoned)?
-            .clone()
-            .unwrap_or_else(|| "unknown-device".to_string());
+        let backup_root = KeyMaterial::from_bytes(*root_key);
 
         // Snapshot the ledger and build a plan.
         let snapshot = self
@@ -8285,7 +8277,7 @@ mod tests {
             .expect_err("must fail without keys");
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("K_backup_root not installed"), "{msg}")
+                assert!(msg.contains("backup keys not installed"), "{msg}")
             }
             other => panic!("unexpected error: {other:?}"),
         }
