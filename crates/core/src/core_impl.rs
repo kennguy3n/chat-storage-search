@@ -108,30 +108,17 @@ pub(crate) struct SealedBackupEventRef {
     pub(crate) created_at_ms: i64,
 }
 
-/// Atomically-installed backup key material.
-///
-/// All three fields (`K_backup_root`, the hybrid signing key, and
-/// the device id) are installed together by
-/// [`CoreImpl::install_backup_keys`] and read together by every
-/// backup operation that needs to seal a segment or sign a
-/// manifest. Bundling them into a single struct behind one
-/// [`Mutex`] makes the "installed atomically as a triple"
-/// invariant non-bypassable: callers cannot observe a
-/// partially-installed state where (for example) the root key is
-/// present but the signing key is still `None`. It also reduces
-/// the lock-acquisition count on backup hot paths from three to
-/// one.
-#[derive(Clone)]
-pub(crate) struct BackupKeys {
-    pub(crate) root_key: Zeroizing<[u8; KEY_LEN]>,
-    pub(crate) signing_key: crate::crypto::signing::HybridSigningKey,
-    pub(crate) device_id: String,
-}
-
+// `BackupKeys` (and its atomic-bundle rationale) lives in
+// `crate::backup::coordinator` as of Phase B.9 — the `Coordinator`
+// there owns the bundle and the in-memory manifest tail / segment
+// ledger previously held directly on `CoreImpl`.
+//
 // `ZkofArchiveBackend` (and its atomic-install rationale) lives in
 // `crate::archive::coordinator` as of Phase B.9 — the `Coordinator`
 // there owns the bundle and the surrounding state previously held
 // directly on `CoreImpl`.
+pub(crate) use crate::backup::coordinator::BackupKeys;
+pub use crate::backup::coordinator::TrackedBackupSegment;
 
 // ---------------------------------------------------------------------------
 // CoreImpl
@@ -185,26 +172,30 @@ pub(crate) struct BackupKeys {
 ///     atomic loads; the corresponding `install_*` /
 ///     `set_delivery_client` setters return
 ///     [`Error::Storage`] on double-install.
-///   * **One write-once atomic bundle** (`BackupKeys`) stays in
-///     [`Mutex`]`<`[`Option`]`<_>>` because the bundle is
-///     legitimately re-installable on key rotation; the bundle
-///     struct itself makes the "all three pieces installed
-///     atomically" invariant non-bypassable. The ZKOF archive
-///     bundle moved to
-///     [`crate::archive::coordinator::Coordinator`] in Phase B.9.
-///   * **Genuinely-mutable in-flight state**
-///     (`previous_backup_manifest`, `tracked_backup_segments`,
-///     `hydration_queue`, `ep_benchmark_cache`) stays in
-///     [`Mutex`]`<T>` / [`Mutex`]`<Option<T>>` because each is
-///     mutated mid-flight (manifest chain append, segment ledger
-///     append, queue enqueue/dequeue, cache update).
-///   * **Phase-B.9 archive coordinator** — the epoch-key
-///     lifecycle (`current_epoch`) and the ZKOF backend wiring
-///     (`zkof_archive`) are owned by
+///   * **Phase-B.9 backup coordinator** — the atomic backup key
+///     bundle (`BackupKeys` — `K_backup_root` + hybrid signing
+///     key + stable device id), the in-memory manifest chain tail
+///     (`previous_backup_manifest`), and the in-memory sealed
+///     segment ledger (`tracked_backup_segments`) all moved to
+///     [`crate::backup::coordinator::Coordinator`] in Phase B.9
+///     (see the `backup` field below). The bundle struct keeps
+///     the "all three pieces installed atomically" invariant
+///     non-bypassable; the coordinator's
+///     [`crate::backup::coordinator::Coordinator::commit_incremental`]
+///     / `commit_compaction` helpers couple the post-persist
+///     manifest tail update with the segment ledger update into
+///     one named operation. The ZKOF archive bundle similarly
+///     lives in
+///     [`crate::archive::coordinator::Coordinator`] (Phase B.9).
+///   * **Genuinely-mutable in-flight state** (`hydration_queue`,
+///     `ep_benchmark_cache`) stays in [`Mutex`]`<T>` /
+///     [`Mutex`]`<Option<T>>` because each is mutated mid-flight
+///     (queue enqueue/dequeue, cache update). The archive epoch
+///     manager and ZKOF backend are owned by
 ///     [`crate::archive::coordinator::Coordinator`] (see the
-///     `archive` field below). `CoreImpl` no longer holds those
-///     mutexes directly; install / rotate / build-router methods
-///     delegate to the coordinator.
+///     `archive` field below). `CoreImpl` no longer holds the
+///     backup or archive mutexes directly; install / rotate /
+///     build-router methods delegate to the coordinators.
 ///   * The DB connections are split into
 ///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
 ///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
@@ -226,13 +217,23 @@ pub(crate) struct BackupKeys {
 ///      `crate::archive::coordinator`), `ep_benchmark_cache`
 ///      (each independent of the others; no method holds two of
 ///      these simultaneously).
-///   3. **Backup bundles** — `backup_keys`,
-///      `previous_backup_manifest`, `tracked_backup_segments`.
-///      `run_incremental_backup` acquires `backup_keys` first,
-///      then `previous_backup_manifest`, then
-///      `tracked_backup_segments`; releases each before taking
-///      the next where possible. Never holds two backup locks
-///      across an I/O call.
+///   3. **Backup bundles** — the three backup mutexes
+///      (`backup_keys`, `previous_backup_manifest`,
+///      `tracked_backup_segments`) are owned by
+///      [`crate::backup::coordinator::Coordinator`] (see the
+///      `backup` field below). `run_incremental_backup` /
+///      `compact_backup` clone keys via
+///      [`crate::backup::coordinator::Coordinator::require_keys`]
+///      first, snapshot the manifest tail via
+///      [`crate::backup::coordinator::Coordinator::previous_manifest`]
+///      next, snapshot the segment ledger via
+///      [`crate::backup::coordinator::Coordinator::tracked_segments`]
+///      next, perform I/O / persist with the locks released, and
+///      finally call
+///      [`crate::backup::coordinator::Coordinator::commit_incremental`]
+///      / `commit_compaction` to atomically update the chain tail
+///      and segment ledger. Never holds two backup locks across
+///      an I/O call.
 ///   4. **Database** — `db_writer` for writes,
 ///      `db_readers.with_reader(...)` for reads. The DB lock is
 ///      acquired *last* and released *first*; nothing inside a
@@ -292,40 +293,20 @@ pub struct CoreImpl {
     /// coordinator. See `crate::archive::coordinator` for the
     /// per-method documentation.
     archive: crate::archive::coordinator::Coordinator,
-    /// Phase-4 backup key material (`K_backup_root`, hybrid
-    /// signing key, stable device id — `docs/PROPOSAL.md §6.2`).
-    /// `None` until [`CoreImpl::install_backup_keys`] is called.
-    /// When unset, [`KChatCore::run_incremental_backup`]
-    /// short-circuits to a noop result rather than failing — the
-    /// device may not have finished unlocking the backup root
-    /// yet. The three pieces are bundled into a single
-    /// [`BackupKeys`] struct so install / read of the triple is
-    /// always atomic.
-    backup_keys: Mutex<Option<BackupKeys>>,
-    /// In-memory tail of the backup manifest chain. The next
-    /// manifest produced by
-    /// [`KChatCore::run_incremental_backup`] chains under this one;
-    /// `None` produces a genesis manifest. Mirrors the persisted
-    /// `backup_manifest_chain` single-row table — rehydrated in
-    /// [`Self::hydrate_backup_manifest_from_db`] at construction
-    /// time and rewritten by
-    /// [`Self::persist_backup_manifest`] after each backup so
-    /// chain continuity survives a process restart.
-    previous_backup_manifest: Mutex<Option<crate::formats::manifest::BackupManifest>>,
-    /// In-memory ledger of every sealed backup segment the
-    /// orchestrator currently knows about (built but not yet
-    /// superseded by compaction). [`KChatCore::run_incremental_backup`]
-    /// appends one entry per call; [`Self::compact_backup`] reads
-    /// it, builds a [`crate::backup::compaction::CompactionPlan`],
-    /// re-seals the merged groups, and rewrites the ledger with
-    /// the compacted entries replacing the superseded ones.
-    /// Mirrors the persisted `backup_segment_ledger` table —
-    /// rehydrated in
-    /// [`Self::hydrate_tracked_backup_segments_from_db`] when
-    /// `K_backup_root` is installed (the per-segment keys are
-    /// stored AES-256-KW-wrapped under that root) and rewritten
-    /// after each backup / compaction step.
-    tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
+    /// Phase-B.9 backup coordinator — owns the Phase-4 backup
+    /// key bundle (`K_backup_root` + hybrid signing key + stable
+    /// device id, `docs/PROPOSAL.md §6.2`), the in-memory manifest
+    /// chain tail (`backup_manifest_chain`), and the in-memory
+    /// sealed-segment ledger (`backup_segment_ledger`)
+    /// previously held directly on `CoreImpl` as the
+    /// `backup_keys` / `previous_backup_manifest` /
+    /// `tracked_backup_segments` fields. All `install_backup_keys`
+    /// / `has_backup_keys` / `hydrate_*` /
+    /// `run_incremental_backup_*` / `compact_backup` methods on
+    /// `CoreImpl` delegate state reads / writes through this
+    /// coordinator. See `crate::backup::coordinator` for the
+    /// per-method documentation.
+    backup: crate::backup::coordinator::Coordinator,
     /// Phase-5 background scheduler bridge. Write-once via
     /// [`CoreImpl::install_scheduler`] by the platform glue
     /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
@@ -477,34 +458,6 @@ pub struct CoreImpl {
     ep_benchmark_cache: Mutex<crate::models::ep_tuning::EpBenchmarkCache>,
 }
 
-/// One row of [`CoreImpl::tracked_backup_segments`].
-#[derive(Debug, Clone)]
-pub struct TrackedBackupSegment {
-    /// Sealed segment record returned by
-    /// [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`].
-    pub built: crate::backup::segment_builder::BuiltBackupSegment,
-    /// Tier the segment currently sits in. New segments produced
-    /// by [`KChatCore::run_incremental_backup`] start at
-    /// [`crate::backup::compaction::CompactionTier::Daily`].
-    pub tier: crate::backup::compaction::CompactionTier,
-    /// Earliest event timestamp covered by the segment (ms epoch).
-    pub min_event_ms: i64,
-    /// Latest event timestamp covered by the segment (ms epoch).
-    pub max_event_ms: i64,
-    /// The `K_backup_segment` instance the segment was sealed
-    /// under. Stored here because
-    /// [`crate::backup::segment_builder::BackupSegmentBuilder::build_segment`]
-    /// generates `built.segment_id` internally — it is **not**
-    /// the input to [`crate::crypto::key_hierarchy::derive_backup_segment`]
-    /// — so the orchestrator cannot re-derive the key on the
-    /// open side. Persisted on the
-    /// `backup_segment_ledger.wrapped_k_segment` column as an
-    /// AES-256-KW (RFC 3394) of these bytes under
-    /// `K_backup_root` — see
-    /// [`CoreImpl::hydrate_tracked_backup_segments_from_db`].
-    pub k_segment: crate::crypto::key_hierarchy::KeyMaterial,
-}
-
 impl std::fmt::Debug for CoreImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreImpl")
@@ -619,9 +572,7 @@ impl CoreImpl {
             delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
-            backup_keys: Mutex::new(None),
-            previous_backup_manifest: Mutex::new(None),
-            tracked_backup_segments: Mutex::new(Vec::new()),
+            backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
@@ -672,9 +623,7 @@ impl CoreImpl {
             delivery_client: OnceLock::new(),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
-            backup_keys: Mutex::new(None),
-            previous_backup_manifest: Mutex::new(None),
-            tracked_backup_segments: Mutex::new(Vec::new()),
+            backup: crate::backup::coordinator::Coordinator::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             image_embedder: OnceLock::new(),
@@ -3406,33 +3355,34 @@ impl CoreImpl {
     ) -> Result<()> {
         // Phase-5 hardening: the `wrapped_k_segment` BLOB column
         // on `backup_segment_ledger` is sealed under
-        // `K_backup_root`. Hydrate the in-memory ledger BEFORE
-        // installing any of the key `Mutex`es, so a hydration
-        // failure (corrupt row, AES-KW unwrap mismatch under a
-        // different root key, etc.) leaves the orchestrator in
-        // the "no keys, no ledger" state instead of the divergent
-        // "keys installed, ledger empty" state. Without this
-        // ordering, `has_backup_keys()` would return `true` after
-        // a hydrate failure and the next backup operation would
-        // proceed against an empty in-memory ledger — the first
-        // compaction would then drop every pre-existing segment.
-        self.hydrate_tracked_backup_segments_from_db(&backup_root)?;
-
-        // Hydration succeeded — commit the keys atomically.
-        *self.backup_keys.lock().map_err(poisoned)? = Some(BackupKeys {
-            root_key: Zeroizing::new(backup_root),
-            signing_key,
-            device_id,
-        });
-        Ok(())
+        // `K_backup_root`. Materialise the in-memory ledger
+        // BEFORE handing it (and the keys) to the coordinator, so
+        // a hydration failure (corrupt row, AES-KW unwrap
+        // mismatch under a different root key, etc.) leaves the
+        // coordinator in the "no keys, no ledger" state instead
+        // of the divergent "keys installed, ledger empty" state.
+        // Without this ordering, `has_backup_keys()` would return
+        // `true` after a hydrate failure and the next backup
+        // operation would proceed against an empty in-memory
+        // ledger — the first compaction would then drop every
+        // pre-existing segment. The coordinator's
+        // [`crate::backup::coordinator::Coordinator::install_keys`]
+        // takes both locks together so the (keys, ledger)
+        // transition is observed atomically.
+        let materialised = self.materialise_backup_segments_from_db(&backup_root)?;
+        self.backup.install_keys(
+            BackupKeys {
+                root_key: Zeroizing::new(backup_root),
+                signing_key,
+                device_id,
+            },
+            materialised,
+        )
     }
 
     /// Whether [`Self::install_backup_keys`] has been called.
     pub fn has_backup_keys(&self) -> bool {
-        self.backup_keys
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false)
+        self.backup.has_keys()
     }
 
     // ----------------------------------------------------------------
@@ -3462,19 +3412,24 @@ impl CoreImpl {
                         .into(),
                     )
                 })?;
-            *self.previous_backup_manifest.lock().map_err(poisoned)? = Some(manifest);
+            self.backup.set_previous_manifest(Some(manifest))?;
         }
         Ok(())
     }
 
     /// Load every row in `backup_segment_ledger`, unwrap each
     /// `wrapped_k_segment` under the supplied `K_backup_root`, and
-    /// install the result as the in-memory ledger.
+    /// return the materialised in-memory ledger.
     ///
     /// Called from [`Self::install_backup_keys`] — before the root
     /// is installed the wrapped keys cannot be opened, so the
-    /// ledger stays empty.
-    fn hydrate_tracked_backup_segments_from_db(&self, backup_root: &[u8; KEY_LEN]) -> Result<()> {
+    /// ledger stays empty. The caller hands the returned Vec to
+    /// [`crate::backup::coordinator::Coordinator::install_keys`]
+    /// so the (keys, ledger) pair is installed atomically.
+    fn materialise_backup_segments_from_db(
+        &self,
+        backup_root: &[u8; KEY_LEN],
+    ) -> Result<Vec<TrackedBackupSegment>> {
         use crate::backup::compaction::CompactionTier;
         use crate::backup::segment_builder::BuiltBackupSegment;
         use crate::crypto::aead::xchacha20_poly1305::NONCE_LEN;
@@ -3558,8 +3513,7 @@ impl CoreImpl {
                 k_segment,
             });
         }
-        *self.tracked_backup_segments.lock().map_err(poisoned)? = materialised;
-        Ok(())
+        Ok(materialised)
     }
 
     /// Encode the given manifest to CBOR for DB persistence.
@@ -3769,22 +3723,11 @@ impl CoreImpl {
             .expect("non-empty events implies a max");
 
         // Phase 2 — seal the segment outside the db lock.
-        let BackupKeys {
-            root_key,
-            signing_key,
-            device_id,
-        } = self
-            .backup_keys
-            .lock()
-            .map_err(poisoned)?
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
-                    "backup_keys",
-                ))
-            })?
-            .clone();
-        let backup_root = KeyMaterial::from_bytes(*root_key);
+        // `keys` is an `Arc<BackupKeys>` so this snapshot is an
+        // 8 byte refcount bump rather than a ~6 KB
+        // `HybridSigningKey` copy on the stack.
+        let keys = self.backup.require_keys()?;
+        let backup_root = KeyMaterial::from_bytes(*keys.root_key);
 
         let segment_id = uuid::Uuid::now_v7();
         let k_segment =
@@ -3798,11 +3741,7 @@ impl CoreImpl {
         )?;
 
         // Build the manifest chained under the in-memory tail.
-        let previous_owned = self
-            .previous_backup_manifest
-            .lock()
-            .map_err(poisoned)?
-            .clone();
+        let previous_owned = self.backup.previous_manifest()?;
         let manifest_id_for_key = uuid::Uuid::now_v7();
         let k_manifest = derive_backup_manifest(&backup_root, manifest_id_for_key.as_bytes())
             .map_err(Error::Crypto)?;
@@ -3813,9 +3752,9 @@ impl CoreImpl {
             media_references: vec![],
             tombstones: vec![],
             previous: previous_owned.as_ref(),
-            device_id: device_id.clone(),
+            device_id: keys.device_id.clone(),
         };
-        let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
+        let sealed_manifest = build_backup_manifest(request, &keys.signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
 
         // `compact_backup` consumes this ledger when the
@@ -3853,12 +3792,11 @@ impl CoreImpl {
         )?;
 
         // Persist succeeded — commit the in-memory state.
-        *self.previous_backup_manifest.lock().map_err(poisoned)? =
-            Some(sealed_manifest.manifest.clone());
-        self.tracked_backup_segments
-            .lock()
-            .map_err(poisoned)?
-            .push(tracked);
+        // [`crate::backup::coordinator::Coordinator::commit_incremental`]
+        // takes both backup locks together so any concurrent reader
+        // observes the (manifest tail, segment ledger) pair atomically.
+        self.backup
+            .commit_incremental(sealed_manifest.manifest.clone(), tracked)?;
 
         Ok((
             BackupResult {
@@ -3911,29 +3849,14 @@ impl CoreImpl {
         use crate::crypto::key_hierarchy::{derive_backup_manifest, derive_backup_segment};
         use crate::formats::SegmentType;
 
-        let BackupKeys {
-            root_key,
-            signing_key,
-            device_id,
-        } = self
-            .backup_keys
-            .lock()
-            .map_err(poisoned)?
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
-                    "backup_keys",
-                ))
-            })?
-            .clone();
-        let backup_root = KeyMaterial::from_bytes(*root_key);
+        // `keys` is an `Arc<BackupKeys>`; access fields via
+        // `&*keys` so no ~6 KB `HybridSigningKey` ever sits on
+        // the stack for this orchestrator.
+        let keys = self.backup.require_keys()?;
+        let backup_root = KeyMaterial::from_bytes(*keys.root_key);
 
         // Snapshot the ledger and build a plan.
-        let snapshot = self
-            .tracked_backup_segments
-            .lock()
-            .map_err(poisoned)?
-            .clone();
+        let snapshot = self.backup.tracked_segments()?;
         if snapshot.is_empty() {
             return Ok(BackupCompactionResult::default());
         }
@@ -4031,11 +3954,7 @@ impl CoreImpl {
         // the chain reflects the compaction.
         let segments_for_manifest: Vec<_> =
             new_ledger_local.iter().map(|s| s.built.clone()).collect();
-        let previous_owned = self
-            .previous_backup_manifest
-            .lock()
-            .map_err(poisoned)?
-            .clone();
+        let previous_owned = self.backup.previous_manifest()?;
         let manifest_id_for_key = uuid::Uuid::now_v7();
         let k_manifest = derive_backup_manifest(&backup_root, manifest_id_for_key.as_bytes())
             .map_err(Error::Crypto)?;
@@ -4045,9 +3964,9 @@ impl CoreImpl {
             media_references: vec![],
             tombstones: vec![],
             previous: previous_owned.as_ref(),
-            device_id,
+            device_id: keys.device_id.clone(),
         };
-        let sealed_manifest = build_backup_manifest(request, &signing_key, &k_manifest)?;
+        let sealed_manifest = build_backup_manifest(request, &keys.signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
 
         // Phase-5 hardening: atomically rewrite the persisted
@@ -4067,9 +3986,12 @@ impl CoreImpl {
         )?;
 
         // Persist succeeded — swap the in-memory state.
-        *self.tracked_backup_segments.lock().map_err(poisoned)? = new_ledger_local;
-        *self.previous_backup_manifest.lock().map_err(poisoned)? =
-            Some(sealed_manifest.manifest.clone());
+        // [`crate::backup::coordinator::Coordinator::commit_compaction`]
+        // takes both backup locks together so any concurrent reader
+        // observes the (segment ledger, manifest tail) pair
+        // atomically after compaction.
+        self.backup
+            .commit_compaction(sealed_manifest.manifest.clone(), new_ledger_local)?;
 
         Ok(BackupCompactionResult {
             groups_compacted,
@@ -8452,7 +8374,7 @@ mod tests {
 
         // Sanity: ledger has three Daily segments before the
         // compaction.
-        let pre_len = core.tracked_backup_segments.lock().unwrap().len();
+        let pre_len = core.backup.tracked_segments().unwrap().len();
         assert_eq!(pre_len, 3);
 
         let result = core.compact_backup(now_ms).expect("compact");
@@ -8468,7 +8390,7 @@ mod tests {
         assert!(result.bytes_before > 0);
 
         // Ledger now has exactly one Weekly entry.
-        let post = core.tracked_backup_segments.lock().unwrap().clone();
+        let post = core.backup.tracked_segments().unwrap();
         assert_eq!(post.len(), 1);
         assert_eq!(
             post[0].tier,
@@ -8504,7 +8426,7 @@ mod tests {
         let result = core.compact_backup(now_ms).expect("compact");
         assert_eq!(result, BackupCompactionResult::default());
         // Ledger preserved.
-        assert_eq!(core.tracked_backup_segments.lock().unwrap().len(), 3);
+        assert_eq!(core.backup.tracked_segments().unwrap().len(), 3);
     }
 
     #[test]
@@ -8539,7 +8461,7 @@ mod tests {
         assert_eq!(result.groups_compacted, 1);
         assert_eq!(result.segments_superseded, 3);
 
-        let post = core.tracked_backup_segments.lock().unwrap().clone();
+        let post = core.backup.tracked_segments().unwrap();
         assert_eq!(post.len(), 1);
         let payload = crate::backup::segment_builder::decrypt_backup_segment(
             &post[0].built,
@@ -8601,16 +8523,16 @@ mod tests {
 
             // Sanity: in-memory state reflects the just-built backup.
             let in_memory_tracked = core
-                .tracked_backup_segments
-                .lock()
+                .backup
+                .tracked_segments()
                 .unwrap()
                 .iter()
                 .map(|s| s.built.segment_id)
                 .collect::<Vec<_>>();
             assert_eq!(in_memory_tracked.len(), 1);
             let in_memory_manifest = core
-                .previous_backup_manifest
-                .lock()
+                .backup
+                .previous_manifest()
                 .unwrap()
                 .as_ref()
                 .map(|m| m.generation);
@@ -8645,15 +8567,15 @@ mod tests {
         let core2 = CoreImpl::new(cfg, TEST_KEY).expect("reopen core");
         // Manifest chain rehydrates eagerly in `new`.
         let manifest_after_restart = core2
-            .previous_backup_manifest
-            .lock()
+            .backup
+            .previous_manifest()
             .unwrap()
             .as_ref()
             .map(|m| m.generation);
         assert_eq!(manifest_after_restart, Some(pre_generation));
         // Segment ledger only rehydrates once the wrapping root is
         // re-installed.
-        assert!(core2.tracked_backup_segments.lock().unwrap().is_empty());
+        assert!(core2.backup.tracked_segments().unwrap().is_empty());
 
         let mut rng = rand::rngs::OsRng;
         let signing = crate::crypto::signing::HybridSigningKey::generate(&mut rng);
@@ -8661,8 +8583,8 @@ mod tests {
             .install_backup_keys(backup_root, signing, device_id.clone())
             .expect("install backup keys (post-restart)");
         let rehydrated = core2
-            .tracked_backup_segments
-            .lock()
+            .backup
+            .tracked_segments()
             .unwrap()
             .iter()
             .map(|s| (s.built.segment_id, s.tier, s.built.event_count))
@@ -8726,8 +8648,8 @@ mod tests {
         seed_backup_event(&core, conv, Uuid::now_v7(), 1_777_000_001_000);
 
         // Pre-call in-memory state.
-        assert!(core.previous_backup_manifest.lock().unwrap().is_none());
-        assert!(core.tracked_backup_segments.lock().unwrap().is_empty());
+        assert!(core.backup.previous_manifest().unwrap().is_none());
+        assert!(core.backup.tracked_segments().unwrap().is_empty());
 
         // Snapshot the pre-call cursor — should be 0 since no
         // backup has ever advanced it.
@@ -8749,11 +8671,11 @@ mod tests {
 
         // In-memory state must be unchanged.
         assert!(
-            core.previous_backup_manifest.lock().unwrap().is_none(),
+            core.backup.previous_manifest().unwrap().is_none(),
             "previous_backup_manifest must not advance on persist failure"
         );
         assert!(
-            core.tracked_backup_segments.lock().unwrap().is_empty(),
+            core.backup.tracked_segments().unwrap().is_empty(),
             "tracked_backup_segments must not gain entries on persist failure"
         );
 
@@ -8793,16 +8715,16 @@ mod tests {
 
         // Snapshot the pre-compaction in-memory state.
         let pre_ledger_ids: Vec<uuid::Uuid> = core
-            .tracked_backup_segments
-            .lock()
+            .backup
+            .tracked_segments()
             .unwrap()
             .iter()
             .map(|s| s.built.segment_id)
             .collect();
         assert_eq!(pre_ledger_ids.len(), 3);
         let pre_manifest_generation = core
-            .previous_backup_manifest
-            .lock()
+            .backup
+            .previous_manifest()
             .unwrap()
             .as_ref()
             .map(|m| m.generation);
@@ -8822,8 +8744,8 @@ mod tests {
         // removed and compacted entries must NOT have been
         // appended.
         let post_ledger_ids: Vec<uuid::Uuid> = core
-            .tracked_backup_segments
-            .lock()
+            .backup
+            .tracked_segments()
             .unwrap()
             .iter()
             .map(|s| s.built.segment_id)
@@ -8836,8 +8758,8 @@ mod tests {
         // Manifest tail must still be at the pre-compaction
         // generation.
         let post_manifest_generation = core
-            .previous_backup_manifest
-            .lock()
+            .backup
+            .previous_manifest()
             .unwrap()
             .as_ref()
             .map(|m| m.generation);
@@ -8893,7 +8815,7 @@ mod tests {
         // `backup_manifest_chain` (manifest hydration runs in
         // `new` and is independent of the wrap key).
         assert!(
-            core2.previous_backup_manifest.lock().unwrap().is_some(),
+            core2.backup.previous_manifest().unwrap().is_some(),
             "manifest tail should rehydrate eagerly"
         );
 
@@ -8927,7 +8849,7 @@ mod tests {
         // result in one shot at the end, so a per-row failure
         // leaves the in-memory Vec untouched).
         assert!(
-            core2.tracked_backup_segments.lock().unwrap().is_empty(),
+            core2.backup.tracked_segments().unwrap().is_empty(),
             "tracked_backup_segments must remain empty when hydration fails"
         );
     }
