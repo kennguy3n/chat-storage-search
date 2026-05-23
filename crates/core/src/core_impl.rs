@@ -4364,7 +4364,7 @@ impl KChatCore for CoreImpl {
             self.enqueue_cold_results_for_hydration(&results);
         }
         trace.insert_metadata("result_count", results.len().to_string());
-        tracing::Span::current().record("result_count", results.len());
+        span.record("result_count", results.len());
         trace.finish();
         self.record_perf_trace(trace);
         Ok(results)
@@ -4701,10 +4701,16 @@ impl KChatCore for CoreImpl {
         // The closure captures `trace` mutably so the success
         // path can attach `is_cold` / `offline` metadata before
         // the surrounding match records the finished trace.
+        let span = tracing::Span::current();
         let mut trace = crate::perf::PerfTrace::new("hydrate_message");
         trace.insert_metadata("reason", reason.to_string());
 
         let trace_ref = &mut trace;
+        // The closure captures `span` by reference; `Span` is just an
+        // `Arc`-backed handle so this is cheap and lets the success
+        // path record `is_cold` / `offline` from inside the closure
+        // while the surrounding error block reuses the same handle.
+        let span_ref = &span;
         let result: Result<HydratedMessage> = (|| {
             // Phase-3 foundation: serve from local storage when a body is
             // already present, otherwise return the skeleton with
@@ -4782,8 +4788,8 @@ impl KChatCore for CoreImpl {
             let offline = !is_local && !self.is_online();
             trace_ref.insert_metadata("is_cold", (!is_local).to_string());
             trace_ref.insert_metadata("offline", offline.to_string());
-            tracing::Span::current().record("is_cold", !is_local);
-            tracing::Span::current().record("offline", offline);
+            span_ref.record("is_cold", !is_local);
+            span_ref.record("offline", offline);
             Ok(HydratedMessage {
                 message_id: message_id_uuid,
                 conversation_id,
@@ -4795,7 +4801,7 @@ impl KChatCore for CoreImpl {
         if let Err(e) = result.as_ref() {
             let err_str = e.to_string();
             trace.insert_metadata("error", err_str.clone());
-            tracing::Span::current().record("error", err_str.as_str());
+            span.record("error", err_str.as_str());
         }
         trace.finish();
         self.record_perf_trace(trace);
@@ -4822,6 +4828,7 @@ impl KChatCore for CoreImpl {
         // backup hot path. `start_ns` is captured up front so
         // the trace covers both the offline short-circuit and
         // the full segment-build + upload path.
+        let span = tracing::Span::current();
         let mut trace = crate::perf::PerfTrace::new("run_incremental_backup");
         trace.insert_metadata("reason", reason);
 
@@ -4837,7 +4844,7 @@ impl KChatCore for CoreImpl {
                 ..BackupResult::default()
             };
             trace.insert_metadata("deferred", "true");
-            tracing::Span::current().record("deferred", true);
+            span.record("deferred", true);
             trace.finish();
             self.record_perf_trace(trace);
             return Ok(result);
@@ -4847,7 +4854,7 @@ impl KChatCore for CoreImpl {
             Err(e) => {
                 let err_str = e.to_string();
                 trace.insert_metadata("error", err_str.clone());
-                tracing::Span::current().record("error", err_str.as_str());
+                span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 return Err(e);
@@ -4856,7 +4863,6 @@ impl KChatCore for CoreImpl {
         result.deferred = false;
         trace.insert_metadata("segments_built", result.segments_built.to_string());
         trace.insert_metadata("events_segmented", result.events_segmented.to_string());
-        let span = tracing::Span::current();
         span.record("deferred", false);
         span.record("segments_built", result.segments_built);
         span.record("events_segmented", result.events_segmented);
@@ -4890,6 +4896,7 @@ impl KChatCore for CoreImpl {
         // `run_incremental_backup` / `hydrate_message`
         // instrumentation — a dashboard consumer can pivot every
         // hot-path trace by the same `reason` key.
+        let span = tracing::Span::current();
         let mut trace = crate::perf::PerfTrace::new("enforce_storage_budget");
         trace.insert_metadata("reason", reason);
 
@@ -4947,9 +4954,9 @@ impl KChatCore for CoreImpl {
         })();
         match outcome {
             Ok((out, pressure_str)) => {
-                tracing::Span::current().record("pressure_level", pressure_str.as_str());
-                tracing::Span::current().record("freed_bytes", out.freed_bytes);
-                tracing::Span::current().record("evicted_count", out.evicted_count);
+                span.record("pressure_level", pressure_str.as_str());
+                span.record("freed_bytes", out.freed_bytes);
+                span.record("evicted_count", out.evicted_count);
                 trace.insert_metadata("pressure_level", pressure_str);
                 trace.insert_metadata("freed_bytes", out.freed_bytes.to_string());
                 trace.insert_metadata("evicted_count", out.evicted_count.to_string());
@@ -4985,7 +4992,7 @@ impl KChatCore for CoreImpl {
             Err(e) => {
                 let err_str = e.to_string();
                 trace.insert_metadata("error", err_str.clone());
-                tracing::Span::current().record("error", err_str.as_str());
+                span.record("error", err_str.as_str());
                 trace.finish();
                 self.record_perf_trace(trace);
                 Err(e)
