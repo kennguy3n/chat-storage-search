@@ -188,13 +188,17 @@ pub struct TrackedBackupSegment {
 ///     the manifest tail and the segment ledger under a single
 ///     guard, so a concurrent reader cannot observe a
 ///     "new segments + old manifest" or vice versa intermediate.
-///   * Snapshot atomicity (readers): orchestrators that need a
-///     consistent (manifest, segments) view use
-///     [`Coordinator::snapshot_chain`] to read both fields under
-///     the same lock acquisition rather than calling
-///     `previous_manifest()` and `tracked_segments()` separately
-///     (each of which would release the lock between calls, with
-///     a write potentially interleaving in between).
+///   * Snapshot atomicity (readers): each accessor
+///     ([`Coordinator::previous_manifest`] /
+///     [`Coordinator::tracked_segments`]) takes the same
+///     `chain_state` guard a writer holds, so any single field
+///     read is internally atomic against concurrent commits. A
+///     caller that needs the (manifest, segments) pair jointly
+///     consistent at the same point in time should request that
+///     accessor at the call site — doing so as a single
+///     guard-and-clone is trivial once a real caller exists,
+///     and adding one speculatively before any caller does is
+///     the kind of unused API surface that bit-rots.
 #[derive(Clone, Default)]
 pub(crate) struct BackupChainState {
     /// In-memory tail of the manifest chain. Mirrors the persisted
@@ -303,12 +307,16 @@ impl Coordinator {
 
     /// Snapshot the in-memory tail of the manifest chain.
     ///
-    /// Independent accessor for callers that only need the
-    /// manifest tail; callers that need both the manifest and the
-    /// segment ledger should use [`Self::snapshot_chain`] instead,
-    /// which reads both under a single lock acquisition (avoids a
-    /// concurrent write interleaving between two separate
-    /// snapshot calls).
+    /// Each call takes the `chain_state` guard for the duration
+    /// of one field clone, so the read is internally atomic
+    /// against any concurrent [`Self::commit_incremental`] /
+    /// [`Self::commit_compaction`]. A caller that needs the
+    /// (manifest, segments) pair jointly consistent should add a
+    /// single-shot accessor on this coordinator at the time the
+    /// call site exists (one guard-and-clone returning both
+    /// fields), rather than calling this method and
+    /// [`Self::tracked_segments`] back-to-back — the two calls
+    /// release the lock between them and a write may interleave.
     pub(crate) fn previous_manifest(&self) -> Result<Option<BackupManifest>> {
         Ok(self
             .chain_state
@@ -333,12 +341,13 @@ impl Coordinator {
 
     /// Snapshot the in-memory segment ledger.
     ///
-    /// Independent accessor for callers that only need the ledger;
-    /// callers that need both the manifest and the ledger should
-    /// use [`Self::snapshot_chain`] instead. Returns a clone so
-    /// the caller can drop the lock before doing the (potentially
-    /// expensive) work of planning a compaction or building a
-    /// manifest over the snapshot.
+    /// Returns a clone so the caller can drop the lock before
+    /// doing the (potentially expensive) work of planning a
+    /// compaction or building a manifest over the snapshot.
+    /// Internally atomic against concurrent commits for the same
+    /// reason as [`Self::previous_manifest`]; the same joint-read
+    /// caveat applies if both fields are needed at the same point
+    /// in time.
     pub(crate) fn tracked_segments(&self) -> Result<Vec<TrackedBackupSegment>> {
         Ok(self
             .chain_state
