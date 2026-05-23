@@ -1464,12 +1464,18 @@ impl CoreImpl {
                     // ZKOF is the configured backend but the
                     // wiring is missing — surface a structured
                     // error rather than silently falling through
-                    // to KChat-only.
+                    // to KChat-only. The typed variant lets the
+                    // platform glue distinguish "never installed"
+                    // from "wrong backend" without parsing the
+                    // message text. The Display form
+                    // `subsystem `zkof_archive_backend` not
+                    // installed` directly names the installer the
+                    // operator needs to call
+                    // (`install_zkof_archive_backend`).
                     None => Err(Error::Storage(
-                        "archive_backend = zkof but no ZKOF backend installed; \
-                         call CoreImpl::install_zkof_archive_backend before \
-                         calling rehydrate_timeline_skeletons"
-                            .into(),
+                        crate::local_store::StorageError::SubsystemNotInstalled(
+                            "zkof_archive_backend",
+                        ),
                     )),
                 }
             }
@@ -7731,9 +7737,21 @@ mod tests {
         let core = CoreImpl::new_in_memory(cfg, TEST_KEY).unwrap();
         let transport = FixtureTransport::default();
         let err = core.build_archive_router(&transport).unwrap_err();
+        // Pattern-match the typed `SubsystemNotInstalled` variant
+        // directly so the test stays stable across message-text
+        // refactors. The previous `msg.to_string().contains(...)`
+        // assertion would have broken on any wording change; the
+        // typed match locks in the structural contract: this code
+        // path produces a `SubsystemNotInstalled` for the
+        // `zkof_archive_backend` subsystem and nothing else.
         assert!(
-            matches!(err, Error::Storage(msg) if msg.to_string().contains("ZKOF backend installed")),
-            "expected install-missing storage error"
+            matches!(
+                err,
+                Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                    "zkof_archive_backend"
+                ))
+            ),
+            "expected SubsystemNotInstalled(\"zkof_archive_backend\")"
         );
     }
 
