@@ -185,6 +185,75 @@ pub(crate) struct ZkofArchiveBackend {
 /// the first UI read does not pay for a fresh `Connection::open`
 /// on its critical path. See
 /// [`LocalStoreDb::open_reader_pool`] for the open semantics.
+///
+/// # Subsystem field organisation (Phase B.2)
+///
+/// The 24 originally-`Mutex<Option<_>>` "platform-bridge"
+/// subsystem fields have been split by their actual mutation
+/// shape:
+///
+///   * **16 bridges that are installed exactly once at boot**
+///     (`text_embedder`, `image_embedder`, `whisper_transcriber`,
+///     `document_extractor`, `video_keyframe_sampler`,
+///     `ocr_bridge`, `resource_probe`, `offline_detector`,
+///     `perf_collector`, `dedup_analytics`,
+///     `conversation_group_resolver`, `spotlight_anchor`,
+///     `windows_search_anchor`, `delivery_client`, `scheduler`,
+///     `ep_benchmark_runner`) live in
+///     [`OnceLock`]`<`[`Arc`]`<dyn T>>`. Reads are lock-free
+///     atomic loads; the corresponding `install_*` /
+///     `set_delivery_client` setters return
+///     [`Error::Storage`] on double-install.
+///   * **Two write-once atomic bundles** (`BackupKeys`,
+///     `ZkofArchiveBackend`) stay in
+///     [`Mutex`]`<`[`Option`]`<_>>` because the bundle is
+///     legitimately re-installable on key rotation /
+///     credentials refresh; the bundle struct itself makes the
+///     "all three pieces installed atomically" invariant
+///     non-bypassable.
+///   * **Genuinely-mutable in-flight state** (`current_epoch`,
+///     `previous_backup_manifest`, `tracked_backup_segments`,
+///     `hydration_queue`, `ep_benchmark_cache`) stays in
+///     [`Mutex`]`<T>` / [`Mutex`]`<Option<T>>` because each is
+///     mutated mid-flight (epoch rotation, manifest chain
+///     append, segment ledger append, queue enqueue/dequeue,
+///     cache update).
+///   * The DB connections are split into
+///     `db_writer: `[`Mutex`]`<`[`LocalStoreDb`]`>` for writes
+///     and `db_readers: `[`LocalStoreReaderPool`] for concurrent
+///     reads (Phase B.1).
+///
+/// # Lock ordering
+///
+/// To avoid deadlocks, locks are acquired in this strictly
+/// non-cyclic order. Methods that need multiple locks acquire
+/// them in this order; methods that only need a subset acquire
+/// only those:
+///
+///   1. **Subsystem lookup** — `OnceLock::get()` on the 16
+///      bridge fields. Lock-free, no ordering constraint with
+///      the locks below.
+///   2. **In-flight state** — `hydration_queue`, `current_epoch`,
+///      `ep_benchmark_cache` (each independent of the others;
+///      no method holds two of these simultaneously).
+///   3. **Backup bundles** — `backup_keys`, `zkof_archive`,
+///      `previous_backup_manifest`, `tracked_backup_segments`.
+///      `run_incremental_backup` acquires `backup_keys` first,
+///      then `previous_backup_manifest`, then
+///      `tracked_backup_segments`; releases each before taking
+///      the next where possible. Never holds two backup locks
+///      across an I/O call.
+///   4. **Database** — `db_writer` for writes,
+///      `db_readers.with_reader(...)` for reads. The DB lock is
+///      acquired *last* and released *first*; nothing inside a
+///      `db_writer.lock()` guard takes any of the locks above.
+///      The reader pool is independent of the writer mutex
+///      under WAL.
+///
+/// The OnceLock conversion in Phase B.2 means installer methods
+/// no longer participate in this ordering (they are install-time
+/// only, not steady-state), and hot-path reads of the 16 bridge
+/// subsystems no longer take any lock at all.
 pub struct CoreImpl {
     config: KChatCoreConfig,
     /// The single SQLCipher writer. Every mutating SQL statement
