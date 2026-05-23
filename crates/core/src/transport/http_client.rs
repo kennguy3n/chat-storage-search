@@ -146,11 +146,17 @@ impl HttpTransportClient {
     /// timeouts (it does not, in practice, but the Result keeps the
     /// signature future-proof).
     pub fn new(base_url: &str, auth_token: &str) -> crate::Result<Self> {
+        // Client builder failures are deterministic configuration
+        // errors (TLS backend init, invalid default header, invalid
+        // timeout value) — retrying produces the same failure. Route
+        // them onto `TransportError::Server` (non-retryable) so
+        // callers don't burn retry budget on a permanent config
+        // problem.
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TRANSPORT_REQUEST_TIMEOUT_SECS))
             .build()
             .map_err(|e| {
-                crate::Error::Transport(crate::transport::TransportError::Network(format!(
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
                     "reqwest builder: {e}"
                 )))
             })?;
@@ -158,7 +164,7 @@ impl HttpTransportClient {
             .timeout(Duration::from_secs(HTTP_TRANSPORT_BLOB_UPLOAD_TIMEOUT_SECS))
             .build()
             .map_err(|e| {
-                crate::Error::Transport(crate::transport::TransportError::Network(format!(
+                crate::Error::Transport(crate::transport::TransportError::Server(format!(
                     "reqwest upload builder: {e}"
                 )))
             })?;
@@ -218,15 +224,62 @@ impl HttpTransportClient {
     }
 
     fn map_err(label: &str, err: reqwest::Error) -> crate::Error {
-        // Categorise the reqwest::Error: most network-level failures
-        // (timeouts, connection failures, TLS) become
-        // TransportError::Network so callers can route them onto
-        // the retry path; payload / decoder failures fall through
-        // to TransportError::Server.
-        let category = if err.is_timeout() || err.is_connect() || err.is_request() {
-            crate::transport::TransportError::Network(format!("{label}: {err}"))
+        let msg = format!("{label}: {err}");
+        // Categorise the reqwest::Error onto TransportError variants
+        // so callers can route on intent (retryable vs not).
+        //
+        // Retryable — `TransportError::Network`:
+        //   * `is_timeout()`  — server didn't reply before the client
+        //                       timeout fired. Walks the cause chain;
+        //                       can fire on any `Kind` if the source
+        //                       contains a `TimedOut`.
+        //   * `is_connect()`  — TCP/TLS handshake failure. Walks the
+        //                       cause chain for hyper connect errors;
+        //                       again `Kind`-orthogonal.
+        //   * `is_request()`  — `Kind::Request`: generic
+        //                       request-sending failure (body stream
+        //                       interrupted, HTTP/2 framing issue,
+        //                       etc.).
+        //   * `is_body()`     — `Kind::Body`: connection drop while
+        //                       reading the response body. The server
+        //                       had started replying but the stream
+        //                       was truncated mid-flight; the partial
+        //                       payload is unusable. Retrying the
+        //                       whole request typically recovers.
+        //                       Critical: this Kind is NOT covered by
+        //                       `is_request()`, so without an explicit
+        //                       check these transient mid-body drops
+        //                       would misclassify as non-retryable.
+        //
+        // Non-retryable — `TransportError::Server`:
+        //   * `is_builder()`  — `Kind::Builder`: client config issue
+        //                       (handled at construction sites, this
+        //                       branch is a defensive fallthrough).
+        //   * `is_redirect()` — `Kind::Redirect`: redirect policy
+        //                       loop / too-many-hops. Deterministic
+        //                       at the same URL.
+        //   * `is_status()`   — `Kind::Status`: HTTP error status
+        //                       surfaced by `error_for_status()`. The
+        //                       caller path normally invokes
+        //                       `map_status` explicitly, but the
+        //                       fallback is to treat the status
+        //                       itself as the failure signal.
+        //   * `is_decode()`   — `Kind::Decode`: the server replied
+        //                       with a malformed payload. Retrying
+        //                       returns the same broken response.
+        //   * `is_upgrade()`  — `Kind::Upgrade`: HTTP upgrade
+        //                       negotiation failed.
+        //
+        // Default: any future `reqwest::Kind` value the classifier
+        // doesn't recognise falls through to `Server` so the caller
+        // surfaces the unfamiliar error rather than burning retry
+        // budget. This is the safer default for a classifier that
+        // wants to err toward visibility over resilience.
+        let category = if err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+        {
+            crate::transport::TransportError::Network(msg)
         } else {
-            crate::transport::TransportError::Server(format!("{label}: {err}"))
+            crate::transport::TransportError::Server(msg)
         };
         crate::Error::Transport(category)
     }
