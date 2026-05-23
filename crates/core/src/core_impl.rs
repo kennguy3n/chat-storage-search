@@ -129,6 +129,29 @@ pub(crate) struct BackupKeys {
     pub(crate) device_id: String,
 }
 
+/// Atomically-installed ZKOF archive backend wiring.
+///
+/// The Phase-3 ZKOF archive router needs both an
+/// [`crate::media::sinks::zk_fabric::S3Client`] (to talk to the
+/// ZKOF gateway) and a
+/// [`crate::media::sinks::zk_fabric::ZkFabricSinkConfig`] (to
+/// know which bucket, endpoint, and content addressing scheme to
+/// use) before it can route any
+/// `archive_segment_map.storage_backend = zk_object_fabric` row.
+/// Both halves are installed together by
+/// [`CoreImpl::install_zkof_archive_backend`]; bundling them
+/// into a single struct behind one [`Mutex`] makes the
+/// "installed atomically as a pair" invariant non-bypassable
+/// and lets [`CoreImpl::build_archive_router`] take one lock
+/// instead of two. Re-installing replaces the whole pair (still
+/// supported so tests can swap in a fresh `InMemoryS3` /
+/// configuration without spinning up a new core).
+#[derive(Clone)]
+pub(crate) struct ZkofArchiveBackend {
+    pub(crate) s3: std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>,
+    pub(crate) config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
+}
+
 // ---------------------------------------------------------------------------
 // CoreImpl
 // ---------------------------------------------------------------------------
@@ -232,19 +255,18 @@ pub struct CoreImpl {
     /// stored AES-256-KW-wrapped under that root) and rewritten
     /// after each backup / compaction step.
     tracked_backup_segments: Mutex<Vec<TrackedBackupSegment>>,
-    /// Phase-3 ZKOF archive backend configuration. `None` until
+    /// Phase-3 ZKOF archive backend wiring (S3 client + gateway
+    /// config). `None` until
     /// [`CoreImpl::install_zkof_archive_backend`] is called. When
-    /// set together with [`Self::zkof_archive_s3`], the
-    /// archive-segment router routes
+    /// set, the archive-segment router routes
     /// `archive_segment_map.storage_backend = zk_object_fabric`
     /// rows through ZKOF instead of the legacy KChat transport.
-    zkof_archive_config: Mutex<Option<crate::media::sinks::zk_fabric::ZkFabricSinkConfig>>,
-    /// Shared `Arc<dyn S3Client>` used by the ZKOF archive router.
-    /// `None` until [`CoreImpl::install_zkof_archive_backend`] is
-    /// called. Wrapped in a `Mutex<Option<_>>` (rather than
+    /// Bundled into a single [`ZkofArchiveBackend`] struct so the
+    /// S3 client and the config are always installed and observed
+    /// atomically. Wrapped in `Mutex<Option<_>>` (rather than
     /// `OnceCell`) so tests can install / re-install in the same
     /// process without spinning up a fresh core.
-    zkof_archive_s3: Mutex<Option<std::sync::Arc<dyn crate::media::sinks::zk_fabric::S3Client>>>,
+    zkof_archive: Mutex<Option<ZkofArchiveBackend>>,
     /// Phase-5 background scheduler bridge. `None` until
     /// [`CoreImpl::install_scheduler`] is called by the platform
     /// glue (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
@@ -496,8 +518,7 @@ impl CoreImpl {
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive_config: Mutex::new(None),
-            zkof_archive_s3: Mutex::new(None),
+            zkof_archive: Mutex::new(None),
             scheduler: Mutex::new(None),
             text_embedder: Mutex::new(None),
             image_embedder: Mutex::new(None),
@@ -549,8 +570,7 @@ impl CoreImpl {
             backup_keys: Mutex::new(None),
             previous_backup_manifest: Mutex::new(None),
             tracked_backup_segments: Mutex::new(Vec::new()),
-            zkof_archive_config: Mutex::new(None),
-            zkof_archive_s3: Mutex::new(None),
+            zkof_archive: Mutex::new(None),
             scheduler: Mutex::new(None),
             text_embedder: Mutex::new(None),
             image_embedder: Mutex::new(None),
@@ -1300,29 +1320,23 @@ impl CoreImpl {
     ) -> Result<crate::archive::download::ArchiveSegmentRouter<'a>> {
         match self.config.archive_backend {
             crate::config::ArchiveBackend::Zkof => {
-                let s3 = self
-                    .zkof_archive_s3
+                let backend = self
+                    .zkof_archive
                     .lock()
                     .map_err(poisoned)?
                     .as_ref()
                     .cloned();
-                let cfg = self
-                    .zkof_archive_config
-                    .lock()
-                    .map_err(poisoned)?
-                    .as_ref()
-                    .cloned();
-                match (s3, cfg) {
-                    (Some(s3), Some(cfg)) => {
+                match backend {
+                    Some(ZkofArchiveBackend { s3, config }) => {
                         Ok(crate::archive::download::ArchiveSegmentRouter::with_zkof(
-                            transport, s3, cfg,
+                            transport, s3, config,
                         ))
                     }
                     // ZKOF is the configured backend but the
                     // wiring is missing — surface a structured
                     // error rather than silently falling through
                     // to KChat-only.
-                    _ => Err(Error::Storage(
+                    None => Err(Error::Storage(
                         "archive_backend = zkof but no ZKOF backend installed; \
                          call CoreImpl::install_zkof_archive_backend before \
                          calling rehydrate_timeline_skeletons"
@@ -1351,8 +1365,8 @@ impl CoreImpl {
         config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
     ) -> Result<()> {
         config.validate()?;
-        *self.zkof_archive_s3.lock().map_err(poisoned)? = Some(s3);
-        *self.zkof_archive_config.lock().map_err(poisoned)? = Some(config);
+        *self.zkof_archive.lock().map_err(poisoned)? =
+            Some(ZkofArchiveBackend { s3, config });
         Ok(())
     }
 
@@ -2213,15 +2227,10 @@ impl CoreImpl {
     /// Whether [`Self::install_zkof_archive_backend`] has been
     /// called.
     pub fn has_zkof_archive_backend(&self) -> bool {
-        self.zkof_archive_s3
+        self.zkof_archive
             .lock()
             .map(|slot| slot.is_some())
             .unwrap_or(false)
-            && self
-                .zkof_archive_config
-                .lock()
-                .map(|slot| slot.is_some())
-                .unwrap_or(false)
     }
 
     /// Cold-result hydration write-back (Phase 5, Task 3).
