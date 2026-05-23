@@ -275,7 +275,7 @@ pub fn prepare_device_transfer(
         k_search_root: keys.k_search_root.to_vec(),
     };
     let plaintext = Zeroizing::new(
-        serde_cbor::to_vec(&envelope)
+        crate::cbor::to_vec(&envelope)
             .map_err(|e| Error::Storage(format!("device-transfer: cbor encode failed: {e}")))?,
     );
     let ciphertext = aead_seal(&key, &nonce, &plaintext, DEVICE_TRANSFER_DOMAIN)?;
@@ -308,7 +308,7 @@ pub fn accept_device_transfer(
         &payload.ciphertext,
         DEVICE_TRANSFER_DOMAIN,
     )?);
-    let envelope: DeviceTransferEnvelope = serde_cbor::from_slice(&plaintext)
+    let envelope: DeviceTransferEnvelope = crate::cbor::from_slice(&plaintext)
         .map_err(|e| Error::Storage(format!("device-transfer: cbor decode failed: {e}")))?;
     fn to_arr(v: &[u8]) -> Result<[u8; KEY_LEN], Error> {
         if v.len() != KEY_LEN {
@@ -756,8 +756,8 @@ mod tests {
             wrapped_key: vec![0u8; WRAPPED_KEY_LEN],
             argon2_params: Argon2Params::owasp_mobile(),
         };
-        let cbor = serde_cbor::to_vec(&envelope).expect("encode");
-        let parsed: PassphraseRecoveryEnvelope = serde_cbor::from_slice(&cbor).expect("decode");
+        let cbor = crate::cbor::to_vec(&envelope).expect("encode");
+        let parsed: PassphraseRecoveryEnvelope = crate::cbor::from_slice(&cbor).expect("decode");
         assert_eq!(parsed, envelope);
     }
 }

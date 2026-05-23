@@ -320,7 +320,7 @@ impl ArchiveSegmentBuilder {
             time_bucket: request.time_bucket.clone(),
             events: request.events.clone(),
         };
-        let cbor = serde_cbor::to_vec(&payload)
+        let cbor = crate::cbor::to_vec(&payload)
             .map_err(|e| Error::Storage(format!("archive segment cbor encode: {e}")))?;
 
         // 2) Compute the integrity root over the CBOR payload —
@@ -413,7 +413,7 @@ pub fn decrypt_segment(
         .map_err(Error::Crypto)?;
     let cbor = zstd::stream::decode_all(&compressed[..])
         .map_err(|e| Error::Storage(format!("archive segment zstd decode: {e}")))?;
-    let payload: ArchiveSegmentPayload = serde_cbor::from_slice(&cbor)
+    let payload: ArchiveSegmentPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("archive segment cbor decode: {e}")))?;
     if payload.magic != ARCHIVE_SEGMENT_PAYLOAD_MAGIC {
         return Err(Error::Storage(

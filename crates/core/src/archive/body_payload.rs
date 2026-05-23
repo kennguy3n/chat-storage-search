@@ -71,7 +71,7 @@ pub fn encode(text_content: Option<&str>) -> Result<Vec<u8>, Error> {
         magic: ARCHIVE_BODY_PAYLOAD_MAGIC.into(),
         text_content: text_content.map(|t| t.to_string()),
     };
-    serde_cbor::to_vec(&payload)
+    crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("archive body payload encode: {e}")))
 }
 
@@ -87,7 +87,7 @@ pub fn encode(text_content: Option<&str>) -> Result<Vec<u8>, Error> {
 /// swallowed so a single malformed event in a segment does not
 /// abort hydration of the surrounding events.
 pub fn try_decode_text(bytes: &[u8]) -> Option<String> {
-    let payload: ArchiveMessageBodyPayload = serde_cbor::from_slice(bytes).ok()?;
+    let payload: ArchiveMessageBodyPayload = crate::cbor::from_slice(bytes).ok()?;
     if payload.magic != ARCHIVE_BODY_PAYLOAD_MAGIC {
         return None;
     }

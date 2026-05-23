@@ -179,7 +179,7 @@ impl<'a> TransportColdShardSource<'a> {
         if bytes.is_empty() {
             return Ok(None);
         }
-        let shard: SearchIndexShard = serde_cbor::from_slice(&bytes).map_err(|e| {
+        let shard: SearchIndexShard = crate::cbor::from_slice(&bytes).map_err(|e| {
             Error::Storage(format!(
                 "TransportColdShardSource: shard cbor decode failed for ({conversation_id}, {time_bucket}, {index_type:?}): {e}"
             ))
@@ -376,7 +376,7 @@ mod tests {
         let conv_hash =
             crate::search::shard_builder::keyed_conversation_id_hash(conv_id, conv_hash_key);
         let conv_hash_b64 = base64_encode_urlsafe(&conv_hash);
-        let bytes = serde_cbor::to_vec(shard).expect("encode shard");
+        let bytes = crate::cbor::to_vec(shard).expect("encode shard");
         transport.stage_index_shard(&conv_hash_b64, bucket, shard_type_str(shard_type), bytes);
     }
 

@@ -342,7 +342,7 @@ pub fn build_text_search_shard(
         magic: TEXT_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = serde_cbor::to_vec(&payload)
+    let cbor = crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("text shard cbor encode: {e}")))?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
@@ -371,7 +371,7 @@ pub fn build_fuzzy_search_shard(
         magic: FUZZY_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = serde_cbor::to_vec(&payload)
+    let cbor = crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("fuzzy shard cbor encode: {e}")))?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
@@ -401,7 +401,7 @@ pub fn restore_text_search_shard(
         )));
     }
     let cbor = open_shard(shard, k_text_index_shard)?;
-    let payload: FtsShardPayload = serde_cbor::from_slice(&cbor)
+    let payload: FtsShardPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("text shard cbor decode: {e}")))?;
     if payload.magic != TEXT_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("text shard payload magic mismatch".into()));
@@ -422,7 +422,7 @@ pub fn restore_fuzzy_search_shard(
         )));
     }
     let cbor = open_shard(shard, k_fuzzy_index_shard)?;
-    let payload: FuzzyShardPayload = serde_cbor::from_slice(&cbor)
+    let payload: FuzzyShardPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("fuzzy shard cbor decode: {e}")))?;
     if payload.magic != FUZZY_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("fuzzy shard payload magic mismatch".into()));
@@ -450,7 +450,7 @@ pub fn build_vector_search_shard(
         magic: VECTOR_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = serde_cbor::to_vec(&payload)
+    let cbor = crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("vector shard cbor encode: {e}")))?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
@@ -480,7 +480,7 @@ pub fn restore_vector_search_shard(
         )));
     }
     let cbor = open_shard(shard, k_vector_index_shard)?;
-    let payload: VectorShardPayload = serde_cbor::from_slice(&cbor)
+    let payload: VectorShardPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("vector shard cbor decode: {e}")))?;
     if payload.magic != VECTOR_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("vector shard payload magic mismatch".into()));
@@ -501,7 +501,7 @@ pub fn build_media_search_shard(
         magic: MEDIA_SHARD_PAYLOAD_MAGIC.to_vec(),
         rows: rows.clone(),
     };
-    let cbor = serde_cbor::to_vec(&payload)
+    let cbor = crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("media shard cbor encode: {e}")))?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
@@ -531,7 +531,7 @@ pub fn restore_media_search_shard(
         )));
     }
     let cbor = open_shard(shard, k_media_index_shard)?;
-    let payload: MediaShardPayload = serde_cbor::from_slice(&cbor)
+    let payload: MediaShardPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("media shard cbor decode: {e}")))?;
     if payload.magic != MEDIA_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("media shard payload magic mismatch".into()));
@@ -680,7 +680,7 @@ pub fn build_bloom_shard(
         hash_count: filter.hash_count,
         bits: filter.bits.clone(),
     };
-    let cbor = serde_cbor::to_vec(&payload)
+    let cbor = crate::cbor::to_vec(&payload)
         .map_err(|e| Error::Storage(format!("bloom shard cbor encode: {e}")))?;
     let conversation_id_hash = keyed_conversation_id_hash(conversation_id, conversation_hash_key);
     let shard = seal_shard(
@@ -710,7 +710,7 @@ pub fn restore_bloom_shard(
         )));
     }
     let cbor = open_shard(shard, k_bloom_index_shard)?;
-    let payload: BloomShardPayload = serde_cbor::from_slice(&cbor)
+    let payload: BloomShardPayload = crate::cbor::from_slice(&cbor)
         .map_err(|e| Error::Storage(format!("bloom shard cbor decode: {e}")))?;
     if payload.magic != BLOOM_SHARD_PAYLOAD_MAGIC {
         return Err(Error::Storage("bloom shard payload magic mismatch".into()));

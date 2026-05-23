@@ -331,12 +331,12 @@ fn large_scale_backup_produces_valid_manifest_chain() {
             event_type: BackupEventType::MessageReceived,
             conversation_id: Some(conv),
             message_id: Some(mid),
-            payload: serde_cbor::to_vec(&serde_cbor::value::Value::Array(vec![
-                serde_cbor::value::Value::Text(mid.to_string()),
-                serde_cbor::value::Value::Text(conv.to_string()),
-                serde_cbor::value::Value::Text(sender.into()),
-                serde_cbor::value::Value::Integer(ts_ms as i128),
-                serde_cbor::value::Value::Text((*text).into()),
+            payload: kchat_core::cbor::to_vec(&kchat_core::cbor::Value::Array(vec![
+                kchat_core::cbor::Value::Text(mid.to_string()),
+                kchat_core::cbor::Value::Text(conv.to_string()),
+                kchat_core::cbor::Value::Text(sender.into()),
+                kchat_core::cbor::Value::Integer(kchat_core::cbor::Integer::from(ts_ms)),
+                kchat_core::cbor::Value::Text((*text).into()),
             ]))
             .expect("cbor"),
             created_at_ms: ts_ms,

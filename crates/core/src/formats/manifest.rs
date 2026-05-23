@@ -385,7 +385,7 @@ where
     let mut clone = manifest.clone();
     clone.set_signature(M::signing_signature_placeholder());
     clone.set_pqc_signature(M::signing_signature_placeholder());
-    serde_cbor::to_vec(&clone)
+    crate::cbor::to_vec(&clone)
         .map_err(|_| CryptoError::Frame("manifest: canonical CBOR encode failed".to_string()))
 }
 
@@ -543,7 +543,7 @@ pub fn verify_manifest(
 /// chain step is: `next.previous_manifest_hash =
 /// compute_manifest_hash(prev)`.
 pub fn compute_manifest_hash(manifest: &BackupManifest) -> CryptoResult<[u8; 32]> {
-    let bytes = serde_cbor::to_vec(manifest)
+    let bytes = crate::cbor::to_vec(manifest)
         .map_err(|_| CryptoError::Frame("manifest: hash CBOR encode failed".to_string()))?;
     let mut hasher = Hasher::new();
     hasher.update(&bytes);
@@ -553,7 +553,7 @@ pub fn compute_manifest_hash(manifest: &BackupManifest) -> CryptoResult<[u8; 32]
 /// 32-byte BLAKE3 over the canonical CBOR encoding of an
 /// [`ArchiveManifest`].
 pub fn compute_archive_manifest_hash(manifest: &ArchiveManifest) -> CryptoResult<[u8; 32]> {
-    let bytes = serde_cbor::to_vec(manifest)
+    let bytes = crate::cbor::to_vec(manifest)
         .map_err(|_| CryptoError::Frame("manifest: hash CBOR encode failed".to_string()))?;
     let mut hasher = Hasher::new();
     hasher.update(&bytes);
@@ -656,8 +656,8 @@ mod tests {
         let (sk, _vk) = keys();
         sign_backup_manifest(&mut m, &sk).unwrap();
 
-        let bytes = serde_cbor::to_vec(&m).expect("encode");
-        let decoded: BackupManifest = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = crate::cbor::to_vec(&m).expect("encode");
+        let decoded: BackupManifest = crate::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, m);
     }
 
@@ -667,8 +667,8 @@ mod tests {
         let (sk, _vk) = keys();
         sign_archive_manifest(&mut m, &sk).unwrap();
 
-        let bytes = serde_cbor::to_vec(&m).expect("encode");
-        let decoded: ArchiveManifest = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = crate::cbor::to_vec(&m).expect("encode");
+        let decoded: ArchiveManifest = crate::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, m);
     }
 

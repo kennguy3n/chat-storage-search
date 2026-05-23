@@ -593,7 +593,7 @@ impl EpBenchmarkCache {
     /// `serde_cbor` and CBOR survives schema evolution slightly
     /// more gracefully for this kind of typed cache.
     pub fn persist_to_path(&self, path: &std::path::Path) -> std::result::Result<(), crate::Error> {
-        let bytes = serde_cbor::to_vec(self)
+        let bytes = crate::cbor::to_vec(self)
             .map_err(|e| crate::Error::Storage(format!("ep-cache serialize: {e}")))?;
         std::fs::write(path, bytes)
             .map_err(|e| crate::Error::Storage(format!("ep-cache write {}: {e}", path.display())))
@@ -607,7 +607,7 @@ impl EpBenchmarkCache {
         }
         let bytes = std::fs::read(path)
             .map_err(|e| crate::Error::Storage(format!("ep-cache read {}: {e}", path.display())))?;
-        serde_cbor::from_slice(&bytes)
+        crate::cbor::from_slice(&bytes)
             .map_err(|e| crate::Error::Storage(format!("ep-cache parse: {e}")))
     }
 

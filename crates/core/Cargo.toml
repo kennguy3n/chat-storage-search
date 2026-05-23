@@ -35,7 +35,12 @@ aes-kw = "0.2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
-serde_cbor = "0.11"
+# CBOR encode / decode for the on-wire / on-disk binary frames in
+# `crates/core/src/formats/`. We use `ciborium` (RustCrypto, actively
+# maintained) rather than `serde_cbor` (last release 2021,
+# `RUSTSEC-2021-0127`). All call sites go through the `crate::cbor`
+# facade so the dependency stays auditable.
+ciborium = "0.2"
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 # ML-DSA-65 (FIPS 204) post-quantum signatures, paired with
 # Ed25519 in the hybrid manifest signing scheme — see

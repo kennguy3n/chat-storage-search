@@ -5,7 +5,8 @@
 //! backup sink. Every type in this module:
 //!
 //! * derives `Serialize` / `Deserialize` and round-trips through
-//!   `serde_cbor::to_vec` / `serde_cbor::from_slice`,
+//!   [`crate::cbor::to_vec`] / [`crate::cbor::from_slice`] (which sit
+//!   on top of `ciborium`),
 //! * carries a literal `magic` field that the deserializer can use to
 //!   reject the wrong frame type,
 //! * uses `#[serde(with = "serde_bytes")]` on byte arrays so CBOR
@@ -280,8 +281,8 @@ mod tests {
     #[test]
     fn backup_segment_frame_round_trips_through_cbor() {
         let frame = sample_backup_segment();
-        let bytes = serde_cbor::to_vec(&frame).expect("encode");
-        let decoded: BackupSegmentFrame = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = crate::cbor::to_vec(&frame).expect("encode");
+        let decoded: BackupSegmentFrame = crate::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, frame);
     }
 
@@ -311,8 +312,8 @@ mod tests {
             SegmentType::Checkpoint,
         ] {
             let frame = sample_archive_segment(st);
-            let bytes = serde_cbor::to_vec(&frame).expect("encode");
-            let decoded: ArchiveSegmentFrame = serde_cbor::from_slice(&bytes).expect("decode");
+            let bytes = crate::cbor::to_vec(&frame).expect("encode");
+            let decoded: ArchiveSegmentFrame = crate::cbor::from_slice(&bytes).expect("decode");
             assert_eq!(decoded, frame, "round-trip failed for {st:?}");
         }
     }
@@ -346,8 +347,8 @@ mod tests {
     fn distinct_segments_produce_distinct_cbor() {
         let backup = sample_backup_segment();
         let archive = sample_archive_segment(SegmentType::MessageDelta);
-        let backup_bytes = serde_cbor::to_vec(&backup).unwrap();
-        let archive_bytes = serde_cbor::to_vec(&archive).unwrap();
+        let backup_bytes = crate::cbor::to_vec(&backup).unwrap();
+        let archive_bytes = crate::cbor::to_vec(&archive).unwrap();
         assert_ne!(backup_bytes, archive_bytes);
     }
 
@@ -358,7 +359,7 @@ mod tests {
         // the 24-byte nonce we expect 0x58 0x18 (byte string,
         // length 24) somewhere in the encoding.
         let frame = sample_backup_segment();
-        let bytes = serde_cbor::to_vec(&frame).unwrap();
+        let bytes = crate::cbor::to_vec(&frame).unwrap();
         assert!(
             bytes.windows(2).any(|w| w == [0x58, 0x18]),
             "expected CBOR byte-string header for the 24-byte nonce, got {:02x?}",

@@ -159,7 +159,7 @@ pub fn build_archive_manifest(
     let signature = sign_archive_manifest(&mut manifest, signing_key).map_err(Error::Crypto)?;
 
     // AEAD-seal the canonical CBOR of the (now-signed) manifest.
-    let manifest_bytes = serde_cbor::to_vec(&manifest)
+    let manifest_bytes = crate::cbor::to_vec(&manifest)
         .map_err(|_| Error::Crypto(CryptoError::Frame("manifest CBOR encode failed".into())))?;
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -203,7 +203,7 @@ pub fn open_sealed_archive_manifest(
     );
     let plaintext =
         open(k_archive_manifest, &sealed.nonce, &sealed.ciphertext, &aad).map_err(Error::Crypto)?;
-    let manifest: ArchiveManifest = serde_cbor::from_slice(&plaintext)
+    let manifest: ArchiveManifest = crate::cbor::from_slice(&plaintext)
         .map_err(|e| Error::Storage(format!("manifest CBOR decode: {e}")))?;
     Ok(manifest)
 }
