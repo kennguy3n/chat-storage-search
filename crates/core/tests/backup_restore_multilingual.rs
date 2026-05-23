@@ -321,8 +321,8 @@ fn backup_restore_multilingual_corpus_round_trip() {
     // path does not touch the local indices. CJK / Thai land
     // behind an ICU probe (same pattern as multilingual_search).
     let icu = source_db.icu_available();
-    let text = TextSearchEngine::new(&source_db);
-    let fuzzy = FuzzySearchEngine::new(&source_db);
+    let text = TextSearchEngine::new(source_db.connection(), source_db.icu_available());
+    let fuzzy = FuzzySearchEngine::new(source_db.connection());
     // For every persisted message, register its tokens with the
     // fuzzy engine so the typo-recall assertion below works.
     for entry in corpus() {

@@ -771,7 +771,7 @@ impl CoreImpl {
         scope: SearchScope,
     ) -> Result<(Vec<SearchResult>, usize)> {
         let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let results = engine
             .execute_search(&query, &scope)
             .map_err(|e| Error::Search(e.to_string()))?;
@@ -807,7 +807,7 @@ impl CoreImpl {
         cold_source: &dyn ColdShardSource,
     ) -> Result<Vec<SearchResult>> {
         let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let results = engine.execute_search_with_cold_source(&query, &scope, cold_source)?;
         drop(db);
         if matches!(scope, SearchScope::IncludeCold) {
@@ -845,7 +845,7 @@ impl CoreImpl {
         emit: F,
     ) -> Result<Vec<SearchResult>> {
         let db = self.db_writer.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         // Use the default tenant policy here for the streaming
         // entry point — callers that need a custom policy
         // already bypass `search_streaming` for
@@ -2032,7 +2032,7 @@ impl CoreImpl {
                     crate::search::search_target::NoopConversationGroupResolver::new(),
                 )
             });
-        crate::search::query_engine::QueryEngine::new(&db)
+        crate::search::query_engine::QueryEngine::new(db.connection(), db.icu_available())
             .execute_search_with_target(query, scope, target, resolver.as_ref(), limit)
             .map_err(|e| crate::Error::Search(e.to_string()))
     }
@@ -2864,7 +2864,7 @@ impl CoreImpl {
                 transcript,
             ],
         );
-        let _ = FuzzySearchEngine::new(db).index_message(message_id, transcript);
+        let _ = FuzzySearchEngine::new(db.connection()).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
         //     up the audio body.
@@ -2963,7 +2963,7 @@ impl CoreImpl {
                     trimmed,
                 ],
             );
-            let _ = FuzzySearchEngine::new(db).index_message(&page_row_id, trimmed);
+            let _ = FuzzySearchEngine::new(db.connection()).index_message(&page_row_id, trimmed);
 
             // (3) Optional XLM-R embedding per page.
             if let Ok(embedder_slot) = self.text_embedder.lock() {
@@ -3253,7 +3253,7 @@ impl CoreImpl {
             // idempotent thanks to the (token, script, message_id)
             // primary key but stale tokens from a previous body are
             // dropped first so search_fuzzy stays in sync.
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             engine
                 .remove_message(&message_id.to_string())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4466,8 +4466,23 @@ impl KChatCore for CoreImpl {
             },
         );
 
-        let db = match self.db_writer.lock().map_err(poisoned) {
-            Ok(db) => db,
+        // Phase B.1 (workstream 6): route the unified search
+        // through `db_readers` so a concurrent UI search does not
+        // contend with the writer's mutex. The reader checked out
+        // here sees a stable WAL snapshot for the duration of
+        // `execute_search`; any writes that commit after checkout
+        // become visible to the *next* checkout, which matches
+        // the previous "writer-locked search" semantics for the
+        // caller (the previous implementation also held a single
+        // snapshot across the search).
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine
+                .execute_search(&query, &scope)
+                .map_err(|e| Error::Search(e.to_string()))
+        });
+        let results = match results {
+            Ok(r) => r,
             Err(e) => {
                 let err_str = e.to_string();
                 trace.insert_metadata("error", err_str.clone());
@@ -4477,19 +4492,6 @@ impl KChatCore for CoreImpl {
                 return Err(e);
             }
         };
-        let engine = QueryEngine::new(&db);
-        let results = match engine.execute_search(&query, &scope) {
-            Ok(r) => r,
-            Err(e) => {
-                let err_str = e.to_string();
-                trace.insert_metadata("error", err_str.clone());
-                span.record("error", err_str.as_str());
-                trace.finish();
-                self.record_perf_trace(trace);
-                return Err(Error::Search(err_str));
-            }
-        };
-        drop(db);
         // When the caller requested the personal archive, enqueue
         // every cold-flagged result for hydration at priority
         // `SearchResultTap` (`docs/PROPOSAL.md §5.5`). The enqueue
@@ -4685,7 +4687,7 @@ impl KChatCore for CoreImpl {
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
-                FuzzySearchEngine::new(&db)
+                FuzzySearchEngine::new(db.connection())
                     .index_message(&skel.message_id, caption)
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
@@ -6779,7 +6781,7 @@ mod tests {
         // rehydration.
         {
             let db = core.db_writer.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             assert!(
                 !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
                 "pre-rehydrate fuzzy search must find original body"
@@ -6795,7 +6797,7 @@ mod tests {
 
         // Old fuzzy tokens are gone …
         let db = core.db_writer.lock().unwrap();
-        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
         assert!(
             engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
             "post-rehydrate fuzzy index must drop stale tokens"
@@ -6856,7 +6858,7 @@ mod tests {
             .expect("text_content present");
         let pre_sodium = {
             let db = core.db_writer.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             engine.search_fuzzy("sodium", 5).unwrap().len()
         };
         assert!(pre_sodium > 0, "pre-call fuzzy index must hit \"sodium\"");
@@ -6886,7 +6888,7 @@ mod tests {
                 .unwrap();
             assert_eq!(mid_body, "completely different content about dogs");
             let db = core.db_writer.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             assert!(
                 engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
                 "old fuzzy tokens cleared post-rehydrate"
@@ -6922,7 +6924,7 @@ mod tests {
         // (the pre-fix shape) the new \"dogs\" tokens would survive
         // the rollback and \"sodium\" would still be missing.
         let db = core.db_writer.lock().unwrap();
-        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
         assert!(
             !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
             "fuzzy index must roll back: \"sodium\" hits again post-rollback"
@@ -10857,7 +10859,7 @@ mod tests {
             // token. Mock transcripts always start with
             // `"mock transcription"`.
             let probe = mock_text.split_whitespace().next().unwrap_or("mock");
-            let fuzzy = FuzzySearchEngine::new(db);
+            let fuzzy = FuzzySearchEngine::new(db.connection());
             let hits = fuzzy.search_fuzzy(probe, 16).unwrap();
             assert!(
                 hits.iter().any(|h| h.message_id == mid.to_string()),

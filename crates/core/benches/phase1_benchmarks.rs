@@ -144,7 +144,7 @@ fn bench_search_recent_messages(c: &mut Criterion) {
     let (db, _conv_ids) = build_corpus();
     c.bench_function("search_recent_messages", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             let q = SearchQuery {
                 query_string: NEEDLE_TERM.to_string(),
                 ..SearchQuery::default()
@@ -163,7 +163,7 @@ fn bench_search_with_structured_filters(c: &mut Criterion) {
     let (db, conv_ids) = build_corpus();
     c.bench_function("search_with_structured_filters", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             let q = SearchQuery {
                 query_string: NEEDLE_TERM.to_string(),
                 sender_filter: Some("user-0".to_string()),
@@ -187,7 +187,7 @@ fn bench_fts_prefix_search(c: &mut Criterion) {
     let (db, _) = build_corpus();
     c.bench_function("fts_prefix_search", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             // "light*" matches "lighthouse" and any other term that
             // starts with "light"; FTS5 handles the prefix expansion
             // natively via the trailing `*`.

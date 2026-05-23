@@ -220,7 +220,7 @@ fn bench_scope_resolver_community_100_conversations(c: &mut Criterion) {
     let db = local_db();
     let community = Uuid::now_v7();
     let _convs = seed_conversations(&db, 100, &community.to_string());
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: String::new(),
         target: SearchTarget::Community(community),
@@ -327,7 +327,7 @@ fn bench_global_search_with_bloom_10_buckets(c: &mut Criterion) {
     }
 
     let db = local_db();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "lighthouse".into(),
         target: SearchTarget::Global,

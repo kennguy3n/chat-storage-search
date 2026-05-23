@@ -71,7 +71,7 @@ fn search_target_global_returns_every_conversation() {
     seed_message(&db, a, "hello world from alpha", 1_000);
     seed_message(&db, b, "hello world from beta", 2_000);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -96,7 +96,7 @@ fn search_target_conversation_filters_to_one_conversation() {
     seed_message(&db, a, "hello world", 1_000);
     seed_message(&db, b, "hello world", 2_000);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -126,7 +126,7 @@ fn search_target_conversation_group_scopes_to_explicit_id_set() {
     seed_message(&db, b, "match-this-beta", 2_000);
     seed_message(&db, c, "match-this-gamma", 3_000);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -157,7 +157,7 @@ fn search_target_starred_uses_resolver_set() {
     starred.insert(a.to_string());
     let resolver = StaticConversationGroupResolver::new(HashMap::new(), starred, HashSet::new());
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let hits = engine
         .execute_search_with_target(
             &query_for("starred-needle"),
@@ -187,7 +187,7 @@ fn search_target_unread_uses_resolver_set() {
     unread.insert(b.to_string());
     let resolver = StaticConversationGroupResolver::new(HashMap::new(), HashSet::new(), unread);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let hits = engine
         .execute_search_with_target(
             &query_for("unread-needle"),
@@ -209,7 +209,7 @@ fn search_target_starred_with_empty_resolver_returns_no_results() {
     let a = Uuid::now_v7();
     insert_conv(&db, a);
     seed_message(&db, a, "no-star-here", 1_000);
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -240,7 +240,7 @@ fn search_target_channel_resolves_via_resolver() {
     channels.insert(channel_id, set);
     let resolver = StaticConversationGroupResolver::new(channels, HashSet::new(), HashSet::new());
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let hits = engine
         .execute_search_with_target(
             &query_for("channel-one-msg"),
@@ -269,7 +269,7 @@ fn search_query_target_field_is_threaded_through_default_execute_search() {
     let mut q = query_for("thread-target");
     q.target = SearchTarget::Conversation(a);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let hits = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
     assert!(!hits.is_empty());
     for h in &hits {

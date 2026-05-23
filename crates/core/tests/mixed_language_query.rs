@@ -113,7 +113,7 @@ fn build_fixture() -> Fixture {
 }
 
 fn search(db: &LocalStoreDb, q: &str) -> Vec<kchat_core::SearchResult> {
-    let engine = QueryEngine::new(db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let query = SearchQuery {
         query_string: q.to_string(),
         ..Default::default()

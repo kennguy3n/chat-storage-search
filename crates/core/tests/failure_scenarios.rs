@@ -824,7 +824,7 @@ impl ColdShardSource for GracefulCold<'_> {
 #[test]
 fn search_shard_missing_from_backend_degrades_to_local_only_with_warning_flag() {
     let db = LocalStoreDb::open_in_memory(&[0x44; 32]).expect("open in-memory db");
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     let conv_id = Uuid::now_v7().to_string();
     let bucket = "2026-04";
@@ -1629,7 +1629,7 @@ fn search_during_active_restore_returns_partial_results() {
         })
         .expect("partial skel");
     }
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "missing-token".into(),
         ..Default::default()

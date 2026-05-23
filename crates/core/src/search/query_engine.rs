@@ -58,13 +58,14 @@ use uuid::Uuid;
 
 use crate::config::TenantSearchPolicy;
 use crate::formats::search_shard::IndexType;
-use crate::local_store::db::{DbResult, LocalStoreDb};
+use crate::local_store::db::{read_list_conversations_by_column, DbResult};
 use crate::search::fuzzy_search::{FuzzySearchEngine, FuzzyTokenizer};
 use crate::search::shard_builder::{BloomFilter, FtsRow, FuzzyRow};
 use crate::search::shard_cache::{CachedShard, ShardCache, ShardCacheKey};
 use crate::search::text_search::TextSearchEngine;
 use crate::search::tokenizer::{fuzzy_min_overlap, ScriptClass};
 use crate::{ContentKind, Error, SearchQuery, SearchResult, SearchScope, SearchTarget};
+use rusqlite::Connection;
 
 /// BM25 contribution weight in the merged rank score
 /// (`docs/PROPOSAL.md §7.5`).
@@ -527,17 +528,39 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 // QueryEngine
 // ---------------------------------------------------------------------------
 
-/// Unified search engine. Borrows a [`LocalStoreDb`]; cheap to
-/// reconstruct per call.
+/// Unified search engine.
+///
+/// Borrows a raw [`Connection`] (rather than a `LocalStoreDb` /
+/// `LocalStoreReader`) so it can be driven from either the
+/// writer's connection or a connection checked out of
+/// [`crate::local_store::db::LocalStoreReaderPool`]. The
+/// `icu_available` flag is passed in explicitly because it is a
+/// schema-time property of the database — see
+/// [`crate::local_store::db::LocalStoreReader::icu_available`]
+/// for the reader-side accessor.
+///
+/// `QueryEngine` itself only issues `SELECT` statements; the
+/// fuzzy-index *writes* that happen alongside the search path
+/// (e.g. `FuzzySearchEngine::index_message`) live in the
+/// writer-locked sections of `core_impl` / `message::processor`,
+/// not in `QueryEngine`.
 #[derive(Debug)]
 pub struct QueryEngine<'a> {
-    db: &'a LocalStoreDb,
+    conn: &'a Connection,
+    icu_available: bool,
 }
 
 impl<'a> QueryEngine<'a> {
-    /// Construct a new engine bound to the given database.
-    pub fn new(db: &'a LocalStoreDb) -> Self {
-        Self { db }
+    /// Construct a new engine bound to the given connection.
+    ///
+    /// `icu_available` selects the FTS5 tokenizer path the engine
+    /// will assume. Pass `db.icu_available()` for a writer
+    /// connection or `reader.icu_available()` for a pool reader.
+    pub fn new(conn: &'a Connection, icu_available: bool) -> Self {
+        Self {
+            conn,
+            icu_available,
+        }
     }
 
     /// Run a unified search and return the matching rows.
@@ -595,12 +618,12 @@ impl<'a> QueryEngine<'a> {
         // query as a `ConversationGroup` so the existing
         // `push_target_filter` SQL helper can take over without
         // needing a parallel resolver-aware path.
-        let resolved = resolve_target_to_conversation_set_with_resolver(target, self.db, resolver)
-            .map_err(|e| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
+        let resolved = resolve_target_to_conversation_set_with_resolver(
+            target, self.conn, resolver,
+        )
+        .map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+        })?;
         let mut narrowed = query.clone();
         narrowed.target = match resolved {
             None => SearchTarget::Global,
@@ -806,7 +829,7 @@ impl<'a> QueryEngine<'a> {
         // the per-arm rustdoc above lines up 1:1 with each pattern.
         #[allow(clippy::manual_unwrap_or_default)]
         let target_set: Option<HashSet<String>> =
-            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+            match resolve_target_to_conversation_set(&query.effective_target(), self.conn) {
                 Ok(opt) => opt,
                 Err(_) => None,
             };
@@ -995,7 +1018,7 @@ impl<'a> QueryEngine<'a> {
         let conv_filter = query.conversation_filter.map(|c| c.to_string());
         #[allow(clippy::manual_unwrap_or_default)]
         let target_set: Option<HashSet<String>> =
-            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+            match resolve_target_to_conversation_set(&query.effective_target(), self.conn) {
                 Ok(opt) => opt,
                 Err(_) => None,
             };
@@ -1175,7 +1198,7 @@ impl<'a> QueryEngine<'a> {
         let conv_filter = query.conversation_filter.map(|c| c.to_string());
         #[allow(clippy::manual_unwrap_or_default)]
         let target_set: Option<HashSet<String>> =
-            match resolve_target_to_conversation_set(&query.effective_target(), self.db) {
+            match resolve_target_to_conversation_set(&query.effective_target(), self.conn) {
                 Ok(opt) => opt,
                 Err(_) => None,
             };
@@ -1377,7 +1400,7 @@ impl<'a> QueryEngine<'a> {
                FROM message_skeleton
               WHERE message_id IN ({placeholders})"
         );
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
         for id in &ids {
@@ -1480,7 +1503,7 @@ impl<'a> QueryEngine<'a> {
             Err(_) => return Ok(local),
         };
         let mv = model_version.unwrap_or(crate::models::embeddings::XLMR_MODEL_VERSION);
-        let conn = self.db.connection();
+        let conn = self.conn;
         let semantic = crate::search::semantic_search::SemanticSearchEngine::new(conn);
         let conv_filter_str = query.conversation_filter.map(|c| c.to_string());
         let hits = match semantic.search_semantic(
@@ -1702,7 +1725,7 @@ impl<'a> QueryEngine<'a> {
               WHERE model_version = ?1
                 AND message_id IN ({placeholders})"
         );
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let mut binds: Vec<Value> = Vec::with_capacity(ids.len() + 1);
         binds.push(Value::Text(mv.to_string()));
@@ -1761,7 +1784,7 @@ impl<'a> QueryEngine<'a> {
                FROM message_skeleton
               WHERE message_id IN ({placeholders})"
         );
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
         for id in ids {
@@ -1807,7 +1830,12 @@ impl<'a> QueryEngine<'a> {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
         push_structured_filters(query, &mut clauses, &mut binds);
-        push_target_filter(&query.effective_target(), self.db, &mut clauses, &mut binds);
+        push_target_filter(
+            &query.effective_target(),
+            self.conn,
+            &mut clauses,
+            &mut binds,
+        );
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -1815,7 +1843,7 @@ impl<'a> QueryEngine<'a> {
         sql.push_str(" ORDER BY created_at_ms DESC LIMIT ?");
         binds.push(Value::Integer(limit as i64));
 
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(binds.iter()), |row| {
@@ -1855,8 +1883,8 @@ impl<'a> QueryEngine<'a> {
         query_string: &str,
         limit: usize,
     ) -> DbResult<Vec<SearchResult>> {
-        let fts_engine = TextSearchEngine::new(self.db);
-        let fuzzy_engine = FuzzySearchEngine::new(self.db);
+        let fts_engine = TextSearchEngine::new(self.conn, self.icu_available);
+        let fuzzy_engine = FuzzySearchEngine::new(self.conn);
         // Over-fetch each engine so the post-filter / dedup still has
         // enough rows to satisfy `limit`. 4× is a heuristic; the
         // structured-only path applies a hard ceiling.
@@ -2008,7 +2036,7 @@ impl<'a> QueryEngine<'a> {
                FROM message_skeleton
               WHERE message_id IN ({placeholders})"
         );
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let mut binds: Vec<Value> = Vec::with_capacity(ids.len());
         for id in &ids {
@@ -2057,7 +2085,12 @@ impl<'a> QueryEngine<'a> {
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
         push_structured_filters(query, &mut clauses, &mut binds);
-        push_target_filter(&query.effective_target(), self.db, &mut clauses, &mut binds);
+        push_target_filter(
+            &query.effective_target(),
+            self.conn,
+            &mut clauses,
+            &mut binds,
+        );
         if clauses.is_empty() {
             return Ok(None);
         }
@@ -2081,7 +2114,7 @@ impl<'a> QueryEngine<'a> {
         sql.push_str(&placeholders);
         sql.push(')');
 
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(binds.iter()), |row| {
@@ -2111,7 +2144,7 @@ impl<'a> QueryEngine<'a> {
                FROM message_skeleton
               WHERE message_id IN ({placeholders})"
         );
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(&sql)?;
         let mut binds: Vec<Value> = Vec::with_capacity(message_ids.len());
         for mid in message_ids {
@@ -2180,11 +2213,11 @@ fn push_structured_filters(query: &SearchQuery, clauses: &mut Vec<String>, binds
 /// conversations to search" rather than as "no filter".
 pub fn resolve_target_to_conversation_set(
     target: &SearchTarget,
-    db: &LocalStoreDb,
+    conn: &Connection,
 ) -> SearchResultSet<Option<HashSet<String>>> {
     resolve_target_to_conversation_set_with_resolver(
         target,
-        db,
+        conn,
         &crate::search::search_target::NoopConversationGroupResolver::new(),
     )
 }
@@ -2197,7 +2230,7 @@ pub fn resolve_target_to_conversation_set(
 /// hit the same DB helpers as before.
 pub fn resolve_target_to_conversation_set_with_resolver(
     target: &SearchTarget,
-    db: &LocalStoreDb,
+    conn: &Connection,
     resolver: &dyn crate::search::search_target::ConversationGroupResolver,
 ) -> SearchResultSet<Option<HashSet<String>>> {
     use crate::SearchTarget as T;
@@ -2211,26 +2244,23 @@ pub fn resolve_target_to_conversation_set_with_resolver(
         T::ConversationGroup(group) => Ok(Some(group.iter().map(|c| c.to_string()).collect())),
         T::Channel(channel_id) => Ok(Some(resolver.resolve_channel(channel_id)?)),
         T::Community(community) => {
-            let convs = db
-                .list_conversations_by_community(&community.to_string())
-                .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
+            let convs =
+                read_list_conversations_by_column(conn, "community_id", &community.to_string())
+                    .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Domain(domain) => {
-            let convs = db
-                .list_conversations_by_domain(&domain.to_string())
+            let convs = read_list_conversations_by_column(conn, "domain_id", &domain.to_string())
                 .map_err(|e| Error::Search(format!("list domain convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Tenant(tenant) => {
-            let convs = db
-                .list_conversations_by_tenant(tenant)
+            let convs = read_list_conversations_by_column(conn, "tenant_id", tenant)
                 .map_err(|e| Error::Search(format!("list tenant convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::B2cAll => {
-            let convs = db
-                .list_conversations_by_scope("b2c")
+            let convs = read_list_conversations_by_column(conn, "scope", "b2c")
                 .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
@@ -2255,14 +2285,14 @@ type SearchResultSet<T> = std::result::Result<T, Error>;
 /// IN-clause collapses cleanly.
 fn push_target_filter(
     target: &SearchTarget,
-    db: &LocalStoreDb,
+    conn: &Connection,
     clauses: &mut Vec<String>,
     binds: &mut Vec<Value>,
 ) {
     if matches!(target, SearchTarget::Global) {
         return;
     }
-    let resolved = match resolve_target_to_conversation_set(target, db) {
+    let resolved = match resolve_target_to_conversation_set(target, conn) {
         Ok(r) => r,
         Err(_) => {
             // Resolution failed (e.g. transient SQL error). Fail
@@ -2519,6 +2549,7 @@ fn content_kind_to_sql(kind: ContentKind) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_store::db::LocalStoreDb;
 
     use std::collections::HashMap;
 
@@ -2624,7 +2655,7 @@ mod tests {
     #[test]
     fn structured_only_filter_by_sender() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             sender_filter: Some("alice".into()),
             ..Default::default()
@@ -2645,7 +2676,7 @@ mod tests {
     #[test]
     fn structured_only_filter_by_date_range() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             date_from: Some(2_000),
             date_to: Some(4_000),
@@ -2661,7 +2692,7 @@ mod tests {
     #[test]
     fn structured_only_filter_by_conversation() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv_a = uuid_fixture(1);
         let q = SearchQuery {
             conversation_filter: Some(conv_a),
@@ -2677,7 +2708,7 @@ mod tests {
     #[test]
     fn structured_only_filter_by_content_kind() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q_media = SearchQuery {
             content_kind: Some(ContentKind::Image),
             ..Default::default()
@@ -2709,7 +2740,7 @@ mod tests {
     #[test]
     fn fts_with_sender_filter() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             sender_filter: Some("alice".into()),
@@ -2727,7 +2758,7 @@ mod tests {
     #[test]
     fn fts_with_date_range() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "good".into(),
             date_from: Some(3_500),
@@ -2742,7 +2773,7 @@ mod tests {
     #[test]
     fn fts_with_conversation_filter() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv_b = uuid_fixture(2);
         let q = SearchQuery {
             query_string: "meeting".into(),
@@ -2759,7 +2790,7 @@ mod tests {
         // Phase 1 invariant: LocalOnly returns purely local rows
         // (is_cold = false) without touching any archive code.
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -2773,7 +2804,7 @@ mod tests {
         // Phase 1 invariant: IncludeCold is a forward-compat marker;
         // no archive fan-out lands until Phase 3 / Phase 5.
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -2787,7 +2818,7 @@ mod tests {
     #[test]
     fn empty_query_with_no_filters_returns_all_recent() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery::default();
         let results = engine.execute_search(&q, &SearchScope::LocalOnly).unwrap();
         assert_eq!(results.len(), 6);
@@ -2800,7 +2831,7 @@ mod tests {
     #[test]
     fn fts_query_with_no_match_returns_empty() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "doesnotappear".into(),
             ..Default::default()
@@ -2812,7 +2843,7 @@ mod tests {
     #[test]
     fn limit_caps_result_count() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery::default();
         let results = engine
             .execute_search_with_limit(&q, &SearchScope::LocalOnly, 2)
@@ -2875,7 +2906,7 @@ mod tests {
         seed_conv(&db, conv);
         let mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthose".into(),
             ..Default::default()
@@ -2897,7 +2928,7 @@ mod tests {
         seed_conv(&db, conv);
         let mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -2922,7 +2953,7 @@ mod tests {
         let mid_exact = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
         let mid_fuzzy = persist(&p, conv, "bob", 2_000, "lighthose typeo only");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -2960,7 +2991,7 @@ mod tests {
         seed_conv(&db, conv);
         let mid = persist(&p, conv, "alice", 1_700_000_000_000, "lighthouse keeper");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthose".into(),
             ..Default::default()
@@ -2986,7 +3017,7 @@ mod tests {
         let _alice_mid = persist(&p, conv, "alice", 1_000, "lighthouse keeper");
         let bob_mid = persist(&p, conv, "bob", 2_000, "lighthose typeo only");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             sender_filter: Some("bob".into()),
@@ -3031,7 +3062,7 @@ mod tests {
             .unwrap();
         flip_to_remote_archive_only(&db, &cold_mid);
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -3060,7 +3091,7 @@ mod tests {
     #[test]
     fn include_cold_leaves_local_rows_untouched() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -3087,7 +3118,7 @@ mod tests {
             .unwrap();
         flip_to_remote_archive_only(&db, &cold_mid);
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         // Structured-only: empty query string, sender filter only.
         let q = SearchQuery {
             sender_filter: Some("carol".into()),
@@ -3186,7 +3217,7 @@ mod tests {
     #[test]
     fn cold_source_includecold_returns_decrypted_shard_hits() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let conv = Uuid::now_v7();
         let cold_mid = Uuid::now_v7();
@@ -3221,7 +3252,7 @@ mod tests {
     #[test]
     fn cold_source_localonly_never_fetches_shards() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let conv = Uuid::now_v7();
         let source = FakeColdSource::new().with_text(
@@ -3275,7 +3306,7 @@ mod tests {
             "lighthouse keeper",
         );
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let cold_conv = Uuid::now_v7();
         let cold_mid = Uuid::now_v7();
@@ -3319,7 +3350,7 @@ mod tests {
         // (which carries sender / conversation / created_at_ms) so
         // the synthetic SearchResult has full metadata.
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let cold_conv = Uuid::now_v7();
         let cold_mid = Uuid::now_v7();
@@ -3363,7 +3394,7 @@ mod tests {
     #[test]
     fn cold_source_filters_by_conversation() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let target_conv = Uuid::now_v7();
         let other_conv = Uuid::now_v7();
@@ -3425,7 +3456,7 @@ mod tests {
         let mid_old = persist(&p, conv, "alice", old_ts, "lighthouse keeper");
         let mid_new = persist(&p, conv, "alice", new_ts, "lighthouse keeper");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -3462,7 +3493,7 @@ mod tests {
         let mid_recent_exact = persist(&p, conv, "alice", recent_ts, "lighthouse keeper");
         let mid_old_fuzzy = persist(&p, conv, "bob", ancient_ts, "lighthose typeo only");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -3498,7 +3529,7 @@ mod tests {
             );
         }
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -3548,7 +3579,7 @@ mod tests {
             )
             .unwrap();
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "lighthouse".into(),
             ..Default::default()
@@ -3594,7 +3625,7 @@ mod tests {
     #[test]
     fn semantic_reranker_falls_back_when_embedder_is_noop() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -3612,7 +3643,7 @@ mod tests {
     #[test]
     fn semantic_reranker_short_circuits_on_empty_query() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery::default();
         let mock = MockTextEmbedder::default();
         let res = engine
@@ -3649,7 +3680,7 @@ mod tests {
                 &mock.embed(target_text).unwrap(),
             )
             .unwrap();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         // Query that misses on FTS but matches semantically — use
         // the same mock embedding so cosine ~ 1.0.
         let q = SearchQuery {
@@ -3686,7 +3717,7 @@ mod tests {
                 &mock.embed("hello world").unwrap(),
             )
             .unwrap();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello world".into(),
             ..Default::default()
@@ -3773,7 +3804,7 @@ mod tests {
         cache.put(&recent_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
         cache.put(&stale_msg, XLMR_MODEL_VERSION, &q_emb).unwrap();
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: q_text.into(),
             ..Default::default()
@@ -3878,7 +3909,7 @@ mod tests {
         let cache = LocalStoreEmbeddingCache::new(db.connection());
         cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: q_text.into(),
             ..Default::default()
@@ -3929,7 +3960,7 @@ mod tests {
         let cache = LocalStoreEmbeddingCache::new(db.connection());
         cache.put(&mid, XLMR_MODEL_VERSION, &q_emb).unwrap();
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: q_text.into(),
             ..Default::default()
@@ -4016,7 +4047,7 @@ mod tests {
         );
 
         let mock = MockTextEmbedder::default();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         // With the sender filter set, only alice's semantic-only
         // hit should surface.
@@ -4067,7 +4098,7 @@ mod tests {
         );
 
         let mock = MockTextEmbedder::default();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let q = SearchQuery {
             query_string: q_text.into(),
@@ -4121,7 +4152,7 @@ mod tests {
         );
 
         let mock = MockTextEmbedder::default();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
 
         let q = SearchQuery {
             query_string: q_text.into(),
@@ -4188,7 +4219,7 @@ mod tests {
         );
 
         let mock = MockTextEmbedder::default();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: q_text.into(),
             ..Default::default()
@@ -4284,7 +4315,7 @@ mod tests {
                 &mock.embed("hello world").unwrap(),
             )
             .unwrap();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello world".into(),
             ..Default::default()
@@ -4305,7 +4336,7 @@ mod tests {
     #[test]
     fn semantic_score_none_for_fts_only_hits() {
         let db = populated_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -4354,7 +4385,7 @@ mod tests {
                 &mock.embed("hello there").unwrap(),
             )
             .unwrap();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -4444,7 +4475,7 @@ mod tests {
                 &mock.embed("hello world").unwrap(),
             )
             .unwrap();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "hello".into(),
             ..Default::default()
@@ -4482,6 +4513,7 @@ mod phase8_target_tests {
     use super::*;
     use std::cell::Cell;
 
+    use crate::local_store::db::LocalStoreDb;
     use crate::local_store::schema::Conversation;
     use crate::message::processor::{IngestedMessage, MessagePersister};
 
@@ -4548,36 +4580,45 @@ mod phase8_target_tests {
 
         // Global → None
         assert!(
-            resolve_target_to_conversation_set(&SearchTarget::Global, &db)
+            resolve_target_to_conversation_set(&SearchTarget::Global, db.connection())
                 .unwrap()
                 .is_none()
         );
         // Conversation → singleton set
-        let s = resolve_target_to_conversation_set(&SearchTarget::Conversation(conv_a), &db)
-            .unwrap()
-            .unwrap();
+        let s = resolve_target_to_conversation_set(
+            &SearchTarget::Conversation(conv_a),
+            db.connection(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(s.len(), 1);
         assert!(s.contains(&conv_a.to_string()));
         // Community → conv_a + conv_b
-        let s = resolve_target_to_conversation_set(&SearchTarget::Community(community), &db)
-            .unwrap()
-            .unwrap();
+        let s = resolve_target_to_conversation_set(
+            &SearchTarget::Community(community),
+            db.connection(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(s.contains(&conv_a.to_string()));
         assert!(s.contains(&conv_b.to_string()));
         assert!(!s.contains(&conv_c.to_string()));
         // Domain → conv_a only
-        let s = resolve_target_to_conversation_set(&SearchTarget::Domain(domain), &db)
+        let s = resolve_target_to_conversation_set(&SearchTarget::Domain(domain), db.connection())
             .unwrap()
             .unwrap();
         assert_eq!(s.len(), 1);
         assert!(s.contains(&conv_a.to_string()));
         // Tenant → conv_a + conv_b
-        let s = resolve_target_to_conversation_set(&SearchTarget::Tenant("tenant-1".into()), &db)
-            .unwrap()
-            .unwrap();
+        let s = resolve_target_to_conversation_set(
+            &SearchTarget::Tenant("tenant-1".into()),
+            db.connection(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(s.len(), 2);
         // B2cAll → conv_c only
-        let s = resolve_target_to_conversation_set(&SearchTarget::B2cAll, &db)
+        let s = resolve_target_to_conversation_set(&SearchTarget::B2cAll, db.connection())
             .unwrap()
             .unwrap();
         assert_eq!(s.len(), 1);
@@ -4596,7 +4637,7 @@ mod phase8_target_tests {
         let _ = persist(&p, conv_in, 1, "shared content meeting");
         let mid_out = persist(&p, conv_out, 2, "shared content meeting");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "meeting".into(),
             target: SearchTarget::Community(community),
@@ -4628,7 +4669,7 @@ mod phase8_target_tests {
         let mid_in = persist(&p, conv_in, 1, "shared content meeting");
         let mid_out = persist(&p, conv_out, 2, "shared content meeting");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "meeting".into(),
             target: SearchTarget::Conversation(conv_in),
@@ -4662,7 +4703,7 @@ mod phase8_target_tests {
         let mid_a = persist(&p, conv_a, 1, "global content meeting");
         let mid_b = persist(&p, conv_b, 2, "global content meeting");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "meeting".into(),
             target: SearchTarget::Global,
@@ -4685,7 +4726,7 @@ mod phase8_target_tests {
         seed_conv(&db, conv, "ca", "", "", "b2c");
         let _ = persist(&p, conv, 1, "global content meeting");
 
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: "meeting".into(),
             target: SearchTarget::Community(Uuid::now_v7()),
@@ -4870,7 +4911,7 @@ mod phase8_target_tests {
     #[test]
     fn bloom_precheck_skips_bucket_when_all_tokens_rejected() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new()
@@ -4897,7 +4938,7 @@ mod phase8_target_tests {
     #[test]
     fn bloom_precheck_passes_bucket_when_any_token_matches() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new()
@@ -4922,7 +4963,7 @@ mod phase8_target_tests {
     #[test]
     fn bloom_precheck_falls_through_when_bloom_shard_missing() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         // No `with_bloom(...)` call → fetch_bloom_shard returns
@@ -4947,7 +4988,7 @@ mod phase8_target_tests {
     #[test]
     fn bloom_precheck_falls_through_on_transport_error() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new()
@@ -5006,7 +5047,7 @@ mod phase8_target_tests {
         // first bucket without ever fetching its text / fuzzy
         // shards.
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid_jan = Uuid::now_v7().to_string();
         let mid_apr = Uuid::now_v7().to_string();
@@ -5038,7 +5079,7 @@ mod phase8_target_tests {
     #[test]
     fn tenant_policy_blocks_global_search_when_disabled() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new().with_text(
@@ -5072,7 +5113,7 @@ mod phase8_target_tests {
     #[test]
     fn tenant_policy_caps_cold_bucket_count() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mut source = BloomFakeColdSource::new();
         for month in 1..=6 {
@@ -5114,7 +5155,7 @@ mod phase8_target_tests {
     #[test]
     fn tenant_policy_requires_bloom_when_configured() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         // Bucket without a bloom shard — under
@@ -5152,7 +5193,7 @@ mod phase8_target_tests {
     #[test]
     fn shard_cache_hit_avoids_transport_fetch() {
         let db = cold_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7().to_string();
         let mid = Uuid::now_v7().to_string();
         let source = BloomFakeColdSource::new().with_text(
@@ -5304,7 +5345,7 @@ mod phase8_target_tests {
     #[test]
     fn parallel_fetch_returns_same_results_as_sequential() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let mut source_seq = CountingParallelSource::new();
         let mut source_par = CountingParallelSource::new();
@@ -5350,7 +5391,7 @@ mod phase8_target_tests {
     #[test]
     fn parallel_fetch_respects_concurrency_limit() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let mut source = CountingParallelSource::new().with_delay_ms(20);
         for i in 0..8 {
@@ -5387,7 +5428,7 @@ mod phase8_target_tests {
     #[test]
     fn parallel_fetch_survives_single_bucket_error() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let conv_str = conv.to_string();
         let good_mid = Uuid::now_v7();
@@ -5432,7 +5473,7 @@ mod phase8_target_tests {
     #[test]
     fn parallel_fetch_empty_buckets_returns_empty() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let source = CountingParallelSource::new();
         let q = SearchQuery {
             query_string: "alpha".into(),
@@ -5460,7 +5501,7 @@ mod phase8_target_tests {
     #[test]
     fn parallel_fetch_local_only_skips_cold_source() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let conv_str = conv.to_string();
         let source = CountingParallelSource::new().with_text(
@@ -5503,7 +5544,7 @@ mod phase8_target_tests {
     #[test]
     fn streaming_search_emits_local_results_first() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let conv_str = conv.to_string();
         let source = CountingParallelSource::new().with_text(
@@ -5543,7 +5584,7 @@ mod phase8_target_tests {
     #[test]
     fn streaming_search_emits_search_complete_last() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let source = CountingParallelSource::new();
         let q = SearchQuery {
             query_string: "alpha".into(),
@@ -5571,7 +5612,7 @@ mod phase8_target_tests {
     #[test]
     fn streaming_search_emits_cold_bucket_complete_per_bucket() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let conv_str = conv.to_string();
         let mut source = CountingParallelSource::new();
@@ -5616,7 +5657,7 @@ mod phase8_target_tests {
     #[test]
     fn streaming_search_local_only_skips_cold_events() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let conv = Uuid::now_v7();
         let conv_str = conv.to_string();
         let source = CountingParallelSource::new().with_text(
@@ -5684,7 +5725,7 @@ mod phase8_target_tests {
         }
 
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let source = FailingBucketsSource;
         let q = SearchQuery {
             query_string: "alpha".into(),
@@ -5725,7 +5766,7 @@ mod phase8_target_tests {
     #[test]
     fn streaming_search_no_cold_buckets_emits_complete_immediately() {
         let db = parallel_db();
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let source = CountingParallelSource::new();
         let q = SearchQuery {
             query_string: "alpha".into(),

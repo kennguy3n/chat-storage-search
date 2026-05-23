@@ -21,8 +21,9 @@
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::local_store::db::{DbError, DbResult, LocalStoreDb};
+use crate::local_store::db::{DbError, DbResult};
 use crate::search::tokenizer::{FallbackMode, FTS5_TOKENIZE_ICU, FTS5_TOKENIZE_UNICODE61};
+use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
 // FtsMatch
@@ -60,8 +61,8 @@ pub struct FtsMatch {
 ///
 /// `docs/PROPOSAL.md §3.3`: see [`FallbackMode`] and the constants
 /// [`FTS5_TOKENIZE_ICU`] / [`FTS5_TOKENIZE_UNICODE61`].
-pub fn schema_fallback_mode(db: &LocalStoreDb) -> FallbackMode {
-    if db.icu_available() {
+pub fn fallback_mode_for(icu_available: bool) -> FallbackMode {
+    if icu_available {
         FallbackMode::Icu
     } else {
         FallbackMode::Unicode61
@@ -73,20 +74,39 @@ pub fn schema_fallback_mode(db: &LocalStoreDb) -> FallbackMode {
 // ---------------------------------------------------------------------------
 
 /// FTS5 search engine over the `search_fts` virtual table.
+///
+/// Borrows a raw [`Connection`] (rather than a `LocalStoreDb`) so
+/// both the writer's own connection and a read-only connection
+/// from [`crate::local_store::db::LocalStoreReaderPool`] can
+/// drive the FTS5 search path uniformly. The
+/// `icu_available` flag is plumbed in explicitly because it is a
+/// schema-time property of the database the connection is open
+/// against — see
+/// [`crate::local_store::db::LocalStoreReader::icu_available`].
 #[derive(Debug)]
 pub struct TextSearchEngine<'a> {
-    db: &'a LocalStoreDb,
+    conn: &'a Connection,
+    icu_available: bool,
 }
 
 impl<'a> TextSearchEngine<'a> {
-    /// Construct a new engine bound to the given database.
-    pub fn new(db: &'a LocalStoreDb) -> Self {
-        Self { db }
+    /// Construct a new engine bound to the given connection.
+    ///
+    /// `icu_available` selects the FTS5 query path: the ICU
+    /// tokenizer when `true`, the `unicode61` fallback when
+    /// `false`. In production this is always sourced from
+    /// `LocalStoreDb::icu_available()` (writer) or
+    /// `LocalStoreReader::icu_available()` (pool reader).
+    pub fn new(conn: &'a Connection, icu_available: bool) -> Self {
+        Self {
+            conn,
+            icu_available,
+        }
     }
 
     /// Returns the [`FallbackMode`] this engine is operating in.
     pub fn tokenizer_mode(&self) -> FallbackMode {
-        schema_fallback_mode(self.db)
+        fallback_mode_for(self.icu_available)
     }
 
     /// Run an FTS5 search, returning at most `limit` matches in
@@ -111,8 +131,7 @@ impl<'a> TextSearchEngine<'a> {
             return Ok(Vec::new());
         }
 
-        let conn = self.db.connection();
-        let mut stmt = conn.prepare(
+        let mut stmt = self.conn.prepare(
             "SELECT message_id, conversation_id, sender_id, created_at_ms,
                     snippet(search_fts, 4, '<b>', '</b>', '...', 32) AS snippet,
                     bm25(search_fts) AS rank
@@ -140,8 +159,7 @@ impl<'a> TextSearchEngine<'a> {
     /// FTS hits with the structured search results in the unified
     /// query engine.
     pub fn lookup_fts_text(&self, message_id: &str) -> DbResult<Option<String>> {
-        self.db
-            .connection()
+        self.conn
             .query_row(
                 "SELECT text_content FROM search_fts WHERE message_id = ?1",
                 params![message_id],
@@ -266,6 +284,7 @@ pub fn tokenize_clause(mode: FallbackMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_store::db::LocalStoreDb;
 
     fn test_db() -> LocalStoreDb {
         LocalStoreDb::open_in_memory(&[0xAB; 32]).unwrap()
@@ -384,7 +403,7 @@ mod tests {
         let db = test_db();
         insert_fixture(&db, 1, "available now");
         insert_fixture(&db, 2, "hello world");
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         for input in ["NOT", "AND", "NEAR", "NOT available", "hello AND", "AND OR"] {
             let r = engine.search_fts(input, 10);
             assert!(
@@ -397,7 +416,7 @@ mod tests {
     #[test]
     fn search_fts_returns_empty_for_empty_query() {
         let db = test_db();
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         assert!(engine.search_fts("", 10).unwrap().is_empty());
         assert!(engine.search_fts("   ", 10).unwrap().is_empty());
     }
@@ -412,7 +431,7 @@ mod tests {
         insert_fixture(&db, 4, "alpha");
         insert_fixture(&db, 5, "alpha bravo charlie");
 
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         let hits = engine.search_fts("alpha", 10).unwrap();
         assert!(!hits.is_empty(), "must return at least one hit");
         // The top hit should be a row that contains "alpha" most
@@ -434,7 +453,7 @@ mod tests {
         insert_fixture(&db, 2, "helmets save lives");
         insert_fixture(&db, 3, "world peace");
 
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         let hits = engine.search_fts("hel*", 10).unwrap();
         let ids: Vec<_> = hits.iter().map(|h| h.message_id.as_str()).collect();
         assert!(ids.contains(&"msg-0001"));
@@ -446,7 +465,7 @@ mod tests {
     fn search_fts_returns_snippet() {
         let db = test_db();
         insert_fixture(&db, 1, "the quick brown fox jumps over the lazy dog");
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         let hits = engine.search_fts("brown", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
@@ -462,7 +481,7 @@ mod tests {
         insert_fixture(&db, 1, "user@example.com sent a note");
         insert_fixture(&db, 2, "no email here");
 
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         // A bare "@" used to be a query-parser error; build_fts_query
         // wraps the token in quotes so the search still runs.
         let hits = engine.search_fts("user@example.com", 10).unwrap();
@@ -476,7 +495,7 @@ mod tests {
         for i in 1..=5 {
             insert_fixture(&db, i, "hit hit hit");
         }
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         let hits = engine.search_fts("hit", 3).unwrap();
         assert_eq!(hits.len(), 3);
     }
@@ -493,7 +512,7 @@ mod tests {
     #[test]
     fn tokenizer_mode_matches_db_state() {
         let db = test_db();
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         // Whatever the build supports — ICU on a build that links
         // it, Unicode61 otherwise — the engine and the db agree.
         let mode = engine.tokenizer_mode();

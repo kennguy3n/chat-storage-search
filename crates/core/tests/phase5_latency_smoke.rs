@@ -121,7 +121,7 @@ fn phase5_cold_shard_decrypt_and_search_finishes_under_smoke_budget() {
     };
 
     let db = LocalStoreDb::open_in_memory(&[0x55; 32]).unwrap();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     let q = SearchQuery {
         query_string: NEEDLE.into(),
@@ -232,7 +232,7 @@ fn phase5_cold_shard_p95_latency_under_1_5s_budget() {
     // Warm criterion-style: discard a single warm-up sample to
     // amortise allocator + page-cache costs before measuring.
     {
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: NEEDLE.into(),
             ..Default::default()
@@ -244,7 +244,7 @@ fn phase5_cold_shard_p95_latency_under_1_5s_budget() {
 
     let mut samples: Vec<Duration> = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: NEEDLE.into(),
             ..Default::default()
@@ -351,7 +351,7 @@ fn assert_p95_under_budget(
     // Warm-up — discard the first sample so allocator / page-cache
     // costs don't bias the histogram.
     {
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: NEEDLE.into(),
             ..Default::default()
@@ -362,7 +362,7 @@ fn assert_p95_under_budget(
     }
     let mut samples: Vec<std::time::Duration> = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        let engine = QueryEngine::new(&db);
+        let engine = QueryEngine::new(db.connection(), db.icu_available());
         let q = SearchQuery {
             query_string: NEEDLE.into(),
             ..Default::default()

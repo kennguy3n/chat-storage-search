@@ -128,6 +128,44 @@ fn fts5_icu_available(conn: &Connection) -> bool {
     }
 }
 
+/// Schema-introspection variant of [`fts5_icu_available`] suitable
+/// for read-only connections.
+///
+/// The CREATE-VIRTUAL-TABLE probe used at writer-open time is not
+/// usable here for two reasons:
+///   1. `LocalStoreReader` opens with `PRAGMA query_only = 1`,
+///      which makes the SQLite engine reject *any* mutating
+///      statement — including `CREATE` for `temp.` tables.
+///   2. The reader does not run migrations, so a fresh sniff
+///      against the loaded `icu` extension would not match the
+///      stored schema if the writer was opened on a build with
+///      different tokenizer availability.
+///
+/// Instead, sniff the persisted `search_fts` `CREATE VIRTUAL
+/// TABLE` SQL from `sqlite_master` and check whether the writer
+/// stamped the schema with the ICU tokenizer
+/// ([`crate::search::tokenizer::FTS5_TOKENIZE_ICU`]) or the
+/// `unicode61` fallback
+/// ([`crate::search::tokenizer::FTS5_TOKENIZE_UNICODE61`]).
+///
+/// Returns `false` on any SQLite error or when the table does
+/// not yet exist — the conservative fallback. Search-engine call
+/// sites already handle the unicode61 path safely.
+fn probe_fts_icu_available(conn: &Connection) -> bool {
+    let sql: rusqlite::Result<Option<String>> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'search_fts'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten());
+    match sql {
+        Ok(Some(sql)) => sql.contains("tokenize = 'icu'") || sql.contains("tokenize='icu'"),
+        Ok(None) | Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LocalStoreDb
 // ---------------------------------------------------------------------------
@@ -2272,6 +2310,14 @@ pub(crate) fn read_search_media_index(
 #[derive(Debug)]
 pub struct LocalStoreReader {
     conn: Connection,
+    /// FTS5 ICU-tokenizer availability for this connection's
+    /// schema. Mirrors [`LocalStoreDb::icu_available`] and is
+    /// cached at open time by sniffing `search_fts`'s tokenizer
+    /// configuration via [`probe_fts_icu_available`]. Read by the
+    /// search engines (`TextSearchEngine`) so they can choose
+    /// between the ICU and `unicode61` query paths without
+    /// having to round-trip through the writer.
+    icu_available: bool,
 }
 
 impl LocalStoreReader {
@@ -2307,7 +2353,11 @@ impl LocalStoreReader {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         init_reader_connection(&conn, key)?;
-        Ok(Self { conn })
+        let icu_available = probe_fts_icu_available(&conn);
+        Ok(Self {
+            conn,
+            icu_available,
+        })
     }
 
     /// Open a new logically read-only connection via an
@@ -2325,7 +2375,21 @@ impl LocalStoreReader {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         init_reader_connection(&conn, key)?;
-        Ok(Self { conn })
+        let icu_available = probe_fts_icu_available(&conn);
+        Ok(Self {
+            conn,
+            icu_available,
+        })
+    }
+
+    /// `true` when this reader's database has the FTS5 ICU
+    /// tokenizer wired up, `false` when it falls back to the
+    /// `unicode61` tokenizer. The flag is sniffed once at open
+    /// time and never changes for the lifetime of the connection
+    /// — schema changes go through the writer and would require
+    /// re-opening the pool to take effect.
+    pub fn icu_available(&self) -> bool {
+        self.icu_available
     }
 
     /// Borrow the underlying read-only connection. Provided so

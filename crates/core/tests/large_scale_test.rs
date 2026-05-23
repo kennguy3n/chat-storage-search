@@ -133,7 +133,7 @@ fn large_scale_ingest_100k_messages_across_10_scripts() {
 
     // Per-script assertion: every distinguishing token must
     // surface at least one hit through the FTS5 path.
-    let text_engine = TextSearchEngine::new(&db);
+    let text_engine = TextSearchEngine::new(db.connection(), db.icu_available());
     for (script, _content, token) in SCRIPTS {
         let hits = text_engine
             .search_fts(token, total_messages)
@@ -179,7 +179,7 @@ fn large_scale_search_latency_under_budget() {
     // is a single distinguishing token so the FTS path is
     // exercised but BM25 ranking still discriminates among
     // documents within the script.
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let mut samples_us: Vec<u128> = Vec::with_capacity(SCRIPTS.len() * 10);
     for (_script, _content, token) in SCRIPTS {
         for _ in 0..10 {

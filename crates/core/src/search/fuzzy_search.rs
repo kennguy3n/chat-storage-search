@@ -27,10 +27,11 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::params;
 
-use crate::local_store::db::{DbResult, LocalStoreDb};
+use crate::local_store::db::DbResult;
 use crate::search::tokenizer::{
     fuzzy_granularity, fuzzy_min_overlap, segment_by_script, FuzzyGranularity, ScriptClass,
 };
+use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -122,15 +123,28 @@ fn split_words(run: &str) -> Vec<&str> {
 // ---------------------------------------------------------------------------
 
 /// DB-backed fuzzy index over the `search_fuzzy` table.
+///
+/// `FuzzySearchEngine` borrows a raw [`Connection`] (rather than
+/// a `LocalStoreDb` / `LocalStoreReader`) so both the writer's
+/// own connection and a reader checked out of
+/// [`crate::local_store::db::LocalStoreReaderPool`] can drive the
+/// search-side methods (`search_fuzzy`) uniformly. The
+/// index-side methods (`index_message` / `remove_message`)
+/// require a *writer* connection — calling them with a
+/// `query_only = 1` reader connection will surface a `SQLITE_
+/// READONLY` error from the engine, which the writer-only call
+/// sites in `core_impl` / `message::processor` never trigger
+/// because they always pass `db.connection()` from the locked
+/// writer.
 #[derive(Debug)]
 pub struct FuzzySearchEngine<'a> {
-    db: &'a LocalStoreDb,
+    conn: &'a Connection,
 }
 
 impl<'a> FuzzySearchEngine<'a> {
-    /// Construct a new engine bound to the given database.
-    pub fn new(db: &'a LocalStoreDb) -> Self {
-        Self { db }
+    /// Construct a new engine bound to the given connection.
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
     }
 
     /// Tokenize `text` and persist the unique (token, script) pairs
@@ -142,7 +156,7 @@ impl<'a> FuzzySearchEngine<'a> {
         if tokens.is_empty() {
             return Ok(());
         }
-        let conn = self.db.connection();
+        let conn = self.conn;
         // De-duplicate before INSERT to avoid re-trying primary key
         // collisions row-by-row.
         let mut seen: HashSet<(String, ScriptClass)> = HashSet::new();
@@ -161,7 +175,7 @@ impl<'a> FuzzySearchEngine<'a> {
     /// Drop every fuzzy token for `message_id`. Idempotent — a
     /// missing message is not an error.
     pub fn remove_message(&self, message_id: &str) -> DbResult<()> {
-        self.db.connection().execute(
+        self.conn.execute(
             "DELETE FROM search_fuzzy WHERE message_id = ?1",
             params![message_id],
         )?;
@@ -205,7 +219,7 @@ impl<'a> FuzzySearchEngine<'a> {
             return Ok(Vec::new());
         }
 
-        let conn = self.db.connection();
+        let conn = self.conn;
         let mut stmt = conn.prepare(
             "SELECT message_id FROM search_fuzzy
               WHERE token = ?1 AND script = ?2",
@@ -288,6 +302,7 @@ fn script_iso_15924(script: ScriptClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_store::db::LocalStoreDb;
 
     fn tokens_with_script(text: &str, script: ScriptClass) -> Vec<String> {
         FuzzyTokenizer::generate_tokens(text)
@@ -392,7 +407,7 @@ mod tests {
     #[test]
     fn index_and_search_latin_fuzzy() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "hello world").unwrap();
         engine.index_message("m2", "hippo").unwrap();
         // "helo" is a typo of "hello" — its trigrams ("hel", "elo")
@@ -417,7 +432,7 @@ mod tests {
     #[test]
     fn index_and_search_cjk_fuzzy() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "会議室で").unwrap();
         engine.index_message("m2", "東京駅").unwrap();
         let hits = engine.search_fuzzy("会議", 10).unwrap();
@@ -431,7 +446,7 @@ mod tests {
     #[test]
     fn remove_message_clears_tokens() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "hello").unwrap();
         assert_eq!(engine.search_fuzzy("hello", 10).unwrap().len(), 1);
         engine.remove_message("m1").unwrap();
@@ -443,7 +458,7 @@ mod tests {
     #[test]
     fn empty_query_returns_empty() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "hello").unwrap();
         assert!(engine.search_fuzzy("", 10).unwrap().is_empty());
         assert!(engine.search_fuzzy("   ", 10).unwrap().is_empty());
@@ -452,7 +467,7 @@ mod tests {
     #[test]
     fn index_message_is_idempotent() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "hello").unwrap();
         // Re-indexing the same message must not double-count tokens.
         engine.index_message("m1", "hello").unwrap();
@@ -471,7 +486,7 @@ mod tests {
     #[test]
     fn search_score_is_overlap_ratio() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("m1", "hello").unwrap();
         // Query "helo" produces trigrams {"hel", "elo"} — only "hel"
         // is in m1's token set, so score = 1/2.
@@ -500,7 +515,7 @@ mod tests {
     #[test]
     fn latin_typo_query_finds_only_latin_rows() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("latin", "lighthouse keeper").unwrap();
         engine.index_message("cjk", "灯台守の物語").unwrap();
 
@@ -517,7 +532,7 @@ mod tests {
     #[test]
     fn cjk_query_finds_only_cjk_rows() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("latin", "meeting agenda").unwrap();
         engine.index_message("cjk", "会議室の予約").unwrap();
 
@@ -531,7 +546,7 @@ mod tests {
     #[test]
     fn mixed_script_query_fans_out_to_both_indexes() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         engine.index_message("latin", "meeting agenda").unwrap();
         engine.index_message("cjk", "会議室の予約").unwrap();
         engine.index_message("both", "meeting 会議 today").unwrap();
@@ -558,7 +573,7 @@ mod tests {
     #[test]
     fn weak_single_trigram_overlap_does_not_surface_unrelated_row() {
         let db = fresh_db();
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         // The query "lighthouse" produces 8 Latin trigrams. A
         // junk row that happens to share exactly one of them
         // (1/8 = 0.125) sits below the 1/3 threshold.

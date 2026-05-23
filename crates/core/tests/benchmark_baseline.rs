@@ -145,7 +145,7 @@ fn benchmark_baseline() {
 
     // ---- Probe 2: FTS search latency over 1 k corpus.
     {
-        let engine = TextSearchEngine::new(&db);
+        let engine = TextSearchEngine::new(db.connection(), db.icu_available());
         let mut samples = Vec::with_capacity(SEARCH_ITERATIONS);
         for _ in 0..SEARCH_ITERATIONS {
             let t = Instant::now();
@@ -157,7 +157,7 @@ fn benchmark_baseline() {
 
     // ---- Probe 3: fuzzy search latency over 1 k corpus.
     {
-        let engine = FuzzySearchEngine::new(&db);
+        let engine = FuzzySearchEngine::new(db.connection());
         let mut samples = Vec::with_capacity(SEARCH_ITERATIONS);
         for _ in 0..SEARCH_ITERATIONS {
             let t = Instant::now();
