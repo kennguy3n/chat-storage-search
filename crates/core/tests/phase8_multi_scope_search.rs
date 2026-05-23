@@ -110,7 +110,7 @@ fn community_scoped_search_returns_only_community_conversations() {
     seed(&db, conv_a, "needle in community a", 1);
     seed(&db, conv_b, "needle in community b", 2);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -143,7 +143,7 @@ fn domain_scoped_search_returns_only_domain_conversations() {
     seed(&db, conv_a, "needle in domain a", 1);
     seed(&db, conv_b, "needle in domain b", 2);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -174,7 +174,7 @@ fn tenant_scoped_search_returns_only_tenant_conversations() {
     seed(&db, conv_a, "needle in acme", 1);
     seed(&db, conv_b, "needle in globex", 2);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -205,7 +205,7 @@ fn global_search_returns_all_conversations() {
     seed(&db, conv_a, "shared needle alpha", 1);
     seed(&db, conv_b, "shared needle beta", 2);
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let resolver = NoopConversationGroupResolver::new();
     let hits = engine
         .execute_search_with_target(
@@ -313,7 +313,7 @@ fn bloom_filter_eliminates_irrelevant_cold_buckets() {
         );
     }
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = q("needle", SearchTarget::Global);
     let _ = engine
         .execute_search_with_cold_source(&q, &SearchScope::IncludeCold, &cat)
@@ -358,7 +358,7 @@ fn shard_cache_eliminates_refetch_on_repeated_search() {
         build_bloom_for_words(&conv_str, bucket, &words),
     );
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let cache = Mutex::new(ShardCache::new(8 * 1024 * 1024));
     let policy = TenantSearchPolicy::default();
     let q = q("needle", SearchTarget::Global);
@@ -423,7 +423,7 @@ fn tenant_policy_blocks_global_search() {
         }],
     );
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let policy = TenantSearchPolicy {
         allow_global_search: false,
         ..TenantSearchPolicy::default()

@@ -30,7 +30,7 @@ use crate::local_store::schema::{
 use crate::local_store::state_machines::{
     ArchiveState, BackupState, BodyState, MediaState, StateTransitionError,
 };
-use crate::search::fuzzy_search::FuzzySearchEngine;
+use crate::search::fuzzy_search::FuzzyIndexWriter;
 use crate::ClientMessageId;
 
 // ---------------------------------------------------------------------------
@@ -415,7 +415,7 @@ impl<'a> MessagePersister<'a> {
                 skel.created_at_ms,
                 text,
             )?;
-            FuzzySearchEngine::new(self.db).index_message(&skel.message_id, text)?;
+            FuzzyIndexWriter::new(self.db).index_message(&skel.message_id, text)?;
         }
 
         // Bump the owning conversation's last_message_id /
@@ -551,7 +551,7 @@ impl<'a> MessagePersister<'a> {
             entry.created_at_ms,
             &entry.text_content,
         )?;
-        FuzzySearchEngine::new(self.db).index_message(&mid, &entry.text_content)?;
+        FuzzyIndexWriter::new(self.db).index_message(&mid, &entry.text_content)?;
 
         // Bump the owning conversation's last_message_id /
         // last_activity_ms so the conversation list surfaces the
@@ -707,7 +707,7 @@ impl<'a> MessagePersister<'a> {
             skel.created_at_ms,
             new_text,
         )?;
-        let fuzzy = FuzzySearchEngine::new(self.db);
+        let fuzzy = FuzzyIndexWriter::new(self.db);
         fuzzy.remove_message(&skel.message_id)?;
         fuzzy.index_message(&skel.message_id, new_text)?;
         // Invalidate the pre-edit embedding so semantic search
@@ -834,7 +834,7 @@ impl<'a> MessagePersister<'a> {
         // `fetch_skeleton_columns_for_semantic` (which does not
         // filter on `body_state`) would materialize it.
         self.db.delete_vector_row(&skel.message_id)?;
-        FuzzySearchEngine::new(self.db).remove_message(&skel.message_id)?;
+        FuzzyIndexWriter::new(self.db).remove_message(&skel.message_id)?;
         if matches!(scope, DeleteScope::ForEveryone) {
             self.db.delete_message_body(&skel.message_id)?;
         }

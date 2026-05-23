@@ -183,7 +183,7 @@ fn run_demo(conversation_count: usize, message_count: usize, media_count: usize)
     let started = Instant::now();
     let mut total_fts_hits: usize = 0;
     let mut scripts_with_hits: usize = 0;
-    let text_engine = TextSearchEngine::new(&db);
+    let text_engine = TextSearchEngine::new(db.connection(), db.icu_available());
     for (lang, token) in SCRIPT_TOKENS {
         let hits = text_engine
             .search_fts(token, 200)
@@ -219,7 +219,7 @@ fn run_demo(conversation_count: usize, message_count: usize, media_count: usize)
 
     // ---- Step 5: fuzzy search with deliberate typos ------------
     let started = Instant::now();
-    let fuzzy_engine = FuzzySearchEngine::new(&db);
+    let fuzzy_engine = FuzzySearchEngine::new(db.connection());
     // "lighthose" is a one-character typo of "lighthouse" — every
     // English-corpus row contains "lighthouse", so the fuzzy
     // engine should surface multiple rows even though FTS5 would
@@ -246,7 +246,7 @@ fn run_demo(conversation_count: usize, message_count: usize, media_count: usize)
 
     // ---- Step 6: structured search -----------------------------
     let started = Instant::now();
-    let query_engine = QueryEngine::new(&db);
+    let query_engine = QueryEngine::new(db.connection(), db.icu_available());
     // 6a) Sender filter: should narrow to ~1/4 of the messages
     // (round-robin over four senders).
     let by_alice = query_engine

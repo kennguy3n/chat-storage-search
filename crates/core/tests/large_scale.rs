@@ -129,7 +129,10 @@ fn large_scale_ingest_and_search_10k_messages() {
 
     let total_messages = 10_000usize;
     let persister = MessagePersister::new(&db);
-    let fuzzy = FuzzySearchEngine::new(&db);
+    // `persist_ingested_message` indexes every message through
+    // `FuzzyIndexWriter` internally (`processor.rs:418`), so we
+    // only need a read-side `FuzzySearchEngine` here.
+    let fuzzy = FuzzySearchEngine::new(db.connection());
     let mut english_msg_ids: Vec<Uuid> = Vec::new();
 
     for i in 0..total_messages {
@@ -152,12 +155,6 @@ fn large_scale_ingest_and_search_10k_messages() {
                 reply_to: None,
             })
             .unwrap_or_else(|e| panic!("persist {lang} #{i}: {e:?}"));
-        // Index every persisted message with the fuzzy engine
-        // so the typo-recall assertion below has a non-empty
-        // index to scan.
-        fuzzy
-            .index_message(&mid.to_string(), text)
-            .expect("fuzzy index");
         if lang == "en" {
             english_msg_ids.push(mid);
         }
@@ -165,7 +162,7 @@ fn large_scale_ingest_and_search_10k_messages() {
 
     // ---- FTS5 path: unicode61 token "meeting" must surface
     // every English row.
-    let text = TextSearchEngine::new(&db);
+    let text = TextSearchEngine::new(db.connection(), db.icu_available());
     let hits = text.search_fts("meeting", total_messages).unwrap();
     let hit_ids: BTreeSet<String> = hits.iter().map(|h| h.message_id.clone()).collect();
     let expected: BTreeSet<String> = english_msg_ids.iter().map(|u| u.to_string()).collect();
@@ -193,7 +190,7 @@ fn large_scale_ingest_and_search_10k_messages() {
     // ---- QueryEngine end-to-end path with a structured filter:
     // sender=alice, query=meeting → roughly half the English
     // rows surface.
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "meeting".into(),
         sender_filter: Some("alice".into()),
@@ -517,7 +514,10 @@ fn large_scale_ingest_and_search_100k_messages() {
 
     let total_messages = 100_000usize;
     let persister = MessagePersister::new(&db);
-    let fuzzy = FuzzySearchEngine::new(&db);
+    // `persist_ingested_message` indexes every message through
+    // `FuzzyIndexWriter` internally (`processor.rs:418`), so we
+    // only need a read-side `FuzzySearchEngine` here.
+    let fuzzy = FuzzySearchEngine::new(db.connection());
     let mut english_msg_ids: Vec<Uuid> = Vec::new();
 
     let started = Instant::now();
@@ -538,7 +538,6 @@ fn large_scale_ingest_and_search_100k_messages() {
                 reply_to: None,
             })
             .expect("persist");
-        fuzzy.index_message(&mid.to_string(), text).expect("fuzzy");
         if lang == "en" {
             english_msg_ids.push(mid);
         }
@@ -551,7 +550,7 @@ fn large_scale_ingest_and_search_100k_messages() {
     eprintln!("100k ingest in {ingest_elapsed:?}");
 
     let search_started = Instant::now();
-    let text_engine = TextSearchEngine::new(&db);
+    let text_engine = TextSearchEngine::new(db.connection(), db.icu_available());
     let hits = text_engine.search_fts("meeting", 1_000).unwrap();
     let search_elapsed = search_started.elapsed();
     assert!(
@@ -565,7 +564,7 @@ fn large_scale_ingest_and_search_100k_messages() {
     assert!(!fuzzy_hits.is_empty(), "fuzzy must recall ≥ 1 row");
 
     // QueryEngine end-to-end with a structured filter.
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "meeting".into(),
         sender_filter: Some("alice".into()),
@@ -742,7 +741,7 @@ fn large_scale_concurrent_operations() {
         handles.push(thread::spawn(move || {
             for _ in 0..200 {
                 let g = db_for_reader.lock().unwrap();
-                let engine = QueryEngine::new(&g);
+                let engine = QueryEngine::new(g.connection(), g.icu_available());
                 let q = SearchQuery {
                     query_string: "meeting".into(),
                     ..Default::default()
@@ -816,7 +815,7 @@ fn large_scale_200k_message_ingest_and_search() {
         .query_row("SELECT COUNT(*) FROM message_skeleton", [], |r| r.get(0))
         .expect("count");
     assert_eq!(row_count, total as i64);
-    let text = TextSearchEngine::new(&db);
+    let text = TextSearchEngine::new(db.connection(), db.icu_available());
     let hits = text.search_fts("meeting", 200).unwrap();
     assert!(!hits.is_empty(), "FTS must surface ≥ 1 hit in 200k corpus");
     println!(
@@ -867,7 +866,7 @@ fn large_scale_concurrent_backup_and_search() {
     let reader = thread::spawn(move || {
         for _ in 0..200 {
             let g = reader_db.lock().unwrap();
-            let engine = QueryEngine::new(&g);
+            let engine = QueryEngine::new(g.connection(), g.icu_available());
             let q = SearchQuery {
                 query_string: "meeting".into(),
                 ..Default::default()
@@ -971,7 +970,7 @@ fn large_scale_cross_epoch_search_across_12_months() {
             })
             .expect("persist");
     }
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "meeting".into(),
         ..Default::default()

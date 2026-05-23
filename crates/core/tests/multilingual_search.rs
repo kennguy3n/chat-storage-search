@@ -176,7 +176,7 @@ fn require_icu_or_skip(label: &str, db: &LocalStoreDb) -> bool {
 #[test]
 fn fts_finds_english_meeting() {
     let f = build_fixture();
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("meeting", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let en_id = f.ids["en"].to_string();
@@ -188,7 +188,7 @@ fn fts_finds_english_meeting() {
 #[test]
 fn fts_finds_cyrillic_vstrecha() {
     let f = build_fixture();
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("Встреча", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let ru_id = f.ids["ru"].to_string();
@@ -200,7 +200,7 @@ fn fts_finds_cyrillic_vstrecha() {
 #[test]
 fn fts_finds_arabic_meeting_word() {
     let f = build_fixture();
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("الاجتماع", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let ar_id = f.ids["ar"].to_string();
@@ -210,7 +210,7 @@ fn fts_finds_arabic_meeting_word() {
 #[test]
 fn fts_finds_devanagari_baithak() {
     let f = build_fixture();
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("बैठक", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let hi_id = f.ids["hi"].to_string();
@@ -220,7 +220,7 @@ fn fts_finds_devanagari_baithak() {
 #[test]
 fn structured_filter_by_sender_returns_per_sender_rows() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let q_alice = SearchQuery {
         sender_filter: Some(f.sender_alice.clone()),
         ..Default::default()
@@ -257,7 +257,7 @@ fn structured_filter_by_sender_returns_per_sender_rows() {
 #[test]
 fn structured_filter_by_date_range_is_inclusive() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let q = SearchQuery {
         date_from: Some(1_700_000_002_000),
         date_to: Some(1_700_000_004_000),
@@ -279,7 +279,7 @@ fn structured_filter_by_date_range_is_inclusive() {
 #[test]
 fn combined_fts_meeting_plus_conversation_filter() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let q = SearchQuery {
         query_string: "meeting".into(),
         conversation_filter: Some(f.conv_c),
@@ -298,7 +298,7 @@ fn combined_fts_meeting_plus_conversation_filter() {
 #[test]
 fn combined_fts_meeting_plus_conversation_a_excludes_other_convs() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let q = SearchQuery {
         query_string: "meeting".into(),
         conversation_filter: Some(f.conv_a),
@@ -314,7 +314,7 @@ fn combined_fts_meeting_plus_conversation_a_excludes_other_convs() {
 #[test]
 fn empty_query_returns_every_inserted_row() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let rows = engine
         .execute_search(&SearchQuery::default(), &SearchScope::LocalOnly)
         .unwrap();
@@ -324,7 +324,7 @@ fn empty_query_returns_every_inserted_row() {
 #[test]
 fn structured_filter_text_kind_keeps_text_messages() {
     let f = build_fixture();
-    let engine = QueryEngine::new(&f.db);
+    let engine = QueryEngine::new(f.db.connection(), f.db.icu_available());
     let q = SearchQuery {
         content_kind: Some(ContentKind::Text),
         ..Default::default()
@@ -363,7 +363,7 @@ fn fts_finds_chinese_huiyi_with_icu() {
     if !require_icu_or_skip("zh hui-yi", &f.db) {
         return;
     }
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("会议", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     // Chinese fixture uses the simplified form 会议. The Japanese
@@ -379,7 +379,7 @@ fn fts_finds_japanese_kaigi_with_icu() {
     if !require_icu_or_skip("ja kai-gi", &f.db) {
         return;
     }
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("会議", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let ja_id = f.ids["ja"].to_string();
@@ -394,7 +394,7 @@ fn fts_finds_thai_prachum_with_icu() {
     if !require_icu_or_skip("th prachum", &f.db) {
         return;
     }
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let hits = engine.search_fts("ประชุม", 50).unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.message_id.clone()).collect();
     let th_id = f.ids["th"].to_string();
@@ -408,7 +408,7 @@ fn fts_finds_thai_prachum_with_icu() {
 #[test]
 fn tokenizer_mode_matches_db_state() {
     let f = build_fixture();
-    let engine = TextSearchEngine::new(&f.db);
+    let engine = TextSearchEngine::new(f.db.connection(), f.db.icu_available());
     let mode = engine.tokenizer_mode();
     let expected = if f.db.icu_available() {
         FallbackMode::Icu

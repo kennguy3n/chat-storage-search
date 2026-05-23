@@ -186,7 +186,7 @@ fn search_ids(f: &Fixture, query: &str) -> Vec<Uuid> {
         query_string: query.to_string(),
         ..Default::default()
     };
-    QueryEngine::new(&f.db)
+    QueryEngine::new(f.db.connection(), f.db.icu_available())
         .execute_search(&q, &SearchScope::LocalOnly)
         .unwrap()
         .into_iter()
@@ -294,7 +294,7 @@ fn exact_match_outranks_fuzzy_only_match() {
         query_string: "lighthouse".into(),
         ..Default::default()
     };
-    let rows = QueryEngine::new(&f.db)
+    let rows = QueryEngine::new(f.db.connection(), f.db.icu_available())
         .execute_search(&q, &SearchScope::LocalOnly)
         .unwrap();
     assert!(!rows.is_empty(), "expected at least one hit");
@@ -325,7 +325,7 @@ fn structured_filters_narrow_fuzzy_results() {
         conversation_filter: Some(f.conv_a),
         ..Default::default()
     };
-    let rows = QueryEngine::new(&f.db)
+    let rows = QueryEngine::new(f.db.connection(), f.db.icu_available())
         .execute_search(&q, &SearchScope::LocalOnly)
         .unwrap();
     let ids: Vec<_> = rows.iter().map(|r| r.message_id).collect();
@@ -350,7 +350,7 @@ fn sender_filter_narrows_fuzzy_results() {
         sender_filter: Some(f.sender_bob.clone()),
         ..Default::default()
     };
-    let rows = QueryEngine::new(&f.db)
+    let rows = QueryEngine::new(f.db.connection(), f.db.icu_available())
         .execute_search(&q, &SearchScope::LocalOnly)
         .unwrap();
     let ids: Vec<_> = rows.iter().map(|r| r.message_id).collect();
@@ -381,7 +381,7 @@ fn fuzzy_only_hit_has_lower_rank_than_exact() {
         query_string: "lighthouse".into(),
         ..Default::default()
     };
-    let rows = QueryEngine::new(&f.db)
+    let rows = QueryEngine::new(f.db.connection(), f.db.icu_available())
         .execute_search(&q, &SearchScope::LocalOnly)
         .unwrap();
     assert!(rows.len() >= 2, "expected ≥2 hits; got {}", rows.len());

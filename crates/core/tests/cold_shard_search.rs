@@ -170,7 +170,7 @@ fn cold_shard_round_trip_returns_decrypted_results() {
     // Fresh local store with no rows — every hit must come from
     // the cold path.
     let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     let q = SearchQuery {
         query_string: "lighthouse".into(),
@@ -224,7 +224,7 @@ fn cold_shard_local_only_skips_decryption() {
     }
 
     let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     let q = SearchQuery {
         query_string: "lighthouse".into(),
@@ -268,7 +268,7 @@ fn cold_shard_conversation_filter_scopes_fan_out() {
     }
 
     let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     let q = SearchQuery {
         query_string: "lighthouse".into(),
@@ -367,7 +367,7 @@ fn cold_shard_merge_does_not_double_weight_local_rows() {
         text_built.k_shard,
     );
 
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
     let q = SearchQuery {
         query_string: "lighthouse".into(),
         ..Default::default()
@@ -501,7 +501,7 @@ fn cold_shard_skips_fan_out_for_non_text_kind() {
     }
 
     let db = LocalStoreDb::open_in_memory(&DB_KEY).unwrap();
-    let engine = QueryEngine::new(&db);
+    let engine = QueryEngine::new(db.connection(), db.icu_available());
 
     // Image / Video / Audio / Document all map to the `media`
     // skeleton kind in Phase 1, and none of them have a cold

@@ -43,7 +43,7 @@ use crate::config::KChatCoreConfig;
 use crate::crypto::aead::BlobClass;
 use crate::crypto::key_hierarchy::{KeyMaterial, KEY_LEN};
 use crate::formats::manifest::WrappedEpochKeyRef;
-use crate::local_store::db::LocalStoreDb;
+use crate::local_store::db::{LocalStoreDb, LocalStoreReaderPool};
 use crate::local_store::schema::{
     BackupEventJournalEntry, Conversation, MediaAsset, MessageBody, MessageKind, MessageSkeleton,
 };
@@ -59,7 +59,7 @@ use crate::offload::eviction::{
     collect_eviction_candidates, execute_eviction, plan_tiered_eviction,
 };
 use crate::offload::hydration::{HydrationQueue, HydrationRequest};
-use crate::search::fuzzy_search::FuzzySearchEngine;
+use crate::search::fuzzy_search::FuzzyIndexWriter;
 use crate::search::query_engine::{ColdShardSource, QueryEngine};
 use crate::transport::{DeliveryClient, RawDeliveryMessage, TransportClient};
 use crate::{
@@ -72,6 +72,18 @@ use crate::{
 /// queue grows beyond this on demand — `HydrationQueue::new`
 /// only sizes the backing `Vec`.
 const DEFAULT_HYDRATION_QUEUE_CAPACITY: usize = 256;
+
+/// Default number of reader connections in
+/// [`CoreImpl::db_readers`]. Chosen as a reasonable default for
+/// a multi-core device: enough parallelism to let the bridge
+/// crate run a small handful of UI reads (timeline fetch,
+/// conversation list, message hydration) in parallel without
+/// any one blocking the others, while keeping the per-process
+/// SQLCipher connection count bounded. The exact number is not
+/// load-bearing — the pool blocks on a condvar when all readers
+/// are checked out and wakes the next waiter immediately on
+/// release.
+const DEFAULT_READER_POOL_SIZE: usize = 4;
 
 /// Cap each backup segment so an event-journal backlog does not
 /// produce a single oversized seal. Mirrors the archive
@@ -102,15 +114,46 @@ pub(crate) struct SealedBackupEventRef {
 // ---------------------------------------------------------------------------
 
 /// Concrete [`KChatCore`] implementation backed by a single
-/// [`LocalStoreDb`].
+/// SQLCipher database, split into a writer + a pool of readers.
 ///
-/// `CoreImpl` is `Send + Sync` — the underlying [`rusqlite::Connection`]
-/// is held inside a [`Mutex`] so the trait's `&self` methods can
-/// short-borrow the connection without making the public surface
-/// `&mut self`.
+/// `CoreImpl` is `Send + Sync` — the underlying writer
+/// [`rusqlite::Connection`] is held inside [`db_writer`] (a
+/// [`Mutex`]) so the trait's `&self` methods can short-borrow it
+/// without making the public surface `&mut self`; the reader
+/// connections live in [`db_readers`] (a
+/// [`LocalStoreReaderPool`]) which is already internally
+/// thread-safe.
+///
+/// # Concurrency model (Phase B.1)
+///
+/// Under SQLite **WAL mode** the writer and the readers do not
+/// block each other:
+///   * Writes (`send_text`, `ingest_messages`, `delete_*`,
+///     `edit_message`, `run_incremental_backup`, etc.) take the
+///     [`db_writer`] mutex and run the mutating SQL there.
+///   * Reads that don't need the writer's connection (timeline
+///     fetch, conversation list, message hydration) check a
+///     reader out of [`db_readers`] via
+///     [`LocalStoreReaderPool::with_reader`] and run SELECTs on
+///     that connection while the writer's mutex is *not* held.
+///
+/// The reader pool is sized at [`DEFAULT_READER_POOL_SIZE`]
+/// connections by default; the constructor opens them eagerly so
+/// the first UI read does not pay for a fresh `Connection::open`
+/// on its critical path. See
+/// [`LocalStoreDb::open_reader_pool`] for the open semantics.
 pub struct CoreImpl {
     config: KChatCoreConfig,
-    db: Mutex<LocalStoreDb>,
+    /// The single SQLCipher writer. Every mutating SQL statement
+    /// goes through this connection. See the type-level doc for
+    /// the lock ordering.
+    db_writer: Mutex<LocalStoreDb>,
+    /// Pool of read-only SQLCipher connections used for
+    /// concurrent SELECTs alongside the writer's transactions.
+    /// Always materialised (no `Option`) — the constructor seeds
+    /// the pool eagerly from [`db_writer`] via
+    /// [`LocalStoreDb::open_reader_pool`].
+    db_readers: LocalStoreReaderPool,
     /// 32-byte `K_local_db` retained so [`KChatCore::initialize`]
     /// can re-open the database at a different `data_dir` without
     /// requiring the caller to re-supply the key.
@@ -425,9 +468,13 @@ impl CoreImpl {
     pub fn new(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open(&config.data_dir, &key)
             .map_err(|e| Error::Storage(e.to_string()))?;
+        let db_readers = db
+            .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let core = Self {
             config,
-            db: Mutex::new(db),
+            db_writer: Mutex::new(db),
+            db_readers,
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
@@ -476,9 +523,13 @@ impl CoreImpl {
     #[doc(hidden)]
     pub fn new_in_memory(config: KChatCoreConfig, key: [u8; 32]) -> Result<Self> {
         let db = LocalStoreDb::open_in_memory(&key).map_err(|e| Error::Storage(e.to_string()))?;
+        let db_readers = db
+            .open_reader_pool(&key, DEFAULT_READER_POOL_SIZE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         let core = Self {
             config,
-            db: Mutex::new(db),
+            db_writer: Mutex::new(db),
+            db_readers,
             key: Zeroizing::new(key),
             delivery_client: Mutex::new(None),
             hydration_queue: Mutex::new(HydrationQueue::new(DEFAULT_HYDRATION_QUEUE_CAPACITY)),
@@ -719,12 +770,19 @@ impl CoreImpl {
         query: SearchQuery,
         scope: SearchScope,
     ) -> Result<(Vec<SearchResult>, usize)> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
-        let results = engine
-            .execute_search(&query, &scope)
-            .map_err(|e| Error::Search(e.to_string()))?;
-        drop(db);
+        // `QueryEngine::execute_search` only issues SELECTs, so we
+        // route through the reader pool rather than parking the
+        // writer mutex for the duration of the local-side query.
+        // Cold-bucket prefetch (`enqueue_cold_results_for_hydration`)
+        // runs *after* the pool checkout drops, so it never holds a
+        // reader connection while waiting on the hydration queue.
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine
+                .execute_search(&query, &scope)
+                .map_err(|e| Error::Search(e.to_string()))
+        });
+        let results = results?;
         let cold_count = results.iter().filter(|r| r.is_cold).count();
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
@@ -755,10 +813,17 @@ impl CoreImpl {
         scope: SearchScope,
         cold_source: &dyn ColdShardSource,
     ) -> Result<Vec<SearchResult>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
-        let results = engine.execute_search_with_cold_source(&query, &scope, cold_source)?;
-        drop(db);
+        // Same rationale as `search_and_prefetch_cold` above: the
+        // engine only issues SELECTs against the local DB, so the
+        // checkout uses a pool reader. Cold-shard fan-out happens
+        // inside `execute_search_with_cold_source` against the
+        // `ColdShardSource` callback (not the DB), and hydration
+        // enqueue runs after the checkout drops.
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine.execute_search_with_cold_source(&query, &scope, cold_source)
+        });
+        let results = results?;
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
         }
@@ -793,25 +858,28 @@ impl CoreImpl {
         cold_source: &dyn ColdShardSource,
         emit: F,
     ) -> Result<Vec<SearchResult>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let engine = QueryEngine::new(&db);
-        // Use the default tenant policy here for the streaming
-        // entry point — callers that need a custom policy
-        // already bypass `search_streaming` for
-        // `execute_search_with_cold_source_full`.
+        // Same rationale as `search_with_cold_source`: streaming
+        // execution only reads from the local DB. The `emit`
+        // closure runs synchronously inside the checkout, which
+        // is identical to the previous writer-locked semantics
+        // for downstream callers (events are emitted in order
+        // before the result list is returned).
         let policy = crate::config::TenantSearchPolicy::default();
-        let results = engine.execute_search_streaming(
-            &query,
-            &scope,
-            cold_source,
-            &policy,
-            None,
-            // Match `execute_search` (no `_with_limit`), which
-            // hardcodes 200 as the engine-default cap.
-            200,
-            emit,
-        )?;
-        drop(db);
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine.execute_search_streaming(
+                &query,
+                &scope,
+                cold_source,
+                &policy,
+                None,
+                // Match `execute_search` (no `_with_limit`), which
+                // hardcodes 200 as the engine-default cap.
+                200,
+                emit,
+            )
+        });
+        let results = results?;
         if matches!(scope, SearchScope::IncludeCold) {
             self.enqueue_cold_results_for_hydration(&results);
         }
@@ -1048,7 +1116,7 @@ impl CoreImpl {
             // so the rows are still present after the cursor
             // advance.
             let (fts_rows, fuzzy_rows) = {
-                let db = self.db.lock().map_err(poisoned)?;
+                let db = self.db_writer.lock().map_err(poisoned)?;
                 let conn = db.connection();
                 let mut fts_rows: Vec<crate::search::shard_builder::FtsRow> = Vec::new();
                 let mut fuzzy_rows: Vec<crate::search::shard_builder::FuzzyRow> = Vec::new();
@@ -1865,7 +1933,7 @@ impl CoreImpl {
         source_sink: &str,
         target_sink: &str,
     ) -> Result<crate::media::migration::MediaMigrationPlan> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         crate::media::migration::plan_media_migration(&db, source_sink, target_sink)
             .map_err(|e| crate::Error::Storage(e.to_string()))
     }
@@ -1881,7 +1949,7 @@ impl CoreImpl {
     /// The DB lock is **not** held across the migration — we
     /// hand the executor a
     /// [`crate::media::migration::LockingDbHandle`] which
-    /// re-acquires `self.db` per DB call (idempotency probe +
+    /// re-acquires `self.db_writer` per DB call (idempotency probe +
     /// storage-sink update). The chunk-fetch / chunk-upload /
     /// roundtrip-verify phases (potentially minutes of network
     /// I/O against iCloud / Google Drive / ZKOF) run with the
@@ -1895,7 +1963,7 @@ impl CoreImpl {
         progress: &dyn crate::media::migration::MigrationProgress,
         delete_source_after_success: bool,
     ) -> Result<crate::media::migration::MigrationReport> {
-        let handle = crate::media::migration::LockingDbHandle::new(&self.db);
+        let handle = crate::media::migration::LockingDbHandle::new(&self.db_writer);
         crate::media::migration::execute_media_migration(
             plan,
             source,
@@ -1969,7 +2037,11 @@ impl CoreImpl {
         target: &crate::SearchTarget,
         limit: usize,
     ) -> Result<Vec<crate::SearchResult>> {
-        let db = self.db.lock().map_err(poisoned)?;
+        // Resolve the installed `ConversationGroupResolver` outside
+        // the reader-pool checkout so we don't hold a pool reader
+        // while contending on the resolver mutex. The resolver itself
+        // does not touch the DB — it only translates a `SearchTarget`
+        // into a conversation-id set inside `execute_search_with_target`.
         let installed = self
             .conversation_group_resolver
             .lock()
@@ -1981,9 +2053,20 @@ impl CoreImpl {
                     crate::search::search_target::NoopConversationGroupResolver::new(),
                 )
             });
-        crate::search::query_engine::QueryEngine::new(&db)
+        // SELECT-only path — route through the reader pool so we
+        // match the other search entry points (`search`,
+        // `search_and_prefetch_cold`, `search_with_cold_source`,
+        // `search_streaming`) and never park the writer mutex on a
+        // pure-read search.
+        let result: Result<Vec<crate::SearchResult>> = self.db_readers.with_reader(|reader| {
+            crate::search::query_engine::QueryEngine::new(
+                reader.connection(),
+                reader.icu_available(),
+            )
             .execute_search_with_target(query, scope, target, resolver.as_ref(), limit)
             .map_err(|e| crate::Error::Search(e.to_string()))
+        });
+        result
     }
 
     /// Replay the supplied search-index shards into the local
@@ -2000,7 +2083,7 @@ impl CoreImpl {
         &self,
         shards: &[crate::restore::pipeline::SealedSearchShardEntry<'_>],
     ) -> Result<Vec<crate::restore::pipeline::RestoredShardSummary>> {
-        let mut db = self.db.lock().map_err(poisoned)?;
+        let mut db = self.db_writer.lock().map_err(poisoned)?;
         crate::restore::pipeline::RestorePipeline::new()
             .restore_search_index_shards_with_replay(db.connection_mut(), shards)
     }
@@ -2093,7 +2176,7 @@ impl CoreImpl {
             .collect();
 
         let summaries = {
-            let mut db = self.db.lock().map_err(poisoned)?;
+            let mut db = self.db_writer.lock().map_err(poisoned)?;
             crate::restore::pipeline::RestorePipeline::new()
                 .restore_search_index_shards_with_replay(db.connection_mut(), &entries)?
         };
@@ -2213,7 +2296,7 @@ impl CoreImpl {
             // decrypt + replay does not starve concurrent
             // readers.
             let prefetched = {
-                let db = self.db.lock().map_err(poisoned)?;
+                let db = self.db_writer.lock().map_err(poisoned)?;
                 crate::archive::prefetch::batch_prefetch_bucket_with_router(
                     db.connection(),
                     &router,
@@ -2280,7 +2363,7 @@ impl CoreImpl {
         F: FnMut(&str) -> Result<[u8; 32]>,
     {
         let segments = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             crate::archive::prefetch::batch_prefetch_bucket_with_router(
                 db.connection(),
                 router,
@@ -2301,7 +2384,7 @@ impl CoreImpl {
             // Drop into the DB lock once per segment so the worker
             // doesn't starve out-of-band reads while we land a
             // potentially long event list.
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             for event in payload.events {
                 let Some(message_id) = event.message_id else {
                     continue;
@@ -2369,7 +2452,7 @@ impl CoreImpl {
         // `send_text` / `search` / `ingest` callers
         // (Task 2 of the Phase 3/4 batch).
         let plan = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             let Some(asset) = db
                 .get_media_asset_by_message(&mid)
                 .map_err(|e| Error::Storage(e.to_string()))?
@@ -2388,7 +2471,7 @@ impl CoreImpl {
         // Phase 3: re-acquire the db lock and flip the state
         // machine + bytes_local under SAVEPOINT.
         {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             crate::media::download::commit_rehydration(
                 &db,
                 &plan.asset_id,
@@ -2476,7 +2559,7 @@ impl CoreImpl {
         let mut trace = crate::perf::PerfTrace::new("ingest_messages");
         trace.insert_metadata("messages_in", messages.len().to_string());
 
-        let db = match self.db.lock().map_err(poisoned) {
+        let db = match self.db_writer.lock().map_err(poisoned) {
             Ok(db) => db,
             Err(e) => {
                 let err_str = e.to_string();
@@ -2756,7 +2839,7 @@ impl CoreImpl {
             EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
         };
         use crate::models::resource_gate::ResourceGate;
-        use crate::search::fuzzy_search::FuzzySearchEngine;
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
 
         if !mime_type.starts_with("audio/") {
             return;
@@ -2813,7 +2896,7 @@ impl CoreImpl {
                 transcript,
             ],
         );
-        let _ = FuzzySearchEngine::new(db).index_message(message_id, transcript);
+        let _ = FuzzyIndexWriter::new(db).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
         //     up the audio body.
@@ -2869,7 +2952,7 @@ impl CoreImpl {
         use crate::models::embeddings::{
             EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
         };
-        use crate::search::fuzzy_search::FuzzySearchEngine;
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
 
         if !is_supported_document_mime(mime_type) {
             return;
@@ -2912,7 +2995,7 @@ impl CoreImpl {
                     trimmed,
                 ],
             );
-            let _ = FuzzySearchEngine::new(db).index_message(&page_row_id, trimmed);
+            let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, trimmed);
 
             // (3) Optional XLM-R embedding per page.
             if let Ok(embedder_slot) = self.text_embedder.lock() {
@@ -3024,7 +3107,7 @@ impl CoreImpl {
     where
         F: FnOnce(&LocalStoreDb) -> T,
     {
-        let db = self.db.lock().expect("db mutex poisoned");
+        let db = self.db_writer.lock().expect("db mutex poisoned");
         f(&db)
     }
 
@@ -3048,7 +3131,7 @@ impl CoreImpl {
         title: Option<&str>,
         last_activity_ms: i64,
     ) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let conv = Conversation {
             conversation_id: conversation_id.to_string(),
             title_cipher: title.map(|t| t.as_bytes().to_vec()),
@@ -3065,17 +3148,24 @@ impl CoreImpl {
 
     /// List every conversation, pinned-first then by descending
     /// `last_activity_ms`.
+    ///
+    /// Routed through [`Self::db_readers`] so the writer's mutex
+    /// is not contended on the UI's conversation-list refresh.
     pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        db.list_conversations()
+        self.db_readers
+            .with_reader(|r| r.list_conversations())
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
     /// Fetch a single conversation by id. Returns `Ok(None)` when
     /// the row does not exist.
+    ///
+    /// Routed through [`Self::db_readers`] — see the doc on
+    /// [`Self::list_conversations`] for the rationale.
     pub fn get_conversation(&self, conversation_id: Uuid) -> Result<Option<Conversation>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        db.get_conversation(&conversation_id.to_string())
+        let id = conversation_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_conversation(&id))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3083,7 +3173,7 @@ impl CoreImpl {
     /// [`Error::Storage`] when the row does not exist so callers can
     /// surface the failure to the user instead of silently no-op'ing.
     pub fn update_conversation_pin(&self, conversation_id: Uuid, pinned: bool) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .update_conversation_pin(&conversation_id.to_string(), pinned)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -3098,7 +3188,7 @@ impl CoreImpl {
     /// Update the `muted` flag for `conversation_id`. Errors with
     /// [`Error::Storage`] when the row does not exist.
     pub fn update_conversation_mute(&self, conversation_id: Uuid, muted: bool) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .update_conversation_mute(&conversation_id.to_string(), muted)
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -3123,8 +3213,12 @@ impl CoreImpl {
         before_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<crate::TimelineRow>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        db.get_timeline(&conversation_id.to_string(), before_ms, limit)
+        // Pure read — timeline JOINs skeletons with bodies once,
+        // both inside the same WAL snapshot the pool reader holds
+        // for the duration of the checkout.
+        let id = conversation_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_timeline(&id, before_ms, limit))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3144,8 +3238,11 @@ impl CoreImpl {
         &self,
         message_id: Uuid,
     ) -> Result<Option<(MessageSkeleton, Option<MessageBody>)>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        db.get_message_with_body(&message_id.to_string())
+        // Pure read — skeleton + body fetched inside a single pool
+        // checkout so both observe the same WAL snapshot.
+        let id = message_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_message_with_body(&id))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3157,8 +3254,10 @@ impl CoreImpl {
     /// Used by the hydration display path. Wraps
     /// [`LocalStoreDb::get_message_body`].
     pub fn get_message_body(&self, message_id: Uuid) -> Result<Option<MessageBody>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        db.get_message_body(&message_id.to_string())
+        // Pure read.
+        let id = message_id.to_string();
+        self.db_readers
+            .with_reader(|r| r.get_message_body(&id))
             .map_err(|e| Error::Storage(e.to_string()))
     }
 
@@ -3184,7 +3283,7 @@ impl CoreImpl {
         text_content: &str,
         new_body_state: BodyState,
     ) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let conn = db.connection();
         conn.execute_batch("SAVEPOINT rehydrate_message_body_locally;")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -3195,7 +3294,7 @@ impl CoreImpl {
             // idempotent thanks to the (token, script, message_id)
             // primary key but stale tokens from a previous body are
             // dropped first so search_fuzzy stays in sync.
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzyIndexWriter::new(&db);
             engine
                 .remove_message(&message_id.to_string())
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -3282,7 +3381,7 @@ impl CoreImpl {
     /// manifest that the *previous* process produced.
     fn hydrate_backup_manifest_from_db(&self) -> Result<()> {
         let manifest_cbor = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             db.load_backup_manifest()
                 .map_err(|e| Error::Storage(e.to_string()))?
         };
@@ -3314,7 +3413,7 @@ impl CoreImpl {
         use crate::formats::SegmentType;
 
         let rows = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             db.load_backup_segment_ledger()
                 .map_err(|e| Error::Storage(e.to_string()))?
         };
@@ -3454,7 +3553,7 @@ impl CoreImpl {
     ) -> Result<()> {
         let row = Self::build_backup_segment_ledger_row(seg, backup_root, now_ms)?;
         let cbor = Self::encode_manifest_cbor(manifest)?;
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         db.atomic_append_segment_and_manifest(
             &row,
             &cbor,
@@ -3485,7 +3584,7 @@ impl CoreImpl {
             )?);
         }
         let cbor = Self::encode_manifest_cbor(manifest)?;
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         db.atomic_replace_ledger_and_manifest(&rows, &cbor, manifest.generation as i64, now_ms)
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
@@ -3541,7 +3640,7 @@ impl CoreImpl {
 
         // Phase 1 — read unsegmented events (db lock).
         let (events_with_seq, last_seq) = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             let journal = BackupEventJournal::new();
             let events = journal
                 .read_unsegmented(db.connection(), MAX_EVENTS_PER_BACKUP_SEGMENT)
@@ -4023,7 +4122,7 @@ impl CoreImpl {
         // outside the db lock (the prefetch helper opens it
         // internally and releases before we decrypt).
         let prefetched = {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             // Filter to `archive_verified` state up-front: only
             // segments past Merkle-cross-check are eligible for
             // compaction.
@@ -4117,7 +4216,7 @@ impl CoreImpl {
         // `archive_compacted`. A SAVEPOINT keeps the bulk of the
         // updates atomic against concurrent reads.
         {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             let conn = db.connection();
             conn.execute_batch("SAVEPOINT compact_archive;")
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4248,8 +4347,23 @@ impl KChatCore for CoreImpl {
     fn initialize(&mut self, config: KChatCoreConfig) -> Result<()> {
         let db = LocalStoreDb::open(&config.data_dir, &self.key)
             .map_err(|e| Error::Storage(e.to_string()))?;
+        // Rebuild the reader pool against the freshly-opened
+        // writer. Without this, the pool would keep handing out
+        // readers attached to the *old* `data_dir`, so every
+        // `db_readers.with_reader(..)` path (list_conversations,
+        // get_conversation, get_message, list_messages, search,
+        // search_with_cold_source, search_streaming) would observe
+        // a different database from the writer until the next
+        // `CoreImpl::new`. We build the new pool *before*
+        // swapping `db_writer` so that a failure here leaves the
+        // store fully bound to the previous `data_dir` rather
+        // than half-migrated.
+        let db_readers = db
+            .open_reader_pool(&self.key, DEFAULT_READER_POOL_SIZE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         self.config = config;
-        self.db = Mutex::new(db);
+        self.db_writer = Mutex::new(db);
+        self.db_readers = db_readers;
         // The delivery client survives a re-init: it is bound to
         // the device / account, not the on-disk store location.
         Ok(())
@@ -4270,7 +4384,7 @@ impl KChatCore for CoreImpl {
     ) -> Result<ClientMessageId> {
         let entry = MessageProcessor::create_outbox_entry(conversation_id, text, reply_to)
             .map_err(|e| Error::Message(e.to_string()))?;
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         let mid = persister
             .persist_outbox_entry(&entry)
@@ -4408,8 +4522,23 @@ impl KChatCore for CoreImpl {
             },
         );
 
-        let db = match self.db.lock().map_err(poisoned) {
-            Ok(db) => db,
+        // Phase B.1 (workstream 6): route the unified search
+        // through `db_readers` so a concurrent UI search does not
+        // contend with the writer's mutex. The reader checked out
+        // here sees a stable WAL snapshot for the duration of
+        // `execute_search`; any writes that commit after checkout
+        // become visible to the *next* checkout, which matches
+        // the previous "writer-locked search" semantics for the
+        // caller (the previous implementation also held a single
+        // snapshot across the search).
+        let results: Result<Vec<SearchResult>> = self.db_readers.with_reader(|reader| {
+            let engine = QueryEngine::new(reader.connection(), reader.icu_available());
+            engine
+                .execute_search(&query, &scope)
+                .map_err(|e| Error::Search(e.to_string()))
+        });
+        let results = match results {
+            Ok(r) => r,
             Err(e) => {
                 let err_str = e.to_string();
                 trace.insert_metadata("error", err_str.clone());
@@ -4419,19 +4548,6 @@ impl KChatCore for CoreImpl {
                 return Err(e);
             }
         };
-        let engine = QueryEngine::new(&db);
-        let results = match engine.execute_search(&query, &scope) {
-            Ok(r) => r,
-            Err(e) => {
-                let err_str = e.to_string();
-                trace.insert_metadata("error", err_str.clone());
-                span.record("error", err_str.as_str());
-                trace.finish();
-                self.record_perf_trace(trace);
-                return Err(Error::Search(err_str));
-            }
-        };
-        drop(db);
         // When the caller requested the personal archive, enqueue
         // every cold-flagged result for hydration at priority
         // `SearchResultTap` (`docs/PROPOSAL.md §5.5`). The enqueue
@@ -4450,7 +4566,7 @@ impl KChatCore for CoreImpl {
     }
 
     fn edit_message(&self, message_id: Uuid, new_text: &str) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         persister
             .edit_message(&message_id.to_string(), new_text)
@@ -4458,7 +4574,7 @@ impl KChatCore for CoreImpl {
     }
 
     fn delete_for_me(&self, message_id: Uuid) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         persister
             .delete_for_me(&message_id.to_string())
@@ -4466,7 +4582,7 @@ impl KChatCore for CoreImpl {
     }
 
     fn delete_for_everyone(&self, message_id: Uuid) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let persister = MessagePersister::new(&db);
         persister
             .delete_for_everyone(&message_id.to_string())
@@ -4474,7 +4590,7 @@ impl KChatCore for CoreImpl {
     }
 
     fn delete_conversation(&self, conversation_id: Uuid) -> Result<()> {
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let n = db
             .delete_conversation(&conversation_id.to_string())
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4487,9 +4603,15 @@ impl KChatCore for CoreImpl {
     }
 
     fn get_message(&self, message_id: Uuid) -> Result<Option<MessageView>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let pair = db
-            .get_message_with_body(&message_id.to_string())
+        // Routed through [`Self::db_readers`] so a UI fetch does
+        // not contend with an in-flight write transaction on the
+        // writer's mutex. Under WAL mode the reader sees a
+        // consistent snapshot that includes every transaction
+        // committed prior to checkout.
+        let id = message_id.to_string();
+        let pair = self
+            .db_readers
+            .with_reader(|r| r.get_message_with_body(&id))
             .map_err(|e| Error::Storage(e.to_string()))?;
         match pair {
             None => Ok(None),
@@ -4503,18 +4625,27 @@ impl KChatCore for CoreImpl {
         before_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<MessageView>> {
-        let db = self.db.lock().map_err(poisoned)?;
-        let skels = db
-            .get_conversation_messages(&conversation_id.to_string(), before_ms, limit)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut out = Vec::with_capacity(skels.len());
-        for skel in skels {
-            let body = db
-                .get_message_body(&skel.message_id)
+        // Routed through [`Self::db_readers`]. The skeleton fetch
+        // and the per-row body fetches share one checked-out
+        // reader so they observe the same WAL snapshot — a body
+        // that is removed between the skeleton SELECT and the
+        // body SELECT shows up as a `None` body, which
+        // [`skeleton_and_body_to_view`] already handles.
+        let conv_id = conversation_id.to_string();
+        let out: Result<Vec<MessageView>> = self.db_readers.with_reader(|r| {
+            let skels = r
+                .get_conversation_messages(&conv_id, before_ms, limit)
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            out.push(skeleton_and_body_to_view(skel, body)?);
-        }
-        Ok(out)
+            let mut views = Vec::with_capacity(skels.len());
+            for skel in skels {
+                let body = r
+                    .get_message_body(&skel.message_id)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                views.push(skeleton_and_body_to_view(skel, body)?);
+            }
+            Ok(views)
+        });
+        out
     }
 
     fn send_media(
@@ -4560,7 +4691,7 @@ impl KChatCore for CoreImpl {
         // 3) Persist skeleton + body + media_asset rows inside a
         //    single SAVEPOINT so a failure mid-write doesn't leave
         //    dangling references.
-        let db = self.db.lock().map_err(poisoned)?;
+        let db = self.db_writer.lock().map_err(poisoned)?;
         let conn = db.connection();
         conn.execute_batch("SAVEPOINT send_media;")
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4612,7 +4743,7 @@ impl KChatCore for CoreImpl {
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
-                FuzzySearchEngine::new(&db)
+                FuzzyIndexWriter::new(&db)
                     .index_message(&skel.message_id, caption)
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
@@ -4795,11 +4926,42 @@ impl KChatCore for CoreImpl {
             // already present, otherwise return the skeleton with
             // `is_cold = true`. The remote archive fetch path is still
             // queued for `Task 10+` once the manifest reader lands.
-            let db = self.db.lock().map_err(poisoned)?;
-            let row = db
-                .get_message_with_body(&message_id.to_string())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            let Some((skeleton, body)) = row else {
+            //
+            // The two DB lookups (`get_message_with_body` +
+            // `get_media_asset_by_message`) are pure reads, so we
+            // run them inside a single `db_readers.with_reader`
+            // checkout — both observe the same WAL snapshot, and
+            // the writer mutex stays free for ingest / send /
+            // delete while a hydrate is in flight. The hydration
+            // queue enqueue runs *after* the reader is returned
+            // to the pool.
+            let mid_str = message_id.to_string();
+            let read: Option<(MessageSkeleton, Option<MessageBody>, bool)> =
+                self.db_readers.with_reader(|r| -> Result<_> {
+                    let Some((skeleton, body)) = r
+                        .get_message_with_body(&mid_str)
+                        .map_err(|e| Error::Storage(e.to_string()))?
+                    else {
+                        return Ok(None);
+                    };
+                    // Detect whether an evicted media asset is
+                    // attached. We surface this so the worker can
+                    // lazily re-download the blob when the user
+                    // taps the row (Task 5 — Phase 3 §5.5). The
+                    // lookup is cheap (`media_asset` carries an
+                    // index on `message_id`) and runs inside the
+                    // same pool checkout as the skeleton fetch
+                    // for snapshot consistency.
+                    let has_evicted_media = r
+                        .get_media_asset_by_message(&skeleton.message_id)
+                        .map(|opt| {
+                            opt.map(|a| matches!(a.media_state, MediaState::Evicted))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    Ok(Some((skeleton, body, has_evicted_media)))
+                })?;
+            let Some((skeleton, body, has_evicted_media)) = read else {
                 return Ok(HydratedMessage::default());
             };
             if skeleton.body_state == BodyState::DeletedForEveryone {
@@ -4814,20 +4976,6 @@ impl KChatCore for CoreImpl {
                 BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
             );
             let text_content = body.as_ref().and_then(|b| b.text_content.clone());
-
-            // Detect whether an evicted media asset is attached. We
-            // surface this so the worker can lazily re-download the
-            // blob when the user taps the row (Task 5 — Phase 3
-            // §5.5). The lookup is cheap (`media_asset` carries an
-            // index on `message_id`) and the enqueue happens
-            // unconditionally below.
-            let has_evicted_media = db
-                .get_media_asset_by_message(&skeleton.message_id)
-                .map(|opt| {
-                    opt.map(|a| matches!(a.media_state, MediaState::Evicted))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
 
             // Enqueue a hydration request regardless of whether the
             // body is local — when the orchestration layer drains the
@@ -4986,7 +5134,7 @@ impl KChatCore for CoreImpl {
         // path closes the trace before propagating, per the
         // contract documented in `docs/ARCHITECTURE.md` §11.11.
         let outcome: Result<(OffloadResult, String)> = (|| -> Result<(OffloadResult, String)> {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             let enforcer = StorageBudgetEnforcer::new();
             let budget = StorageBudget::default_recommended();
             let assessment = enforcer.assess(db.connection(), &budget)?;
@@ -5102,7 +5250,7 @@ impl KChatCore for CoreImpl {
         // `BackupSource` is fleshed out, the segments, manifests,
         // and shard list flow through here unchanged.
         let result = (|| -> Result<RestoreResult> {
-            let db = self.db.lock().map_err(poisoned)?;
+            let db = self.db_writer.lock().map_err(poisoned)?;
             let conn = db.connection();
             crate::restore::state_machine::reset(conn)?;
             let mut transitions = 0usize;
@@ -5402,6 +5550,52 @@ mod tests {
         let conv = Uuid::now_v7();
         seed_conversation(&core, &conv);
         core.send_text(conv, "after reinit", None).unwrap();
+    }
+
+    #[test]
+    fn core_impl_initialize_rebuilds_reader_pool() {
+        // Regression: `initialize` must rebuild `db_readers` against
+        // the new `data_dir`. Otherwise the reader pool would keep
+        // serving rows from the *old* tempdir while writes go to the
+        // new one — observable as `list_conversations` and
+        // `get_conversation` returning data the writer can no longer
+        // see (and missing data the writer just wrote).
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = KChatCoreConfig::new(tmp.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        let mut core = CoreImpl::new(cfg, TEST_KEY).expect("core");
+
+        // Seed a row into the first DB so we can detect leakage
+        // across the re-init.
+        let stale_conv = Uuid::now_v7();
+        seed_conversation(&core, &stale_conv);
+        assert_eq!(core.list_conversations().unwrap().len(), 1);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let cfg2 = KChatCoreConfig::new(tmp2.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        core.initialize(cfg2.clone()).expect("re-open");
+
+        // The reader pool now targets the new (empty) DB, so the
+        // stale row from the previous tempdir is invisible.
+        assert!(
+            core.list_conversations().unwrap().is_empty(),
+            "reader pool still attached to old data_dir after initialize()",
+        );
+        assert!(
+            core.get_conversation(stale_conv).unwrap().is_none(),
+            "stale conversation visible through pool reader after initialize()",
+        );
+
+        // Writes through the new writer are immediately visible
+        // through the freshly-built reader pool.
+        let fresh_conv = Uuid::now_v7();
+        seed_conversation(&core, &fresh_conv);
+        let listed = core.list_conversations().unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "fresh conversation not visible: {listed:?}"
+        );
+        assert_eq!(listed[0].conversation_id, fresh_conv.to_string());
     }
 
     #[test]
@@ -5770,7 +5964,7 @@ mod tests {
             .restore_from_backup(BackupSource::default())
             .expect("restore_from_backup should walk to FullRestoreComplete");
         assert_eq!(result, RestoreResult::default());
-        let db = core.db.lock().unwrap();
+        let db = core.db_writer.lock().unwrap();
         let (state, _) = crate::restore::state_machine::load(db.connection())
             .unwrap()
             .expect("restore_state row should be persisted");
@@ -6705,8 +6899,8 @@ mod tests {
         // Sanity: a fuzzy query for "sodium" hits before
         // rehydration.
         {
-            let db = core.db.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let db = core.db_writer.lock().unwrap();
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             assert!(
                 !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
                 "pre-rehydrate fuzzy search must find original body"
@@ -6721,8 +6915,8 @@ mod tests {
         .expect("rehydrate");
 
         // Old fuzzy tokens are gone …
-        let db = core.db.lock().unwrap();
-        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        let db = core.db_writer.lock().unwrap();
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
         assert!(
             engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
             "post-rehydrate fuzzy index must drop stale tokens"
@@ -6773,24 +6967,34 @@ mod tests {
             .expect("send_text");
 
         // Snapshot pre-call body / fuzzy state so we can compare
-        // against post-rollback.
-        let before_body = core
-            .get_message_body(mid.0)
-            .unwrap()
-            .expect("body present pre-call")
-            .text_content
-            .clone()
-            .expect("text_content present");
+        // against post-rollback. We read through the writer
+        // connection (not `core.get_message_body`, which now goes
+        // through the reader pool) because this test exercises
+        // writer-side transactional semantics: a SAVEPOINT held
+        // open on the writer must be visible to the read that
+        // observes mid-transaction state, and on the in-memory
+        // shared-cache DB SQLite downgrades WAL to MEMORY journal
+        // mode (so the pool reader is `SQLITE_LOCKED` against the
+        // writer's open transaction).
+        let before_body = {
+            let db = core.db_writer.lock().unwrap();
+            db.get_message_body(&mid.0.to_string())
+                .unwrap()
+                .expect("body present pre-call")
+                .text_content
+                .clone()
+                .expect("text_content present")
+        };
         let pre_sodium = {
-            let db = core.db.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let db = core.db_writer.lock().unwrap();
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             engine.search_fuzzy("sodium", 5).unwrap().len()
         };
         assert!(pre_sodium > 0, "pre-call fuzzy index must hit \"sodium\"");
 
         // Open outer savepoint, run rehydrate, then ROLLBACK.
         {
-            let db = core.db.lock().unwrap();
+            let db = core.db_writer.lock().unwrap();
             db.connection()
                 .execute_batch("SAVEPOINT outer;")
                 .expect("open outer savepoint");
@@ -6804,16 +7008,20 @@ mod tests {
         .expect("rehydrate");
 
         // Sanity: post-rehydrate, body and fuzzy reflect new text.
+        // Same writer-connection rationale as the pre-call read
+        // above — we must observe the open-transaction state, not
+        // the pre-SAVEPOINT snapshot that the reader pool would
+        // return.
         {
-            let mid_body = core
-                .get_message_body(mid.0)
+            let db = core.db_writer.lock().unwrap();
+            let mid_body = db
+                .get_message_body(&mid.0.to_string())
                 .unwrap()
                 .unwrap()
                 .text_content
                 .unwrap();
             assert_eq!(mid_body, "completely different content about dogs");
-            let db = core.db.lock().unwrap();
-            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+            let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
             assert!(
                 engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
                 "old fuzzy tokens cleared post-rehydrate"
@@ -6826,19 +7034,25 @@ mod tests {
 
         // Roll back outer savepoint.
         {
-            let db = core.db.lock().unwrap();
+            let db = core.db_writer.lock().unwrap();
             db.connection()
                 .execute_batch("ROLLBACK TO SAVEPOINT outer;\nRELEASE SAVEPOINT outer;")
                 .expect("rollback outer savepoint");
         }
 
-        // Body must be restored to its pre-call text.
-        let after_body = core
-            .get_message_body(mid.0)
-            .unwrap()
-            .expect("body present post-rollback")
-            .text_content
-            .expect("text_content present");
+        // Body must be restored to its pre-call text. After the
+        // ROLLBACK the writer's transaction is closed, so the
+        // reader pool can serve this read; we still use the
+        // writer connection for symmetry with the pre/post reads
+        // above.
+        let after_body = {
+            let db = core.db_writer.lock().unwrap();
+            db.get_message_body(&mid.0.to_string())
+                .unwrap()
+                .expect("body present post-rollback")
+                .text_content
+                .expect("text_content present")
+        };
         assert_eq!(
             after_body, before_body,
             "body upsert must roll back with the outer SAVEPOINT"
@@ -6848,8 +7062,8 @@ mod tests {
         // does not. If the fuzzy ops had run outside the savepoint
         // (the pre-fix shape) the new \"dogs\" tokens would survive
         // the rollback and \"sodium\" would still be missing.
-        let db = core.db.lock().unwrap();
-        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(&db);
+        let db = core.db_writer.lock().unwrap();
+        let engine = crate::search::fuzzy_search::FuzzySearchEngine::new(db.connection());
         assert!(
             !engine.search_fuzzy("sodium", 5).unwrap().is_empty(),
             "fuzzy index must roll back: \"sodium\" hits again post-rollback"
@@ -10784,7 +10998,7 @@ mod tests {
             // token. Mock transcripts always start with
             // `"mock transcription"`.
             let probe = mock_text.split_whitespace().next().unwrap_or("mock");
-            let fuzzy = FuzzySearchEngine::new(db);
+            let fuzzy = FuzzySearchEngine::new(db.connection());
             let hits = fuzzy.search_fuzzy(probe, 16).unwrap();
             assert!(
                 hits.iter().any(|h| h.message_id == mid.to_string()),

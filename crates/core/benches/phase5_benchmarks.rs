@@ -235,7 +235,7 @@ fn bench_shard_decrypt_and_search(c: &mut Criterion) {
     group.sample_size(20);
     group.bench_function("text_only_one_month", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             let q = SearchQuery {
                 query_string: NEEDLE.into(),
                 ..Default::default()
@@ -275,7 +275,7 @@ fn bench_fuzzy_shard_decrypt_and_search(c: &mut Criterion) {
     group.sample_size(20);
     group.bench_function("fuzzy_only_one_month", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             // Use a typo to exercise the fuzzy path explicitly.
             let q = SearchQuery {
                 query_string: "lighthose".into(),
@@ -338,7 +338,7 @@ fn bench_combined_local_plus_cold_search(c: &mut Criterion) {
         b.iter_batched(
             || (),
             |_| {
-                let engine = QueryEngine::new(&local_db);
+                let engine = QueryEngine::new(local_db.connection(), local_db.icu_available());
                 let q = SearchQuery {
                     query_string: NEEDLE.into(),
                     ..Default::default()
@@ -413,7 +413,7 @@ fn phase5_p95_multilingual(c: &mut Criterion) {
         let db = fresh_db();
         group.bench_function(*label, |b| {
             b.iter(|| {
-                let engine = QueryEngine::new(&db);
+                let engine = QueryEngine::new(db.connection(), db.icu_available());
                 let q = SearchQuery {
                     query_string: needle.clone(),
                     ..Default::default()
@@ -464,7 +464,7 @@ fn phase5_p95_large_bucket(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_function("text_only_5k", |b| {
         b.iter(|| {
-            let engine = QueryEngine::new(&db);
+            let engine = QueryEngine::new(db.connection(), db.icu_available());
             let q = SearchQuery {
                 query_string: NEEDLE.into(),
                 ..Default::default()
