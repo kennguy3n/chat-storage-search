@@ -4272,6 +4272,27 @@ impl KChatCore for CoreImpl {
     // attribute wall-clock to the transport-fetch phase vs the
     // local-persist phase. Fields kept lean to avoid leaking
     // cursor opaque tokens or message payloads into traces.
+    //
+    // SKIP + FIELDS INTERACTION: every parameter that appears in
+    // the `fields(...)` expression list is *also* in `skip(...)`.
+    // This is intentional, not contradictory — the two lists do
+    // different things:
+    //   * `skip(p)`  suppresses the macro's *automatic* Debug-
+    //                formatted recording of `p` as a span field
+    //                named `p`. Without `skip`, `tracing` would
+    //                eagerly emit a `Debug`-formatted `?p` field.
+    //   * `fields(p = %p)` (or `p = expr`) records an *explicit*
+    //                field whose value is computed from the
+    //                parameter using the named formatter (`%` =
+    //                Display, `?` = Debug, no prefix = `Value`
+    //                impl).
+    // The result is: opaque or large parameters (cursors, byte
+    // buffers) never leak as auto-Debug, but their explicit
+    // Display/length/`is_some()` projection still appears. This
+    // pattern is used identically on every instrumented hot path
+    // in this file. See
+    // https://docs.rs/tracing-attributes/latest/tracing_attributes/attr.instrument.html
+    // for the underlying macro contract.
     #[tracing::instrument(
         skip(self, conversation_id, after_cursor),
         fields(
