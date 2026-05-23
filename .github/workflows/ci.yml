@@ -110,28 +110,35 @@ jobs:
       matrix:
         include:
           - label: linux-x86_64
-            runs-on: ubuntu-latest
+            # `runner` (NOT `runs-on`) is the matrix key because GitHub
+            # Actions expressions treat `-` as the subtraction operator,
+            # so `${{ matrix.runs-on }}` is parsed as `matrix.runs - on`
+            # (both undefined → 0) rather than as a property lookup. The
+            # bracket-notation alternative `${{ matrix['runs-on'] }}` works
+            # but is easier to break on rename; an unhyphenated key is
+            # the cleaner long-term shape.
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             packages: --workspace
             tool: rustup
           - label: macos-aarch64
-            runs-on: macos-14
+            runner: macos-14
             target: aarch64-apple-darwin
             packages: --workspace
             tool: rustup
           - label: windows-x86_64
-            runs-on: windows-latest
+            runner: windows-latest
             target: x86_64-pc-windows-msvc
             packages: --workspace
             tool: rustup
           - label: android-aarch64
-            runs-on: ubuntu-latest
+            runner: ubuntu-latest
             target: aarch64-linux-android
             # ios-bridge (uniffi) and desktop need host-only deps; on Android
             # we only ship `kchat-core` + `kchat-android-bridge`.
             packages: -p kchat-core -p kchat-android-bridge
             tool: cross
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -182,8 +189,13 @@ jobs:
           echo "Upstream job results:"
           echo "${NEEDS_JSON}"
           # `needs.<job>.result` is one of: success | failure | cancelled | skipped.
-          # Anything other than `success` is treated as a gate failure.
-          if echo "${NEEDS_JSON}" | grep -E '"result"[[:space:]]*:[[:space:]]*"(failure|cancelled|skipped)"' > /dev/null; then
+          # `jq` (preinstalled on ubuntu-latest runners) gives us a robust
+          # JSON parse that won't be fooled by future GitHub Actions output
+          # changes — e.g. a sibling field that happens to contain the word
+          # `"result"`. The expression asserts every `.result` value equals
+          # "success"; any other state (failure / cancelled / skipped) fails
+          # the gate.
+          if ! echo "${NEEDS_JSON}" | jq -e 'to_entries | map(.value.result) | all(. == "success")' > /dev/null; then
             echo "::error::At least one required CI job failed, was cancelled, or was skipped."
             exit 1
           fi
