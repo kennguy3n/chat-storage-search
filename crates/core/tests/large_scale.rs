@@ -63,7 +63,7 @@ use kchat_core::offload::eviction::{
 use kchat_core::restore::manifest_verifier::verify_manifest_chain;
 use kchat_core::restore::pipeline::RestorePipeline;
 use kchat_core::restore::state_machine;
-use kchat_core::search::fuzzy_search::{FuzzyIndexWriter, FuzzySearchEngine};
+use kchat_core::search::fuzzy_search::FuzzySearchEngine;
 use kchat_core::search::query_engine::QueryEngine;
 use kchat_core::search::text_search::TextSearchEngine;
 use kchat_core::{SearchQuery, SearchScope};
@@ -129,7 +129,9 @@ fn large_scale_ingest_and_search_10k_messages() {
 
     let total_messages = 10_000usize;
     let persister = MessagePersister::new(&db);
-    let fuzzy_writer = FuzzyIndexWriter::new(&db);
+    // `persist_ingested_message` indexes every message through
+    // `FuzzyIndexWriter` internally (`processor.rs:418`), so we
+    // only need a read-side `FuzzySearchEngine` here.
     let fuzzy = FuzzySearchEngine::new(db.connection());
     let mut english_msg_ids: Vec<Uuid> = Vec::new();
 
@@ -153,12 +155,6 @@ fn large_scale_ingest_and_search_10k_messages() {
                 reply_to: None,
             })
             .unwrap_or_else(|e| panic!("persist {lang} #{i}: {e:?}"));
-        // Index every persisted message with the fuzzy engine
-        // so the typo-recall assertion below has a non-empty
-        // index to scan.
-        fuzzy_writer
-            .index_message(&mid.to_string(), text)
-            .expect("fuzzy index");
         if lang == "en" {
             english_msg_ids.push(mid);
         }
@@ -518,7 +514,9 @@ fn large_scale_ingest_and_search_100k_messages() {
 
     let total_messages = 100_000usize;
     let persister = MessagePersister::new(&db);
-    let fuzzy_writer = FuzzyIndexWriter::new(&db);
+    // `persist_ingested_message` indexes every message through
+    // `FuzzyIndexWriter` internally (`processor.rs:418`), so we
+    // only need a read-side `FuzzySearchEngine` here.
     let fuzzy = FuzzySearchEngine::new(db.connection());
     let mut english_msg_ids: Vec<Uuid> = Vec::new();
 
@@ -540,9 +538,6 @@ fn large_scale_ingest_and_search_100k_messages() {
                 reply_to: None,
             })
             .expect("persist");
-        fuzzy_writer
-            .index_message(&mid.to_string(), text)
-            .expect("fuzzy");
         if lang == "en" {
             english_msg_ids.push(mid);
         }
