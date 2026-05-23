@@ -347,10 +347,10 @@ impl LocalStoreDb {
     // Conversation
     // ---------------------------------------------------------------
 
-    /// Insert a row into `conversation`. hierarchy
-    /// columns ([`Conversation::conversation_type`], `scope`,
-    /// `tenant_id`, `community_id`, `domain_id`) are always
-    /// written so `SELECT *` round-trips the full struct.
+    /// Insert a row into `conversation`. The conversation
+    /// hierarchy columns ([`Conversation::conversation_type`],
+    /// `scope`, `tenant_id`, `community_id`, `domain_id`) are
+    /// always written so `SELECT *` round-trips the full struct.
     pub fn insert_conversation(&self, conv: &Conversation) -> DbResult<()> {
         self.conn.execute(
             "INSERT INTO conversation (

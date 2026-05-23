@@ -8,15 +8,15 @@
 //! [`BuiltSegment`].
 //!
 //! The builder does **not** own the connection, the event journal,
-//! or the manifest writer. The orchestration layer ( Task
-//! 10 wires it on `CoreImpl`) drives it explicitly:
+//! or the manifest writer. The orchestration layer
+//! ([`crate::core_impl::CoreImpl`]) drives it explicitly:
 //!
 //! 1. `journal.read_unsegmented(...)` → `Vec<ArchiveEvent>`,
 //! 2. `ArchiveSegmentBuilder::group_events_by_bucket(...)`,
 //! 3. for each `(conversation_id, time_bucket)`, derive
-//!    `K_archive_segment` from the active epoch key (Task 6),
+//!    `K_archive_segment` from the active epoch key,
 //! 4. `build_segment(...)` → `BuiltSegment`,
-//! 5. upload the ciphertext + persist the segment_map row,
+//! 5. upload the ciphertext + persist the `segment_map` row,
 //! 6. `journal.advance_cursor(...)`.
 
 use std::collections::BTreeMap;

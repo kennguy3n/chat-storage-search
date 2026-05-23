@@ -602,9 +602,9 @@ impl<'a> MessagePersister<'a> {
     }
 
     /// Mark an outbox entry as having been confirmed by the MLS
-    /// delivery layer. records this as an `"outbox_sent"`
-    /// entry in `backup_event_journal`; later phases lift it into a
-    /// dedicated outbox-status column.
+    /// delivery layer. The confirmation is recorded as an
+    /// `"outbox_sent"` entry in `backup_event_journal`; a later
+    /// iteration lifts it into a dedicated outbox-status column.
     pub fn mark_sent(&self, client_message_id: &str) -> Result<(), ProcessorError> {
         // Look up the row to confirm it exists and to populate the
         // event payload. We do not change body_state — the message

@@ -750,11 +750,12 @@ pub struct MessageView {
 /// Public core trait — `docs/DESIGN.md §12`.
 ///
 /// **Async note.** The methods below are declared as synchronous
-/// `Result<_>`-returning functions for now. turns them into
-/// proper `async fn`s (or `Pin<Box<dyn Future>>`-returning functions
-/// behind `async_trait`) once the SQLCipher / transport plumbing
-/// exists for them to actually do I/O. Bridge crates are expected
-/// to track the iteration of this trait.
+/// `Result<_>`-returning functions for now. A follow-up iteration
+/// turns them into proper `async fn`s (or
+/// `Pin<Box<dyn Future>>`-returning functions behind `async_trait`)
+/// once the SQLCipher / transport plumbing exists for them to
+/// actually do I/O. Bridge crates are expected to track the
+/// iteration of this trait.
 pub trait KChatCore: Send + Sync {
     /// Returns the configuration this core was initialized with.
     fn config(&self) -> &KChatCoreConfig;

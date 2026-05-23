@@ -654,11 +654,11 @@ impl<'a> QueryEngine<'a> {
     /// * Empty query strings short-circuit to the structured-only
     ///   path; cold fan-out only runs on free-text queries.
     /// * Non-text `query.content_kind` values short-circuit to
-    ///   the local result set. only ships text + fuzzy
-    ///   cold shards, so a media-only query has no cold
+    ///   the local result set. The cold path only ships text +
+    ///   fuzzy cold shards, so a media-only query has no cold
     ///   contribution to merge; consulting the cold source would
     ///   leak text-shard hits through the kind filter.
-    /// * Errors from the cold source bubble out of this call
+    /// * Errors from the cold source bubble out of this call;
     ///   callers that want graceful degradation should pass an
     ///   adapter that swallows transient transport failures.
     pub fn execute_search_with_cold_source(

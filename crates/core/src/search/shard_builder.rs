@@ -213,11 +213,11 @@ pub struct BuiltShard {
     /// Wire-format shard ready to attach to a backup manifest.
     pub shard: SearchIndexShard,
     /// `K_*_index_shard(shard_id)` the orchestrator just sealed
-    /// the shard under. will move this into a
+    /// the shard under. A follow-up will move this into a
     /// `wrapped_k_shard` field on the manifest entry — until
     /// then the orchestrator keeps it in memory the same way the
     /// backup pipeline keeps `K_backup_segment` next to
-    /// `BuiltBackupSegment` (Task 5).
+    /// `BuiltBackupSegment`.
     pub k_shard: KeyMaterial,
 }
 

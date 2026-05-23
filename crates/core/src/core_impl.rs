@@ -2009,7 +2009,7 @@ impl CoreImpl {
         )
     }
 
-    /// Run a unified search scoped to `target`. entry
+    /// Run a unified search scoped to `target`. This is the entry
     /// point that ferries the installed
     /// [`crate::search::search_target::ConversationGroupResolver`]
     /// (or the [`crate::search::search_target::NoopConversationGroupResolver`]

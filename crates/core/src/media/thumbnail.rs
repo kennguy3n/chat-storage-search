@@ -148,8 +148,8 @@ impl ThumbnailGenerator {
 }
 
 /// Map a MIME type to the `image::ImageFormat` that decodes it, or
-/// return [`Error::Message`] for unsupported types. only
-/// supports PNG and JPEG inputs.
+/// return [`Error::Message`] for unsupported types. The current
+/// thumbnail generator only supports PNG and JPEG inputs.
 fn image_format_for_mime(mime_type: &str) -> Result<ImageFormat, Error> {
     match mime_type {
         "image/png" => Ok(ImageFormat::Png),

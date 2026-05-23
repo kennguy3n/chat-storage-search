@@ -166,8 +166,8 @@ impl MediaCache {
 }
 
 impl Default for MediaCache {
-    /// Default cache with a 256 MiB budget. leaves the real
-    /// budget to the caller — production builds set it from the
+    /// Default cache with a 256 MiB budget. The real budget is
+    /// left to the caller — production builds set it from the
     /// platform-side storage-budget configuration. The default
     /// exists so tests / scratch code don't have to invent a value.
     fn default() -> Self {
