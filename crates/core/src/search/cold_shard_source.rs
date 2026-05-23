@@ -182,7 +182,7 @@ impl<'a> TransportColdShardSource<'a> {
         let shard: SearchIndexShard = crate::cbor::from_slice(&bytes).map_err(|e| {
             Error::Storage(format!(
                 "TransportColdShardSource: shard cbor decode failed for ({conversation_id}, {time_bucket}, {index_type:?}): {e}"
-            ))
+            ).into())
         })?;
         Ok(Some(shard))
     }
@@ -207,7 +207,7 @@ impl ColdShardSource for TransportColdShardSource<'_> {
             .ok_or_else(|| {
                 Error::Storage(format!(
                     "TransportColdShardSource: missing K_text_index_shard for ({conversation_id}, {time_bucket})"
-                ))
+                ).into())
             })?;
         restore_text_search_shard(&shard, k_shard)
     }
@@ -226,7 +226,7 @@ impl ColdShardSource for TransportColdShardSource<'_> {
             .ok_or_else(|| {
                 Error::Storage(format!(
                     "TransportColdShardSource: missing K_fuzzy_index_shard for ({conversation_id}, {time_bucket})"
-                ))
+                ).into())
             })?;
         restore_fuzzy_search_shard(&shard, k_shard)
     }
@@ -468,7 +468,7 @@ mod tests {
         let err = adapter.fetch_text_rows(&conv_id, bucket).unwrap_err();
         match err {
             Error::Storage(msg) => {
-                assert!(msg.contains("K_text_index_shard"), "got: {msg}");
+                assert!(msg.to_string().contains("K_text_index_shard"), "got: {msg}");
             }
             other => panic!("expected Error::Storage, got {other:?}"),
         }

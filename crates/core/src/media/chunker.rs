@@ -305,7 +305,7 @@ pub fn verify_and_decrypt(
         if recomputed != chunk.chunk_sha256 {
             return Err(Error::Storage(format!(
                 "verify_and_decrypt: chunk {idx} ciphertext SHA-256 mismatch"
-            )));
+            ).into()));
         }
     }
 
@@ -579,7 +579,7 @@ mod tests {
         );
         match res {
             Err(Error::Storage(msg)) => {
-                assert!(msg.contains("SHA-256"), "unexpected error: {msg}")
+                assert!(msg.to_string().contains("SHA-256"), "unexpected error: {msg}")
             }
             other => panic!("expected SHA-256 mismatch, got {other:?}"),
         }

@@ -20,3 +20,49 @@ pub mod shard_cache;
 pub mod shard_prefetch;
 pub mod text_search;
 pub mod tokenizer;
+
+/// Search-layer error type wrapped by [`crate::Error::Search`].
+///
+/// Search failures fall into two buckets: SQL-side failures (the
+/// `search_fts` / `search_fuzzy` / `search_vector` virtual-table
+/// queries) and pure-Rust failures (query parse, shard cache miss,
+/// cold-source fetch). The SQL bucket bubbles up through
+/// [`SearchError::Sqlite`] so the `?` operator works; the rest are
+/// either structured variants ([`SearchError::QueryParse`]) or fall
+/// through to [`SearchError::Custom`].
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    /// A SQL query against `search_fts` / `search_fuzzy` /
+    /// `search_vector` failed. Includes the upstream
+    /// [`rusqlite::Error`] verbatim.
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// Parsing the user-supplied [`crate::SearchQuery`] failed
+    /// (malformed FTS5 expression, unbalanced quotes, …).
+    #[error("query parse: {0}")]
+    QueryParse(String),
+
+    /// A cold-source fetch (downloading a remote shard, opening a
+    /// search-index manifest) failed.
+    #[error("cold source ({context}): {detail}")]
+    ColdSource {
+        /// Static label identifying the cold-source operation.
+        context: &'static str,
+        /// Free-form detail captured from the underlying failure.
+        detail: String,
+    },
+
+    /// Free-form fallback. New failure modes should prefer a typed
+    /// variant.
+    #[error("{0}")]
+    Custom(String),
+}
+
+impl SearchError {
+    /// Construct a [`SearchError::Custom`] from anything convertible
+    /// to [`String`]. Mirrors [`crate::local_store::StorageError::msg`].
+    pub fn msg(msg: impl Into<String>) -> Self {
+        SearchError::Custom(msg.into())
+    }
+}

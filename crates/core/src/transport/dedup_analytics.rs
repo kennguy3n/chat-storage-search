@@ -438,7 +438,7 @@ impl ZkofDedupAnalytics {
 
     fn parse_stats(bytes: &[u8]) -> Result<DedupStats> {
         let parsed: DedupStats = crate::cbor::from_slice(bytes)
-            .map_err(|e| crate::Error::Storage(format!("dedup snapshot parse: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("dedup snapshot parse: {e}").into()))?;
         Ok(parsed)
     }
 
@@ -449,7 +449,7 @@ impl ZkofDedupAnalytics {
                 Self::snapshot_key(),
                 0..self.max_snapshot_bytes,
             )
-            .map_err(|e| crate::Error::Storage(format!("dedup snapshot fetch: {e}")))
+            .map_err(|e| crate::Error::Storage(format!("dedup snapshot fetch: {e}").into()))
     }
 }
 

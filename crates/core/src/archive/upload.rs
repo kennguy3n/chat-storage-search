@@ -72,7 +72,7 @@ pub fn upload_archive_segment(
             segment.segment_id,
             hex_encode_root(&ciphertext_root),
             hex_encode_root(&commit.merkle_root),
-        )));
+        ).into()));
     }
 
     Ok(handle.blob_id)
@@ -111,7 +111,7 @@ pub fn persist_segment_map_row(
             state_str,
         ],
     )
-    .map_err(|e| Error::Storage(e.to_string()))?;
+    .map_err(|e| Error::Storage(e.to_string().into()))?;
     Ok(())
 }
 

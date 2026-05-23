@@ -223,7 +223,7 @@ impl RestorePipeline {
         let mut summary = Vec::with_capacity(shards.len());
         let tx = conn
             .transaction()
-            .map_err(|e| Error::Storage(format!("restore_search_index_shards: begin tx: {e}")))?;
+            .map_err(|e| Error::Storage(format!("restore_search_index_shards: begin tx: {e}").into()))?;
         for entry in shards {
             match entry.shard.index_type {
                 IndexType::Text => {
@@ -245,7 +245,7 @@ impl RestorePipeline {
                         .map_err(|e| {
                             Error::Storage(format!(
                                 "restore_search_index_shards: insert search_fts: {e}"
-                            ))
+                            ).into())
                         })?;
                     }
                     summary.push(RestoredShardSummary {
@@ -265,7 +265,7 @@ impl RestorePipeline {
                         .map_err(|e| {
                             Error::Storage(format!(
                                 "restore_search_index_shards: insert search_fuzzy: {e}"
-                            ))
+                            ).into())
                         })?;
                     }
                     summary.push(RestoredShardSummary {
@@ -288,7 +288,7 @@ impl RestorePipeline {
             }
         }
         tx.commit()
-            .map_err(|e| Error::Storage(format!("restore_search_index_shards: commit: {e}")))?;
+            .map_err(|e| Error::Storage(format!("restore_search_index_shards: commit: {e}").into()))?;
         Ok(summary)
     }
 

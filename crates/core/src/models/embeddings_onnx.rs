@@ -395,7 +395,7 @@ use crate::Result;
 /// ML pipeline is a single error domain at the public surface.
 #[cfg(feature = "onnx-runtime")]
 pub(crate) fn map_ort_error(err: ort::Error) -> crate::Error {
-    crate::Error::Model(err.to_string())
+    crate::Error::Model(err.to_string().into())
 }
 
 /// Long-lived ONNX Runtime wrapper for the XLM-R text encoder.

@@ -279,7 +279,7 @@ impl ModelManager {
         // hashes.
         use sha2::{Digest, Sha256};
         let bytes = std::fs::read(&artifact.file_path)
-            .map_err(|e| crate::Error::Storage(format!("model read: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("model read: {e}").into()))?;
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let got = hasher.finalize();
@@ -413,7 +413,7 @@ impl ModelManager {
             .find(|((id, _), _)| id == model_id)
             .map(|(_, a)| a.clone())
             .ok_or_else(|| {
-                crate::Error::Model(format!("benchmark_ep: model_id {model_id} not registered"))
+                crate::Error::Model(format!("benchmark_ep: model_id {model_id} not registered").into())
             })?;
         drop(guard);
         runner.run_benchmark(ep, &artifact)

@@ -103,12 +103,12 @@ impl ThumbnailGenerator {
     ) -> Result<ThumbnailResult, Error> {
         if plaintext.is_empty() {
             return Err(Error::Message(
-                "thumbnail generation requires non-empty input".to_string(),
+                "thumbnail generation requires non-empty input".to_string().into(),
             ));
         }
         if max_dimension == 0 {
             return Err(Error::Message(
-                "thumbnail max_dimension must be > 0".to_string(),
+                "thumbnail max_dimension must be > 0".to_string().into(),
             ));
         }
 
@@ -118,7 +118,7 @@ impl ThumbnailGenerator {
         reader.set_format(format);
         let img = reader
             .decode()
-            .map_err(|e| Error::Message(format!("failed to decode image: {e}")))?;
+            .map_err(|e| Error::Message(format!("failed to decode image: {e}").into()))?;
 
         let resized = img.resize(max_dimension, max_dimension, FilterType::Triangle);
         let (width, height) = (resized.width(), resized.height());
@@ -126,7 +126,7 @@ impl ThumbnailGenerator {
         let mut out = Vec::new();
         resized
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-            .map_err(|e| Error::Message(format!("failed to encode thumbnail: {e}")))?;
+            .map_err(|e| Error::Message(format!("failed to encode thumbnail: {e}").into()))?;
 
         Ok(ThumbnailResult {
             thumbnail_bytes: out,
@@ -146,7 +146,7 @@ fn image_format_for_mime(mime_type: &str) -> Result<ImageFormat, Error> {
         "image/jpeg" | "image/jpg" => Ok(ImageFormat::Jpeg),
         other => Err(Error::Message(format!(
             "thumbnail generation not supported for mime_type {other:?}"
-        ))),
+        ).into())),
     }
 }
 

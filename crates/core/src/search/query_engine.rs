@@ -730,7 +730,7 @@ impl<'a> QueryEngine<'a> {
         // is_cold = true.
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string()))?;
+            .map_err(|e| Error::Search(e.to_string().into()))?;
 
         // LocalOnly is the offline-only contract — never call the
         // cold source.
@@ -994,7 +994,7 @@ impl<'a> QueryEngine<'a> {
         // fetch + merge fan-out.
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string()))?;
+            .map_err(|e| Error::Search(e.to_string().into()))?;
         if !matches!(scope, SearchScope::IncludeCold) {
             return Ok(local);
         }
@@ -1155,7 +1155,7 @@ impl<'a> QueryEngine<'a> {
     ) -> Result<Vec<SearchResult>, Error> {
         let local = self
             .execute_search_with_limit(query, scope, limit)
-            .map_err(|e| Error::Search(e.to_string()))?;
+            .map_err(|e| Error::Search(e.to_string().into()))?;
         emit(crate::SearchEvent::LocalResults(local.clone()));
 
         // Replicate every short-circuit branch from the
@@ -2251,7 +2251,7 @@ pub fn resolve_target_to_conversation_set_with_resolver(
                 ConversationFilterColumn::Community,
                 &community.to_string(),
             )
-            .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
+            .map_err(|e| Error::Search(format!("list community convs: {e:?}").into()))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Domain(domain) => {
@@ -2260,19 +2260,19 @@ pub fn resolve_target_to_conversation_set_with_resolver(
                 ConversationFilterColumn::Domain,
                 &domain.to_string(),
             )
-            .map_err(|e| Error::Search(format!("list domain convs: {e:?}")))?;
+            .map_err(|e| Error::Search(format!("list domain convs: {e:?}").into()))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Tenant(tenant) => {
             let convs =
                 read_list_conversations_by_column(conn, ConversationFilterColumn::Tenant, tenant)
-                    .map_err(|e| Error::Search(format!("list tenant convs: {e:?}")))?;
+                    .map_err(|e| Error::Search(format!("list tenant convs: {e:?}").into()))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::B2cAll => {
             let convs =
                 read_list_conversations_by_column(conn, ConversationFilterColumn::Scope, "b2c")
-                    .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
+                    .map_err(|e| Error::Search(format!("list b2c convs: {e:?}").into()))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Starred => Ok(Some(resolver.resolve_starred()?)),

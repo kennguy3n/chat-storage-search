@@ -248,7 +248,7 @@ pub fn execute_eviction(conn: &Connection, plan: &EvictionPlan) -> Result<Evicti
                   WHERE asset_id = ?1",
                 params![cand.asset_id.to_string()],
             )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         // `asset_id` is the table's primary key, so `updated` is
         // either 0 (row not found) or 1.
         if updated > 0 {
@@ -343,7 +343,7 @@ pub fn collect_eviction_candidates(
                 END ASC,
                 ms.created_at_ms ASC",
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let rows = stmt
         .query_map(params![cutoff_ms], |row| {
@@ -364,7 +364,7 @@ pub fn collect_eviction_candidates(
                 storage_sink,
             ))
         })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -376,13 +376,13 @@ pub fn collect_eviction_candidates(
             bytes_local,
             created_at_ms,
             storage_sink,
-        ) = row.map_err(|e| Error::Storage(e.to_string()))?;
+        ) = row.map_err(|e| Error::Storage(e.to_string().into()))?;
         let asset_id = Uuid::parse_str(&asset_id)
-            .map_err(|e| Error::Storage(format!("invalid asset_id: {e}")))?;
+            .map_err(|e| Error::Storage(format!("invalid asset_id: {e}").into()))?;
         let message_id = Uuid::parse_str(&message_id)
-            .map_err(|e| Error::Storage(format!("invalid message_id: {e}")))?;
+            .map_err(|e| Error::Storage(format!("invalid message_id: {e}").into()))?;
         let conversation_id = Uuid::parse_str(&conversation_id)
-            .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}")))?;
+            .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}").into()))?;
         let bytes = u64::try_from(bytes_local.max(0)).unwrap_or(0);
         out.push(EvictionCandidate {
             asset_id,

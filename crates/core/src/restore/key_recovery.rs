@@ -276,7 +276,7 @@ pub fn prepare_device_transfer(
     };
     let plaintext = Zeroizing::new(
         crate::cbor::to_vec(&envelope)
-            .map_err(|e| Error::Storage(format!("device-transfer: cbor encode failed: {e}")))?,
+            .map_err(|e| Error::Storage(format!("device-transfer: cbor encode failed: {e}").into()))?,
     );
     let ciphertext = aead_seal(&key, &nonce, &plaintext, DEVICE_TRANSFER_DOMAIN)?;
     Ok(DeviceTransferPayload {
@@ -309,7 +309,7 @@ pub fn accept_device_transfer(
         DEVICE_TRANSFER_DOMAIN,
     )?);
     let envelope: DeviceTransferEnvelope = crate::cbor::from_slice(&plaintext)
-        .map_err(|e| Error::Storage(format!("device-transfer: cbor decode failed: {e}")))?;
+        .map_err(|e| Error::Storage(format!("device-transfer: cbor decode failed: {e}").into()))?;
     fn to_arr(v: &[u8]) -> Result<[u8; KEY_LEN], Error> {
         if v.len() != KEY_LEN {
             return Err(Error::Crypto(CryptoError::InvalidInput(

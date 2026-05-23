@@ -179,9 +179,9 @@ impl S3ZkofArchiveAdapter {
     pub fn pattern_c_seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         let hash = content_hash(plaintext);
         let dek = derive_convergent_dek(&hash, &self.tenant_id)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}")))?;
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}").into()))?;
         encrypt_object_pattern_c(plaintext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C seal: {e}")))
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C seal: {e}").into()))
     }
 
     /// Pattern C `open` — inverse of [`Self::pattern_c_seal`].
@@ -194,9 +194,9 @@ impl S3ZkofArchiveAdapter {
         plaintext_hash: &[u8; 32],
     ) -> Result<Vec<u8>, Error> {
         let dek = derive_convergent_dek(plaintext_hash, &self.tenant_id)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}")))?;
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: derive DEK: {e}").into()))?;
         decrypt_object_pattern_c(ciphertext, dek.as_bytes(), DEFAULT_CHUNK_SIZE)
-            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C open: {e}")))
+            .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: pattern C open: {e}").into()))
     }
 }
 
@@ -265,7 +265,7 @@ pub(crate) fn encode_sealed_archive_manifest(
         ciphertext: manifest.ciphertext.clone(),
     };
     crate::cbor::to_vec(&wire)
-        .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: cbor encode manifest: {e}")))
+        .map_err(|e| Error::Storage(format!("S3ZkofArchiveAdapter: cbor encode manifest: {e}").into()))
 }
 
 /// Route an archive segment upload to the configured backend.
@@ -653,7 +653,7 @@ mod tests {
             let objects = self.objects.lock().unwrap();
             let bytes = objects
                 .get(&(bucket.into(), key.into()))
-                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}")))?;
+                .ok_or_else(|| Error::Storage(format!("no such object: {bucket}/{key}").into()))?;
             let start = range.start.min(bytes.len() as u64) as usize;
             let end = range.end.min(bytes.len() as u64) as usize;
             Ok(bytes[start..end].to_vec())
@@ -692,7 +692,7 @@ mod tests {
     fn s3_zkof_archive_adapter_rejects_empty_tenant() {
         let s3 = StdArc::new(InMemoryS3::default());
         let err = S3ZkofArchiveAdapter::new(s3, fresh_zkof_config(), "").unwrap_err();
-        assert!(matches!(err, Error::Storage(msg) if msg.contains("tenant_id")));
+        assert!(matches!(err, Error::Storage(msg) if msg.to_string().contains("tenant_id")));
     }
 
     #[test]

@@ -278,7 +278,7 @@ pub fn collect_storage_usage(conn: &Connection) -> Result<StorageUsage, Error> {
 fn scalar_u64(conn: &Connection, sql: &str) -> Result<u64, Error> {
     let v: i64 = conn
         .query_row(sql, [], |row| row.get(0))
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
     Ok(v.max(0) as u64)
 }
 

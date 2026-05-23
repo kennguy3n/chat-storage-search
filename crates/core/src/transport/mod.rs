@@ -806,7 +806,7 @@ impl TransportClient for MockTransportClient {
         );
         state.fetch_calls.push(key.clone());
         if let Some(msg) = state.fail_fetch_once.remove(&key) {
-            return Err(crate::Error::Transport(msg));
+            return Err(crate::Error::Transport(msg.into()));
         }
         Ok(state.fetch_responses.get(&key).cloned().unwrap_or_default())
     }
@@ -833,7 +833,7 @@ impl TransportClient for MockTransportClient {
                 shard_type.into(),
                 ciphertext.to_vec(),
             ));
-            return Err(crate::Error::Transport(msg));
+            return Err(crate::Error::Transport(msg.into()));
         }
         state.upload_calls.push((
             conversation_hash.into(),

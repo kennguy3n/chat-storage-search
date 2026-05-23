@@ -170,7 +170,7 @@ impl DocumentExtractor for MockDocumentExtractor {
         if !is_supported_document_mime(mime_type) {
             return Err(crate::Error::Model(format!(
                 "MockDocumentExtractor rejects unsupported mime_type: {mime_type}"
-            )));
+            ).into()));
         }
         let mut hasher = blake3::Hasher::new();
         hasher.update(mime_type.as_bytes());

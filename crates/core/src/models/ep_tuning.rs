@@ -595,9 +595,9 @@ impl EpBenchmarkCache {
     /// of typed cache.
     pub fn persist_to_path(&self, path: &std::path::Path) -> std::result::Result<(), crate::Error> {
         let bytes = crate::cbor::to_vec(self)
-            .map_err(|e| crate::Error::Storage(format!("ep-cache serialize: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("ep-cache serialize: {e}").into()))?;
         std::fs::write(path, bytes)
-            .map_err(|e| crate::Error::Storage(format!("ep-cache write {}: {e}", path.display())))
+            .map_err(|e| crate::Error::Storage(format!("ep-cache write {}: {e}", path.display()).into()))
     }
 
     /// Load a cache from `path`.
@@ -624,7 +624,7 @@ impl EpBenchmarkCache {
             return Ok(Self::default());
         }
         let bytes = std::fs::read(path)
-            .map_err(|e| crate::Error::Storage(format!("ep-cache read {}: {e}", path.display())))?;
+            .map_err(|e| crate::Error::Storage(format!("ep-cache read {}: {e}", path.display()).into()))?;
         match crate::cbor::from_slice::<Self>(&bytes) {
             Ok(cache) => Ok(cache),
             Err(e) => {

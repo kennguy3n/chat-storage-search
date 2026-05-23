@@ -435,7 +435,7 @@ impl<'a> SemanticSearchEngine<'a> {
 }
 
 fn map_sql(e: rusqlite::Error) -> crate::Error {
-    crate::Error::Storage(format!("semantic_search: {e}"))
+    crate::Error::Storage(format!("semantic_search: {e}").into())
 }
 
 pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {

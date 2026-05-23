@@ -149,11 +149,11 @@ impl HttpTransportClient {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TRANSPORT_REQUEST_TIMEOUT_SECS))
             .build()
-            .map_err(|e| crate::Error::Transport(format!("reqwest builder: {e}")))?;
+            .map_err(|e| crate::Error::Transport(format!("reqwest builder: {e}").into()))?;
         let upload_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TRANSPORT_BLOB_UPLOAD_TIMEOUT_SECS))
             .build()
-            .map_err(|e| crate::Error::Transport(format!("reqwest upload builder: {e}")))?;
+            .map_err(|e| crate::Error::Transport(format!("reqwest upload builder: {e}").into()))?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth_token: auth_token.to_string(),
@@ -210,7 +210,7 @@ impl HttpTransportClient {
     }
 
     fn map_err(label: &str, err: reqwest::Error) -> crate::Error {
-        crate::Error::Transport(format!("{label}: {err}"))
+        crate::Error::Transport(format!("{label}: {err}").into())
     }
 
     fn map_status(label: &str, status: reqwest::StatusCode, body: &str) -> crate::Error {
@@ -218,7 +218,7 @@ impl HttpTransportClient {
             "{label}: HTTP {} — {}",
             status.as_u16(),
             body.chars().take(256).collect::<String>()
-        ))
+        ).into())
     }
 }
 
@@ -344,7 +344,7 @@ impl TransportClient for HttpTransportClient {
             .map_err(|e| Self::map_err("upload_chunk decode", e))?;
         let mut bytes = [0u8; 32];
         hex_decode_into(&wire.sha256_hex, &mut bytes)
-            .map_err(|e| crate::Error::Transport(format!("upload_chunk: {e}")))?;
+            .map_err(|e| crate::Error::Transport(format!("upload_chunk: {e}").into()))?;
         Ok(ChunkReceipt {
             blob_id: wire.blob_id,
             chunk_idx: wire.chunk_idx,
@@ -372,7 +372,7 @@ impl TransportClient for HttpTransportClient {
             .map_err(|e| Self::map_err("commit_blob decode", e))?;
         let mut root = [0u8; 32];
         hex_decode_into(&wire.merkle_root_hex, &mut root)
-            .map_err(|e| crate::Error::Transport(format!("commit_blob: {e}")))?;
+            .map_err(|e| crate::Error::Transport(format!("commit_blob: {e}").into()))?;
         Ok(CommitBlobResponse {
             blob_id: wire.blob_id,
             chunk_count: wire.chunk_count,
@@ -433,9 +433,9 @@ impl TransportClient for HttpTransportClient {
         for w in wires {
             let mut hash = [0u8; 32];
             hex_decode_into(&w.previous_manifest_hash_hex, &mut hash)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}")))?;
+                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}").into()))?;
             let payload = base64_decode(&w.payload_b64)
-                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}")))?;
+                .map_err(|e| crate::Error::Transport(format!("fetch_archive_manifests: {e}").into()))?;
             out.push(EncryptedManifest {
                 generation: w.generation,
                 previous_manifest_hash: hash,

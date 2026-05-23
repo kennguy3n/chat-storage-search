@@ -84,7 +84,7 @@ impl ArchiveEventType {
             other => {
                 return Err(Error::Storage(format!(
                     "unknown archive event_type {other:?}"
-                )))
+                ).into()))
             }
         })
     }
@@ -152,7 +152,7 @@ impl ArchiveEventJournal {
                 event.created_at_ms,
             ],
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(conn.last_insert_rowid())
     }
 
@@ -175,7 +175,7 @@ impl ArchiveEventJournal {
                   ORDER BY event_seq ASC
                   LIMIT ?2",
             )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
         let rows = stmt
             .query_map(params![after_seq, limit as i64], |row| {
                 let seq: i64 = row.get(0)?;
@@ -186,19 +186,19 @@ impl ArchiveEventJournal {
                 let created_at_ms: i64 = row.get(5)?;
                 Ok((seq, type_str, conv_str, mid_str, payload, created_at_ms))
             })
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            .map_err(|e| Error::Storage(e.to_string().into()))?;
 
         let mut out = Vec::new();
         for row in rows {
             let (seq, type_str, conv_str, mid_str, payload, created_at_ms) =
-                row.map_err(|e| Error::Storage(e.to_string()))?;
+                row.map_err(|e| Error::Storage(e.to_string().into()))?;
             let event_type = ArchiveEventType::parse_snake_case(&type_str)?;
             let conversation_id = Uuid::parse_str(&conv_str)
-                .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}")))?;
+                .map_err(|e| Error::Storage(format!("invalid conversation_id: {e}").into()))?;
             let message_id = mid_str
                 .map(|s| {
                     Uuid::parse_str(&s)
-                        .map_err(|e| Error::Storage(format!("invalid message_id: {e}")))
+                        .map_err(|e| Error::Storage(format!("invalid message_id: {e}").into()))
                 })
                 .transpose()?;
             out.push((
@@ -224,7 +224,7 @@ impl ArchiveEventJournal {
             |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map_err(|e| Error::Storage(e.to_string()))
+        .map_err(|e| Error::Storage(e.to_string().into()))
         .map(|opt| opt.unwrap_or(0))
     }
 
@@ -243,14 +243,14 @@ impl ArchiveEventJournal {
         if new_cursor < current {
             return Err(Error::Storage(format!(
                 "archive cursor cannot go backwards (current={current}, requested={new_cursor})"
-            )));
+            ).into()));
         }
         conn.execute(
             "INSERT INTO archive_event_cursor(id, cursor_seq) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET cursor_seq = excluded.cursor_seq",
             params![new_cursor],
         )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        .map_err(|e| Error::Storage(e.to_string().into()))?;
         Ok(())
     }
 

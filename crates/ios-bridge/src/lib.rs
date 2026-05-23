@@ -103,14 +103,28 @@ impl From<kchat_core::Error> for KChatError {
             kchat_core::Error::Crypto(e) => KChatError::Crypto {
                 message: e.to_string(),
             },
-            kchat_core::Error::Storage(s) => KChatError::Storage { message: s },
-            kchat_core::Error::Search(s) => KChatError::Search { message: s },
-            kchat_core::Error::Message(s) => KChatError::Message { message: s },
-            kchat_core::Error::Transport(s) => KChatError::Transport { message: s },
+            // Each sub-enum lowers to its `Display` text for the
+            // bridge's JSON / Codable surface; the bridge consumer
+            // historically expected a `String`, and the structured
+            // typed sub-enums are an internal-only Rust refactor.
+            kchat_core::Error::Storage(s) => KChatError::Storage {
+                message: s.to_string(),
+            },
+            kchat_core::Error::Search(s) => KChatError::Search {
+                message: s.to_string(),
+            },
+            kchat_core::Error::Message(s) => KChatError::Message {
+                message: s.to_string(),
+            },
+            kchat_core::Error::Transport(s) => KChatError::Transport {
+                message: s.to_string(),
+            },
             kchat_core::Error::NotImplemented(m) => KChatError::NotImplemented {
                 method: m.to_string(),
             },
-            kchat_core::Error::Model(s) => KChatError::Model { message: s },
+            kchat_core::Error::Model(s) => KChatError::Model {
+                message: s.to_string(),
+            },
         }
     }
 }
@@ -755,7 +769,7 @@ impl CoreICloudBlobBridge for ICloudBlobBridgeImpl {
     ) -> std::result::Result<String, kchat_core::Error> {
         self.callback
             .upload_file(record_name.to_string(), bytes.to_vec())
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 
     fn download_file_range(
@@ -769,13 +783,13 @@ impl CoreICloudBlobBridge for ICloudBlobBridgeImpl {
                 range.start,
                 range.end.saturating_sub(range.start),
             )
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 
     fn delete_file(&self, record_name: &str) -> std::result::Result<(), kchat_core::Error> {
         self.callback
             .delete_file(record_name.to_string())
-            .map_err(kchat_core::Error::Transport)
+            .map_err(|s| kchat_core::Error::Transport(s.into()))
     }
 }
 

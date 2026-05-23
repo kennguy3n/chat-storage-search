@@ -213,7 +213,7 @@ mod tests {
                 .unwrap()
                 .get(record_name)
                 .cloned()
-                .ok_or_else(|| Error::Storage(format!("no such record: {record_name}")))
+                .ok_or_else(|| Error::Storage(format!("no such record: {record_name}").into()))
         }
 
         fn list_files(&self, prefix: &str) -> Result<Vec<String>, Error> {

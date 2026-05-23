@@ -388,7 +388,7 @@ impl WhisperTranscriber for MockWhisperTranscriber {
         if !mime_type.starts_with("audio/") {
             return Err(crate::Error::Model(format!(
                 "MockWhisperTranscriber rejects non-audio mime_type: {mime_type}"
-            )));
+            ).into()));
         }
         let mut hasher = blake3::Hasher::new();
         hasher.update(mime_type.as_bytes());

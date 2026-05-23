@@ -124,7 +124,7 @@ impl BackupSegmentBuilder {
             events: request.events.clone(),
         };
         let cbor = crate::cbor::to_vec(&payload)
-            .map_err(|e| Error::Storage(format!("backup segment cbor encode: {e}")))?;
+            .map_err(|e| Error::Storage(format!("backup segment cbor encode: {e}").into()))?;
 
         // 2) Compute the integrity root over the CBOR payload —
         //    *not* the compressed bytes, so segments are
@@ -134,7 +134,7 @@ impl BackupSegmentBuilder {
         // 3) zstd-compress the CBOR. `decode_all` on the read
         //    side is symmetric.
         let compressed = zstd::stream::encode_all(&cbor[..], ZSTD_COMPRESSION_LEVEL)
-            .map_err(|e| Error::Storage(format!("backup segment zstd encode: {e}")))?;
+            .map_err(|e| Error::Storage(format!("backup segment zstd encode: {e}").into()))?;
 
         // 4) Allocate a fresh segment_id and AEAD-seal the
         //    compressed payload. AAD ties the segment_id and
@@ -186,9 +186,9 @@ pub fn decrypt_backup_segment(
     )
     .map_err(Error::Crypto)?;
     let cbor = zstd::stream::decode_all(&compressed[..])
-        .map_err(|e| Error::Storage(format!("backup segment zstd decode: {e}")))?;
+        .map_err(|e| Error::Storage(format!("backup segment zstd decode: {e}").into()))?;
     let payload: BackupSegmentPayload = crate::cbor::from_slice(&cbor)
-        .map_err(|e| Error::Storage(format!("backup segment cbor decode: {e}")))?;
+        .map_err(|e| Error::Storage(format!("backup segment cbor decode: {e}").into()))?;
     if payload.magic != BACKUP_SEGMENT_PAYLOAD_MAGIC {
         return Err(Error::Storage(
             "backup segment payload magic mismatch".into(),
@@ -265,7 +265,7 @@ mod tests {
             )
             .unwrap_err();
         match err {
-            Error::Storage(msg) => assert!(msg.contains("empty events list"), "got {msg}"),
+            Error::Storage(msg) => assert!(msg.to_string().contains("empty events list"), "got {msg}"),
             other => panic!("expected Storage, got {other:?}"),
         }
     }

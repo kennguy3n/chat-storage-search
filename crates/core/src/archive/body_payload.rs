@@ -72,7 +72,7 @@ pub fn encode(text_content: Option<&str>) -> Result<Vec<u8>, Error> {
         text_content: text_content.map(|t| t.to_string()),
     };
     crate::cbor::to_vec(&payload)
-        .map_err(|e| Error::Storage(format!("archive body payload encode: {e}")))
+        .map_err(|e| Error::Storage(format!("archive body payload encode: {e}").into()))
 }
 
 /// Best-effort decode of an archive event payload back to its

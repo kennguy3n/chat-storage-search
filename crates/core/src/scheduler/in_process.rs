@@ -410,7 +410,7 @@ impl InProcessScheduler {
                     }
                 }
             })
-            .map_err(|e| Error::Storage(format!("scheduler thread spawn failed: {e}")))?;
+            .map_err(|e| Error::Storage(format!("scheduler thread spawn failed: {e}").into()))?;
 
         workers.insert(task, WorkerHandle { state, join });
         Ok(())
@@ -575,7 +575,7 @@ mod tests {
         let s = InProcessScheduler::new();
         let err = s.schedule_backup(0).unwrap_err();
         assert!(
-            matches!(err, Error::Storage(ref m) if m.contains("interval_ms")),
+            matches!(err, Error::Storage(ref m) if m.to_string().contains("interval_ms")),
             "unexpected error: {err:?}"
         );
     }

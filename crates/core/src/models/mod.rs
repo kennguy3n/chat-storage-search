@@ -51,3 +51,69 @@ pub mod ocr;
 pub mod resource_gate;
 pub mod video;
 pub mod whisper;
+
+/// On-device ML error type wrapped by [`crate::Error::Model`].
+///
+/// Surfaces ONNX Runtime / MLX session errors, tokenizer failures,
+/// image / video decode failures, and EP-tuning cache I/O. New
+/// failure modes should prefer a typed variant over
+/// [`ModelError::Custom`].
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    /// An ONNX Runtime call failed (session create, input bind,
+    /// inference). `op` names the call site (`"session_create"`,
+    /// `"infer"`, …).
+    #[error("ort ({op}): {detail}")]
+    Ort {
+        /// ORT operation that failed.
+        op: &'static str,
+        /// Free-form detail captured from the upstream `ort` crate.
+        detail: String,
+    },
+
+    /// A tokenizer call failed (load, encode, decode).
+    #[error("tokenizer ({op}): {detail}")]
+    Tokenizer {
+        /// Tokenizer operation that failed.
+        op: &'static str,
+        /// Free-form detail captured from the tokenizer crate.
+        detail: String,
+    },
+
+    /// An image / video decode call failed.
+    #[error("media decode ({op}): {detail}")]
+    MediaDecode {
+        /// Decode operation that failed.
+        op: &'static str,
+        /// Free-form detail captured from the codec.
+        detail: String,
+    },
+
+    /// An EP-tuning cache file could not be read / written.
+    #[error("ep cache ({op}): {source}")]
+    EpCache {
+        /// EP-cache operation that failed.
+        op: &'static str,
+        #[source]
+        /// Upstream I/O error.
+        source: std::io::Error,
+    },
+
+    /// The requested model artifact is not present in the on-device
+    /// cache (download required).
+    #[error("model `{0}` not cached")]
+    NotCached(&'static str),
+
+    /// Free-form fallback. New failure modes should prefer a typed
+    /// variant.
+    #[error("{0}")]
+    Custom(String),
+}
+
+impl ModelError {
+    /// Construct a [`ModelError::Custom`] from anything convertible
+    /// to [`String`].
+    pub fn msg(msg: impl Into<String>) -> Self {
+        ModelError::Custom(msg.into())
+    }
+}
