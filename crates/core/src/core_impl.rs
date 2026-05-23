@@ -4323,8 +4323,23 @@ impl KChatCore for CoreImpl {
     fn initialize(&mut self, config: KChatCoreConfig) -> Result<()> {
         let db = LocalStoreDb::open(&config.data_dir, &self.key)
             .map_err(|e| Error::Storage(e.to_string()))?;
+        // Rebuild the reader pool against the freshly-opened
+        // writer. Without this, the pool would keep handing out
+        // readers attached to the *old* `data_dir`, so every
+        // `db_readers.with_reader(..)` path (list_conversations,
+        // get_conversation, get_message, list_messages, search,
+        // search_with_cold_source, search_streaming) would observe
+        // a different database from the writer until the next
+        // `CoreImpl::new`. We build the new pool *before*
+        // swapping `db_writer` so that a failure here leaves the
+        // store fully bound to the previous `data_dir` rather
+        // than half-migrated.
+        let db_readers = db
+            .open_reader_pool(&self.key, DEFAULT_READER_POOL_SIZE)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         self.config = config;
         self.db_writer = Mutex::new(db);
+        self.db_readers = db_readers;
         // The delivery client survives a re-init: it is bound to
         // the device / account, not the on-disk store location.
         Ok(())
@@ -5494,6 +5509,52 @@ mod tests {
         let conv = Uuid::now_v7();
         seed_conversation(&core, &conv);
         core.send_text(conv, "after reinit", None).unwrap();
+    }
+
+    #[test]
+    fn core_impl_initialize_rebuilds_reader_pool() {
+        // Regression: `initialize` must rebuild `db_readers` against
+        // the new `data_dir`. Otherwise the reader pool would keep
+        // serving rows from the *old* tempdir while writes go to the
+        // new one — observable as `list_conversations` and
+        // `get_conversation` returning data the writer can no longer
+        // see (and missing data the writer just wrote).
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = KChatCoreConfig::new(tmp.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        let mut core = CoreImpl::new(cfg, TEST_KEY).expect("core");
+
+        // Seed a row into the first DB so we can detect leakage
+        // across the re-init.
+        let stale_conv = Uuid::now_v7();
+        seed_conversation(&core, &stale_conv);
+        assert_eq!(core.list_conversations().unwrap().len(), 1);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let cfg2 = KChatCoreConfig::new(tmp2.path().to_path_buf(), Platform::MacOs, "tenant-test");
+        core.initialize(cfg2.clone()).expect("re-open");
+
+        // The reader pool now targets the new (empty) DB, so the
+        // stale row from the previous tempdir is invisible.
+        assert!(
+            core.list_conversations().unwrap().is_empty(),
+            "reader pool still attached to old data_dir after initialize()",
+        );
+        assert!(
+            core.get_conversation(stale_conv).unwrap().is_none(),
+            "stale conversation visible through pool reader after initialize()",
+        );
+
+        // Writes through the new writer are immediately visible
+        // through the freshly-built reader pool.
+        let fresh_conv = Uuid::now_v7();
+        seed_conversation(&core, &fresh_conv);
+        let listed = core.list_conversations().unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "fresh conversation not visible: {listed:?}"
+        );
+        assert_eq!(listed[0].conversation_id, fresh_conv.to_string());
     }
 
     #[test]
