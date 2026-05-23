@@ -273,19 +273,25 @@ pub struct CoreImpl {
     /// orchestration layer treats `None` as "no scheduler
     /// available — run maintenance loops on demand only".
     scheduler: Mutex<Option<Box<dyn crate::scheduler::BackgroundScheduler>>>,
-    /// Phase-6 on-device text-embedding seam. `None` until
-    /// [`CoreImpl::install_text_embedder`] is called. When set,
-    /// the message-ingest path computes XLM-R embeddings on
-    /// every text body and writes them through the
+    /// Phase-6 on-device text-embedding seam. Write-once via
+    /// [`CoreImpl::install_text_embedder`]. When set, the
+    /// message-ingest path computes XLM-R embeddings on every
+    /// text body and writes them through the
     /// [`crate::models::embeddings::EmbeddingCache`] to
-    /// `search_vector`; when `None` the ingest path skips the
-    /// embedding step (text is still searchable via FTS5 +
-    /// fuzzy).
-    text_embedder: Mutex<Option<Box<dyn crate::models::embeddings::TextEmbedder>>>,
+    /// `search_vector`; when not installed the ingest path
+    /// skips the embedding step (text is still searchable via
+    /// FTS5 + fuzzy). Held in [`OnceLock`] so reads on the
+    /// text-ingest / audio-transcript / document-page hot paths
+    /// are lock-free atomic loads; the underlying ONNX session
+    /// is itself a per-process resource that cannot be replaced
+    /// without tearing down the model.
+    text_embedder: OnceLock<Arc<dyn crate::models::embeddings::TextEmbedder>>,
     /// Phase-6 on-device image-embedding seam (MobileCLIP-S2).
-    /// `None` until [`CoreImpl::install_image_embedder`] is
-    /// called. Mirrors the [`Self::text_embedder`] wiring.
-    image_embedder: Mutex<Option<Box<dyn crate::models::clip::ImageEmbedder>>>,
+    /// Write-once via [`CoreImpl::install_image_embedder`].
+    /// Mirrors the [`Self::text_embedder`] wiring: [`OnceLock`]
+    /// makes ingest reads lock-free; the ONNX session is a
+    /// per-process resource that cannot be replaced live.
+    image_embedder: OnceLock<Arc<dyn crate::models::clip::ImageEmbedder>>,
     /// Phase-6 platform OCR bridge. Write-once via
     /// [`CoreImpl::install_ocr_bridge`]. Held in [`OnceLock`] so
     /// reads on the media-ingest hot path are lock-free atomic
@@ -304,23 +310,29 @@ pub struct CoreImpl {
     /// every Whisper / Vision / video-keyframe operation is a
     /// lock-free atomic load.
     resource_probe: OnceLock<Arc<dyn crate::models::resource_gate::ResourceProbe>>,
-    /// Phase-6 on-device Whisper transcription seam. `None` until
-    /// [`CoreImpl::install_whisper_transcriber`] is called. When
-    /// set, audio media writes a transcript row into
-    /// `media_search_index` during `send_media`. Mirrors
-    /// [`Self::text_embedder`] / [`Self::image_embedder`] wiring.
-    whisper_transcriber: Mutex<Option<Box<dyn crate::models::whisper::WhisperTranscriber>>>,
-    /// Phase-6 on-device document text-extraction seam. `None`
-    /// until [`CoreImpl::install_document_extractor`] is called.
+    /// Phase-6 on-device Whisper transcription seam. Write-once
+    /// via [`CoreImpl::install_whisper_transcriber`]. When set,
+    /// audio media writes a transcript row into
+    /// `media_search_index` during `send_media`. Held in
+    /// [`OnceLock`] for the same reason as
+    /// [`Self::text_embedder`] (lock-free hot-path reads, ONNX
+    /// session is a per-process resource).
+    whisper_transcriber: OnceLock<Arc<dyn crate::models::whisper::WhisperTranscriber>>,
+    /// Phase-6 on-device document text-extraction seam.
+    /// Write-once via [`CoreImpl::install_document_extractor`].
     /// When set, PDF / DOCX media writes per-page text rows into
-    /// `media_search_index` (kind `"caption"`) during `send_media`.
-    document_extractor: Mutex<Option<Box<dyn crate::models::document::DocumentExtractor>>>,
-    /// Phase-6 on-device video keyframe-sampling seam. `None`
-    /// until [`CoreImpl::install_video_keyframe_sampler`] is
-    /// called. Combined with [`Self::image_embedder`] this drives
-    /// the video keyframe → MobileCLIP-S2 → `search_vector`
-    /// pipeline in `send_media`.
-    video_keyframe_sampler: Mutex<Option<Box<dyn crate::models::video::VideoKeyframeSampler>>>,
+    /// `media_search_index` (kind `"caption"`) during
+    /// `send_media`. Held in [`OnceLock`] for lock-free reads on
+    /// the document-ingest path.
+    document_extractor: OnceLock<Arc<dyn crate::models::document::DocumentExtractor>>,
+    /// Phase-6 on-device video keyframe-sampling seam.
+    /// Write-once via
+    /// [`CoreImpl::install_video_keyframe_sampler`]. Combined
+    /// with [`Self::image_embedder`] this drives the
+    /// video-keyframe → MobileCLIP-S2 → `search_vector` pipeline
+    /// in `send_media`. Held in [`OnceLock`] for lock-free reads
+    /// on the video-ingest path.
+    video_keyframe_sampler: OnceLock<Arc<dyn crate::models::video::VideoKeyframeSampler>>,
     /// Phase-6 offline-detection seam. Write-once via
     /// [`CoreImpl::install_offline_detector`]; the
     /// orchestration layer treats "not installed" as "always
@@ -535,13 +547,13 @@ impl CoreImpl {
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive: Mutex::new(None),
             scheduler: Mutex::new(None),
-            text_embedder: Mutex::new(None),
-            image_embedder: Mutex::new(None),
+            text_embedder: OnceLock::new(),
+            image_embedder: OnceLock::new(),
             ocr_bridge: OnceLock::new(),
             resource_probe: OnceLock::new(),
-            whisper_transcriber: Mutex::new(None),
-            document_extractor: Mutex::new(None),
-            video_keyframe_sampler: Mutex::new(None),
+            whisper_transcriber: OnceLock::new(),
+            document_extractor: OnceLock::new(),
+            video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
@@ -587,13 +599,13 @@ impl CoreImpl {
             tracked_backup_segments: Mutex::new(Vec::new()),
             zkof_archive: Mutex::new(None),
             scheduler: Mutex::new(None),
-            text_embedder: Mutex::new(None),
-            image_embedder: Mutex::new(None),
+            text_embedder: OnceLock::new(),
+            image_embedder: OnceLock::new(),
             ocr_bridge: OnceLock::new(),
             resource_probe: OnceLock::new(),
-            whisper_transcriber: Mutex::new(None),
-            document_extractor: Mutex::new(None),
-            video_keyframe_sampler: Mutex::new(None),
+            whisper_transcriber: OnceLock::new(),
+            document_extractor: OnceLock::new(),
+            video_keyframe_sampler: OnceLock::new(),
             offline_detector: OnceLock::new(),
             perf_collector: Mutex::new(None),
             dedup_analytics: Mutex::new(None),
@@ -1586,8 +1598,8 @@ impl CoreImpl {
     // Phase-6 model bridges (Task 2 / 4 / 6 / 9)
     // ----------------------------------------------------------------
 
-    /// Install (or replace) the on-device text-embedding bridge
-    /// used by message ingest and the semantic-search query path
+    /// Install the on-device text-embedding bridge used by
+    /// message ingest and the semantic-search query path
     /// (`docs/PROPOSAL.md §7.6 / §7.6.1`, Phase 6, Task 2).
     ///
     /// When set, the message-ingest path computes an XLM-R
@@ -1595,41 +1607,50 @@ impl CoreImpl {
     /// [`crate::models::embeddings::EmbeddingCache`]. When unset
     /// (the default), the embedding step is skipped — text is
     /// still searchable via FTS5 + fuzzy.
+    ///
+    /// Write-once: returns [`Error::Storage`] if a text
+    /// embedder has already been installed on this core. The
+    /// underlying ONNX session is a per-process resource;
+    /// replacing it live would leak the previous session's GPU
+    /// allocations and racily change the embedding model under
+    /// in-flight ingest tasks.
     pub fn install_text_embedder(
         &self,
-        embedder: Box<dyn crate::models::embeddings::TextEmbedder>,
+        embedder: Arc<dyn crate::models::embeddings::TextEmbedder>,
     ) -> Result<()> {
-        *self.text_embedder.lock().map_err(poisoned)? = Some(embedder);
-        Ok(())
+        self.text_embedder.set(embedder).map_err(|_| {
+            Error::Storage(
+                "text_embedder already installed (install_text_embedder is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_text_embedder`] has been called
     /// with a real bridge.
     pub fn has_text_embedder(&self) -> bool {
-        self.text_embedder
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.text_embedder.get().is_some()
     }
 
-    /// Install (or replace) the on-device image-embedding bridge
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 9). When set, MobileCLIP-S2 embeddings are written to
+    /// Install the on-device image-embedding bridge used by
+    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 9).
+    /// When set, MobileCLIP-S2 embeddings are written to
     /// `search_vector` for image-typed media on ingest.
+    /// Write-once — same per-process-ONNX-session rationale as
+    /// [`Self::install_text_embedder`].
     pub fn install_image_embedder(
         &self,
-        embedder: Box<dyn crate::models::clip::ImageEmbedder>,
+        embedder: Arc<dyn crate::models::clip::ImageEmbedder>,
     ) -> Result<()> {
-        *self.image_embedder.lock().map_err(poisoned)? = Some(embedder);
-        Ok(())
+        self.image_embedder.set(embedder).map_err(|_| {
+            Error::Storage(
+                "image_embedder already installed (install_image_embedder is write-once)".into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_image_embedder`] has been called.
     pub fn has_image_embedder(&self) -> bool {
-        self.image_embedder
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.image_embedder.get().is_some()
     }
 
     /// Install the platform OCR bridge used by media ingest
@@ -1677,72 +1698,80 @@ impl CoreImpl {
         self.resource_probe.get().is_some()
     }
 
-    /// Install (or replace) the on-device Whisper transcriber
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 1 of the 2026-05-04 batch). When set, audio media
-    /// writes a transcript row into `media_search_index` during
-    /// `send_media`.
+    /// Install the on-device Whisper transcriber used by media
+    /// ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 1 of the
+    /// 2026-05-04 batch). When set, audio media writes a
+    /// transcript row into `media_search_index` during
+    /// `send_media`. Write-once — the underlying Whisper ONNX
+    /// session cannot be replaced live without leaking GPU
+    /// allocations and racing in-flight transcription tasks.
     pub fn install_whisper_transcriber(
         &self,
-        transcriber: Box<dyn crate::models::whisper::WhisperTranscriber>,
+        transcriber: Arc<dyn crate::models::whisper::WhisperTranscriber>,
     ) -> Result<()> {
-        *self.whisper_transcriber.lock().map_err(poisoned)? = Some(transcriber);
-        Ok(())
+        self.whisper_transcriber.set(transcriber).map_err(|_| {
+            Error::Storage(
+                "whisper_transcriber already installed (install_whisper_transcriber is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_whisper_transcriber`] has been
     /// called with a real bridge.
     pub fn has_whisper_transcriber(&self) -> bool {
-        self.whisper_transcriber
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.whisper_transcriber.get().is_some()
     }
 
-    /// Install (or replace) the on-device document
-    /// text-extraction bridge used by media ingest
-    /// (`docs/PROPOSAL.md §7.6`, Phase 6, Task 2 of the
-    /// 2026-05-04 batch). When set, PDF / DOCX media writes
-    /// per-page text rows into `media_search_index` during
-    /// `send_media`.
+    /// Install the on-device document text-extraction bridge
+    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
+    /// Task 2 of the 2026-05-04 batch). When set, PDF / DOCX
+    /// media writes per-page text rows into
+    /// `media_search_index` during `send_media`. Write-once —
+    /// the platform document parser (PDFKit / Apache Tika /
+    /// MlKit) is a per-process resource.
     pub fn install_document_extractor(
         &self,
-        extractor: Box<dyn crate::models::document::DocumentExtractor>,
+        extractor: Arc<dyn crate::models::document::DocumentExtractor>,
     ) -> Result<()> {
-        *self.document_extractor.lock().map_err(poisoned)? = Some(extractor);
-        Ok(())
+        self.document_extractor.set(extractor).map_err(|_| {
+            Error::Storage(
+                "document_extractor already installed (install_document_extractor is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_document_extractor`] has been
     /// called with a real bridge.
     pub fn has_document_extractor(&self) -> bool {
-        self.document_extractor
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.document_extractor.get().is_some()
     }
 
-    /// Install (or replace) the on-device video keyframe sampler
-    /// used by media ingest (`docs/PROPOSAL.md §7.6`, Phase 6,
-    /// Task 3 of the 2026-05-04 batch). When set together with
-    /// an [`crate::models::clip::ImageEmbedder`], video media
+    /// Install the on-device video keyframe sampler used by
+    /// media ingest (`docs/PROPOSAL.md §7.6`, Phase 6, Task 3 of
+    /// the 2026-05-04 batch). When set together with an
+    /// [`crate::models::clip::ImageEmbedder`], video media
     /// embeds the first keyframe via MobileCLIP-S2 and writes
     /// the embedding to `search_vector` during `send_media`.
+    /// Write-once — platform video decoders (AVFoundation /
+    /// MediaCodec) hold per-process hardware decoder handles.
     pub fn install_video_keyframe_sampler(
         &self,
-        sampler: Box<dyn crate::models::video::VideoKeyframeSampler>,
+        sampler: Arc<dyn crate::models::video::VideoKeyframeSampler>,
     ) -> Result<()> {
-        *self.video_keyframe_sampler.lock().map_err(poisoned)? = Some(sampler);
-        Ok(())
+        self.video_keyframe_sampler.set(sampler).map_err(|_| {
+            Error::Storage(
+                "video_keyframe_sampler already installed (install_video_keyframe_sampler is write-once)"
+                    .into(),
+            )
+        })
     }
 
     /// Whether [`Self::install_video_keyframe_sampler`] has been
     /// called with a real bridge.
     pub fn has_video_keyframe_sampler(&self) -> bool {
-        self.video_keyframe_sampler
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.video_keyframe_sampler.get().is_some()
     }
 
     /// Install the offline-detection probe used by the
@@ -2688,10 +2717,7 @@ impl CoreImpl {
         let Some(text) = msg.text_content.as_deref() else {
             return false;
         };
-        let Ok(slot) = self.text_embedder.lock() else {
-            return false;
-        };
-        let Some(embedder) = slot.as_ref() else {
+        let Some(embedder) = self.text_embedder.get() else {
             // No embedder installed — semantic search still works for
             // messages embedded by a previous run, but new rows will
             // not contribute vectors until `install_text_embedder` is
@@ -2805,10 +2831,7 @@ impl CoreImpl {
         if !mime_type.starts_with("image/") {
             return;
         }
-        let Ok(slot) = self.image_embedder.lock() else {
-            return;
-        };
-        let Some(embedder) = slot.as_ref() else {
+        let Some(embedder) = self.image_embedder.get() else {
             // Same rationale as `maybe_embed_text_message`: cold-start
             // before the bridge installs MobileCLIP-S2 is normal; a
             // warn-level event would flood logs. Stay at debug.
@@ -2892,10 +2915,7 @@ impl CoreImpl {
             }
         }
 
-        let Ok(slot) = self.whisper_transcriber.lock() else {
-            return;
-        };
-        let Some(transcriber) = slot.as_ref() else {
+        let Some(transcriber) = self.whisper_transcriber.get() else {
             return;
         };
         let result = match transcriber.transcribe(plaintext, mime_type) {
@@ -2935,14 +2955,13 @@ impl CoreImpl {
         let _ = FuzzyIndexWriter::new(db).index_message(message_id, transcript);
 
         // (3) Optional XLM-R embedding so semantic search picks
-        //     up the audio body.
-        if let Ok(embedder_slot) = self.text_embedder.lock() {
-            if let Some(embedder) = embedder_slot.as_ref() {
-                let cache = LocalStoreEmbeddingCache::new(db.connection());
-                if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
-                    if let Ok(vec) = embedder.embed(transcript) {
-                        let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
-                    }
+        //     up the audio body. Lock-free atomic load — the
+        //     text embedder is installed once at boot.
+        if let Some(embedder) = self.text_embedder.get() {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                if let Ok(vec) = embedder.embed(transcript) {
+                    let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
                 }
             }
         }
@@ -2993,10 +3012,7 @@ impl CoreImpl {
         if !is_supported_document_mime(mime_type) {
             return;
         }
-        let Ok(slot) = self.document_extractor.lock() else {
-            return;
-        };
-        let Some(extractor) = slot.as_ref() else {
+        let Some(extractor) = self.document_extractor.get() else {
             return;
         };
         let pages = match extractor.extract_text(plaintext, mime_type) {
@@ -3033,14 +3049,14 @@ impl CoreImpl {
             );
             let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, trimmed);
 
-            // (3) Optional XLM-R embedding per page.
-            if let Ok(embedder_slot) = self.text_embedder.lock() {
-                if let Some(embedder) = embedder_slot.as_ref() {
-                    let cache = LocalStoreEmbeddingCache::new(db.connection());
-                    if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
-                        if let Ok(vec) = embedder.embed(trimmed) {
-                            let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
-                        }
+            // (3) Optional XLM-R embedding per page. Lock-free
+            //     atomic load — the text embedder is installed
+            //     once at boot.
+            if let Some(embedder) = self.text_embedder.get() {
+                let cache = LocalStoreEmbeddingCache::new(db.connection());
+                if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
+                    if let Ok(vec) = embedder.embed(trimmed) {
+                        let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
                     }
                 }
             }
@@ -3075,16 +3091,10 @@ impl CoreImpl {
         if !mime_type.starts_with("video/") {
             return;
         }
-        let Ok(sampler_slot) = self.video_keyframe_sampler.lock() else {
+        let Some(sampler) = self.video_keyframe_sampler.get() else {
             return;
         };
-        let Some(sampler) = sampler_slot.as_ref() else {
-            return;
-        };
-        let Ok(embedder_slot) = self.image_embedder.lock() else {
-            return;
-        };
-        let Some(embedder) = embedder_slot.as_ref() else {
+        let Some(embedder) = self.image_embedder.get() else {
             return;
         };
 
@@ -10560,7 +10570,7 @@ mod tests {
         };
 
         let core = fresh_core();
-        core.install_text_embedder(Box::new(MockTextEmbedder::default()))
+        core.install_text_embedder(Arc::new(MockTextEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10791,7 +10801,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10817,7 +10827,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10863,9 +10873,9 @@ mod tests {
         use crate::models::video::MockVideoKeyframeSampler;
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
-        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+        core.install_video_keyframe_sampler(Arc::new(MockVideoKeyframeSampler))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10902,9 +10912,9 @@ mod tests {
         use crate::models::video::MockVideoKeyframeSampler;
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
-        core.install_video_keyframe_sampler(Box::new(MockVideoKeyframeSampler))
+        core.install_video_keyframe_sampler(Arc::new(MockVideoKeyframeSampler))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10928,7 +10938,7 @@ mod tests {
         use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
 
         let core = fresh_core();
-        core.install_image_embedder(Box::new(MockImageEmbedder::default()))
+        core.install_image_embedder(Arc::new(MockImageEmbedder::default()))
             .unwrap();
         // Note: no sampler installed.
 
@@ -10951,7 +10961,7 @@ mod tests {
         use crate::models::whisper::MockWhisperTranscriber;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -10984,7 +10994,7 @@ mod tests {
         use crate::search::fuzzy_search::FuzzySearchEngine;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11030,7 +11040,7 @@ mod tests {
         use crate::models::whisper::MockWhisperTranscriber;
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11078,7 +11088,7 @@ mod tests {
         }
 
         let core = fresh_core();
-        core.install_whisper_transcriber(Box::new(MockWhisperTranscriber))
+        core.install_whisper_transcriber(Arc::new(MockWhisperTranscriber))
             .unwrap();
         core.install_resource_probe(std::sync::Arc::new(CriticalProbe))
             .unwrap();
@@ -11110,7 +11120,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11149,7 +11159,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
@@ -11187,7 +11197,7 @@ mod tests {
         use crate::models::document::MockDocumentExtractor;
 
         let core = fresh_core();
-        core.install_document_extractor(Box::new(MockDocumentExtractor::default()))
+        core.install_document_extractor(Arc::new(MockDocumentExtractor::default()))
             .unwrap();
 
         let conv = Uuid::now_v7();
