@@ -59,6 +59,14 @@ zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "column_decltype"] }
 unicode-normalization = "0.1"
+# Structured logging / span instrumentation. `kchat-core` only
+# emits trace events and spans — no subscriber is initialised
+# here. Bridge crates (ios-bridge, android-bridge, desktop)
+# install platform-appropriate `tracing-subscriber` layers
+# (os_log on iOS, android_log on Android, fmt on desktop) so
+# the same events surface in the host OS's log stream without
+# the core crate caring about the destination.
+tracing = "0.1"
 # Image decoding + resizing for Phase 2 thumbnail generation
 # (`crates/core/src/media/thumbnail.rs`). `default-features = false`
 # keeps the dep tree lean — we only need PNG and JPEG codecs at this

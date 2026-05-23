@@ -34,7 +34,7 @@
 //! case.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use kchat_core::config::Platform as CorePlatform;
 #[cfg(test)]
@@ -44,6 +44,75 @@ use kchat_core::{
     SearchScope,
 };
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Tracing subscriber installation
+// ---------------------------------------------------------------------------
+//
+// `kchat-core` emits `tracing` spans / events on every hot path
+// (Phase A.3). Without a process-wide subscriber installed those
+// events would be discarded by `tracing`'s no-op default.
+//
+// The Android bridge installs the subscriber once on the first
+// `initialize` call. Subsequent calls are no-ops; the
+// `set_global_default` race is handled by `try_init`, which
+// returns `Err` if a subscriber was already installed and we
+// swallow that — the second-caller path is by design (e.g. the
+// app process forks a worker that calls `initialize` again).
+//
+// The filter respects the standard `RUST_LOG` env var so a debug
+// build can crank up verbosity without rebuilding (`adb shell
+// setprop log.tag.kchat DEBUG` does the equivalent at the logcat
+// layer). Per-crate targets are `kchat_core` and
+// `kchat_android_bridge` — Cargo converts crate-name hyphens to
+// underscores when forming the tracing target. The default is
+// `info`.
+//
+// `Once::call_once` makes the install idempotent and thread-safe:
+// the first JNI `initialize` call on any thread wins. The
+// `try_init` call also bails on duplicate installation, so even
+// if `Once` were removed the worst case is a swallowed error.
+static TRACING_INIT: Once = Once::new();
+
+#[cfg(target_os = "android")]
+fn install_tracing_subscriber() {
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    TRACING_INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        // `paranoid_android` writes through `__android_log_write`.
+        // The tag is what `adb logcat -s <tag>:V` filters on;
+        // matching the Kotlin façade's logger name keeps
+        // grep-by-tag uniform across the JNI boundary.
+        let android_layer = paranoid_android::layer("kchat");
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(android_layer)
+            .try_init();
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn install_tracing_subscriber() {
+    // Host-machine builds (unit tests, host-side bench) install a
+    // plain stderr fmt subscriber so the same `tracing` events
+    // remain visible during developer-loop runs.
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    TRACING_INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .try_init();
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Pure-Rust bridge layer
@@ -166,6 +235,11 @@ impl KChatBridgeHandle {
         tenant_id: &str,
         key: &[u8],
     ) -> BridgeResult<Self> {
+        // Install the tracing subscriber on the first `initialize`
+        // call so `kchat-core`'s span / event output is routed to
+        // logcat (Android) or stderr (host tests). `try_init`
+        // swallows the duplicate-install error on subsequent calls.
+        install_tracing_subscriber();
         let key = key_from_slice(key)?;
         let cfg = KChatCoreConfig::new(
             PathBuf::from(data_dir),

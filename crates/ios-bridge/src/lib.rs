@@ -38,7 +38,7 @@
 //!   Phase 2.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use kchat_core::config::Platform as CorePlatform;
 use kchat_core::{
@@ -488,10 +488,90 @@ fn key_from_vec(key: Vec<u8>) -> Result<[u8; 32]> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Tracing subscriber installation
+// ---------------------------------------------------------------------------
+//
+// `kchat-core` emits `tracing` spans / events on every hot path
+// (Phase A.3). Without a process-wide subscriber installed those
+// events would be discarded by `tracing`'s no-op default.
+//
+// We use `std::sync::Once` so the subscriber is installed exactly
+// once per process — even if the Swift / Objective-C side has
+// multiple `KChatCore` instances open in different sandboxes (e.g.
+// the main app, the share extension, the notification service
+// extension; each is a distinct process so this still does the
+// right thing). `tracing_subscriber::util::try_init` already
+// handles the duplicate-install case at the `set_global_default`
+// layer, but Once gives us a single point of contention for the
+// rare case where two threads race the first `new` call.
+//
+// The filter respects the standard `RUST_LOG` env var (per-crate
+// targets: `kchat_core`, `kchat_ios_bridge`). Default is `info`.
+static TRACING_INIT: Once = Once::new();
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+fn install_tracing_subscriber() {
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    TRACING_INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        // `OsLogger` routes through Apple's unified logging system.
+        // Subsystem matches the bundle id convention; `kchat.core`
+        // is the category that the Xcode Console / `log show`
+        // command will surface. Swift code that wants to forward
+        // its own logs through the same subsystem uses
+        // `Logger(subsystem: "com.kchat.core", category: "...")`.
+        let os_layer = tracing_oslog::OsLogger::new("com.kchat.core", "default");
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(os_layer)
+            .try_init();
+    });
+}
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+)))]
+fn install_tracing_subscriber() {
+    // Host-machine builds (unit tests on Linux / Windows CI) install
+    // a plain stderr fmt subscriber so the same `tracing` events
+    // remain visible during developer-loop runs without pulling
+    // darwin-only `os_log` system frameworks.
+    use tracing_subscriber::filter::EnvFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    TRACING_INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .try_init();
+    });
+}
+
 impl KChatCore {
     /// UDL `constructor` — opens the SQLCipher store at
     /// `{config.data_dir}/kchat.db` with the supplied 32-byte key.
     pub fn new(config: KChatCoreConfig, key: Vec<u8>) -> Result<Self> {
+        // Install the tracing subscriber on the first `new` call
+        // so `kchat-core`'s span / event output is routed to
+        // `os_log` on Apple targets (and stderr on host tests).
+        // `Once::call_once` makes this idempotent and thread-safe.
+        install_tracing_subscriber();
         let key = key_from_vec(key)?;
         let core = CoreImpl::new(config.into(), key)?;
         Ok(KChatCore {

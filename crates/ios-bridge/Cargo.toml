@@ -14,6 +14,18 @@ kchat-core = { path = "../core" }
 uniffi = { version = "0.28", features = ["cli"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
+# Structured logging — `kchat-core` emits tracing spans / events on
+# all hot paths (Phase A.3). The iOS bridge installs a
+# `tracing-subscriber` so those events surface via Apple `os_log`
+# on device and via stderr on host-machine cargo tests.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `tracing-oslog` is the actively-maintained `tracing` Layer for
+# Apple's unified logging system. Apple-only — gate to the Apple
+# targets so a host `cargo test` on Linux/Windows doesn't pull
+# darwin-only system frameworks.
+[target.'cfg(any(target_os = "ios", target_os = "macos", target_os = "tvos", target_os = "watchos"))'.dependencies]
+tracing-oslog = "0.3"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
