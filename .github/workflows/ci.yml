@@ -11,30 +11,60 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check + Test
+  # -------------------------------------------------------------------------
+  # Format check — fast (< 5 s on a warm cache). Runs in its own job so a
+  # failed `cargo fmt` is obvious in the PR status check list and does not
+  # block visibility of later failures (lint, test).
+  # -------------------------------------------------------------------------
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # -------------------------------------------------------------------------
+  # Lint — clippy with `-D warnings` over all targets and all features. Kept
+  # separate from `test` so a lint failure does not invalidate the test
+  # cache and vice versa.
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Build
-        run: cargo build --workspace
+
+  # -------------------------------------------------------------------------
+  # Unit + integration tests — full workspace, default features. The
+  # `--all-features` matrix is covered by clippy in the `lint` job.
+  # -------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --verbose
 
+  # -------------------------------------------------------------------------
   # Comprehensive end-to-end demo — exercises the full pipeline
-  # (ingest → FTS / fuzzy / structured search → archive →
-  # backup → manifest verification → skeleton-first restore →
-  # search-after-restore → storage-budget enforcement) against a
-  # 200-message multilingual corpus. See `docs/PROGRESS.md`'s
-  # 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  # (ingest → FTS / fuzzy / structured search → archive → backup → manifest
+  # verification → skeleton-first restore → search-after-restore →
+  # storage-budget enforcement) against a 200-message multilingual corpus.
+  # See `docs/PROGRESS.md`'s 2026-05-08 entry and `crates/core/tests/e2e_demo.rs`.
+  # -------------------------------------------------------------------------
   e2e-demo:
     name: E2E Demo
     runs-on: ubuntu-latest
@@ -45,11 +75,102 @@ jobs:
       - name: E2E Demo
         run: cargo test --test e2e_demo --verbose
 
-  # Phase 0+ : cross-language interop check via the Go vector
-  # generator. Uses a local replace to the zk-object-fabric SDK on
-  # CI nodes that have the sibling repo available; on a fresh
-  # GitHub Actions runner the generator falls back to the public
-  # module path. Disabled by default until both repos are CI-linked.
+  # -------------------------------------------------------------------------
+  # Supply-chain audit — `cargo-deny` (license allowlist + advisory-db) and
+  # `cargo-audit` (RustSec advisory database). Configuration lives in
+  # `deny.toml` at the workspace root.
+  # -------------------------------------------------------------------------
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        # The `deny.toml` ignore list documents preexisting advisories that
+        # cannot be fixed without breaking downstream pinning (see comments
+        # in that file). `cargo audit` reads its own ignore list; mirror the
+        # set here so the two tools agree.
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2021-0127 \
+            --ignore RUSTSEC-2025-0141 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2025-0144
+
+  # -------------------------------------------------------------------------
+  # Cross-compile sanity check — the four release targets KChat ships to
+  # (Linux x86_64, macOS Apple Silicon, Android arm64, Windows x86_64). Runs
+  # `cargo check` rather than a full build so the job stays under ~3 min;
+  # the bridges' real binary builds happen in the iOS / Android repo CI.
+  # -------------------------------------------------------------------------
+  cross-compile:
+    name: Cross-compile (${{ matrix.label }})
+    needs: [fmt, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            packages: --workspace
+            tool: rustup
+          - label: macos-aarch64
+            runs-on: macos-14
+            target: aarch64-apple-darwin
+            packages: --workspace
+            tool: rustup
+          - label: windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+            packages: --workspace
+            tool: rustup
+          - label: android-aarch64
+            runs-on: ubuntu-latest
+            target: aarch64-linux-android
+            # ios-bridge (uniffi) and desktop need host-only deps; on Android
+            # we only ship `kchat-core` + `kchat-android-bridge`.
+            packages: -p kchat-core -p kchat-android-bridge
+            tool: cross
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross (Android only)
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: cargo check (rustup)
+        if: matrix.tool == 'rustup'
+        run: cargo check ${{ matrix.packages }} --target ${{ matrix.target }} --all-features
+      - name: cargo check (cross)
+        if: matrix.tool == 'cross'
+        run: cross check ${{ matrix.packages }} --target ${{ matrix.target }}
+
+  # -------------------------------------------------------------------------
+  # Phase 0+ : cross-language interop check via the Go vector generator.
+  # Uses a local replace to the zk-object-fabric SDK on CI nodes that have
+  # the sibling repo available; on a fresh GitHub Actions runner the
+  # generator falls back to the public module path. Disabled by default
+  # until both repos are CI-linked.
   # interop-vectors:
   #   name: Pattern C Interop Vectors
   #   runs-on: ubuntu-latest

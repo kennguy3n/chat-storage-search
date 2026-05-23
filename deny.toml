@@ -1,0 +1,108 @@
+# cargo-deny configuration for kchat-core and bridge crates.
+#
+# Run locally with:
+#   cargo deny check
+#
+# CI runs `cargo deny check advisories` and `cargo deny check licenses`
+# as part of the `audit` job (.github/workflows/ci.yml).
+#
+# Documentation: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec advisory database checks.
+# ---------------------------------------------------------------------------
+[advisories]
+# Database is fetched from https://github.com/rustsec/advisory-db on every
+# CI run; results are cached by Swatinem/rust-cache.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+ignore = [
+    # serde_cbor 0.11 — last release 2021. Tracked for removal in Phase A.2
+    # (replace with `ciborium`). Keeping the ignore so CI on the A.1 branch
+    # stays green; the A.2 PR removes both `serde_cbor` and this ignore line.
+    "RUSTSEC-2021-0127",
+    # bincode 1.x — unmaintained, pulled transitively by the `ort` crate
+    # (ONNX Runtime bindings) and by `criterion`. ort 2.0.0-rc.13+ moves to
+    # bincode 2; we currently pin 2.0.0-rc.12 to avoid a VitisAI binding bug
+    # (see comment in workspace Cargo.toml). Re-evaluate when the next ort
+    # release stabilizes.
+    "RUSTSEC-2025-0141",
+    # paste 1.x — unmaintained, pulled transitively by `ort-sys` and a few
+    # macro crates. No suitable replacement; the crate is feature-frozen and
+    # functionally correct. Watch for an alternative as the ecosystem migrates.
+    "RUSTSEC-2024-0436",
+    # ml-dsa 0.0.4 — timing side-channel in the decomposition step (RustCrypto
+    # advisory). The fixed releases (0.1.x) move to `signature` 3.x and
+    # `rand_core` 0.10, which break compatibility with the `ed25519-dalek 2`
+    # stack the manifest signer shares. Hybrid signing pairs ML-DSA with
+    # Ed25519, so a recovered ML-DSA key alone does not forge a manifest. The
+    # upgrade is tracked as a Phase-D follow-up alongside the broader PQC
+    # stack refresh.
+    "RUSTSEC-2025-0144",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — explicit allowlist of SPDX expressions.
+# ---------------------------------------------------------------------------
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # webpki-roots ships the Mozilla CA cert bundle under CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "Unlicense",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "MIT-0",
+    "BSD-1-Clause",
+]
+
+# Workspace crates are licensed as "Proprietary" in their Cargo.toml; mark
+# them as private so the license checker skips them.
+[licenses.private]
+ignore = true
+registries = []
+
+# ---------------------------------------------------------------------------
+# Bans — disallow specific crates or duplicate versions where it matters.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "allow"
+# Path-dependencies within the workspace use a wildcard implicitly; that is
+# fine and idiomatic, so suppress the wildcard warning for them.
+wildcards = "warn"
+allow-wildcard-paths = true
+highlight = "all"
+
+deny = [
+    # openssl — we vendor SQLCipher's bundled OpenSSL; ad-hoc openssl bindings
+    # would split the TLS stack between rustls and openssl-sys and break
+    # mobile builds. If a transitive dep adds it, file an exception here with
+    # a tracking issue.
+    # { name = "openssl-sys", reason = "use rustls" },
+]
+
+# ---------------------------------------------------------------------------
+# Sources — where crates are allowed to come from.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

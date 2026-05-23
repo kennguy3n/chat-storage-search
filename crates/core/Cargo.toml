@@ -3,6 +3,7 @@ name = "kchat-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "KChat Storage & Search — platform-agnostic core (E2EE local store, archive, backup, search)."
 
 [features]
