@@ -126,9 +126,9 @@ impl Coordinator {
         F: FnOnce(&[u8; KEY_LEN]) -> T,
     {
         let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let mgr = slot.as_ref().ok_or_else(|| {
+            Error::Storage(StorageError::SubsystemNotInstalled("epoch_key_manager"))
+        })?;
         Ok(f(mgr.current_epoch_key()))
     }
 
@@ -142,9 +142,9 @@ impl Coordinator {
         new_epoch_id: &str,
     ) -> Result<WrappedEpochKeyRef> {
         let mut slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_mut()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let mgr = slot.as_mut().ok_or_else(|| {
+            Error::Storage(StorageError::SubsystemNotInstalled("epoch_key_manager"))
+        })?;
         let outgoing_id = mgr.current_epoch_id().to_string();
         mgr.rotate_epoch(k_archive_root, new_epoch_id)?;
         let wrapped = mgr
@@ -168,9 +168,9 @@ impl Coordinator {
         k_archive_root: &KeyMaterial,
     ) -> Result<[u8; KEY_LEN]> {
         let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let mgr = slot.as_ref().ok_or_else(|| {
+            Error::Storage(StorageError::SubsystemNotInstalled("epoch_key_manager"))
+        })?;
         mgr.unwrap_prior_epoch_key(epoch_id, k_archive_root)
     }
 
@@ -178,9 +178,9 @@ impl Coordinator {
     /// `true` if a key was actually removed from the manager.
     pub(crate) fn delete_archive_epoch_key(&self, epoch_id: &str) -> Result<bool> {
         let mut slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_mut()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let mgr = slot.as_mut().ok_or_else(|| {
+            Error::Storage(StorageError::SubsystemNotInstalled("epoch_key_manager"))
+        })?;
         Ok(mgr.delete_epoch_key(epoch_id))
     }
 
@@ -189,9 +189,9 @@ impl Coordinator {
     /// [`crate::archive::manifest_builder::ManifestBuildRequest::wrapped_prior_epoch_keys`].
     pub(crate) fn wrapped_prior_epoch_keys_for_manifest(&self) -> Result<Vec<WrappedEpochKeyRef>> {
         let slot = self.current_epoch.lock().map_err(poisoned)?;
-        let mgr = slot
-            .as_ref()
-            .ok_or_else(|| Error::Storage("no epoch key manager installed".into()))?;
+        let mgr = slot.as_ref().ok_or_else(|| {
+            Error::Storage(StorageError::SubsystemNotInstalled("epoch_key_manager"))
+        })?;
         Ok(mgr.wrapped_prior_epoch_keys_for_manifest())
     }
 
