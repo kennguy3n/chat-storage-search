@@ -66,3 +66,19 @@ impl SearchError {
         SearchError::Custom(msg.into())
     }
 }
+
+/// Lift a [`crate::local_store::DbError`] into a [`SearchError`].
+///
+/// `DbError::Rusqlite` lowers to [`SearchError::Sqlite`] verbatim so
+/// pattern-matches on raw `rusqlite::Error` codes (e.g. `SQLITE_BUSY`)
+/// keep working through the search lane; the remaining `DbError`
+/// variants are free-form and lower to [`SearchError::Custom`] with
+/// their [`std::fmt::Display`] text preserved.
+impl From<crate::local_store::db::DbError> for SearchError {
+    fn from(e: crate::local_store::db::DbError) -> Self {
+        match e {
+            crate::local_store::db::DbError::Rusqlite(s) => SearchError::Sqlite(s),
+            other => SearchError::Custom(other.to_string()),
+        }
+    }
+}

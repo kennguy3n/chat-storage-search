@@ -1335,15 +1335,16 @@ fn manifest_upload_interrupted_mid_write_retries_without_chain_break() {
         .expect_err("first attempt must fail");
     match err {
         // The mock surfaces the failure as a free-form transport
-        // error; the legacy `String` payload now travels through
-        // `TransportError::Server`, so pattern-match on the typed
-        // variant and assert the captured message verbatim instead
-        // of comparing to the `Display` text (which prefixes
-        // `"server: "`).
-        Error::Transport(kchat_core::transport::TransportError::Server(msg)) => {
+        // error; the legacy `String` payload travels through the
+        // [`TransportError::Custom`] bridging conversion, which
+        // preserves the message verbatim (no `network:` / `auth:` /
+        // `server:` prefix). Pattern-match on the typed variant so
+        // the assertion is structural rather than relying on the
+        // `Display` text.
+        Error::Transport(kchat_core::transport::TransportError::Custom(msg)) => {
             assert_eq!(msg, "connection reset")
         }
-        other => panic!("expected Error::Transport(Server(_)), got {other:?}"),
+        other => panic!("expected Error::Transport(Custom(_)), got {other:?}"),
     }
     assert!(
         sink.uploaded().is_empty(),

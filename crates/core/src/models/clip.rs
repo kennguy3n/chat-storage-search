@@ -293,7 +293,10 @@ impl ImageEmbedder for MockImageEmbedder {
     fn embed_image(&self, image_data: &[u8], mime_type: &str) -> Result<Vec<f32>> {
         if !mime_type.starts_with("image/") {
             return Err(crate::Error::Model(
-                format!("MockImageEmbedder rejects non-image mime_type: {mime_type}").into(),
+                crate::models::ModelError::MediaDecode {
+                    op: "embed_image",
+                    detail: format!("MockImageEmbedder rejects non-image mime_type: {mime_type}"),
+                },
             ));
         }
         let mut hasher = blake3::Hasher::new();

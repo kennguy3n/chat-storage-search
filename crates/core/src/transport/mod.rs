@@ -65,6 +65,19 @@ pub enum TransportError {
     /// payload corruption, missing conversation, …).
     #[error("server: {0}")]
     Server(String),
+
+    /// Free-form fallback for legacy call sites whose context is a
+    /// plain `String` today and that do not (yet) merit being routed
+    /// onto one of the typed `Network` / `Auth` / `Server` categories.
+    ///
+    /// The Display impl emits the wrapped string verbatim — no
+    /// `network:` / `auth:` / `server:` prefix — so bridging
+    /// `Error::Transport(msg.into())` sites preserve the exact message
+    /// they shipped before the workstream-B.8 migration. New typed
+    /// failure modes should prefer one of the three categorised
+    /// variants instead.
+    #[error("{0}")]
+    Custom(String),
 }
 
 /// One MLS-decrypted message returned by [`DeliveryClient::fetch_messages`].

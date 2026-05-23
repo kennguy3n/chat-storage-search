@@ -268,7 +268,7 @@ pub(crate) fn encode_sealed_archive_manifest(
     };
     crate::cbor::to_vec(&wire).map_err(|e| {
         Error::Storage(crate::local_store::StorageError::CborEncode {
-            context: "S3ZkofArchiveAdapter:",
+            context: "S3ZkofArchiveAdapter",
             source: e,
         })
     })

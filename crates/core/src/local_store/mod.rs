@@ -22,11 +22,19 @@ pub mod state_machines;
 /// Storage-layer error type wrapped by [`crate::Error::Storage`].
 ///
 /// Callers may pattern-match on the specific failure mode without
-/// parsing free-form text — retry loops route on
-/// [`StorageError::DatabaseLocked`], the reader pool distinguishes
+/// parsing free-form text. The reader pool distinguishes
 /// [`StorageError::LockPoisoned`] from [`StorageError::Sqlite`], and
 /// tests assert on [`StorageError::SubsystemNotInstalled`] instead
 /// of `msg.to_string().contains("not installed")`.
+///
+/// The [`StorageError::DatabaseLocked`] / [`StorageError::DiskFull`]
+/// variants exist for retry-loop callers that want to route on
+/// `SQLITE_BUSY`/`SQLITE_LOCKED`/`SQLITE_FULL` without inspecting the
+/// underlying [`rusqlite::Error`] extended code — see
+/// [`classify_rusqlite`] for the opt-in promoter. No caller does this
+/// today; the variants are reserved for the async-conversion wave
+/// where the writer mutex becomes a tokio mutex with explicit retry
+/// semantics.
 ///
 /// # Construction
 ///

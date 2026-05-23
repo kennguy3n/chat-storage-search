@@ -205,17 +205,24 @@ impl From<&str> for models::ModelError {
 // — until they migrate to `TransportError::Network` /
 // `TransportError::Auth` / `TransportError::Server`, the bridging
 // `From<String>` / `From<&str>` impls below map the legacy string
-// form onto `TransportError::Server`, which is the closest analogue
-// to "non-retryable, free-form failure".
+// form onto [`TransportError::Custom`], whose Display emits the
+// wrapped string verbatim (no `server:` / `network:` / `auth:`
+// prefix). This mirrors the [`StorageError::Custom`] /
+// [`SearchError::Custom`] / [`MessageError::Custom`] /
+// [`ModelError::Custom`] pattern and preserves the exact pre-B.8
+// observable message through the bridge layer's `.to_string()` —
+// avoiding the doubled-prefix scenario
+// (`"transport: server: connection reset"`) the bridge comments
+// guard against.
 impl From<String> for transport::TransportError {
     fn from(s: String) -> Self {
-        transport::TransportError::Server(s)
+        transport::TransportError::Custom(s)
     }
 }
 
 impl From<&str> for transport::TransportError {
     fn from(s: &str) -> Self {
-        transport::TransportError::Server(s.to_string())
+        transport::TransportError::Custom(s.to_string())
     }
 }
 

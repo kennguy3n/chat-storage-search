@@ -276,7 +276,7 @@ pub fn prepare_device_transfer(
     };
     let plaintext = Zeroizing::new(crate::cbor::to_vec(&envelope).map_err(|e| {
         Error::Storage(crate::local_store::StorageError::CborEncode {
-            context: "device-transfer:",
+            context: "device-transfer",
             source: e,
         })
     })?);
@@ -312,7 +312,7 @@ pub fn accept_device_transfer(
     )?);
     let envelope: DeviceTransferEnvelope = crate::cbor::from_slice(&plaintext).map_err(|e| {
         Error::Storage(crate::local_store::StorageError::CborDecode {
-            context: "device-transfer:",
+            context: "device-transfer",
             source: e,
         })
     })?;
