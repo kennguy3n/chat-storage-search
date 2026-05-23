@@ -39,14 +39,14 @@ pub mod state_machines;
 /// # Construction
 ///
 /// Most variants come from `#[from]` conversions so call sites that
-/// previously did `.map_err(|e| Error::Storage(e.to_string.into))?`
+/// previously did `.map_err(|e| Error::Storage(e.to_string().into()))?`
 /// can use the `?` operator directly once they switch to the typed
 /// form:
 ///
 /// ```ignore
 /// // legacy form (still compiles via `From<String>`)
 /// stmt.execute(params![..])
-///.map_err(|e| Error::Storage(e.to_string.into))?;
+///     .map_err(|e| Error::Storage(e.to_string().into()))?;
 /// // typed form (preferred)
 /// stmt.execute(params![..])?;
 /// ```

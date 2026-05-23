@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Desktop (macOS / Windows) consumer crate for kchat-core. "
+description = "Desktop (macOS / Windows) consumer crate for kchat-core."
 
 [lib]
 crate-type = ["lib"]

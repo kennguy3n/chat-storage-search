@@ -581,9 +581,8 @@ pub struct DeliveryCursor(pub String);
 /// Widens the placeholder to carry the rehydrated body
 /// (when one exists), the originating skeleton metadata, and a
 /// `is_cold` flag the renderer can use to decide whether to wait
-/// on a background fetch. Subsequent phases (3+ / ) will
-/// extend this with decrypted media descriptors and hydration
-/// provenance.
+/// on a background fetch. Future iterations will extend this with
+/// decrypted media descriptors and hydration provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HydratedMessage {
     /// Stable message identifier the request was for.

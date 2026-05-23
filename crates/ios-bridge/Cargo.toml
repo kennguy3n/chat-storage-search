@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "iOS UniFFI bridge for kchat-core. scaffold — UDL + scaffolding for the public KChatCore API."
+description = "iOS UniFFI bridge for kchat-core — UDL + scaffolding for the public KChatCore API."
 
 [lib]
 crate-type = ["lib", "cdylib"]

@@ -7,7 +7,7 @@
 //!
 //! ```sh
 //! cd tests/generate_vectors
-//! go run. >../../crates/core/tests/pattern_c_interop_vectors.json
+//! go run . > ../../crates/core/tests/pattern_c_interop_vectors.json
 //! ```
 //!
 //! The Rust implementation in `crate::crypto::convergent` must

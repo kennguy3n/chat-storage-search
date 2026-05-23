@@ -1,8 +1,8 @@
 //! backup compaction policy.
 //!
-//! Implements the **daily → weekly → monthly** strategy described
-//! in: as backup segments age, the
-//! orchestrator periodically merges adjacent same-tier segments
+//! Implements the **daily → weekly → monthly** tier-promotion
+//! strategy: as backup segments age, the orchestrator periodically
+//! merges adjacent same-tier segments
 //! into a single, denser segment. Merging applies tombstones so
 //! deleted-message events do not get carried forward — the
 //! compacted segment only contains the still-live events.

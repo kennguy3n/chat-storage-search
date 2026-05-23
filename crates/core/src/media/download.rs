@@ -33,9 +33,9 @@
 //! formula.
 //!
 //! Keeps the download pipeline synchronous to match the
-//! [`crate::transport::TransportClient`] surface; the
-//! production async client lands together with the upload async flip
-//! in +.
+//! [`crate::transport::TransportClient`] surface; both flip to
+//! `async fn` together when the production HTTP / gRPC / MLS-blob
+//! client lands.
 
 use std::ops::Range;
 

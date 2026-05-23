@@ -22,9 +22,9 @@
 //!   commit is a no-op.
 //!
 //! Keeps the upload pipeline synchronous to match the
-//! [`crate::transport::TransportClient`] surface; +
-//! flips both to `async fn` together once the production HTTP /
-//! gRPC / MLS-blob client lands.
+//! [`crate::transport::TransportClient`] surface; both flip to
+//! `async fn` together once the production HTTP / gRPC / MLS-blob
+//! client lands.
 
 use crate::crypto::aead::BlobClass;
 use crate::media::chunker::SealedChunk;

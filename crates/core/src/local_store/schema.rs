@@ -43,14 +43,14 @@ CREATE TABLE IF NOT EXISTS conversation (
     muted             INTEGER NOT NULL DEFAULT 0,
     last_message_id   TEXT,
     last_activity_ms  INTEGER NOT NULL,
- -- conversation hierarchy (`docs/DESIGN.md §11`).
- -- `conversation_type` discriminates the conversation shape
- -- (`'dm'`, `'group'`, `'channel'`); `scope` distinguishes
- -- the consumer (`'b2c'`) from enterprise (`'b2b'`)
- -- conversations. The remaining columns are foreign keys
- -- into the (future) `tenant`, `community`, and `domain`
- -- tables — empty strings encode "not part of a hierarchy"
- -- so legacy rows continue to round-trip without migration.
+    -- conversation hierarchy (`docs/DESIGN.md §11`).
+    -- `conversation_type` discriminates the conversation shape
+    -- (`'dm'`, `'group'`, `'channel'`); `scope` distinguishes
+    -- the consumer (`'b2c'`) from enterprise (`'b2b'`)
+    -- conversations. The remaining columns are foreign keys
+    -- into the (future) `tenant`, `community`, and `domain`
+    -- tables — empty strings encode "not part of a hierarchy"
+    -- so legacy rows continue to round-trip without migration.
     conversation_type TEXT NOT NULL DEFAULT 'dm',
     scope             TEXT NOT NULL DEFAULT 'b2c',
     tenant_id         TEXT NOT NULL DEFAULT '',
@@ -186,8 +186,8 @@ CREATE TABLE IF NOT EXISTS archive_segment_map (
 CREATE INDEX IF NOT EXISTS idx_asm_tenant_bucket
     ON archive_segment_map(tenant_id, time_bucket);
 
--- Per-archive event log feeding the archive segment builder
---. Mirrors `backup_event_journal` but
+-- Per-archive event log feeding the archive segment builder.
+-- Mirrors `backup_event_journal` but
 -- carries the archive-side event types (message_received,
 -- message_edited, message_deleted, media_received, …) and a
 -- single-row cursor that the segment builder advances after each
