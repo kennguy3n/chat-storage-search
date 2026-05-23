@@ -132,17 +132,40 @@ fn fts5_icu_available(conn: &Connection) -> bool {
 // LocalStoreDb
 // ---------------------------------------------------------------------------
 
+/// How the [`LocalStoreDb`] writer is materialised on storage.
+///
+/// The variant is consulted only when the writer needs to seed
+/// fresh connections (currently only the reader pool); the writer
+/// itself uses the [`Connection`] it carries directly.
+#[derive(Debug, Clone)]
+enum WriterBacking {
+    /// On-disk SQLCipher database at the given path. The reader
+    /// pool opens additional connections to the same path.
+    OnDisk(PathBuf),
+    /// In-memory database identified by the given shared-cache
+    /// URI (e.g. `file:kchat_mem_<uuid>?mode=memory&cache=shared`).
+    /// As long as at least one connection is alive on the URI,
+    /// the in-memory pages persist; closing every connection
+    /// destroys the database. Used only by `open_in_memory`.
+    InMemoryShared(String),
+}
+
 /// SQLCipher-backed local-store connection wrapper.
 ///
-/// One instance maps 1:1 with the `kchat.db` file (or the in-memory
-/// database used by tests). Cloning is intentionally not supported —
-/// `Connection` is not `Send`-cheap and Phase 1 keeps the model
-/// "one connection per core instance".
+/// One instance maps 1:1 with the `kchat.db` file (or the
+/// shared-cache in-memory database used by tests). Cloning is
+/// intentionally not supported — [`Connection`] is not
+/// `Send`-cheap and the writer is held inside `Mutex<_>` at the
+/// core level so a single connection per core instance is the
+/// intended shape.
 #[derive(Debug)]
 pub struct LocalStoreDb {
     conn: Connection,
-    /// Resolved on-disk path. `None` for `:memory:` databases.
-    path: Option<PathBuf>,
+    /// Backing-store identity: on-disk path or in-memory shared-
+    /// cache URI. Carried so the writer can seed reader-pool
+    /// connections against the same database without the caller
+    /// having to plumb the path / URI through a second time.
+    backing: WriterBacking,
     /// Whether the FTS5 ICU tokenizer was available at open time.
     /// `false` means the schema was created with the `unicode61`
     /// fallback.
@@ -165,7 +188,7 @@ impl LocalStoreDb {
         let icu_available = init_connection(&conn, key)?;
         Ok(Self {
             conn,
-            path: Some(path),
+            backing: WriterBacking::OnDisk(path),
             icu_available,
         })
     }
@@ -184,11 +207,33 @@ impl LocalStoreDb {
     /// `crates/core/Cargo.toml` for the broader policy.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_in_memory(key: &[u8; 32]) -> DbResult<Self> {
-        let conn = Connection::open_in_memory()?;
+        // Use a `file:?mode=memory&cache=shared` URI so the reader
+        // pool can attach additional connections to the same
+        // in-memory database. A `:memory:` open (the SQLite
+        // default) creates a *private* in-memory db that no
+        // other connection can see, which would make
+        // [`Self::open_reader_pool`] hand out empty connections.
+        //
+        // The URI is keyed by a fresh UUID per call so concurrent
+        // tests don't collide on a common shared-cache namespace.
+        // As long as at least one connection (the writer + each
+        // pool reader) is alive, the in-memory pages persist;
+        // dropping every connection destroys the database — same
+        // lifetime semantics as a `:memory:` handle.
+        let uri = format!(
+            "file:kchat_mem_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         let icu_available = init_connection(&conn, key)?;
         Ok(Self {
             conn,
-            path: None,
+            backing: WriterBacking::InMemoryShared(uri),
             icu_available,
         })
     }
@@ -205,9 +250,40 @@ impl LocalStoreDb {
         &mut self.conn
     }
 
-    /// Resolved on-disk path. `None` for `:memory:` databases.
+    /// Resolved on-disk path. `None` for in-memory databases.
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        match &self.backing {
+            WriterBacking::OnDisk(p) => Some(p.as_path()),
+            WriterBacking::InMemoryShared(_) => None,
+        }
+    }
+
+    /// Open a fresh [`LocalStoreReaderPool`] backed by the same
+    /// SQLCipher database this writer is currently open against.
+    ///
+    /// `key` is the 32-byte `K_local_db` the readers will set via
+    /// `PRAGMA key`; in production it's the same value the writer
+    /// was opened with, but it is passed explicitly because the
+    /// writer does not retain a copy. `capacity` is the number of
+    /// reader connections to materialise — clamped to at least 1
+    /// inside [`LocalStoreReaderPool::open`].
+    ///
+    /// For on-disk databases the readers open against the
+    /// canonical `<data_dir>/kchat.db` path. For shared-cache
+    /// in-memory databases (used by `cfg(test)` / `test-support`)
+    /// the readers attach to the writer's URI; pooling works the
+    /// same way, just with no on-disk persistence.
+    pub fn open_reader_pool(
+        &self,
+        key: &[u8; 32],
+        capacity: usize,
+    ) -> DbResult<LocalStoreReaderPool> {
+        match &self.backing {
+            WriterBacking::OnDisk(path) => LocalStoreReaderPool::open(path, key, capacity),
+            WriterBacking::InMemoryShared(uri) => {
+                LocalStoreReaderPool::open_uri(uri, key, capacity)
+            }
+        }
     }
 
     /// `true` when the schema was created with the FTS5 ICU
@@ -1991,9 +2067,8 @@ pub(crate) fn read_message_with_body(
                 let text_content: Option<String> = row.get(13)?;
                 let detected_language: Option<String> = row.get(14)?;
                 let rich_meta: Option<Vec<u8>> = row.get(15)?;
-                let body_present = text_content.is_some()
-                    || detected_language.is_some()
-                    || rich_meta.is_some();
+                let body_present =
+                    text_content.is_some() || detected_language.is_some() || rich_meta.is_some();
                 let body = if body_present {
                     Some(MessageBody {
                         message_id: raw.message_id.clone(),
@@ -4639,10 +4714,9 @@ mod tests {
         let (_tmp, dir, _writer) = fresh_writer_with_dir();
         let pool = LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 1).unwrap();
         let pool_ref = &pool;
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pool_ref.with_reader(|_r| panic!("simulated reader failure"))
-            }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool_ref.with_reader(|_r| panic!("simulated reader failure"))
+        }));
         assert!(result.is_err(), "panic must propagate");
         // The slot must be back in the pool — a subsequent
         // checkout must succeed without blocking forever.
@@ -4720,10 +4794,7 @@ mod tests {
         let (_tmp, dir, writer) = fresh_writer_with_dir();
         for i in 0..8 {
             writer
-                .insert_conversation(&sample_conversation(
-                    &format!("conv-{i}"),
-                    1_000 + i as i64,
-                ))
+                .insert_conversation(&sample_conversation(&format!("conv-{i}"), 1_000 + i as i64))
                 .unwrap();
         }
         let pool = Arc::new(LocalStoreReaderPool::open(&db_file(&dir), &test_key(), 4).unwrap());
