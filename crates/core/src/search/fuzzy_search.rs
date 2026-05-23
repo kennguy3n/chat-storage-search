@@ -15,9 +15,15 @@
 //!   [`segment_by_script`] to split mixed-script text into per-script
 //!   runs and [`fuzzy_granularity`] to choose bigrams vs trigrams per
 //!   run.
-//! * [`FuzzySearchEngine`] — DB-backed wrapper that indexes / removes
-//!   per-message tokens and runs a token-overlap search against the
-//!   `search_fuzzy` table.
+//! * [`FuzzySearchEngine`] — read-only token-overlap search against
+//!   the `search_fuzzy` table. Borrows a raw [`rusqlite::Connection`]
+//!   so it can run against either the writer connection or a
+//!   [`crate::local_store::db::LocalStoreReader`] checked out of the
+//!   pool.
+//! * [`FuzzyIndexWriter`] — write-only counterpart that indexes /
+//!   removes per-message tokens. Borrows a
+//!   [`crate::local_store::db::LocalStoreDb`] so the type system
+//!   prevents accidental writes through a `query_only = 1` reader.
 //!
 //! Tokens are lowercased so the index is case-insensitive. Whitespace,
 //! ASCII punctuation, and ASCII digits inside a script run are

@@ -11,9 +11,15 @@
 //! API:
 //!
 //! * [`FtsMatch`] — one match row with snippet + BM25 score.
-//! * [`TextSearchEngine`] — borrows a [`LocalStoreDb`] and runs
+//! * [`TextSearchEngine`] — borrows a raw [`rusqlite::Connection`]
+//!   and runs
 //!   [`bm25`-ordered](https://www.sqlite.org/fts5.html#the_bm25_function)
-//!   queries against `search_fts`.
+//!   queries against `search_fts`. Taking a `&Connection` (rather
+//!   than a `&LocalStoreDb`) lets the engine run against either the
+//!   writer's connection or a
+//!   [`crate::local_store::db::LocalStoreReader`] checked out of the
+//!   pool — the FTS query path is pure-SELECT, so reader-pool
+//!   service is the common case.
 //! * Query-parsing helpers that escape FTS5 syntax for free-text
 //!   queries while preserving explicit operators (`NEAR`, `*`,
 //!   `"phrase"`).
