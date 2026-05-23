@@ -4263,23 +4263,55 @@ impl KChatCore for CoreImpl {
         Ok(mid)
     }
 
+    // Phase A.3: trace the transport-fetch + ingest pair as a
+    // single span. The inner `ingest_messages` already has its own
+    // span (see `CoreImpl::ingest_messages`), so a tracing
+    // subscriber sees a clean parent/child relationship:
+    // `ingest_remote_messages { conversation_id, ... } >
+    // ingest_messages { batch_size, ... }`. This lets dashboards
+    // attribute wall-clock to the transport-fetch phase vs the
+    // local-persist phase. Fields kept lean to avoid leaking
+    // cursor opaque tokens or message payloads into traces.
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            conversation_id = %conversation_id,
+            has_cursor = after_cursor.is_some(),
+            messages_fetched = tracing::field::Empty,
+            new_messages = tracing::field::Empty,
+            duplicate_count = tracing::field::Empty,
+            error = tracing::field::Empty,
+        ),
+    )]
     fn ingest_remote_messages(
         &self,
         conversation_id: Uuid,
         after_cursor: Option<DeliveryCursor>,
     ) -> Result<IngestResult> {
+        let span = tracing::Span::current();
         // Snapshot the configured delivery client. We hold the
         // mutex only for the duration of the fetch dispatch so the
         // database mutex below can be acquired without nesting.
         let fetch = {
-            let guard = self.delivery_client.lock().map_err(poisoned)?;
-            let client = guard
-                .as_ref()
-                .ok_or_else(|| Error::Transport("no delivery client configured".to_string()))?;
+            let guard = self.delivery_client.lock().map_err(|e| {
+                let err = poisoned(e);
+                span.record("error", err.to_string().as_str());
+                err
+            })?;
+            let client = guard.as_ref().ok_or_else(|| {
+                let err = Error::Transport("no delivery client configured".to_string());
+                span.record("error", err.to_string().as_str());
+                err
+            })?;
             let cursor_owned = after_cursor.as_ref().map(|c| c.0.clone());
             client.fetch_messages(&conversation_id.to_string(), cursor_owned.as_deref())
         };
-        let fetched = fetch.map_err(|e| Error::Transport(e.to_string()))?;
+        let fetched = fetch.map_err(|e| {
+            let err = Error::Transport(e.to_string());
+            span.record("error", err.to_string().as_str());
+            err
+        })?;
+        span.record("messages_fetched", fetched.messages.len());
 
         // Convert each RawDeliveryMessage to an IngestedMessage and
         // route through the inherent ingest_messages entry point so
@@ -4287,9 +4319,15 @@ impl KChatCore for CoreImpl {
         // happen inside the existing per-message SAVEPOINT.
         let mut converted: Vec<IngestedMessage> = Vec::with_capacity(fetched.messages.len());
         for raw in &fetched.messages {
-            converted.push(raw_delivery_to_ingested(raw)?);
+            converted.push(raw_delivery_to_ingested(raw).inspect_err(|e| {
+                span.record("error", e.to_string().as_str());
+            })?);
         }
-        let mut result = self.ingest_messages(&converted)?;
+        let mut result = self.ingest_messages(&converted).inspect_err(|e| {
+            span.record("error", e.to_string().as_str());
+        })?;
+        span.record("new_messages", result.new_messages);
+        span.record("duplicate_count", result.duplicate_count);
         // Propagate the transport cursor through `IngestResult` so
         // bridge layers can drive paginated drains without poking
         // into the transport mock.
