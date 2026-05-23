@@ -445,25 +445,29 @@ impl LocalStoreDb {
         &self,
         community_id: &str,
     ) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "community_id", community_id)
+        read_list_conversations_by_column(
+            &self.conn,
+            ConversationFilterColumn::Community,
+            community_id,
+        )
     }
 
     /// List every conversation that belongs to `domain_id`.
     /// Phase 8 helper for [`crate::SearchTarget::Domain`].
     pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "domain_id", domain_id)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Domain, domain_id)
     }
 
     /// List every conversation that belongs to `tenant_id`.
     /// Phase 8 helper for [`crate::SearchTarget::Tenant`].
     pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "tenant_id", tenant_id)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Tenant, tenant_id)
     }
 
     /// List every conversation with the given `scope`. Phase 8
     /// helper for [`crate::SearchTarget::B2cAll`].
     pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "scope", scope)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Scope, scope)
     }
 
     /// Toggle the `pinned` flag for `conversation_id`. Returns the
@@ -824,41 +828,7 @@ impl LocalStoreDb {
     /// inspect [`MediaState`] before deciding whether to fetch the
     /// blob.
     pub fn get_media_asset_by_message(&self, message_id: &str) -> DbResult<Option<MediaAsset>> {
-        self.conn
-            .query_row(
-                "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
-                        media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
-                        storage_sink
-                   FROM media_asset
-                  WHERE message_id = ?1
-                  LIMIT 1",
-                params![message_id],
-                |row| {
-                    let media_state: String = row.get(5)?;
-                    let media_state = media_state.parse::<MediaState>().map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-                        )
-                    })?;
-                    Ok(MediaAsset {
-                        asset_id: row.get(0)?,
-                        message_id: row.get(1)?,
-                        mime_type: row.get(2)?,
-                        bytes_total: row.get(3)?,
-                        bytes_local: row.get(4)?,
-                        media_state,
-                        wrapped_k_asset: row.get(6)?,
-                        chunk_count: row.get(7)?,
-                        merkle_root: row.get(8)?,
-                        blob_id: row.get(9)?,
-                        storage_sink: row.get(10)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(DbError::from)
+        read_media_asset_by_message(&self.conn, message_id)
     }
 
     /// List every `media_asset` row attached to `message_id`,
@@ -1995,13 +1965,16 @@ pub(crate) fn read_list_conversations(conn: &Connection) -> DbResult<Vec<Convers
 /// `_by_domain` / `_by_tenant` / `_by_scope` for the four
 /// caller-side wrappers.
 ///
-/// `column` must come from a closed set of literals
-/// (`tenant_id`, `community_id`, `domain_id`, `scope`) chosen by
-/// the caller — never user input — so the inline format string is
-/// safe.
+/// The `column` parameter is a closed enum rather than a `&str`
+/// so the inline format string is *non-bypassable* at the type
+/// level — callers cannot pass user input or an arbitrary column
+/// name. Each variant maps to a single `conversation`-table
+/// column that ships with a covering index. Adding a new variant
+/// requires adding a column to the schema *and* extending this
+/// match, so the SQL surface stays grep-able.
 pub(crate) fn read_list_conversations_by_column(
     conn: &Connection,
-    column: &str,
+    column: ConversationFilterColumn,
     value: &str,
 ) -> DbResult<Vec<Conversation>> {
     let sql = format!(
@@ -2011,13 +1984,42 @@ pub(crate) fn read_list_conversations_by_column(
                 community_id, domain_id
            FROM conversation
           WHERE {column} = ?1
-          ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC"
+          ORDER BY pinned DESC, last_activity_ms DESC, conversation_id ASC",
+        column = column.as_sql_column(),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![value], row_to_conversation)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Closed set of columns that
+/// [`read_list_conversations_by_column`] may filter on.
+///
+/// Used as the type-level guard that prevents SQL injection on
+/// the otherwise-format-string-driven `WHERE {column} = ?1`
+/// clause. Every variant is a column that exists on the
+/// `conversation` table and carries a covering index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationFilterColumn {
+    Community,
+    Domain,
+    Tenant,
+    Scope,
+}
+
+impl ConversationFilterColumn {
+    /// Stable SQL identifier for this column. Always a static
+    /// string literal — never derived from user input.
+    pub(crate) fn as_sql_column(self) -> &'static str {
+        match self {
+            ConversationFilterColumn::Community => "community_id",
+            ConversationFilterColumn::Domain => "domain_id",
+            ConversationFilterColumn::Tenant => "tenant_id",
+            ConversationFilterColumn::Scope => "scope",
+        }
+    }
 }
 
 /// Fetch a [`MessageSkeleton`] by `message_id`. See
@@ -2255,6 +2257,48 @@ pub(crate) fn read_timeline(
     Ok(out)
 }
 
+/// Fetch the at-most-one `media_asset` row attached to
+/// `message_id`. See [`LocalStoreDb::get_media_asset_by_message`].
+pub(crate) fn read_media_asset_by_message(
+    conn: &Connection,
+    message_id: &str,
+) -> DbResult<Option<MediaAsset>> {
+    conn.query_row(
+        "SELECT asset_id, message_id, mime_type, bytes_total, bytes_local,
+                media_state, wrapped_k_asset, chunk_count, merkle_root, blob_id,
+                storage_sink
+           FROM media_asset
+          WHERE message_id = ?1
+          LIMIT 1",
+        params![message_id],
+        |row| {
+            let media_state: String = row.get(5)?;
+            let media_state = media_state.parse::<MediaState>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                )
+            })?;
+            Ok(MediaAsset {
+                asset_id: row.get(0)?,
+                message_id: row.get(1)?,
+                mime_type: row.get(2)?,
+                bytes_total: row.get(3)?,
+                bytes_local: row.get(4)?,
+                media_state,
+                wrapped_k_asset: row.get(6)?,
+                chunk_count: row.get(7)?,
+                merkle_root: row.get(8)?,
+                blob_id: row.get(9)?,
+                storage_sink: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
 /// Search `media_search_index` by substring across all kinds (or
 /// a specific `kind` filter). See
 /// [`LocalStoreDb::search_media_index`].
@@ -2426,22 +2470,26 @@ impl LocalStoreReader {
         &self,
         community_id: &str,
     ) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "community_id", community_id)
+        read_list_conversations_by_column(
+            &self.conn,
+            ConversationFilterColumn::Community,
+            community_id,
+        )
     }
 
     /// See [`LocalStoreDb::list_conversations_by_domain`].
     pub fn list_conversations_by_domain(&self, domain_id: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "domain_id", domain_id)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Domain, domain_id)
     }
 
     /// See [`LocalStoreDb::list_conversations_by_tenant`].
     pub fn list_conversations_by_tenant(&self, tenant_id: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "tenant_id", tenant_id)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Tenant, tenant_id)
     }
 
     /// See [`LocalStoreDb::list_conversations_by_scope`].
     pub fn list_conversations_by_scope(&self, scope: &str) -> DbResult<Vec<Conversation>> {
-        read_list_conversations_by_column(&self.conn, "scope", scope)
+        read_list_conversations_by_column(&self.conn, ConversationFilterColumn::Scope, scope)
     }
 
     // -------- Message reads --------
@@ -2484,7 +2532,12 @@ impl LocalStoreReader {
         read_timeline(&self.conn, conversation_id, before_ms, limit)
     }
 
-    // -------- Media search --------
+    // -------- Media reads --------
+
+    /// See [`LocalStoreDb::get_media_asset_by_message`].
+    pub fn get_media_asset_by_message(&self, message_id: &str) -> DbResult<Option<MediaAsset>> {
+        read_media_asset_by_message(&self.conn, message_id)
+    }
 
     /// See [`LocalStoreDb::search_media_index`].
     pub fn search_media_index(

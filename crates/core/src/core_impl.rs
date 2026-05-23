@@ -4926,11 +4926,42 @@ impl KChatCore for CoreImpl {
             // already present, otherwise return the skeleton with
             // `is_cold = true`. The remote archive fetch path is still
             // queued for `Task 10+` once the manifest reader lands.
-            let db = self.db_writer.lock().map_err(poisoned)?;
-            let row = db
-                .get_message_with_body(&message_id.to_string())
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            let Some((skeleton, body)) = row else {
+            //
+            // The two DB lookups (`get_message_with_body` +
+            // `get_media_asset_by_message`) are pure reads, so we
+            // run them inside a single `db_readers.with_reader`
+            // checkout — both observe the same WAL snapshot, and
+            // the writer mutex stays free for ingest / send /
+            // delete while a hydrate is in flight. The hydration
+            // queue enqueue runs *after* the reader is returned
+            // to the pool.
+            let mid_str = message_id.to_string();
+            let read: Option<(MessageSkeleton, Option<MessageBody>, bool)> =
+                self.db_readers.with_reader(|r| -> Result<_> {
+                    let Some((skeleton, body)) = r
+                        .get_message_with_body(&mid_str)
+                        .map_err(|e| Error::Storage(e.to_string()))?
+                    else {
+                        return Ok(None);
+                    };
+                    // Detect whether an evicted media asset is
+                    // attached. We surface this so the worker can
+                    // lazily re-download the blob when the user
+                    // taps the row (Task 5 — Phase 3 §5.5). The
+                    // lookup is cheap (`media_asset` carries an
+                    // index on `message_id`) and runs inside the
+                    // same pool checkout as the skeleton fetch
+                    // for snapshot consistency.
+                    let has_evicted_media = r
+                        .get_media_asset_by_message(&skeleton.message_id)
+                        .map(|opt| {
+                            opt.map(|a| matches!(a.media_state, MediaState::Evicted))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    Ok(Some((skeleton, body, has_evicted_media)))
+                })?;
+            let Some((skeleton, body, has_evicted_media)) = read else {
                 return Ok(HydratedMessage::default());
             };
             if skeleton.body_state == BodyState::DeletedForEveryone {
@@ -4945,20 +4976,6 @@ impl KChatCore for CoreImpl {
                 BodyState::LocalPlainAvailable | BodyState::LocalEncryptedAvailable
             );
             let text_content = body.as_ref().and_then(|b| b.text_content.clone());
-
-            // Detect whether an evicted media asset is attached. We
-            // surface this so the worker can lazily re-download the
-            // blob when the user taps the row (Task 5 — Phase 3
-            // §5.5). The lookup is cheap (`media_asset` carries an
-            // index on `message_id`) and the enqueue happens
-            // unconditionally below.
-            let has_evicted_media = db
-                .get_media_asset_by_message(&skeleton.message_id)
-                .map(|opt| {
-                    opt.map(|a| matches!(a.media_state, MediaState::Evicted))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
 
             // Enqueue a hydration request regardless of whether the
             // body is local — when the orchestration layer drains the

@@ -58,7 +58,9 @@ use uuid::Uuid;
 
 use crate::config::TenantSearchPolicy;
 use crate::formats::search_shard::IndexType;
-use crate::local_store::db::{read_list_conversations_by_column, DbResult};
+use crate::local_store::db::{
+    read_list_conversations_by_column, ConversationFilterColumn, DbResult,
+};
 use crate::search::fuzzy_search::{FuzzySearchEngine, FuzzyTokenizer};
 use crate::search::shard_builder::{BloomFilter, FtsRow, FuzzyRow};
 use crate::search::shard_cache::{CachedShard, ShardCache, ShardCacheKey};
@@ -2244,24 +2246,33 @@ pub fn resolve_target_to_conversation_set_with_resolver(
         T::ConversationGroup(group) => Ok(Some(group.iter().map(|c| c.to_string()).collect())),
         T::Channel(channel_id) => Ok(Some(resolver.resolve_channel(channel_id)?)),
         T::Community(community) => {
-            let convs =
-                read_list_conversations_by_column(conn, "community_id", &community.to_string())
-                    .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
+            let convs = read_list_conversations_by_column(
+                conn,
+                ConversationFilterColumn::Community,
+                &community.to_string(),
+            )
+            .map_err(|e| Error::Search(format!("list community convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Domain(domain) => {
-            let convs = read_list_conversations_by_column(conn, "domain_id", &domain.to_string())
-                .map_err(|e| Error::Search(format!("list domain convs: {e:?}")))?;
+            let convs = read_list_conversations_by_column(
+                conn,
+                ConversationFilterColumn::Domain,
+                &domain.to_string(),
+            )
+            .map_err(|e| Error::Search(format!("list domain convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Tenant(tenant) => {
-            let convs = read_list_conversations_by_column(conn, "tenant_id", tenant)
-                .map_err(|e| Error::Search(format!("list tenant convs: {e:?}")))?;
+            let convs =
+                read_list_conversations_by_column(conn, ConversationFilterColumn::Tenant, tenant)
+                    .map_err(|e| Error::Search(format!("list tenant convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::B2cAll => {
-            let convs = read_list_conversations_by_column(conn, "scope", "b2c")
-                .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
+            let convs =
+                read_list_conversations_by_column(conn, ConversationFilterColumn::Scope, "b2c")
+                    .map_err(|e| Error::Search(format!("list b2c convs: {e:?}")))?;
             Ok(Some(convs.into_iter().map(|c| c.conversation_id).collect()))
         }
         T::Starred => Ok(Some(resolver.resolve_starred()?)),
