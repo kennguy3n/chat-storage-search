@@ -24,9 +24,9 @@
 //!   exactly 480 000 f32 samples
 //!     │  WhisperMelKernel::log_mel  (Hann window + STFT + mel + log10)
 //!     ▼
-//!   [80 × 3000] log-mel spectrogram (column-major:
-//!     mel-bin = outer, time-frame = inner, row-major flat
-//!     `[mel_bin * 3000 + frame]`).
+//!   [80 × 3000] log-mel spectrogram (row-major flat
+//!     `Vec<f32>` of length 240_000 with mel bin as the
+//!     slow-changing axis: `out[mel_bin * 3000 + frame]`).
 //! ```
 //!
 //! ## Why not pull in `symphonia` / `hound` / `mel_filter`?
@@ -478,32 +478,39 @@ pub fn whisper_pad_or_truncate(samples: Vec<f32>) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Hann window — `np.hanning(N_FFT)`.
+// Hann window — periodic, length N_FFT.
 // ---------------------------------------------------------------------------
 //
-// `whisper/audio.py` uses the periodic (symmetric=False) Hann
-// window of length 400. Numpy's `np.hanning(M)` is the
-// *symmetric* Hann window — equivalent to
-// `torch.hann_window(M, periodic=False)`. We replicate the
-// symmetric form here because that is what
-// `whisper/audio.py::log_mel_spectrogram` uses by way of
-// `torch.stft(..., window=torch.hann_window(N_FFT))` (PyTorch's
-// `torch.hann_window` defaults to `periodic=True`, but the
-// Whisper preprocessing call passes the default and the
-// reference test fixtures match the symmetric form because the
-// off-by-one between periodic/symmetric Hann produces a
-// negligible boundary-window magnitude difference at this
-// window length).
+// `whisper/audio.py::log_mel_spectrogram` runs
+// `torch.stft(..., window=torch.hann_window(N_FFT))`, and
+// `torch.hann_window` defaults to `periodic=True` — i.e.
+// `0.5 * (1 - cos(2 pi i / N))`, with denominator `N` rather
+// than `N - 1`. The periodic form is the one designed for STFT
+// analysis because the implicit `N+1`-point symmetric window
+// has its zero endpoint at `i = N`, which is the same sample
+// the next overlapping frame would start with — making the
+// running sum of windowed frames tile a flat unit gain.
+//
+// We previously emitted the *symmetric* form
+// (`0.5 * (1 - cos(2 pi i / (N - 1)))`); the per-bin
+// difference is ~0.6% at most, but for bitwise parity with
+// the Whisper preprocessing reference (and with future
+// log-mel snapshot tests against librosa output) we now emit
+// the periodic form directly.
 
 fn whisper_hann_window(n: usize) -> Vec<f32> {
     let mut w = Vec::with_capacity(n);
+    if n == 0 {
+        return w;
+    }
     if n == 1 {
         w.push(1.0);
         return w;
     }
     for i in 0..n {
-        // Symmetric Hann window: 0.5 * (1 - cos(2 pi i / (N - 1)))
-        let phase = 2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32;
+        // Periodic Hann window: 0.5 * (1 - cos(2 pi i / N))
+        // (matches `torch.hann_window(N, periodic=True)`).
+        let phase = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
         w.push(0.5 * (1.0 - phase.cos()));
     }
     w
@@ -531,7 +538,22 @@ const SLANEY_F_MIN: f32 = 0.0;
 const SLANEY_F_SP: f32 = 200.0 / 3.0;
 const SLANEY_MIN_LOG_HZ: f32 = 1_000.0;
 const SLANEY_MIN_LOG_MEL: f32 = SLANEY_MIN_LOG_HZ / SLANEY_F_SP;
-const SLANEY_LOGSTEP: f32 = std::f32::consts::LN_2 / 27.0;
+// ln(6.4) / 27, the Slaney Auditory Toolbox log-step constant
+// used by `librosa.filters.mel(..., htk=False, norm='slaney')`.
+// The 6.4 comes from 6400 / 1000 — Slaney's reference defines
+// 27 mel-bands across the [1 kHz, 6.4 kHz] log-spaced region
+// such that `mel(1 kHz) = 15` and `mel(6.4 kHz) = 42`. The
+// resulting mel value at 8 kHz (the Whisper Nyquist) is
+// approximately 45.245.
+//
+// IMPORTANT: this is *not* `ln(2) / 27` — using `ln(2)` here
+// would expand the log region by a factor of `ln(6.4)/ln(2) ≈
+// 2.679`, which corrupts every filter centre above 1 kHz and
+// produces a filterbank the Whisper encoder was never trained
+// against. We encode the constant as a numeric literal
+// (rather than `f32::ln(6.4)`) because `f32::ln` is not
+// `const` in stable Rust.
+const SLANEY_LOGSTEP: f32 = 1.856_297_9_f32 / 27.0;
 
 fn hz_to_mel_slaney(hz: f32) -> f32 {
     if hz >= SLANEY_MIN_LOG_HZ {
@@ -600,8 +622,9 @@ fn whisper_mel_filterbank() -> Vec<Vec<f32>> {
 // ---------------------------------------------------------------------------
 
 /// Pre-computed Whisper mel kernel — Hann window, forward FFT
-/// planner, and mel filterbank. Re-uses the planner across
-/// calls so subsequent transcription invocations do not pay
+/// plan, and mel filterbank. The FFT plan is built once at
+/// kernel construction and re-used across every `log_mel`
+/// call, so subsequent transcription invocations do not pay
 /// the FFT-twiddle-factor allocation cost.
 ///
 /// The kernel does NOT own audio buffers; callers pass
@@ -619,6 +642,12 @@ fn whisper_mel_filterbank() -> Vec<Vec<f32>> {
 pub struct WhisperMelKernel {
     window: Vec<f32>,
     filterbank: Vec<Vec<f32>>,
+    /// Forward complex FFT of length [`WHISPER_N_FFT`].
+    /// `Arc<dyn Fft<f32>>` is what `rustfft` itself returns
+    /// from `plan_fft_forward`, so storing it directly avoids
+    /// re-planning on every `log_mel` invocation. The plan
+    /// owns its twiddle-factor lookup table internally.
+    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
 }
 
 impl std::fmt::Debug for WhisperMelKernel {
@@ -639,11 +668,15 @@ impl Default for WhisperMelKernel {
 
 impl WhisperMelKernel {
     /// Build a fresh kernel. The mel filterbank and Hann window
-    /// allocate ~16 KiB of f32 data combined.
+    /// allocate ~16 KiB of f32 data combined; the FFT plan
+    /// additionally pre-computes the twiddle-factor table.
     pub fn new() -> Self {
+        let mut planner = rustfft::FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(WHISPER_N_FFT);
         Self {
             window: whisper_hann_window(WHISPER_N_FFT),
             filterbank: whisper_mel_filterbank(),
+            fft,
         }
     }
 
@@ -689,28 +722,39 @@ impl WhisperMelKernel {
 
         // Reflective padding by N_FFT / 2 = 200 on each side
         // matches `torch.stft(center=True, pad_mode='reflect')`
-        // which is the default for `whisper/audio.py`.
+        // which is the default for `whisper/audio.py`. The
+        // numpy/torch reflect-pad spec for a buffer
+        // `[x0, x1, x2, ..., xN-1]` with pad `p` is:
+        //
+        //   left:  [xp, x{p-1}, ..., x1]    (mirrored across x0)
+        //   right: [x{N-2}, x{N-3}, ..., x{N-1-p}]  (mirrored across x{N-1})
+        //
+        // — i.e. both sides reflect *around the edge sample*,
+        // not including it. So the iteration direction matters:
+        // left pad walks `1..=pad` in reverse so the closest-to-
+        // edge sample (xp) appears furthest from the original
+        // x0 in the padded buffer.
         let pad = WHISPER_N_FFT / 2;
         let mut padded = Vec::with_capacity(samples.len() + 2 * pad);
-        // Left reflective pad: samples[1..=pad] reversed. We
-        // intentionally iterate over an index range (rather
-        // than `samples.iter()`) because the reflection wraps
-        // off the front of the slice and reads sample [i] for
-        // i in 1..=pad — which `iter().take(pad+1).skip(1)`
-        // also expresses, but less obviously.
+        // Left reflective pad: samples[pad], samples[pad-1], ..., samples[1].
+        // We iterate by index (rather than e.g.
+        // `samples[1..=pad].iter().rev()`) only because
+        // expressing the bounds inline is the clearest read.
         #[allow(clippy::needless_range_loop)]
-        for i in 1..=pad {
+        for i in (1..=pad).rev() {
             padded.push(samples[i]);
         }
         padded.extend_from_slice(samples);
-        // Right reflective pad: samples[n-2..=n-1-pad] reversed.
+        // Right reflective pad: samples[n-2], samples[n-3], ..., samples[n-1-pad].
         let n = samples.len();
         for i in 1..=pad {
             padded.push(samples[n - 1 - i]);
         }
 
-        let mut planner = rustfft::FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(WHISPER_N_FFT);
+        // FFT plan reused from the kernel — no per-call planner
+        // allocation. `Arc<dyn Fft<f32>>` is cheap to clone
+        // and the underlying plan owns the twiddle factor table.
+        let fft = &self.fft;
 
         let n_freqs = WHISPER_N_FFT / 2 + 1;
         let mut frame_buf: Vec<rustfft::num_complex::Complex<f32>> =
@@ -972,22 +1016,161 @@ mod tests {
     }
 
     #[test]
-    fn hann_window_is_symmetric_and_zero_at_endpoints() {
+    fn hann_window_periodic_shape() {
+        // Periodic Hann (matches `torch.hann_window(N, periodic=True)`):
+        //   w[i] = 0.5 * (1 - cos(2 pi i / N))   for i = 0..N
+        //
+        // Properties:
+        //  * w[0] is exactly 0 (cos(0) = 1).
+        //  * w[N-1] is *not* zero in general — the periodic Hann
+        //    is the first N samples of an (N+1)-symmetric Hann;
+        //    the right-zero endpoint sits at the implicit i = N
+        //    which is not stored.
+        //  * The window is symmetric about i = N/2 *between i = 1
+        //    and i = N - 1*: w[N/2 + k] == w[N/2 - k] for k in
+        //    1..N/2. The i = 0 sample is the unique special case.
+        //  * w[N/2] is the peak with value exactly 1.0.
         let w = whisper_hann_window(WHISPER_N_FFT);
         assert_eq!(w.len(), WHISPER_N_FFT);
-        assert!(w[0].abs() < 1e-6);
-        assert!(w[WHISPER_N_FFT - 1].abs() < 1e-6);
-        // Symmetric: w[i] == w[N - 1 - i].
-        for i in 0..(WHISPER_N_FFT / 2) {
-            let diff = (w[i] - w[WHISPER_N_FFT - 1 - i]).abs();
-            assert!(diff < 1e-6, "asymmetry at i={i}: {diff}");
-        }
-        // Centre is peak (= 1.0).
-        let mid = WHISPER_N_FFT / 2;
+        assert!(w[0].abs() < 1e-6, "w[0] should be 0; got {}", w[0]);
+        // w[N-1] = 0.5 * (1 - cos(2 pi (N-1) / N)) — not zero,
+        // but small (< 5e-5 for N = 400).
+        let expected_last = 0.5
+            * (1.0
+                - (2.0 * std::f32::consts::PI * (WHISPER_N_FFT - 1) as f32 / WHISPER_N_FFT as f32)
+                    .cos());
         assert!(
-            (w[mid] - 1.0).abs() < 1e-3,
-            "hann peak at midpoint should be ≈ 1.0; got {}",
+            (w[WHISPER_N_FFT - 1] - expected_last).abs() < 1e-5,
+            "w[N-1] = {}, expected {expected_last}",
+            w[WHISPER_N_FFT - 1]
+        );
+        // Symmetric about the midpoint, excluding the boundary
+        // sample i = 0.
+        let mid = WHISPER_N_FFT / 2;
+        for k in 1..mid {
+            let lhs = w[mid + k];
+            let rhs = w[mid - k];
+            assert!(
+                (lhs - rhs).abs() < 1e-6,
+                "asymmetry at offset k={k}: w[{}]={} vs w[{}]={}",
+                mid + k,
+                lhs,
+                mid - k,
+                rhs
+            );
+        }
+        // Centre is peak (= 1.0 exactly: cos(pi) = -1).
+        assert!(
+            (w[mid] - 1.0).abs() < 1e-6,
+            "hann peak at midpoint should be 1.0; got {}",
             w[mid]
+        );
+    }
+
+    #[test]
+    fn slaney_mel_matches_librosa_reference_values() {
+        // Reference values from
+        // `librosa.core.convert.hz_to_mel(hz, htk=False)` and
+        // its inverse `mel_to_hz`. These pin down the absolute
+        // mel scale so a future regression in `SLANEY_LOGSTEP`
+        // (e.g. accidentally swapping `ln(6.4)` for `ln(2)`)
+        // immediately fails this test instead of silently
+        // producing a degraded filterbank.
+        //
+        // Linear region anchors:
+        assert!(
+            (hz_to_mel_slaney(0.0) - 0.0).abs() < 1e-4,
+            "mel(0 Hz) should be 0; got {}",
+            hz_to_mel_slaney(0.0)
+        );
+        assert!(
+            (hz_to_mel_slaney(200.0 / 3.0) - 1.0).abs() < 1e-4,
+            "mel(66.667 Hz) should be 1; got {}",
+            hz_to_mel_slaney(200.0 / 3.0)
+        );
+        assert!(
+            (hz_to_mel_slaney(SLANEY_MIN_LOG_HZ) - 15.0).abs() < 1e-4,
+            "mel(1000 Hz) should be 15; got {}",
+            hz_to_mel_slaney(SLANEY_MIN_LOG_HZ)
+        );
+        // Log region anchors:
+        //   mel(6400 Hz) = 15 + ln(6.4) / (ln(6.4)/27) = 15 + 27 = 42.
+        assert!(
+            (hz_to_mel_slaney(6_400.0) - 42.0).abs() < 1e-3,
+            "mel(6400 Hz) should be 42; got {}",
+            hz_to_mel_slaney(6_400.0)
+        );
+        //   mel(8000 Hz) = 15 + ln(8) * 27 / ln(6.4) ≈ 45.2450.
+        assert!(
+            (hz_to_mel_slaney(8_000.0) - 45.245).abs() < 1e-2,
+            "mel(8000 Hz) should be ≈ 45.245; got {}",
+            hz_to_mel_slaney(8_000.0)
+        );
+
+        // Inverse direction:
+        assert!(
+            (mel_to_hz_slaney(15.0) - 1_000.0).abs() < 1e-2,
+            "mel⁻¹(15) should be 1000; got {}",
+            mel_to_hz_slaney(15.0)
+        );
+        assert!(
+            (mel_to_hz_slaney(42.0) - 6_400.0).abs() < 1e-1,
+            "mel⁻¹(42) should be 6400; got {}",
+            mel_to_hz_slaney(42.0)
+        );
+        assert!(
+            (mel_to_hz_slaney(45.245) - 8_000.0).abs() < 1.0,
+            "mel⁻¹(45.245) should be ≈ 8000; got {}",
+            mel_to_hz_slaney(45.245)
+        );
+    }
+
+    #[test]
+    fn filterbank_peaks_at_expected_librosa_bins() {
+        // Anchor a few hand-computed filterbank weights against
+        // the Slaney reference to catch any future drift in
+        // SLANEY_LOGSTEP, mel anchor spacing, or triangle
+        // construction. n_fft = 400, sr = 16000, so each FFT
+        // bin spans 40 Hz.
+        let fb = whisper_mel_filterbank();
+        assert_eq!(fb.len(), WHISPER_N_MELS);
+        assert_eq!(fb[0].len(), WHISPER_N_FFT / 2 + 1);
+
+        // Filter 0: spans mel anchors 0, 1, 2.
+        //   left:   mel(0)  -> 0 Hz       -> bin 0
+        //   centre: mel(~0.5586) -> 37.24 Hz (linear, ≈ 200/3 * mel)
+        //   right:  mel(~1.1172) -> 74.47 Hz
+        // FFT bin 1 = 40 Hz lies between centre and right ->
+        // weight ≈ (74.47 - 40) / (74.47 - 37.24) * 2 / 74.47
+        //        ≈ 0.0249.
+        let bin1_weight = fb[0][1];
+        assert!(
+            bin1_weight > 0.015 && bin1_weight < 0.035,
+            "filter 0, bin 1 weight out of expected ≈ 0.025 band: {bin1_weight}"
+        );
+        // Filter 0 should be zero at high frequencies.
+        assert!(
+            fb[0][10] < 1e-6,
+            "filter 0 should be 0 at bin 10 (400 Hz); got {}",
+            fb[0][10]
+        );
+
+        // Filter 79 (last): spans mel anchors 79, 80, 81. With
+        // mel step = 45.245 / 81 ≈ 0.5585 we get:
+        //   left:   mel(~44.13) -> 7416 Hz  -> bin 185 (= 7400 Hz)
+        //   centre: mel(~44.69) -> 7700 Hz  -> bin 192 (= 7680 Hz)
+        //   right:  mel(~45.24) -> 8000 Hz  -> bin 200 (= 8000 Hz)
+        // Bin 192 should have a strictly positive weight.
+        assert!(
+            fb[WHISPER_N_MELS - 1][192] > 0.0,
+            "last filter should have positive weight near 7700 Hz (bin 192); got {}",
+            fb[WHISPER_N_MELS - 1][192]
+        );
+        // Last filter should be zero well below its left edge.
+        assert!(
+            fb[WHISPER_N_MELS - 1][100] < 1e-6,
+            "last filter should be 0 at bin 100 (4000 Hz); got {}",
+            fb[WHISPER_N_MELS - 1][100]
         );
     }
 
