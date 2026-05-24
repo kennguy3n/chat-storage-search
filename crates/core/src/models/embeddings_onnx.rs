@@ -374,28 +374,44 @@ pub fn create_xlmr_session_with_ep(
 // What lives outside the feature gate (and is therefore unit-
 // testable on every target) is the error-mapping shim:
 // [`map_ort_error`] turns any `ort::Error` into the canonical
-// [`crate::Error::Model(String)`] variant added in this task. The
-// shim is a free function so the lifetime contract — "wrapping
-// and inference share one error path" — is enforced at compile
-// time.
+// [`crate::Error::Model`] variant with a typed
+// [`crate::models::ModelError::Ort { op, detail }`] payload.
+// The shim is a curried free function so each call site supplies
+// a stable `op` label (`"session_create"`, `"infer"`,
+// `"output_extract"`, …) that downstream telemetry can route on
+// without parsing the wrapped detail string.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "onnx-runtime")]
 use crate::Result;
 
-/// Map an `ort::Error` to the canonical [`crate::Error::Model`]
-/// variant.
+/// Curried error-mapping shim that turns an `ort::Error` into the
+/// canonical [`crate::Error::Model`] variant with the typed
+/// [`crate::models::ModelError::Ort`] payload.
 ///
-/// Captures the upstream message verbatim so telemetry pipelines
-/// (and the bridge crates in `kennguy3n/slm-guardrail` /
-/// `kennguy3n/cv-guard`) can pattern-match on the `model:` prefix
-/// without parsing the wrapped substring. Always returns the
-/// `Model` variant; never `Storage` or `Search`, even if the
-/// upstream message mentions a database or query — the on-device
-/// ML pipeline is a single error domain at the public surface.
+/// `op` names the call site so telemetry pipelines (and the
+/// bridge crates in `kennguy3n/slm-guardrail` /
+/// `kennguy3n/cv-guard`) can route on the structured field
+/// instead of grepping a free-form string. Pass a stable static
+/// label per call site — `"session_create"` for session-builder
+/// errors, `"infer"` for `session.run` failures,
+/// `"output_extract"` for tensor-extraction failures,
+/// `"input_tensor_build"` for `Tensor::from_array` failures, etc.
+///
+/// Usage: `result.map_err(map_ort_error("infer"))?`.
+///
+/// Always returns the `Model` variant; never `Storage` or
+/// `Search`, even if the upstream message mentions a database or
+/// query — the on-device ML pipeline is a single error domain at
+/// the public surface.
 #[cfg(feature = "onnx-runtime")]
-pub(crate) fn map_ort_error(err: ort::Error) -> crate::Error {
-    crate::Error::Model(err.to_string().into())
+pub(crate) fn map_ort_error(op: &'static str) -> impl FnOnce(ort::Error) -> crate::Error {
+    move |err| {
+        crate::Error::Model(crate::models::ModelError::Ort {
+            op,
+            detail: err.to_string(),
+        })
+    }
 }
 
 /// Long-lived ONNX Runtime wrapper for the XLM-R text encoder.
@@ -446,7 +462,8 @@ impl OnnxTextEmbedder {
     /// whether DirectML registration, model load, or graph
     /// optimization failed.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let (session, report) = create_xlmr_session(model_path).map_err(map_ort_error)?;
+        let (session, report) =
+            create_xlmr_session(model_path).map_err(map_ort_error("session_create"))?;
         Ok(Self {
             session: std::sync::Mutex::new(session),
             report,

@@ -455,8 +455,9 @@ impl OnnxImageEmbedder {
     /// variant, regardless of whether DirectML registration,
     /// model load, or graph optimisation failed.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let (session, report) = create_mobileclip_session(model_path)
-            .map_err(crate::models::embeddings_onnx::map_ort_error)?;
+        let (session, report) = create_mobileclip_session(model_path).map_err(
+            crate::models::embeddings_onnx::map_ort_error("session_create"),
+        )?;
         Ok(Self {
             session: std::sync::Mutex::new(session),
             report,
@@ -472,8 +473,9 @@ impl OnnxImageEmbedder {
         model_path: &std::path::Path,
         ep: crate::models::ep_tuning::ExecutionProvider,
     ) -> Result<Self> {
-        let (session, report) = create_mobileclip_session_with_ep(model_path, ep)
-            .map_err(crate::models::embeddings_onnx::map_ort_error)?;
+        let (session, report) = create_mobileclip_session_with_ep(model_path, ep).map_err(
+            crate::models::embeddings_onnx::map_ort_error("session_create_with_ep"),
+        )?;
         Ok(Self {
             session: std::sync::Mutex::new(session),
             report,
@@ -599,7 +601,9 @@ impl ImageEmbedder for OnnxImageEmbedder {
             ],
             tensor_data,
         ))
-        .map_err(crate::models::embeddings_onnx::map_ort_error)?;
+        .map_err(crate::models::embeddings_onnx::map_ort_error(
+            "input_tensor_build",
+        ))?;
 
         // Hold the session lock across `run` AND tensor extraction:
         // `SessionOutputs<'s>` borrows from the session, so the
@@ -615,7 +619,7 @@ impl ImageEmbedder for OnnxImageEmbedder {
             })?;
             let outputs = session
                 .run(ort::inputs![self.input_name.as_str() => input_tensor])
-                .map_err(crate::models::embeddings_onnx::map_ort_error)?;
+                .map_err(crate::models::embeddings_onnx::map_ort_error("infer"))?;
 
             // Guard `outputs[0]` — see equivalent guard in
             // `OnnxTextEmbedder::embed_text`. A bare index panic
@@ -627,9 +631,9 @@ impl ImageEmbedder for OnnxImageEmbedder {
                         .to_string(),
                 )));
             }
-            let (out_shape, hidden) = outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(crate::models::embeddings_onnx::map_ort_error)?;
+            let (out_shape, hidden) = outputs[0].try_extract_tensor::<f32>().map_err(
+                crate::models::embeddings_onnx::map_ort_error("output_extract"),
+            )?;
             // MobileCLIP-S2 image_features shape is `[1, hidden]`
             // (post-projection); the visual encoder's pre-
             // projection last_hidden_state would be `[1, seq,
