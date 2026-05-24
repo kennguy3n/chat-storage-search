@@ -100,7 +100,8 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 instant-distance = "0.6"
 ort = { workspace = true, optional = true }
 # HuggingFace `tokenizers` backs the XLM-R inference loop's
-# tokenization step (`OnnxTextEmbedder::embed`). Optional + only
+# tokenization step (`OnnxTextEmbedder::embed_text`, which also
+# satisfies the `TextEmbedder::embed` trait method). Optional + only
 # enabled under the `onnx-runtime` feature so the default workspace
 # build does not pull the tokenizer dep tree. Features are pruned via
 # the workspace pin (`default-features = false`); see the workspace

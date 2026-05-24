@@ -899,6 +899,33 @@ impl OnnxTextEmbedder {
     }
 }
 
+// `TextEmbedder` trait impl — wires `OnnxTextEmbedder` into the
+// `Arc<dyn TextEmbedder>` slot in `CoreImpl` so the production
+// search / guardrail pipelines can swap the test
+// `MockTextEmbedder` for the real XLM-R session without any
+// adapter at the call site.
+//
+// The trait method is `embed`; the inherent method is
+// `embed_text`. Both have identical signatures and the trait
+// impl just forwards. We keep `embed_text` as the inherent name
+// because it pairs symmetrically with the upcoming
+// `OnnxImageEmbedder::embed_image` (CLIP-S2 follow-up) and
+// `OnnxAudioEmbedder::embed_audio` (Whisper follow-up) — all
+// three then satisfy their respective `TextEmbedder` /
+// `ImageEmbedder` / `AudioEmbedder` traits via thin forwards.
+//
+// The impl is unconditional (compiled for both
+// `feature = "onnx-runtime"` and `not(feature = "onnx-runtime")`):
+// the feature-on path delegates to the real inference loop, the
+// feature-off path delegates to the `NotImplemented` stub. This
+// keeps `Arc<dyn TextEmbedder>` injection wiring identical
+// across the two configurations.
+impl crate::models::embeddings::TextEmbedder for OnnxTextEmbedder {
+    fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
+        self.embed_text(text)
+    }
+}
+
 // Sanity tests for the always-compiled stub variant — the real
 // inference loop tests live behind `cfg(feature = "onnx-runtime")`
 // in the model-manager integration suite.
