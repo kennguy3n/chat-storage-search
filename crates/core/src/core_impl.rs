@@ -2767,7 +2767,7 @@ impl CoreImpl {
     ///   `"ocr"`, holding the concatenated recognized-text for
     ///   the asset, the first non-`None` language tag the
     ///   bridge reported, and the mean per-region confidence.
-    /// * `search_fts` and `search_fuzzy`, keyed by the audio
+    /// * `search_fts` and `search_fuzzy`, keyed by the image
     ///   message's `message_id` so an OCR'd screenshot ranks
     ///   alongside text bodies, captions, transcripts, and
     ///   document pages.
