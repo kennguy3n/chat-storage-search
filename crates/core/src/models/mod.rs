@@ -51,6 +51,7 @@ pub mod resource_gate;
 pub mod video;
 pub mod whisper;
 pub mod whisper_audio;
+pub mod whisper_onnx;
 
 /// On-device ML error type wrapped by [`crate::Error::Model`].
 ///

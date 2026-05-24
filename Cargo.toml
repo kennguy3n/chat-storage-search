@@ -47,3 +47,16 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "n
 # Rust — no native libs to link — so it compiles cleanly for every
 # cross-target (Linux/macOS/Windows/iOS/Android).
 rustfft = { version = "6.2", default-features = false }
+
+# HuggingFace `tokenizers` — backs both the XLM-R inference loop
+# (`crates/core/src/models/embeddings_onnx.rs`) and the Whisper
+# inference loop (`crates/core/src/models/whisper_onnx.rs`).
+# Both ONNX exports ship a HuggingFace-compatible `tokenizer.json`
+# next to the `.onnx` artifact, so the same `Tokenizer::from_file`
+# entry point loads either model's vocab + merges + special tokens.
+# `default-features = false` drops the `progressbar` + `http`
+# features we don't need on-device; `onig` is the Oniguruma regex
+# backend the GPT-2 byte-level pre-tokeniser uses for Whisper, and
+# is also the dependency XLM-R selects via its sentencepiece
+# normaliser path inside `tokenizers/src/utils/mod.rs`.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
