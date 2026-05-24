@@ -1103,7 +1103,19 @@ mod with_ort {
                     ),
                 }));
             }
-            Ok(data.to_vec())
+            // Greedy autoregressive decoding only ever consumes
+            // the logits row at position `prefix_len - 1`. Copy
+            // just that row out so callers get the contract the
+            // doc comment promises (`vocab_size` floats) and the
+            // per-step transient allocation stays O(vocab_size)
+            // instead of O(prefix_len * vocab_size). Indexing is
+            // safe because we already validated
+            // `data.len() == prefix_len * vocab_size` above and
+            // `prefix_len >= 1` (the decoder is only called with
+            // non-empty prefixes — see callers in `transcribe` /
+            // `detect_language`).
+            let last_row_start = (prefix_len - 1) * self.vocab_size;
+            Ok(data[last_row_start..last_row_start + self.vocab_size].to_vec())
         }
 
         /// Whisper-style language detection.
@@ -1123,11 +1135,14 @@ mod with_ort {
         fn detect_language(&self, hidden_tensor: &Tensor<f32>) -> Result<u32> {
             let probe_prefix = [self.special.start_of_transcript];
             let logits = self.run_decoder(&probe_prefix, hidden_tensor)?;
-            // `run_decoder` now returns ONLY the last-position
-            // row (`vocab_size` floats). With a single-token
-            // `[SOT]` prefix, the last position IS position 0, so
-            // the returned buffer is the row we need verbatim —
-            // no `&logits[..vocab_size]` slice required.
+            // `run_decoder` returns ONLY the last-position row
+            // (`vocab_size` floats) — regardless of `prefix_len`
+            // it slices `data[(prefix_len - 1) * vocab_size ..
+            // prefix_len * vocab_size]` before returning. For
+            // language detection the prefix is the single token
+            // `[SOT]`, so `prefix_len == 1` and the slice is the
+            // position-0 row; no further `&logits[..vocab_size]`
+            // narrowing is required.
             let row: &[f32] = &logits;
             let language_ids: Vec<u32> = self.special.languages.values().copied().collect();
             super::argmax_language_token(row, &language_ids).ok_or_else(|| {
