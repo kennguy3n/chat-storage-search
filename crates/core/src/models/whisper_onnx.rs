@@ -844,9 +844,30 @@ mod with_ort {
                 })?
                 .1;
             let (shape, data) = out.try_extract_tensor::<f32>().map_err(map_ort_error)?;
-            // `Shape` derefs to `&[i64]` so `shape_inner_dim`
-            // gets the slice it needs without an explicit `&`.
-            let d_model_dim = shape_inner_dim(shape.as_ref())?;
+            // Encoder output must be exactly `[1, WHISPER_ENCODER_FRAMES,
+            // d_model]` — 3 dims, batch == 1, time axis == 1500. The
+            // total-element-count check below catches "data length
+            // disagrees with shape", but only AFTER asserting the
+            // rank+leading-dims pin down the (batch, time) axes the
+            // greedy loop later assumes. Without the rank check a
+            // tensor shaped `[N, T, d_model]` with N*T == 1500 (e.g.
+            // `[3, 500, d_model]`) would slip through the length
+            // equality, mis-layout the hidden states, and corrupt the
+            // decoder cross-attention silently.
+            let shape_slice: &[i64] = shape.as_ref();
+            if shape_slice.len() != 3
+                || shape_slice[0] != 1
+                || shape_slice[1] != WHISPER_ENCODER_FRAMES as i64
+            {
+                return Err(crate::Error::Model(ModelError::Ort {
+                    op: "whisper_encoder_output_shape",
+                    detail: format!(
+                        "encoder output expected `[1, {}, d_model]`, got `{:?}`",
+                        WHISPER_ENCODER_FRAMES, shape
+                    ),
+                }));
+            }
+            let d_model_dim = shape_inner_dim(shape_slice)?;
             let expected_len =
                 WHISPER_ENCODER_FRAMES
                     .checked_mul(d_model_dim)
