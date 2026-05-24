@@ -392,6 +392,15 @@ pub fn create_xlmr_session_with_ep(
 // canonical [`crate::Error::Model`] variant. The shim is a free
 // function so the lifetime contract — "wrapping and inference
 // share one error path" — is enforced at compile time.
+// What lives outside the feature gate (and is therefore unit-
+// testable on every target) is the error-mapping shim:
+// [`map_ort_error`] turns any `ort::Error` into the canonical
+// [`crate::Error::Model`] variant with a typed
+// [`crate::models::ModelError::Ort { op, detail }`] payload.
+// The shim is a curried free function so each call site supplies
+// a stable `op` label (`"session_create"`, `"infer"`,
+// `"output_extract"`, …) that downstream telemetry can route on
+// without parsing the wrapped detail string.
 // ---------------------------------------------------------------------------
 
 /// Pad or truncate a tokenizer `(ids, mask)` pair to a fixed
@@ -534,19 +543,33 @@ pub fn l2_normalize_in_place(v: &mut [f32]) {
 #[cfg(feature = "onnx-runtime")]
 use crate::Result;
 
-/// Map an `ort::Error` to the canonical [`crate::Error::Model`]
-/// variant.
+/// Curried error-mapping shim that turns an `ort::Error` into the
+/// canonical [`crate::Error::Model`] variant with the typed
+/// [`crate::models::ModelError::Ort`] payload.
 ///
-/// Captures the upstream message verbatim so telemetry pipelines
-/// (and the bridge crates in `kennguy3n/slm-guardrail` /
-/// `kennguy3n/cv-guard`) can pattern-match on the `model:` prefix
-/// without parsing the wrapped substring. Always returns the
-/// `Model` variant; never `Storage` or `Search`, even if the
-/// upstream message mentions a database or query — the on-device
-/// ML pipeline is a single error domain at the public surface.
+/// `op` names the call site so telemetry pipelines (and the
+/// bridge crates in `kennguy3n/slm-guardrail` /
+/// `kennguy3n/cv-guard`) can route on the structured field
+/// instead of grepping a free-form string. Pass a stable static
+/// label per call site — `"session_create"` for session-builder
+/// errors, `"infer"` for `session.run` failures,
+/// `"output_extract"` for tensor-extraction failures,
+/// `"input_tensor_build"` for `Tensor::from_array` failures, etc.
+///
+/// Usage: `result.map_err(map_ort_error("infer"))?`.
+///
+/// Always returns the `Model` variant; never `Storage` or
+/// `Search`, even if the upstream message mentions a database or
+/// query — the on-device ML pipeline is a single error domain at
+/// the public surface.
 #[cfg(feature = "onnx-runtime")]
-pub(crate) fn map_ort_error(err: ort::Error) -> crate::Error {
-    crate::Error::Model(err.to_string().into())
+pub(crate) fn map_ort_error(op: &'static str) -> impl FnOnce(ort::Error) -> crate::Error {
+    move |err| {
+        crate::Error::Model(crate::models::ModelError::Ort {
+            op,
+            detail: err.to_string(),
+        })
+    }
 }
 
 /// Long-lived ONNX Runtime wrapper for the XLM-R text encoder.
@@ -652,7 +675,8 @@ impl OnnxTextEmbedder {
         model_path: &std::path::Path,
         tokenizer_path: &std::path::Path,
     ) -> Result<Self> {
-        let (session, report) = create_xlmr_session(model_path).map_err(map_ort_error)?;
+        let (session, report) =
+            create_xlmr_session(model_path).map_err(map_ort_error("session_create"))?;
         let tokenizer = load_xlmr_tokenizer(tokenizer_path)?;
         let pad_token_id = resolve_pad_token_id(&tokenizer);
         Ok(Self {
@@ -739,12 +763,12 @@ impl OnnxTextEmbedder {
         // than a heap clone.
         let ids_tensor =
             ort::value::Tensor::from_array((vec![1_i64, self.max_length as i64], input_ids))
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("input_tensor_build"))?;
         let mask_tensor = ort::value::Tensor::from_array((
             vec![1_i64, self.max_length as i64],
             attention_mask.clone(),
         ))
-        .map_err(map_ort_error)?;
+        .map_err(map_ort_error("input_tensor_build"))?;
 
         // Hold the session lock across `run` AND the tensor
         // extraction: `SessionOutputs<'s>` borrows from the
@@ -762,7 +786,7 @@ impl OnnxTextEmbedder {
                     "input_ids" => ids_tensor,
                     "attention_mask" => mask_tensor,
                 ])
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("infer"))?;
             // The XLM-R encoder export emits its last hidden
             // state as output 0 — different `optimum` /
             // `transformers` export passes name the tensor
@@ -786,7 +810,7 @@ impl OnnxTextEmbedder {
             }
             let (out_shape, hidden) = outputs[0]
                 .try_extract_tensor::<f32>()
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("output_extract"))?;
             if out_shape.len() != 3 || out_shape[0] != 1 {
                 return Err(crate::Error::Model(ModelError::Custom(format!(
                     "xlmr session returned unexpected output shape {out_shape:?}; expected [1, seq, hidden]"
