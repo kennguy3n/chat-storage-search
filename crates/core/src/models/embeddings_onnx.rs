@@ -778,6 +778,20 @@ impl OnnxTextEmbedder {
                     "xlmr session returned unexpected output shape {out_shape:?}; expected [1, seq, hidden]"
                 ))));
             }
+            // ORT resolves dynamic axes at inference time so we
+            // do not expect to see `-1` here, but defensive code:
+            // a future ORT release that surfaced an unresolved
+            // axis would silently wrap to `usize::MAX` under a
+            // bare `as usize`, and the downstream `checked_mul`
+            // in `mask_aware_mean_pool` would only fail with a
+            // generic shape-mismatch message. Surface the actual
+            // bad dimension instead.
+            if out_shape[1] < 0 || out_shape[2] < 0 {
+                return Err(crate::Error::Model(ModelError::Custom(format!(
+                    "xlmr session returned negative dimension in output shape {out_shape:?}; \
+                     expected fully resolved [1, seq, hidden]"
+                ))));
+            }
             let seq_len = out_shape[1] as usize;
             let hidden_size = out_shape[2] as usize;
             // Pin the hidden-size invariant inline. The
