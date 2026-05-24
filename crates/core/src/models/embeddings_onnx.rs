@@ -408,13 +408,22 @@ pub fn create_xlmr_session_with_ep(
 /// * pad with `pad_token_id` (and a zero attention mask) to fill
 ///   the gap when `ids.len() < max_length`.
 ///
-/// The function is total: it never panics on malformed inputs,
-/// silently clamps `max_length == 0` to one empty pair (so a
-/// downstream tensor-build does not see a zero-dimensional
-/// shape), and is robust to `ids.len() != mask.len()` by
-/// truncating to the shorter slice (the HuggingFace contract
-/// guarantees they are equal, but defensive code keeps fuzz /
-/// proptest input from triggering `Vec`-bound `panic`s).
+/// The function is total: it never panics on malformed inputs.
+/// In particular:
+///
+/// * `max_length == 0` returns `(Vec::new(), Vec::new())` — the
+///   caller is responsible for either rejecting this at the
+///   builder boundary (`OnnxTextEmbedder::with_max_length` panics
+///   on zero via `assert!`) or for handling the empty pair before
+///   passing it to a tensor-build call, since
+///   `ort::value::Tensor::from_array` does not accept a
+///   zero-dimensional shape. In the wired-up `embed_text` path
+///   this branch is unreachable because the constructor default
+///   is 128 and the builder rejects 0.
+/// * `ids.len() != mask.len()` is tolerated by truncating to the
+///   shorter slice (the HuggingFace contract guarantees they are
+///   equal, but defensive code keeps fuzz / proptest input from
+///   triggering `Vec`-bound `panic`s).
 pub fn pad_or_truncate_ids(
     ids: &[u32],
     mask: &[u32],
