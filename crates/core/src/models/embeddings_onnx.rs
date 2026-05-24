@@ -412,8 +412,16 @@ pub fn create_xlmr_session_with_ep(
 /// ONNX graph expects fixed `[1, max_length]` `int64` inputs, so
 /// we either:
 ///
-/// * truncate the suffix when `ids.len() > max_length` — mirroring
-///   the HuggingFace `truncation=True` default — OR
+/// * truncate the suffix when `ids.len() > max_length` — a
+///   defensive belt-and-braces for callers that hand us an
+///   already-too-long pair. The wired-up `embed_text` path
+///   configures `Tokenizer::with_truncation` so HuggingFace-style
+///   truncation runs *inside* the tokenizer before special-token
+///   post-processing, which means `<s>` and `</s>` are preserved
+///   and the input here is already at most `max_length`; this
+///   branch is therefore unreachable from `embed_text` and only
+///   fires when the helper is called standalone with a hand-
+///   crafted long input. OR
 /// * pad with `pad_token_id` (and a zero attention mask) to fill
 ///   the gap when `ids.len() < max_length`.
 ///
@@ -686,7 +694,16 @@ impl OnnxTextEmbedder {
         // unavoidable since the tokenizer cannot fail-validate the
         // model — but we no longer waste session-build work when
         // the artifact pair is incomplete on the tokenizer side.
-        let tokenizer = load_xlmr_tokenizer(tokenizer_path)?;
+        let mut tokenizer = load_xlmr_tokenizer(tokenizer_path)?;
+        // Configure tokenizer-side truncation so `encode` produces a
+        // sequence already capped at `DEFAULT_MAX_LENGTH` with the
+        // `<s>` / `</s>` special tokens preserved, matching the
+        // HuggingFace `truncation=True` reference flow. Without this,
+        // a manual suffix-truncate after `encode(text, true)` would
+        // drop the trailing `</s>` for inputs longer than
+        // `max_length`, producing embeddings that drift from a
+        // canonical reference run of the same model.
+        configure_xlmr_truncation(&mut tokenizer, Self::DEFAULT_MAX_LENGTH)?;
         let pad_token_id = resolve_pad_token_id(&tokenizer);
         let (session, report) =
             create_xlmr_session(model_path).map_err(map_ort_error("session_create"))?;
@@ -702,9 +719,24 @@ impl OnnxTextEmbedder {
     /// Replace the maximum input-token sequence length. Call this
     /// before the first `embed_text` to override the
     /// [`Self::DEFAULT_MAX_LENGTH`] default.
+    ///
+    /// Also re-configures the underlying tokenizer's truncation
+    /// limit so `encode` keeps the `<s>` / `</s>` special tokens for
+    /// long inputs (HuggingFace `truncation=True` parity).
     pub fn with_max_length(mut self, max_length: usize) -> Self {
         assert!(max_length > 0, "max_length must be > 0");
         self.max_length = max_length;
+        // Keep the tokenizer's truncation limit in sync with the
+        // session's `[1, max_length]` input shape so the encoded
+        // sequence is already capped at `max_length` with both
+        // special tokens preserved by the time it reaches
+        // `pad_or_truncate_ids`. Reconfiguration with valid params
+        // (max_length > 0, stride = 0, default strategy) cannot
+        // fail — the only documented failure mode is `stride >=
+        // effective_max_length`, which our hard-coded `stride = 0`
+        // makes unreachable — so `expect` is the right call here.
+        configure_xlmr_truncation(&mut self.tokenizer, max_length)
+            .expect("xlmr tokenizer truncation reconfig with valid params must not fail");
         self
     }
 
@@ -900,6 +932,37 @@ fn make_tokenizer_error(
 #[cfg(feature = "onnx-runtime")]
 fn load_xlmr_tokenizer(path: &std::path::Path) -> Result<tokenizers::Tokenizer> {
     tokenizers::Tokenizer::from_file(path).map_err(|e| make_tokenizer_error("from_file", e))
+}
+
+/// Configure tokenizer-side truncation so `encode(text, true)`
+/// produces a sequence already capped at `max_length` with the
+/// special tokens (`<s>` at the start, `</s>` at the end)
+/// preserved — matching HuggingFace's `truncation=True` default,
+/// which truncates raw tokens *before* the post-processor adds
+/// the special tokens, so the result for an over-long input is
+/// `[<s>, raw_0, …, raw_{max-3}, </s>]` rather than the
+/// `[<s>, raw_0, …, raw_{max-1}]` (no trailing `</s>`) that
+/// a naive suffix-truncate after `encode` would produce.
+///
+/// Centralised so [`OnnxTextEmbedder::new_with_tokenizer`] and
+/// [`OnnxTextEmbedder::with_max_length`] cannot drift in the
+/// `TruncationParams` they pass, and so the operation label
+/// passed to [`make_tokenizer_error`] stays consistent for
+/// telemetry routing.
+#[cfg(feature = "onnx-runtime")]
+fn configure_xlmr_truncation(
+    tokenizer: &mut tokenizers::Tokenizer,
+    max_length: usize,
+) -> Result<()> {
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            direction: tokenizers::TruncationDirection::Right,
+            max_length,
+            strategy: tokenizers::TruncationStrategy::LongestFirst,
+            stride: 0,
+        }))
+        .map_err(|e| make_tokenizer_error("with_truncation", e))?;
+    Ok(())
 }
 
 /// Compute the default `tokenizer.json` path co-located with
