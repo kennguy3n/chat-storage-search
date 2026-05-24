@@ -311,7 +311,13 @@ pub fn build_decoder_prefix(
 ///   `f32::NEG_INFINITY` before argmax. Typically the prefix
 ///   control tokens (`<|startoftranscript|>`, language tokens,
 ///   `<|notimestamps|>`, …) so the greedy decoder cannot emit
-///   them as content.
+///   them as content. **MUST be sorted in ascending order and
+///   deduplicated** — the membership test uses `binary_search`
+///   on this slice for O(log n) lookup per vocab position.
+///   `OnnxWhisperTranscriber::build_suppression_set` enforces
+///   this invariant via `sort_unstable() + dedup()` before
+///   passing the slice in; unit tests construct already-sorted
+///   slices directly.
 ///
 /// Returns the picked token id. Ties go to the lower id
 /// (`Vec::iter().enumerate()` natural order).
@@ -339,13 +345,22 @@ pub fn argmax_next_token(
     let mut best_idx = 0usize;
     let mut best_val = f32::NEG_INFINITY;
     for (idx, &v) in row.iter().enumerate() {
-        // Skip suppressed token ids. We pay the inner-loop
-        // membership cost (linear scan of a typically <10-element
-        // `suppress` slice) because materialising a HashSet here
-        // would dominate the cost of a single decode step. The
-        // suppression list is small and stable across the loop;
-        // tests pin its membership.
-        if suppress.iter().any(|&s| s as usize == idx) {
+        // Skip suppressed token ids via `binary_search` on the
+        // sorted-deduped `suppress` slice. For Whisper-base the
+        // suppression set is ~104 entries (4 control tokens +
+        // optionally `<|nospeech|>` + ~99 language tokens); a
+        // linear scan would be O(104) per vocab position, ~5 M
+        // comparisons per decode step (52k vocab × 104) × up to
+        // 448 decode steps = ~2.4 B comparisons per full
+        // transcription. `binary_search` cuts that to O(log₂
+        // 104) ≈ 7 comparisons per position, ~160 M total —
+        // ~15× speedup on the inner loop. The caller's contract
+        // (suppress is sorted-deduped) is enforced upstream by
+        // `build_suppression_set`. The `as u32` cast on `idx` is
+        // safe because `idx < vocab_size` and `vocab_size` came
+        // from `tokenizer.get_vocab_size(true)` which fits in
+        // u32 for every shipped Whisper variant.
+        if suppress.binary_search(&(idx as u32)).is_ok() {
             continue;
         }
         if v > best_val {
@@ -1468,6 +1483,32 @@ mod tests {
         let logits = vec![0.0_f32; 8];
         let pick = argmax_next_token(&logits, 3, 4, &[]);
         assert_eq!(pick, None);
+    }
+
+    #[test]
+    fn argmax_binary_search_pins_sorted_multi_id_suppression() {
+        // Pins the `binary_search` contract: with a sorted-deduped
+        // suppress slice carrying multiple ids, the right ids
+        // must be skipped and the picked id must come from the
+        // gaps. Mirrors `build_suppression_set`'s output shape
+        // (~104 ids in production; here we use a smaller stand-in
+        // to keep the test fast and readable).
+        //
+        // Vocab of 12. Suppress ids {0, 2, 4, 6, 8, 10} (every
+        // even id). Logits put their max at id 4 (12.0 —
+        // suppressed) with a strong second at id 7 (9.5 —
+        // emittable because 7 is odd). Picker MUST return 7, not
+        // 4 — confirming binary_search correctly rejects the
+        // suppressed-id max.
+        let mut logits = vec![0.0_f32; 12];
+        logits[4] = 12.0;
+        logits[7] = 9.5;
+        logits[10] = 11.0; // also suppressed
+        logits[3] = 1.5; // emittable but lower than 7
+                         // Suppress slice MUST be sorted ascending for binary_search.
+        let suppress: Vec<u32> = vec![0, 2, 4, 6, 8, 10];
+        let pick = argmax_next_token(&logits, 1, 12, &suppress).unwrap();
+        assert_eq!(pick, 7);
     }
 
     #[test]
