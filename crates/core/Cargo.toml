@@ -99,6 +99,14 @@ zstd = { version = "0.13", default-features = false }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 instant-distance = "0.6"
 ort = { workspace = true, optional = true }
+# Pure-Rust FFT, always compiled (no feature gate). Backs the
+# log-mel spectrogram in `crates/core/src/models/whisper_audio.rs`
+# — that module's mel filterbank, hanning window, and forward FFT
+# are pure CPU code (no ORT), so unit tests on every host
+# exercise the spectrogram path end-to-end. The future
+# `OnnxWhisperTranscriber` (`onnx-runtime` feature) reuses the
+# same `WhisperMelKernel` to feed its encoder input tensor.
+rustfft = { workspace = true }
 # production
 # HTTP transport. Pinned with `rustls-tls` so we don't drag in
 # system OpenSSL on iOS / Android / desktop builds. `blocking`

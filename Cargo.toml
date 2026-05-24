@@ -35,3 +35,15 @@ license = "LicenseRef-Proprietary"
 # bug in ort 2.0.0-rc.12 (`ort/src/ep/vitis.rs` references a field
 # that is not in `ort-sys` 2.0.0-rc.12's `OrtApi`).
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }
+
+# Pure-Rust FFT used by `crates/core/src/models/whisper_audio.rs` for
+# the log-mel spectrogram step of the Whisper inference loop. Pinned
+# at a single workspace version so the `whisper_audio` mel kernel
+# (no-feature, always compiled) and the future ORT-feature Whisper
+# wrapper (`OnnxWhisperTranscriber`) consume the same FFT planner.
+# `default-features = false` removes the optional `avx` runtime
+# dispatch (we run on aarch64 mobile too, where AVX is irrelevant and
+# the dispatch adds an unnecessary CPUID branch). The crate is pure
+# Rust — no native libs to link — so it compiles cleanly for every
+# cross-target (Linux/macOS/Windows/iOS/Android).
+rustfft = { version = "6.2", default-features = false }
