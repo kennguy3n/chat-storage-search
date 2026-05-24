@@ -241,14 +241,28 @@ impl WhisperSpecialTokens {
 /// Build the initial decoder input-ids prefix for one
 /// transcription pass.
 ///
-/// Whisper expects the prefix `[SOT, <|lang|>, <|task|>,
-/// <|notimestamps|>?]`. If `language` is `None` we drop the
-/// `<|lang|>` slot — Whisper will run language identification
-/// over the encoder hidden state at decode step 0 and fill the
-/// language token from its own argmax. (For our greedy
-/// implementation that just means the first emitted token IS
-/// the language token, which downstream callers can read off
-/// the result.)
+/// Whisper was trained on prefixes shaped
+/// `[SOT, <|lang|>, <|task|>, <|notimestamps|>?]`. The
+/// `<|lang|>` slot is mandatory in practice — Whisper's
+/// reference implementation always pre-detects the language
+/// via a separate single-step decoder pass and threads the
+/// resulting language token into this position before the
+/// real decode loop starts. Production callers in this crate
+/// follow the same protocol via
+/// [`OnnxWhisperTranscriber::detect_language`].
+///
+/// `language = None` is preserved as a low-level escape hatch
+/// for callers that intentionally want to omit the language
+/// slot (for example: external language detection that hasn't
+/// run yet, or custom decoder protocols). Note that omitting
+/// the language slot produces a prefix Whisper was NOT trained
+/// against (`[SOT, <|task|>, ...]`); the model will still
+/// decode but quality typically degrades. The greedy loop in
+/// this module suppresses every language token from the body
+/// argmax, so `language = None` will NOT cause the decoder to
+/// "auto-emit" a language token as the first body token —
+/// pre-detection via the dedicated path is the only way to
+/// recover a language code from Whisper.
 ///
 /// `with_timestamps = false` appends `<|notimestamps|>` so the
 /// decoder emits plain text tokens. With timestamps the prefix
@@ -339,6 +353,56 @@ pub fn argmax_next_token(
         return None;
     }
     Some(best_idx as u32)
+}
+
+/// Pure helper for Whisper-style language detection.
+///
+/// Whisper's reference implementation (`whisper.decoding.detect_language`)
+/// runs the decoder once with a prefix of just `[SOT]` (a single
+/// token), reads the position-0 logits, masks every token id
+/// that is NOT a language token to `-inf`, and argmaxes. This
+/// helper implements the masked argmax in pure Rust so the
+/// production transcribe pipeline can pre-resolve the language
+/// before the greedy decode loop starts (matching Whisper's
+/// training-time prefix layout `[SOT, <|lang|>, <|task|>,
+/// <|notimestamps|>?]`).
+///
+/// Inputs:
+///
+/// * `logits_row` — the position-0 logits row, length
+///   `vocab_size`. Callers extract this from the full decoder
+///   output (`logits[0..vocab_size]`).
+/// * `language_token_ids` — the set of valid language token
+///   ids (typically `special.languages.values()`). Tokens NOT
+///   in this set are masked to `-inf` before argmax.
+///
+/// Returns the picked language token id (which is guaranteed
+/// to be a member of `language_token_ids`), or `None` if
+/// either input is empty or every candidate id is out of
+/// range of the logits row.
+pub fn argmax_language_token(logits_row: &[f32], language_token_ids: &[u32]) -> Option<u32> {
+    if logits_row.is_empty() || language_token_ids.is_empty() {
+        return None;
+    }
+    let mut best_id: Option<u32> = None;
+    let mut best_val = f32::NEG_INFINITY;
+    for &id in language_token_ids {
+        let idx = id as usize;
+        if idx >= logits_row.len() {
+            // Defensive: silently skip ids past the logits row.
+            // This can only happen if `language_token_ids`
+            // disagrees with the decoder's vocab size — the
+            // caller's `vocab_size` invariant is the contract,
+            // we just don't panic if it is violated.
+            continue;
+        }
+        let v = logits_row[idx];
+        if v > best_val {
+            best_val = v;
+            best_id = Some(id);
+        }
+    }
+    best_id
 }
 
 // ---------------------------------------------------------------------------
@@ -804,26 +868,40 @@ mod with_ort {
             Ok(data.to_vec())
         }
 
-        /// Run the decoder once over the current prefix and the
-        /// encoder hidden-state buffer; return the logits as a
-        /// flat row-major `Vec<f32>` of length
-        /// `prefix.len() * vocab_size`.
-        fn run_decoder(
+        /// Wrap the encoder hidden-state buffer into an ORT
+        /// `Tensor<f32>` once per transcription. The decoder
+        /// re-runs many times (up to `max_decode_tokens`)
+        /// against the same hidden state, so we construct the
+        /// tensor once and pass it by reference each iteration
+        /// rather than copying the ~768 KB hidden state on every
+        /// greedy step.
+        fn build_hidden_tensor(
             &self,
-            prefix: &[u32],
-            encoder_hidden: &[f32],
+            encoder_hidden: Vec<f32>,
             encoder_d_model: usize,
-        ) -> Result<Vec<f32>> {
+        ) -> Result<Tensor<f32>> {
+            Tensor::from_array((
+                vec![1_i64, WHISPER_ENCODER_FRAMES as i64, encoder_d_model as i64],
+                encoder_hidden,
+            ))
+            .map_err(map_ort_error)
+        }
+
+        /// Run the decoder once over the current prefix and a
+        /// pre-built encoder hidden-state tensor; return the
+        /// logits as a flat row-major `Vec<f32>` of length
+        /// `prefix.len() * vocab_size`.
+        ///
+        /// `hidden_tensor` is borrowed (not consumed) so the
+        /// caller can reuse it across every greedy iteration
+        /// without paying the cost of copying the encoder
+        /// hidden state on each step.
+        fn run_decoder(&self, prefix: &[u32], hidden_tensor: &Tensor<f32>) -> Result<Vec<f32>> {
             // Whisper decoder expects `input_ids` as i64.
             let input_ids: Vec<i64> = prefix.iter().map(|&t| i64::from(t)).collect();
             let prefix_len = input_ids.len();
             let ids_tensor = Tensor::from_array((vec![1_i64, prefix_len as i64], input_ids))
                 .map_err(map_ort_error)?;
-            let hidden_tensor = Tensor::from_array((
-                vec![1_i64, WHISPER_ENCODER_FRAMES as i64, encoder_d_model as i64],
-                encoder_hidden.to_vec(),
-            ))
-            .map_err(map_ort_error)?;
 
             let mut decoder = self.decoder.lock().map_err(|_| {
                 crate::Error::Model(ModelError::LockPoisoned("whisper_decoder_session"))
@@ -862,6 +940,36 @@ mod with_ort {
             }
             Ok(data.to_vec())
         }
+
+        /// Whisper-style language detection.
+        ///
+        /// Runs the decoder once with a single-token prefix
+        /// `[SOT]`, reads the position-0 logits, and argmaxes
+        /// over the language token ids. This mirrors
+        /// `whisper.decoding.detect_language` and produces the
+        /// language token id that the production decode loop
+        /// then threads into its `[SOT, <|lang|>, <|task|>,
+        /// <|notimestamps|>?]` prefix.
+        ///
+        /// Returns a typed [`ModelError::Ort`] when the decoder
+        /// emits no language-token logits (degenerate model) so
+        /// callers can distinguish detection failure from
+        /// downstream decode failure in telemetry.
+        fn detect_language(&self, hidden_tensor: &Tensor<f32>) -> Result<u32> {
+            let probe_prefix = [self.special.start_of_transcript];
+            let logits = self.run_decoder(&probe_prefix, hidden_tensor)?;
+            // `run_decoder` already validated that `data.len()
+            // == prefix_len * vocab_size`; with a single-token
+            // prefix the position-0 row is the whole buffer.
+            let row = &logits[..self.vocab_size];
+            let language_ids: Vec<u32> = self.special.languages.values().copied().collect();
+            super::argmax_language_token(row, &language_ids).ok_or_else(|| {
+                crate::Error::Model(ModelError::Ort {
+                    op: "whisper_detect_language",
+                    detail: "decoder emitted no language-token logits during detection".into(),
+                })
+            })
+        }
     }
 
     impl WhisperTranscriber for OnnxWhisperTranscriber {
@@ -894,24 +1002,68 @@ mod with_ort {
             }
             let encoder_d_model = encoder_hidden.len() / WHISPER_ENCODER_FRAMES;
 
-            // 3. Build decoder prefix.
-            let language_token = self
-                .language
-                .as_deref()
-                .and_then(|code| self.special.language_token(code));
+            // 3. Wrap the encoder hidden state in an ORT tensor
+            //    ONCE. The decoder re-runs up to
+            //    `max_decode_tokens` times against the same
+            //    hidden state, so building the tensor inside the
+            //    loop would copy ~768 KB of f32s per iteration
+            //    (up to ~340 MB of transient allocations for a
+            //    full 448-token decode against whisper-base).
+            let hidden_tensor = self.build_hidden_tensor(encoder_hidden, encoder_d_model)?;
+
+            // 4. Resolve the language token.
+            //
+            //    Whisper was trained with prefixes shaped
+            //    `[SOT, <|lang|>, <|task|>, <|notimestamps|>?]`
+            //    — the language slot is mandatory in practice.
+            //    If the caller pinned a language via
+            //    [`OnnxWhisperTranscriber::with_language`] we
+            //    use that; otherwise we run Whisper's standard
+            //    detection protocol (one decoder pass over a
+            //    `[SOT]` prefix, argmax over language tokens at
+            //    position 0).
+            let (language_token, detected_language) = if let Some(code) = self.language.as_deref() {
+                // `with_language` rejects unknown codes at
+                // configure-time, so this lookup cannot fail
+                // here. We still surface a typed error
+                // defensively rather than panic if the
+                // tokenizer was swapped out between
+                // `with_language` and `transcribe`.
+                let id = self.special.language_token(code).ok_or_else(|| {
+                    crate::Error::Model(ModelError::Tokenizer {
+                        op: "whisper_transcribe_language",
+                        detail: format!(
+                            "pinned language `{code}` not exposed by the loaded Whisper vocab"
+                        ),
+                    })
+                })?;
+                (id, Some(code.to_string()))
+            } else {
+                let id = self.detect_language(&hidden_tensor)?;
+                let code = self
+                    .special
+                    .languages
+                    .iter()
+                    .find(|(_, &v)| v == id)
+                    .map(|(code, _)| code.clone());
+                (id, code)
+            };
+
+            // 5. Build the real decode prefix, now that we have
+            //    a language token in hand.
             let suppress = self.build_suppression_set();
             let mut prefix = super::build_decoder_prefix(
                 &self.special,
-                language_token,
+                Some(language_token),
                 self.task,
                 self.with_timestamps,
             );
             let prefix_initial_len = prefix.len();
 
-            // 4. Greedy decode loop.
+            // 6. Greedy decode loop.
             let mut emitted: Vec<u32> = Vec::new();
             for _ in 0..self.max_decode_tokens {
-                let logits = self.run_decoder(&prefix, &encoder_hidden, encoder_d_model)?;
+                let logits = self.run_decoder(&prefix, &hidden_tensor)?;
                 let next =
                     super::argmax_next_token(&logits, prefix.len(), self.vocab_size, &suppress)
                         .ok_or_else(|| {
@@ -929,24 +1081,7 @@ mod with_ort {
                 prefix.push(next);
             }
 
-            // 5. Resolve detected language. If the user pinned a
-            // language we report it back verbatim; otherwise we
-            // try to read whichever language token Whisper put
-            // at the start of the emitted stream (Whisper's
-            // greedy decoder always emits the language token as
-            // the first output past the prefix when the prefix
-            // does not contain one already).
-            let detected_language = self.language.clone().or_else(|| {
-                emitted.first().and_then(|&tok| {
-                    self.special
-                        .languages
-                        .iter()
-                        .find(|(_, &id)| id == tok)
-                        .map(|(code, _)| code.clone())
-                })
-            });
-
-            // 6. Decode token stream → text + segments.
+            // 7. Decode token stream → text + segments.
             let tokenizer = &self.tokenizer;
             let decode =
                 |body: &[u32]| -> String { tokenizer.decode(body, true).unwrap_or_default() };
@@ -996,6 +1131,14 @@ mod with_ort {
         /// `<|endoftext|>`. We allow `<|endoftext|>` so the
         /// decoder can terminate; we allow timestamp tokens so
         /// timestamp-mode decoding still works.
+        ///
+        /// Note: language tokens are unconditionally suppressed
+        /// here. The production transcribe pipeline pre-resolves
+        /// the language via [`OnnxWhisperTranscriber::detect_language`]
+        /// (or via the explicit `with_language` setter) and
+        /// threads the resulting language token into the decoder
+        /// prefix. Once language is in the prefix it should never
+        /// appear in the body, so the suppression is correct.
         fn build_suppression_set(&self) -> Vec<u32> {
             let mut suppress = vec![
                 self.special.start_of_transcript,
@@ -1245,7 +1388,13 @@ mod tests {
     }
 
     #[test]
-    fn decoder_prefix_no_language_autodetect() {
+    fn decoder_prefix_omits_language_slot_when_none() {
+        // Low-level escape hatch: `build_decoder_prefix` still
+        // accepts `language = None` for callers that intend to
+        // omit the slot. Production transcribe NEVER uses this
+        // path — it pre-detects via `detect_language` and always
+        // passes `Some(lang)`. The test pins the documented
+        // escape-hatch behaviour.
         let timestamp_begin = 50_363;
         let added = synthetic_added_tokens(timestamp_begin);
         let s = WhisperSpecialTokens::resolve_from_added_tokens(&added).unwrap();
@@ -1292,6 +1441,47 @@ mod tests {
         let logits = vec![0.0_f32; 8];
         let pick = argmax_next_token(&logits, 3, 4, &[]);
         assert_eq!(pick, None);
+    }
+
+    #[test]
+    fn argmax_language_token_picks_highest_scoring_language() {
+        // Vocab of 12. Language tokens at ids {3, 7, 10}.
+        // Whisper would put `<|en|>` at the highest logit
+        // (here id 7, score 5.0); plain content tokens have
+        // higher absolute scores but must be ignored because
+        // they're not in `language_token_ids`.
+        let mut row = vec![0.0_f32; 12];
+        row[0] = 9.9; // content
+        row[3] = 2.0; // language
+        row[5] = 8.5; // content
+        row[7] = 5.0; // language — winner
+        row[10] = 1.0; // language
+        let pick = argmax_language_token(&row, &[3, 7, 10]).unwrap();
+        assert_eq!(pick, 7);
+    }
+
+    #[test]
+    fn argmax_language_token_returns_none_for_empty_inputs() {
+        assert_eq!(argmax_language_token(&[], &[3, 7]), None);
+        assert_eq!(argmax_language_token(&[1.0, 2.0, 3.0], &[]), None);
+    }
+
+    #[test]
+    fn argmax_language_token_skips_ids_past_logits_row() {
+        // ids 3 and 100 both reference into a 5-wide row;
+        // id 100 is past the row and must be silently skipped
+        // (defensive — vocab mismatches should not panic).
+        let row = vec![0.0_f32, 1.0, 2.0, 7.0, 3.0];
+        let pick = argmax_language_token(&row, &[3, 100]).unwrap();
+        assert_eq!(pick, 3);
+    }
+
+    #[test]
+    fn argmax_language_token_returns_none_when_every_id_out_of_range() {
+        let row = vec![0.0_f32; 5];
+        // Every candidate is past the row → no in-range
+        // language id → None.
+        assert_eq!(argmax_language_token(&row, &[10, 20, 30]), None);
     }
 
     #[test]
