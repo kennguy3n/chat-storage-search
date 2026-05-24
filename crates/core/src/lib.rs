@@ -698,24 +698,31 @@ pub struct OffloadResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResult {
     /// UUID of the manifest the restore was driven from.
+    #[serde(default)]
     pub manifest_id: Option<Uuid>,
     /// Monotonic generation of the restored manifest.
+    #[serde(default)]
     pub manifest_generation: u64,
     /// Number of segments fetched from the backup sink and
     /// successfully decrypted into the local skeleton index.
+    #[serde(default)]
     pub segments_restored: u32,
     /// Number of `(conversation_id, conversation_created)` rows
     /// reconstructed from the backup event journal.
+    #[serde(default)]
     pub conversations_restored: u32,
     /// Number of timeline skeleton placeholders the pipeline
     /// hydrated into the local store.
+    #[serde(default)]
     pub skeletons_restored: u32,
     /// Number of recent message bodies the pipeline rehydrated
     /// inside the recency window.
+    #[serde(default)]
     pub recent_bodies_restored: u32,
     /// Terminal restore-state machine value reached. `None` if
     /// the orchestration short-circuited before any forward
     /// transition.
+    #[serde(default)]
     pub final_state: Option<crate::local_store::state_machines::RestoreState>,
 }
 
@@ -1222,6 +1229,28 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let back: RestoreResult = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn restore_result_tolerates_partial_json_via_serde_default() {
+        // Matches the contract `BackupResult` already honours
+        // (`#[serde(default)]` on every counter field): a bridge
+        // consumer that round-trips a partial / older JSON payload
+        // must not get a hard deserialization error just because a
+        // new field was added — the missing field should fall back
+        // to its `Default::default()` value. Pinning this in a
+        // test means a future contributor cannot silently drop
+        // `#[serde(default)]` from one of the fields and break
+        // wire compatibility.
+        let json = r#"{"segments_restored":3}"#;
+        let back: RestoreResult = serde_json::from_str(json).unwrap();
+        assert_eq!(back.segments_restored, 3);
+        assert_eq!(back.manifest_id, None);
+        assert_eq!(back.manifest_generation, 0);
+        assert_eq!(back.conversations_restored, 0);
+        assert_eq!(back.skeletons_restored, 0);
+        assert_eq!(back.recent_bodies_restored, 0);
+        assert_eq!(back.final_state, None);
     }
 
     #[test]

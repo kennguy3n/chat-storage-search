@@ -5582,9 +5582,21 @@ impl CoreImpl {
             source.now_ms,
             source.recency_window_ms,
         )?;
-        // Zeroise the shim key — `KeyMaterial::from_bytes` does
-        // not currently zeroise on drop, but we no longer need the
-        // shim once the pipeline returns.
+        // Belt-and-suspenders shim-key cleanup.
+        //
+        // `shim_key` (a `KeyMaterial`) zeroes on drop via the
+        // `#[derive(ZeroizeOnDrop)]` on
+        // `crate::crypto::key_hierarchy::KeyMaterial`, so the
+        // copy held in `shim_key` is scrubbed when the binding
+        // goes out of scope. The local `shim_key_bytes: [u8; 32]`
+        // is a plain stack array though — it would otherwise sit
+        // in the stack frame as live key material until the
+        // frame is reused. Scrub it explicitly so an attacker
+        // who later reads the stack (e.g., via core dump or a
+        // mis-zeroed allocator) does not recover the shim key.
+        // The shim is only the *transport* key between segment
+        // re-seal and `RestorePipeline::run`; `K_backup_root`
+        // and `K_backup_segment(*)` never escape this function.
         shim_key_bytes.fill(0);
 
         let conversations_restored = u32::try_from(summary.conversations.len()).unwrap_or(u32::MAX);
