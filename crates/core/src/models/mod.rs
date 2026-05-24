@@ -44,6 +44,7 @@ pub mod document;
 pub mod embeddings;
 pub mod embeddings_onnx;
 pub mod ep_tuning;
+pub mod http_downloader;
 pub mod model_manager;
 pub mod ocr;
 pub mod resource_gate;
