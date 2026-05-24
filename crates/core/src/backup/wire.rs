@@ -81,6 +81,24 @@ pub const SEGMENT_BUNDLE_MAGIC: &[u8; 16] = b"KCHAT_BAK_S_V1\0\0";
 /// the version they were compiled against.
 pub const BUNDLE_VERSION: u16 = 1;
 
+/// Hard cap on the byte length of a single [`SealedManifestBundle`]
+/// before CBOR decoding. A manifest body is small in practice (a
+/// list of segment refs + signatures + a short ciphertext over the
+/// CBOR-encoded manifest), so 1 MiB is generous yet bounded — it
+/// prevents a malicious or corrupted sink from forcing the decoder
+/// to allocate gigabytes for `ciphertext` / `manifest` before the
+/// magic / version check fires. Defence in depth: the SHA-256 +
+/// signature verification downstream would also reject, but this
+/// guard fails fast before allocation pressure builds up.
+pub const MAX_MANIFEST_BUNDLE_BYTES: usize = 1 << 20;
+
+/// Hard cap on the byte length of a single [`SealedSegmentBundle`]
+/// before CBOR decoding. Segments hold zstd-compressed CBOR events
+/// — production runs target a few thousand events per segment, so
+/// 64 MiB is well above the realistic upper bound while still
+/// preventing unbounded allocation from a crafted blob.
+pub const MAX_SEGMENT_BUNDLE_BYTES: usize = 64 << 20;
+
 /// CBOR-serializable on-wire bundle for a sealed backup manifest.
 ///
 /// Carries the cleartext [`BackupManifest`] (signatures live
@@ -141,7 +159,23 @@ impl SealedManifestBundle {
 
     /// CBOR-decode a manifest bundle produced by
     /// [`Self::encode`]. Rejects on magic / version mismatch.
+    ///
+    /// Inputs longer than [`MAX_MANIFEST_BUNDLE_BYTES`] are
+    /// rejected before any CBOR decoding so a malicious or
+    /// corrupted sink cannot force the decoder to allocate
+    /// unbounded memory for the `ciphertext` / `manifest` fields
+    /// ahead of the magic / version checks.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_MANIFEST_BUNDLE_BYTES {
+            return Err(Error::Storage(
+                format!(
+                    "manifest bundle: input {} bytes exceeds {}-byte cap",
+                    bytes.len(),
+                    MAX_MANIFEST_BUNDLE_BYTES,
+                )
+                .into(),
+            ));
+        }
         let bundle: Self = crate::cbor::from_slice(bytes)
             .map_err(|e| Error::Storage(format!("manifest bundle CBOR decode: {e}").into()))?;
         if bundle.magic != *MANIFEST_BUNDLE_MAGIC {
@@ -273,7 +307,23 @@ impl SealedSegmentBundle {
 
     /// CBOR-decode a segment bundle produced by
     /// [`Self::encode`]. Rejects on magic / version mismatch.
+    ///
+    /// Inputs longer than [`MAX_SEGMENT_BUNDLE_BYTES`] are
+    /// rejected before any CBOR decoding so a malicious or
+    /// corrupted sink cannot force the decoder to allocate
+    /// unbounded memory for the `ciphertext` field ahead of the
+    /// magic / version checks.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_SEGMENT_BUNDLE_BYTES {
+            return Err(Error::Storage(
+                format!(
+                    "segment bundle: input {} bytes exceeds {}-byte cap",
+                    bytes.len(),
+                    MAX_SEGMENT_BUNDLE_BYTES,
+                )
+                .into(),
+            ));
+        }
         let bundle: Self = crate::cbor::from_slice(bytes)
             .map_err(|e| Error::Storage(format!("segment bundle CBOR decode: {e}").into()))?;
         if bundle.magic != *SEGMENT_BUNDLE_MAGIC {
@@ -330,16 +380,29 @@ mod tests {
     use crate::crypto::signing::HybridSigningKey;
     use rand::rngs::OsRng;
 
-    fn fresh_keys() -> (KeyMaterial, KeyMaterial, KeyMaterial) {
+    /// Build a coherent producer-side fixture: a fresh
+    /// `backup_root`, a `(segment_id, k_seg)` pair derived from it
+    /// so `derive_backup_segment(root, segment_id) == k_seg`, plus
+    /// a per-test `k_man`. Tests pair `segment_id` and `k_seg`
+    /// together via [`sample_segment`] below so the seal honours
+    /// the same id contract production code uses.
+    fn fresh_keys() -> (KeyMaterial, Uuid, KeyMaterial, KeyMaterial) {
         let identity = KeyMaterial::from_bytes([0x11; 32]);
         let backup_root = derive_backup_root(&identity).expect("derive backup root");
         let segment_id = Uuid::now_v7();
         let k_seg = derive_backup_segment(&backup_root, &segment_id.into_bytes()).expect("seg key");
         let k_man = derive_backup_manifest(&backup_root, b"wire-test").expect("man key");
-        (backup_root, k_seg, k_man)
+        (backup_root, segment_id, k_seg, k_man)
     }
 
-    fn sample_segment(k_seg: &KeyMaterial) -> BuiltBackupSegment {
+    /// Seal a single-event segment under a caller-supplied id +
+    /// key pair. The fixture mirrors the production contract: the
+    /// id stamped into the on-wire bundle MUST be the same id the
+    /// `k_seg` was derived from, otherwise a future contributor
+    /// adding a `derive_backup_segment(root, segment_id) == k_seg`
+    /// assertion would see the segment fail validation despite the
+    /// wire round-trip working.
+    fn sample_segment(segment_id: Uuid, k_seg: &KeyMaterial) -> BuiltBackupSegment {
         let event = BackupEvent {
             event_type: BackupEventType::MessageReceived,
             conversation_id: Some(Uuid::now_v7()),
@@ -348,11 +411,12 @@ mod tests {
             created_at_ms: 1_777_000_000_000,
         };
         BackupSegmentBuilder::new()
-            .build_segment(
+            .build_segment_with_id(
                 BackupSegmentBuildRequest {
                     events: vec![event],
                     segment_type: SegmentType::Events,
                 },
+                segment_id,
                 k_seg,
             )
             .expect("seal segment")
@@ -360,8 +424,8 @@ mod tests {
 
     #[test]
     fn segment_bundle_round_trips_through_cbor() {
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         let bytes = bundle.encode().unwrap();
         let back = SealedSegmentBundle::decode(&bytes).unwrap();
@@ -371,8 +435,8 @@ mod tests {
 
     #[test]
     fn segment_bundle_rejects_wrong_magic() {
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let mut bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         bundle.magic = *b"NOT_KCHAT_V1\0\0\0\0";
         let bytes = bundle.encode().unwrap();
@@ -382,8 +446,8 @@ mod tests {
 
     #[test]
     fn segment_bundle_rejects_wrong_version() {
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let mut bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         bundle.version = BUNDLE_VERSION + 1;
         let bytes = bundle.encode().unwrap();
@@ -393,8 +457,8 @@ mod tests {
 
     #[test]
     fn segment_bundle_wrap_unwrap_round_trip_recovers_key() {
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         let recovered = bundle.unwrap_segment_key(&backup_root).unwrap();
         assert_eq!(recovered.as_bytes(), k_seg.as_bytes());
@@ -402,8 +466,8 @@ mod tests {
 
     #[test]
     fn segment_bundle_wrong_root_rejects_unwrap() {
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         let wrong_root = KeyMaterial::from_bytes([0x22; 32]);
         let err = bundle.unwrap_segment_key(&wrong_root).unwrap_err();
@@ -412,8 +476,8 @@ mod tests {
 
     #[test]
     fn manifest_bundle_round_trips_through_cbor() {
-        let (_, k_seg, k_man) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (_, segment_id, k_seg, k_man) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let mut rng = OsRng;
         let signing = HybridSigningKey::generate(&mut rng);
         let sealed = build_backup_manifest(
@@ -448,8 +512,8 @@ mod tests {
         // merkle_root, so any CBOR roundtrip that mangles them
         // would surface as an "xchacha20-poly1305 open failed"
         // even though the magic / version checks pass).
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let bundle = SealedSegmentBundle::from_built(&built, &k_seg, &backup_root).unwrap();
         let bytes = bundle.encode().unwrap();
         let back = SealedSegmentBundle::decode(&bytes).unwrap();
@@ -476,8 +540,8 @@ mod tests {
         // [`BackupManifestBuildRequest::manifest_id`] so the
         // builder seals under the same key the restoring side
         // will derive from `bundle.manifest.manifest_id`.
-        let (backup_root, k_seg, _) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (backup_root, segment_id, k_seg, _) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let mut rng = OsRng;
         let signing = HybridSigningKey::generate(&mut rng);
         let device_id = "device-e2e-test";
@@ -521,8 +585,8 @@ mod tests {
 
     #[test]
     fn manifest_bundle_rejects_wrong_magic() {
-        let (_, k_seg, k_man) = fresh_keys();
-        let built = sample_segment(&k_seg);
+        let (_, segment_id, k_seg, k_man) = fresh_keys();
+        let built = sample_segment(segment_id, &k_seg);
         let mut rng = OsRng;
         let signing = HybridSigningKey::generate(&mut rng);
         let sealed = build_backup_manifest(
@@ -544,5 +608,38 @@ mod tests {
         let bytes = bundle.encode().unwrap();
         let err = SealedManifestBundle::decode(&bytes).unwrap_err();
         assert!(format!("{err}").contains("magic mismatch"));
+    }
+
+    #[test]
+    fn manifest_bundle_decode_rejects_oversized_input_before_cbor() {
+        // Defence in depth against a malicious sink shipping a
+        // multi-MiB CBOR blob: `decode` must reject the input on
+        // length alone, before ciborium walks the bytes and tries
+        // to allocate `ciphertext` / `manifest` from a tampered
+        // length header. The body bytes here are intentionally
+        // garbage — the cap check fires first.
+        let oversized = vec![0u8; MAX_MANIFEST_BUNDLE_BYTES + 1];
+        let err = SealedManifestBundle::decode(&oversized).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("byte cap"),
+            "expected size-cap error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn segment_bundle_decode_rejects_oversized_input_before_cbor() {
+        // Symmetric to the manifest size-cap guard. Uses a one-
+        // page buffer rather than the full cap value to keep the
+        // test fast, exploiting the fact that the check is
+        // strictly `>`: a vector exactly `MAX + 1` bytes long is
+        // rejected without touching the CBOR decoder.
+        let oversized = vec![0u8; MAX_SEGMENT_BUNDLE_BYTES + 1];
+        let err = SealedSegmentBundle::decode(&oversized).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("byte cap"),
+            "expected size-cap error, got: {msg}"
+        );
     }
 }

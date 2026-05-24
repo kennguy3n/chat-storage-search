@@ -20,8 +20,11 @@
 //! `Mutex<BTreeMap<…>>`. It is not a load test target — its
 //! storage is unbounded, and concurrent uploads serialise on the
 //! mutex.
-
-#![cfg(any(test, feature = "test-support"))]
+//!
+//! Module gating lives on the `pub mod memory` declaration in
+//! [`super::mod`] — there is no inner `#![cfg]` here because that
+//! would be belt-and-suspenders relative to the outer gate (the
+//! compiler never loads this file in non-test builds).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
