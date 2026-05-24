@@ -478,6 +478,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &signing,
             &k_man,

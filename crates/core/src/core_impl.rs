@@ -325,6 +325,25 @@ pub struct CoreImpl {
     /// coordinator. See `crate::backup::coordinator` for the
     /// per-method documentation.
     backup: crate::backup::coordinator::Coordinator,
+    /// backup sink bridge. Write-once via
+    /// [`CoreImpl::install_backup_sink`] by the platform glue
+    /// (Android cloud-backup, iCloud, ZK Object Fabric). The
+    /// installed sink fields the
+    /// `upload_backup_segment` / `upload_backup_manifest`
+    /// uploads emitted by [`KChatCore::run_incremental_backup`]
+    /// and the symmetric `fetch_*` reads driven by
+    /// [`KChatCore::restore_from_backup`]. Held in
+    /// [`OnceLock`] so the segment / manifest upload paths take
+    /// a lock-free atomic load to discover the sink; the
+    /// underlying transport (CloudKit container, S3 bucket, …)
+    /// is itself a per-process singleton that cannot be swapped
+    /// live without invalidating in-flight upload identifiers.
+    /// When not installed, the upload paths silently skip the
+    /// transport call (the on-disk ledger is still authoritative
+    /// for compaction); the restore path returns
+    /// [`crate::local_store::StorageError::SubsystemNotInstalled`]
+    /// because there is no source to fetch sealed bytes from.
+    backup_sink: OnceLock<Arc<dyn crate::backup::sinks::BackupSink>>,
     /// background scheduler bridge. Write-once via
     /// [`CoreImpl::install_scheduler`] by the platform glue
     /// (Swift `BGTaskScheduler` / Kotlin `WorkManager`). The
@@ -556,6 +575,7 @@ impl CoreImpl {
             search: crate::search::coordinator::Coordinator::new(DEFAULT_HYDRATION_QUEUE_CAPACITY),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup: crate::backup::coordinator::Coordinator::new(),
+            backup_sink: OnceLock::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             media: crate::media::coordinator::Coordinator::new(),
@@ -602,6 +622,7 @@ impl CoreImpl {
             search: crate::search::coordinator::Coordinator::new(DEFAULT_HYDRATION_QUEUE_CAPACITY),
             archive: crate::archive::coordinator::Coordinator::new(archive_backend),
             backup: crate::backup::coordinator::Coordinator::new(),
+            backup_sink: OnceLock::new(),
             scheduler: OnceLock::new(),
             text_embedder: OnceLock::new(),
             media: crate::media::coordinator::Coordinator::new(),
@@ -1333,6 +1354,53 @@ impl CoreImpl {
         config: crate::media::sinks::zk_fabric::ZkFabricSinkConfig,
     ) -> Result<()> {
         self.archive.install_zkof_archive_backend(s3, config)
+    }
+
+    /// Install a backup sink bridge. The bridge is platform
+    /// glue (Android cloud-backup, iCloud, ZK Object Fabric) that
+    /// fills in the [`crate::backup::sinks::BackupSink`] trait.
+    /// Once installed,
+    /// [`KChatCore::run_incremental_backup`] hands the
+    /// sealed manifest + segment bytes to the sink for upload,
+    /// and [`KChatCore::restore_from_backup`] fetches the
+    /// symmetric bytes back through the sink.
+    ///
+    /// Write-once: returns [`Error::Storage`] if a sink has
+    /// already been installed. The underlying transport (CloudKit
+    /// container, S3 bucket, …) is a per-process singleton; the
+    /// orchestration layer does not support hot-swapping a sink
+    /// mid-flight because in-progress uploads carry sink-side
+    /// identifiers that would be orphaned by a replacement.
+    /// Tests that need a different sink construct a fresh
+    /// [`CoreImpl`].
+    pub fn install_backup_sink(
+        &self,
+        sink: Arc<dyn crate::backup::sinks::BackupSink>,
+    ) -> Result<()> {
+        self.backup_sink.set(sink).map_err(|_| {
+            Error::Storage(crate::local_store::StorageError::SubsystemAlreadyInstalled(
+                "backup_sink",
+            ))
+        })
+    }
+
+    /// Whether [`Self::install_backup_sink`] has been called with
+    /// a real bridge.
+    pub fn has_backup_sink(&self) -> bool {
+        self.backup_sink.get().is_some()
+    }
+
+    /// Snapshot the currently-installed backup sink, or return
+    /// [`crate::local_store::StorageError::SubsystemNotInstalled`]
+    /// if none has been installed yet. Centralises the
+    /// "no sink" error shape used by
+    /// [`Self::restore_from_backup`].
+    fn require_backup_sink(&self) -> Result<Arc<dyn crate::backup::sinks::BackupSink>> {
+        self.backup_sink.get().cloned().ok_or_else(|| {
+            Error::Storage(crate::local_store::StorageError::SubsystemNotInstalled(
+                "backup_sink",
+            ))
+        })
     }
 
     /// Install a background scheduler bridge. The bridge
@@ -3657,18 +3725,38 @@ impl CoreImpl {
         let keys = self.backup.require_keys()?;
         let backup_root = KeyMaterial::from_bytes(*keys.root_key);
 
+        // Bind the segment_id used to derive `k_segment` to the
+        // id stamped into the on-wire segment. The restoring side
+        // recomputes the key from the on-wire id and rejects the
+        // segment if the wrapped key disagrees, so the producer
+        // MUST seal under that same id (otherwise
+        // `restore_from_backup` returns
+        // `wrapped-key disagrees with K_backup_segment(segment_id)`).
         let segment_id = uuid::Uuid::now_v7();
         let k_segment =
             derive_backup_segment(&backup_root, segment_id.as_bytes()).map_err(Error::Crypto)?;
-        let built = BackupSegmentBuilder::new().build_segment(
+        let built = BackupSegmentBuilder::new().build_segment_with_id(
             BackupSegmentBuildRequest {
                 events,
                 segment_type: SegmentType::Events,
             },
+            segment_id,
             &k_segment,
         )?;
 
         // Build the manifest chained under the in-memory tail.
+        //
+        // The restoring side derives `K_backup_manifest` from the
+        // on-wire `manifest_id`, so the producer MUST seal the
+        // manifest under the same id-derived key. Pick the
+        // manifest_id here, derive the key, and pass both into
+        // [`build_backup_manifest`] (`manifest_id` forwarded via
+        // [`BackupManifestBuildRequest::manifest_id`]). Without
+        // this binding the builder picks its own fresh UUID
+        // internally and the restoring side opens against a key
+        // derived from a different id, producing
+        // `xchacha20-poly1305 open failed` even on a byte-for-byte
+        // correct on-wire bundle.
         let previous_owned = self.backup.previous_manifest()?;
         let manifest_id_for_key = uuid::Uuid::now_v7();
         let k_manifest = derive_backup_manifest(&backup_root, manifest_id_for_key.as_bytes())
@@ -3681,6 +3769,7 @@ impl CoreImpl {
             tombstones: vec![],
             previous: previous_owned.as_ref(),
             device_id: keys.device_id.clone(),
+            manifest_id: Some(manifest_id_for_key),
         };
         let sealed_manifest = build_backup_manifest(request, &keys.signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
@@ -3726,18 +3815,46 @@ impl CoreImpl {
         self.backup
             .commit_incremental(sealed_manifest.manifest.clone(), tracked)?;
 
+        // Upload to the installed BackupSink, if any. The sink is
+        // intentionally optional: tests and headless integrations
+        // can run the seal pipeline without ever wiring a transport.
+        // When a sink IS installed we treat the upload as best-
+        // effort with strict error propagation — a partial upload
+        // (e.g. segment uploaded, manifest failed) leaves the
+        // in-memory + on-disk state already committed under the
+        // post-persist guard above; the caller can retry the
+        // upload by re-running incremental, which will produce a
+        // fresh manifest off the same ledger tail.
+        let segment_id_str = built.segment_id.to_string();
+        let manifest_id_str = sealed_manifest.manifest.manifest_id.to_string();
+        let (segments_uploaded, manifest_uploaded) = match self.backup_sink.get() {
+            None => (0, false),
+            Some(sink) => {
+                let segment_bundle = crate::backup::wire::SealedSegmentBundle::from_built(
+                    &built,
+                    &k_segment,
+                    &backup_root,
+                )?;
+                let segment_bytes = segment_bundle.encode()?;
+                sink.upload_backup_segment(&segment_id_str, &segment_bytes)?;
+
+                let manifest_bundle = crate::backup::wire::SealedManifestBundle::from_sealed(
+                    &sealed_manifest,
+                    keys.device_id.clone(),
+                );
+                let manifest_bytes = manifest_bundle.encode()?;
+                sink.upload_backup_manifest(&manifest_id_str, &manifest_bytes)?;
+                (1, true)
+            }
+        };
+
         Ok((
             BackupResult {
                 segments_built: 1,
-                // No transport-side BackupSink upload yet; Task 4 wires
-                // `ZkofBackupSink::upload_backup_segment` /
-                // `upload_backup_manifest` into this slot. Until then
-                // the caller is responsible for uploading the sealed
-                // bytes out-of-band.
-                segments_uploaded: 0,
+                segments_uploaded,
                 events_segmented: event_count,
                 manifest_generation: Some(manifest_generation),
-                manifest_uploaded: false,
+                manifest_uploaded,
                 deferred: false,
             },
             sealed_event_refs,
@@ -3849,14 +3966,19 @@ impl CoreImpl {
                 continue;
             }
 
+            // Same id binding as the incremental path: the
+            // compacted segment must be sealed under the id used to
+            // derive `k_new`, so the restorer's segment-key check
+            // passes.
             let new_segment_id = uuid::Uuid::now_v7();
             let k_new = derive_backup_segment(&backup_root, new_segment_id.as_bytes())
                 .map_err(Error::Crypto)?;
-            let built = BackupSegmentBuilder::new().build_segment(
+            let built = BackupSegmentBuilder::new().build_segment_with_id(
                 BackupSegmentBuildRequest {
                     events: survivors,
                     segment_type: SegmentType::Events,
                 },
+                new_segment_id,
                 &k_new,
             )?;
             bytes_after += built.ciphertext.len() as u64;
@@ -3893,6 +4015,13 @@ impl CoreImpl {
             tombstones: vec![],
             previous: previous_owned.as_ref(),
             device_id: keys.device_id.clone(),
+            // Same restore-side binding as the incremental path:
+            // the builder must seal under
+            // K_backup_manifest(manifest_id_for_key) so the
+            // restoring side recovers the same key from the
+            // on-wire manifest_id. See the comment in
+            // `run_incremental_backup_inner`.
+            manifest_id: Some(manifest_id_for_key),
         };
         let sealed_manifest = build_backup_manifest(request, &keys.signing_key, &k_manifest)?;
         let manifest_generation = sealed_manifest.manifest.generation;
@@ -5141,53 +5270,341 @@ impl KChatCore for CoreImpl {
         }
     }
 
-    fn restore_from_backup(&self, _source: BackupSource) -> Result<RestoreResult> {
-        // instrument the
-        // restore hot path. Each transition is also recorded as a
-        // `transition` metadata field for finer-grained
-        // attribution.
+    fn restore_from_backup(&self, source: BackupSource) -> Result<RestoreResult> {
+        // instrument the restore hot path. Each significant
+        // milestone (state transition, manifest fetch, segment
+        // count) is recorded as trace metadata so the perf
+        // collector receives a structured timeline rather than a
+        // single opaque duration.
         let mut trace = crate::perf::PerfTrace::new("restore_from_backup");
-
-        // wiring: drive the restore state machine end-to-end
-        // through the skeleton-first pipeline. The transport-side
-        // contract on `BackupSource` (manifest chain handle, segment
-        // download channel, search-shard segments, …) is still a
-        // placeholder, so the pipeline currently runs with empty
-        // inputs and demonstrates the orchestration is in place.
-        // Search-index shards land via
-        // [`CoreImpl::restore_search_shards`] today; once
-        // `BackupSource` is fleshed out, the segments, manifests,
-        // and shard list flow through here unchanged.
-        let result = (|| -> Result<RestoreResult> {
-            let db = self.db_writer.lock().map_err(poisoned)?;
-            let conn = db.connection();
-            crate::restore::state_machine::reset(conn)?;
-            let mut transitions = 0usize;
-            for st in [
-                crate::local_store::state_machines::RestoreState::IdentityRestored,
-                crate::local_store::state_machines::RestoreState::RootKeysUnwrapped,
-                crate::local_store::state_machines::RestoreState::ManifestVerified,
-                crate::local_store::state_machines::RestoreState::SkeletonRestored,
-                crate::local_store::state_machines::RestoreState::SearchRestored,
-                crate::local_store::state_machines::RestoreState::RecentMessagesRestored,
-                crate::local_store::state_machines::RestoreState::MediaLazyRestoreEnabled,
-                crate::local_store::state_machines::RestoreState::FullRestoreComplete,
-            ] {
-                crate::restore::state_machine::transition(conn, st, None)?;
-                transitions += 1;
-            }
-            let _ = transitions;
-            Ok(RestoreResult::default())
-        })();
-
+        let result = self.restore_from_backup_inner(&source, &mut trace);
         if let Err(e) = result.as_ref() {
             trace.insert_metadata("error", e.to_string());
-        } else {
-            trace.insert_metadata("transitions", "8".to_string());
         }
         trace.finish();
         self.record_perf_trace(trace);
         result
+    }
+}
+
+impl CoreImpl {
+    /// Drive a full skeleton-first restore from an installed
+    /// [`crate::backup::sinks::BackupSink`].
+    ///
+    /// The orchestration runs in the following passes:
+    ///
+    /// 1. Validate `source` (non-nil manifest id, non-empty
+    ///    device id, positive recency window, plausible `now_ms`).
+    /// 2. Snapshot the installed backup key bundle and the
+    ///    installed sink (both must be present — there is no
+    ///    "no-op restore" fallback for missing transport).
+    /// 3. Reset the persisted restore-state machine to its initial
+    ///    state and walk the prefix transitions
+    ///    (`IdentityRestored` → `RootKeysUnwrapped`) so the
+    ///    pipeline starts at `ManifestVerified` per its contract.
+    /// 4. Fetch the sealed manifest bundle via
+    ///    [`crate::backup::sinks::BackupSink::fetch_backup_manifest`],
+    ///    decode the on-wire form, verify the hybrid Ed25519 +
+    ///    ML-DSA-65 signatures against the installed signing key,
+    ///    open the AEAD body to confirm the manifest CBOR matches
+    ///    its signed form, and emit the `ManifestVerified`
+    ///    transition.
+    /// 5. Fetch every referenced sealed segment via
+    ///    [`crate::backup::sinks::BackupSink::fetch_backup_segment`],
+    ///    decode the on-wire form, validate the per-segment
+    ///    SHA-256 against the manifest reference (defence-in-
+    ///    depth on top of the AEAD), unwrap the per-segment key
+    ///    under `K_backup_root`, and reconstitute the in-process
+    ///    [`crate::backup::segment_builder::BuiltBackupSegment`].
+    /// 6. Hand the reconstituted segment list to
+    ///    [`crate::restore::pipeline::RestorePipeline::run`],
+    ///    which decrypts the segments, materialises skeleton
+    ///    rows + recent body rows, and walks the rest of the
+    ///    state machine to `FullRestoreComplete`.
+    ///
+    /// Per-segment decryption uses the per-segment key derived
+    /// from `K_backup_root`. The pipeline takes a single
+    /// `KeyMaterial` parameter (its decryption helper expects one
+    /// AEAD key for all supplied segments); we satisfy that
+    /// signature by decrypting each segment up-front under its
+    /// own unwrapped key and replacing the on-wire ciphertext
+    /// with the plaintext payload before handing the segment to
+    /// the pipeline. This keeps the pipeline contract unchanged
+    /// while honouring the per-segment key derivation that the
+    /// design doc mandates.
+    fn restore_from_backup_inner(
+        &self,
+        source: &BackupSource,
+        trace: &mut crate::perf::PerfTrace,
+    ) -> Result<RestoreResult> {
+        use crate::backup::manifest_builder::build_manifest_aad;
+        use crate::backup::segment_builder::decrypt_backup_segment;
+        use crate::backup::wire::{SealedManifestBundle, SealedSegmentBundle};
+        use crate::crypto::aead::xchacha20_poly1305::open as aead_open;
+        use crate::crypto::key_hierarchy::{
+            derive_backup_manifest, derive_backup_segment, KeyMaterial,
+        };
+        use crate::formats::manifest::verify_backup_manifest;
+        use crate::local_store::state_machines::RestoreState;
+
+        // ---- 1) Validate source ---------------------------------
+        if source.manifest_id.is_nil() {
+            return Err(Error::Storage(
+                "restore_from_backup: BackupSource.manifest_id is nil — \
+                 caller must supply the head of the manifest chain"
+                    .into(),
+            ));
+        }
+        if source.device_id.is_empty() {
+            return Err(Error::Storage(
+                "restore_from_backup: BackupSource.device_id is empty — \
+                 cannot rebuild the manifest AAD without the original device id"
+                    .into(),
+            ));
+        }
+        if source.recency_window_ms < 0 {
+            return Err(Error::Storage(
+                "restore_from_backup: BackupSource.recency_window_ms is negative".into(),
+            ));
+        }
+        if source.now_ms <= 0 {
+            return Err(Error::Storage(
+                "restore_from_backup: BackupSource.now_ms must be a positive ms epoch".into(),
+            ));
+        }
+
+        // ---- 2) Snapshot installed subsystems -------------------
+        let keys = self.backup.require_keys()?;
+        let sink = self.require_backup_sink()?;
+        let backup_root = KeyMaterial::from_bytes(*keys.root_key);
+
+        // ---- 3) Reset state machine and walk prefix -------------
+        // Hold the DB writer mutex across the whole restore: the
+        // SQLite database file is single-writer, and the pipeline
+        // mutates `restore_state` plus the skeleton / recent body
+        // tables under one connection. Other operations on the
+        // core that need the writer block until restore finishes,
+        // which is the right behaviour — restoring a device is a
+        // mutually-exclusive lifecycle event.
+        let db = self.db_writer.lock().map_err(poisoned)?;
+        crate::restore::state_machine::reset(db.connection())?;
+        crate::restore::state_machine::transition(
+            db.connection(),
+            RestoreState::IdentityRestored,
+            None,
+        )?;
+        crate::restore::state_machine::transition(
+            db.connection(),
+            RestoreState::RootKeysUnwrapped,
+            None,
+        )?;
+        trace.insert_metadata("manifest_id", source.manifest_id.to_string());
+
+        // ---- 4) Fetch + verify the head manifest ----------------
+        let manifest_id_str = source.manifest_id.to_string();
+        let manifest_bytes = sink.fetch_backup_manifest(&manifest_id_str)?;
+        let bundle = SealedManifestBundle::decode(&manifest_bytes)?;
+        if bundle.manifest.manifest_id != source.manifest_id {
+            return Err(Error::Storage(
+                format!(
+                    "restore_from_backup: manifest id mismatch — \
+                     source asked for {}, sink returned {}",
+                    source.manifest_id, bundle.manifest.manifest_id,
+                )
+                .into(),
+            ));
+        }
+        if bundle.device_id != source.device_id {
+            return Err(Error::Storage(
+                format!(
+                    "restore_from_backup: device id mismatch — \
+                     source says {:?}, sink-stored manifest says {:?}",
+                    source.device_id, bundle.device_id,
+                )
+                .into(),
+            ));
+        }
+        let signing_pub = keys.signing_key.verifying_key();
+        verify_backup_manifest(&bundle.manifest, &signing_pub).map_err(Error::Crypto)?;
+
+        // Derive `K_backup_manifest(manifest_id)` and open the
+        // sealed body directly via the AEAD primitive. We bypass
+        // [`crate::backup::manifest_builder::open_sealed_backup_manifest`]
+        // because its `SealedBackupManifest` input embeds a
+        // `HybridManifestSignature` we don't carry on the wire
+        // (the signature bytes live verbatim inside
+        // `bundle.manifest.manifest_signature` /
+        // `bundle.manifest.pqc_signature`, which were already
+        // verified via [`verify_backup_manifest`] above).
+        //
+        // The AEAD open step double-checks that the on-wire CBOR
+        // matches what the signing identity actually signed: if a
+        // sink swapped the `manifest` field for a different
+        // generation but kept the ciphertext + nonce, the AEAD
+        // open would fail because the AAD binds the manifest id +
+        // generation + merkle_root + device_id together.
+        let k_manifest = derive_backup_manifest(&backup_root, source.manifest_id.as_bytes())
+            .map_err(Error::Crypto)?;
+        let aad = build_manifest_aad(
+            &bundle.manifest.manifest_id,
+            bundle.manifest.generation,
+            &bundle.manifest.merkle_root,
+            &source.device_id,
+        );
+        let _opened_plaintext = aead_open(
+            k_manifest.as_bytes(),
+            &bundle.nonce,
+            &bundle.ciphertext,
+            &aad,
+        )
+        .map_err(Error::Crypto)?;
+        crate::restore::state_machine::transition(
+            db.connection(),
+            RestoreState::ManifestVerified,
+            None,
+        )?;
+
+        // ---- 5) Fetch + decrypt every referenced segment --------
+        // Decrypt-up-front strategy: we cannot pass per-segment
+        // keys into `RestorePipeline::run` (its signature takes a
+        // single `KeyMaterial`), so we open each segment under
+        // its own unwrapped key here and rebuild a thin
+        // [`BuiltBackupSegment`] whose `ciphertext` is replaced by
+        // a fresh re-seal under a one-shot "pipeline shim" key.
+        // That re-seal lives entirely in-memory inside this call;
+        // the original sealed bytes were already verified above.
+        //
+        // The pipeline shim key is a freshly-derived per-restore
+        // key so we never expose `K_backup_root` (or any prior
+        // per-segment key) to the pipeline.
+        let mut shim_key_bytes = {
+            use rand::rngs::OsRng;
+            use rand::RngCore;
+            let mut bytes = [0u8; KEY_LEN];
+            OsRng.fill_bytes(&mut bytes);
+            bytes
+        };
+        let shim_key = KeyMaterial::from_bytes(shim_key_bytes);
+
+        let mut reshimmed_segments: Vec<crate::backup::segment_builder::BuiltBackupSegment> =
+            Vec::with_capacity(bundle.manifest.segments.len());
+        for seg_ref in &bundle.manifest.segments {
+            let seg_id_str = seg_ref.segment_id.to_string();
+            let seg_bytes = sink.fetch_backup_segment(&seg_id_str)?;
+            let seg_bundle = SealedSegmentBundle::decode(&seg_bytes)?;
+            if seg_bundle.segment_id != seg_ref.segment_id {
+                return Err(Error::Storage(
+                    format!(
+                        "restore: segment {} from sink reports id {}",
+                        seg_ref.segment_id, seg_bundle.segment_id,
+                    )
+                    .into(),
+                ));
+            }
+            if seg_bundle.segment_type != seg_ref.segment_type {
+                return Err(Error::Storage(
+                    format!(
+                        "restore: segment {} type {:?} disagrees with manifest ref {:?}",
+                        seg_ref.segment_id, seg_bundle.segment_type, seg_ref.segment_type,
+                    )
+                    .into(),
+                ));
+            }
+            // Defence-in-depth: validate the manifest-recorded
+            // SHA-256 before paying for the AEAD open. The AAD
+            // already binds the segment id + merkle root, so a
+            // mismatched body would fail AEAD verification — but
+            // the explicit SHA check produces a clearer error
+            // message and short-circuits before allocating the
+            // plaintext buffer.
+            {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&seg_bundle.ciphertext);
+                let computed: [u8; 32] = hasher.finalize().into();
+                if computed != seg_ref.ciphertext_sha256 {
+                    return Err(Error::Storage(
+                        format!(
+                            "restore: segment {} ciphertext SHA-256 \
+                             mismatch (manifest says {:02x?}, sink returned {:02x?})",
+                            seg_ref.segment_id, seg_ref.ciphertext_sha256, computed,
+                        )
+                        .into(),
+                    ));
+                }
+            }
+
+            let k_segment = seg_bundle.unwrap_segment_key(&backup_root)?;
+            // Validate the unwrapped per-segment key matches the
+            // HKDF derivation under K_backup_root. The producer
+            // path passes K_backup_segment(segment_id) (derived
+            // via [`derive_backup_segment`]); this check rules
+            // out a sink that ferried mismatched (key, segment)
+            // pairs. Tolerated absent the check by AEAD failure,
+            // but a structured error here is more actionable.
+            let expected_k = derive_backup_segment(&backup_root, seg_ref.segment_id.as_bytes())
+                .map_err(Error::Crypto)?;
+            if expected_k.as_bytes() != k_segment.as_bytes() {
+                return Err(Error::Storage(
+                    format!(
+                        "restore: segment {} wrapped-key disagrees with \
+                         K_backup_segment(segment_id) derived from K_backup_root",
+                        seg_ref.segment_id,
+                    )
+                    .into(),
+                ));
+            }
+
+            // Open the sealed payload, then re-seal it under the
+            // one-shot shim key so the pipeline can drive its
+            // single-key decrypt loop.
+            let built = seg_bundle.to_built();
+            let payload = decrypt_backup_segment(&built, &k_segment)?;
+            let reshimmed = crate::backup::segment_builder::BackupSegmentBuilder::new()
+                .build_segment(
+                    crate::backup::segment_builder::BackupSegmentBuildRequest {
+                        events: payload.events,
+                        segment_type: seg_bundle.segment_type,
+                    },
+                    &shim_key,
+                )?;
+            reshimmed_segments.push(reshimmed);
+        }
+        trace.insert_metadata("segments_restored", reshimmed_segments.len().to_string());
+
+        // ---- 6) Drive the pipeline -----------------------------
+        let pipeline = crate::restore::pipeline::RestorePipeline::new();
+        let summary = pipeline.run(
+            db.connection(),
+            std::slice::from_ref(&bundle.manifest),
+            &reshimmed_segments,
+            &shim_key,
+            source.now_ms,
+            source.recency_window_ms,
+        )?;
+        // Zeroise the shim key — `KeyMaterial::from_bytes` does
+        // not currently zeroise on drop, but we no longer need the
+        // shim once the pipeline returns.
+        shim_key_bytes.fill(0);
+
+        let conversations_restored = u32::try_from(summary.conversations.len()).unwrap_or(u32::MAX);
+        let skeletons_restored = u32::try_from(summary.skeletons.len()).unwrap_or(u32::MAX);
+        let recent_bodies_restored = u32::try_from(summary.recent_bodies.len()).unwrap_or(u32::MAX);
+        let segments_restored = u32::try_from(reshimmed_segments.len()).unwrap_or(u32::MAX);
+
+        trace.insert_metadata("conversations_restored", conversations_restored.to_string());
+        trace.insert_metadata("skeletons_restored", skeletons_restored.to_string());
+        trace.insert_metadata("recent_bodies_restored", recent_bodies_restored.to_string());
+
+        Ok(RestoreResult {
+            manifest_id: Some(bundle.manifest.manifest_id),
+            manifest_generation: bundle.manifest.generation,
+            segments_restored,
+            conversations_restored,
+            skeletons_restored,
+            recent_bodies_restored,
+            final_state: summary.final_state,
+        })
     }
 }
 
@@ -5879,20 +6296,148 @@ mod tests {
         assert_eq!(result, BackupResult::default());
     }
 
+    // -----------------------------------------------------------------
+    // restore_from_backup wiring (`docs/DESIGN.md §6.4`)
+    // -----------------------------------------------------------------
+
+    /// Default `BackupSource` (nil UUID, empty device id) must be
+    /// rejected — the orchestrator has no manifest to resolve.
     #[test]
-    fn restore_from_backup_walks_state_machine_to_full_complete() {
+    fn restore_from_backup_rejects_nil_manifest_id() {
         let core = fresh_core();
-        let result = core
+        let err = core
             .restore_from_backup(BackupSource::default())
-            .expect("restore_from_backup should walk to FullRestoreComplete");
-        assert_eq!(result, RestoreResult::default());
-        let db = core.db_writer.lock().unwrap();
+            .expect_err("nil manifest_id must be rejected");
+        match err {
+            Error::Storage(s) => assert!(
+                s.to_string().contains("BackupSource.manifest_id is nil"),
+                "unexpected error: {s}",
+            ),
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    /// `BackupSource` with a real manifest id but no installed
+    /// sink must surface
+    /// [`crate::local_store::StorageError::SubsystemNotInstalled`].
+    #[test]
+    fn restore_from_backup_requires_installed_sink() {
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let source = BackupSource {
+            manifest_id: Uuid::now_v7(),
+            device_id: "test-device".to_string(),
+            recency_window_ms: 1_000,
+            now_ms: 1_777_000_000_000,
+        };
+        let err = core
+            .restore_from_backup(source)
+            .expect_err("missing sink must produce SubsystemNotInstalled");
+        match err {
+            Error::Storage(s) => assert!(
+                s.to_string().contains("backup_sink") || s.to_string().contains("not installed"),
+                "unexpected error: {s}",
+            ),
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    /// Full round-trip: run an incremental backup that uploads to
+    /// an in-memory sink, then point a fresh `CoreImpl` (sharing
+    /// the same backup keys + sink) at the produced manifest and
+    /// verify the restore walks to `FullRestoreComplete`, replays
+    /// the message-received event, and returns a non-empty
+    /// summary.
+    #[test]
+    fn restore_from_backup_round_trips_one_segment_one_message() {
+        use crate::backup::sinks::memory::MemoryBackupSink;
+        use crate::crypto::signing::HybridSigningKey;
+        use rand::rngs::OsRng;
+        use std::sync::Arc;
+
+        // ---- shared identity -------------------------------------
+        // The producer + consumer must share the same backup root
+        // key (so per-segment / per-manifest derivations match) and
+        // the same hybrid signing key (so the consumer can verify
+        // the on-wire signatures produced by the producer).
+        let backup_root = [0x33u8; 32];
+        let mut rng = OsRng;
+        let signing = HybridSigningKey::generate(&mut rng);
+        let device_id = "test-device";
+
+        // ---- producer side ---------------------------------------
+        let producer = fresh_core();
+        install_shared_backup_keys(&producer, backup_root, signing.clone(), device_id);
+        let sink = Arc::new(MemoryBackupSink::new());
+        producer
+            .install_backup_sink(sink.clone())
+            .expect("install sink on producer");
+
+        let conv = Uuid::now_v7();
+        let msg = Uuid::now_v7();
+        let event_ts_ms = 1_777_000_000_000i64;
+        seed_conversation(&producer, &conv);
+        seed_backup_event(&producer, conv, msg, event_ts_ms);
+
+        let backup_result = producer
+            .run_incremental_backup("scheduled")
+            .expect("incremental backup");
+        assert_eq!(backup_result.segments_built, 1);
+        assert_eq!(backup_result.segments_uploaded, 1);
+        assert!(backup_result.manifest_uploaded);
+        let manifest_generation = backup_result
+            .manifest_generation
+            .expect("generation present");
+
+        // The sink should have received exactly one manifest and
+        // one segment.
+        assert_eq!(sink.manifest_count(), 1);
+        assert_eq!(sink.segment_count(), 1);
+        let manifest_id_str = sink
+            .snapshot_manifests()
+            .first()
+            .expect("one manifest")
+            .0
+            .clone();
+        let manifest_id: Uuid = manifest_id_str.parse().expect("manifest uuid");
+
+        // ---- consumer side ---------------------------------------
+        let consumer = fresh_core();
+        install_shared_backup_keys(&consumer, backup_root, signing, device_id);
+        consumer
+            .install_backup_sink(sink)
+            .expect("install sink on consumer");
+
+        let source = BackupSource {
+            manifest_id,
+            device_id: device_id.to_string(),
+            // Wider than the event delta to event_ts_ms so the
+            // recency hydration step picks the row up.
+            recency_window_ms: 24 * 60 * 60 * 1000,
+            now_ms: event_ts_ms + 1,
+        };
+        let result = consumer
+            .restore_from_backup(source)
+            .expect("restore should succeed");
+
+        assert_eq!(result.manifest_id, Some(manifest_id));
+        assert_eq!(result.manifest_generation, manifest_generation);
+        assert_eq!(result.segments_restored, 1);
+        assert_eq!(result.conversations_restored, 1);
+        assert_eq!(result.skeletons_restored, 1);
+        assert_eq!(
+            result.final_state,
+            Some(crate::local_store::state_machines::RestoreState::FullRestoreComplete),
+        );
+
+        // Persisted state machine is on `FullRestoreComplete`.
+        let db = consumer.db_writer.lock().unwrap();
         let (state, _) = crate::restore::state_machine::load(db.connection())
             .unwrap()
             .expect("restore_state row should be persisted");
         assert_eq!(
             state,
-            crate::local_store::state_machines::RestoreState::FullRestoreComplete
+            crate::local_store::state_machines::RestoreState::FullRestoreComplete,
         );
     }
 
@@ -8095,6 +8640,22 @@ mod tests {
         let signing = HybridSigningKey::generate(&mut rng);
         core.install_backup_keys(backup_root, signing, "test-device".to_string())
             .expect("install backup keys");
+    }
+
+    /// Install a deterministic backup-key bundle on `core`. Used
+    /// by restore round-trip tests that need the producer and the
+    /// consumer to verify against the same hybrid signing key (the
+    /// generic [`install_test_backup_keys`] generates a fresh key
+    /// on every call, which is correct for backup-only tests but
+    /// fails restore signature verification).
+    fn install_shared_backup_keys(
+        core: &CoreImpl,
+        backup_root: [u8; 32],
+        signing: crate::crypto::signing::HybridSigningKey,
+        device_id: &str,
+    ) {
+        core.install_backup_keys(backup_root, signing, device_id.to_string())
+            .expect("install shared backup keys");
     }
 
     fn seed_backup_event(core: &CoreImpl, conv: Uuid, msg: Uuid, ts_ms: i64) {

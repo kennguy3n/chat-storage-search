@@ -683,19 +683,96 @@ pub struct OffloadResult {
 
 /// Result of [`KChatCore::restore_from_backup`].
 ///
-/// Placeholder result type. The full restore contract (manifest
-/// chain verified, segments installed, deferred rehydration plan,
-/// …) is filled in by the restore engine.
+/// Summarises one restore run. Populated by
+/// [`crate::core_impl::CoreImpl::restore_from_backup`] from the
+/// underlying [`crate::restore::pipeline::RestoreSummary`] plus
+/// the manifest metadata observed during fetch / verify.
+///
+/// `final_state` is the terminal restore state the pipeline
+/// transitioned into. On the happy path that is
+/// [`crate::local_store::state_machines::RestoreState::FullRestoreComplete`];
+/// it is left `None` only when the call failed before reaching
+/// any forward transition. Callers should treat any value other
+/// than `FullRestoreComplete` as a partial restore that the
+/// caller is responsible for resuming or aborting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RestoreResult {}
+pub struct RestoreResult {
+    /// UUID of the manifest the restore was driven from.
+    pub manifest_id: Option<Uuid>,
+    /// Monotonic generation of the restored manifest.
+    pub manifest_generation: u64,
+    /// Number of segments fetched from the backup sink and
+    /// successfully decrypted into the local skeleton index.
+    pub segments_restored: u32,
+    /// Number of `(conversation_id, conversation_created)` rows
+    /// reconstructed from the backup event journal.
+    pub conversations_restored: u32,
+    /// Number of timeline skeleton placeholders the pipeline
+    /// hydrated into the local store.
+    pub skeletons_restored: u32,
+    /// Number of recent message bodies the pipeline rehydrated
+    /// inside the recency window.
+    pub recent_bodies_restored: u32,
+    /// Terminal restore-state machine value reached. `None` if
+    /// the orchestration short-circuited before any forward
+    /// transition.
+    pub final_state: Option<crate::local_store::state_machines::RestoreState>,
+}
 
 /// Source descriptor for [`KChatCore::restore_from_backup`].
 ///
-/// Placeholder source type. The full source contract (backup root
-/// key reference, manifest chain head, transport handle for the
-/// backup sink, …) is filled in by the restore engine.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackupSource {}
+/// Carries everything the orchestration layer needs to drive the
+/// skeleton-first restore pipeline against an installed
+/// [`crate::backup::sinks::BackupSink`]:
+///
+/// * `manifest_id` selects the head of the manifest chain to
+///   restore from. The orchestrator resolves prior generations
+///   by walking `previous_manifest_hash` chains lazily — the
+///   caller only needs to know the tip.
+/// * `device_id` MUST match the device id stamped into the
+///   manifest AAD at seal time. The restoring side cannot rebuild
+///   the AAD without this string and the AEAD open will fail with
+///   `Error::Crypto` if it disagrees with the on-wire bundle.
+/// * `recency_window_ms` is forwarded to the pipeline as the cut-
+///   off for the "recent message bodies" hydration step. Bodies
+///   older than `now_ms - recency_window_ms` stay cold (lazy
+///   media restore covers them on tap).
+/// * `now_ms` anchors the recency window against the caller's
+///   clock. The pipeline never reads the wall clock itself; the
+///   caller supplies it so tests can pin the cutoff
+///   deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSource {
+    /// Head of the manifest chain to restore from.
+    pub manifest_id: Uuid,
+    /// Stable device id that signed the manifest at seal time.
+    pub device_id: String,
+    /// Recency window for the body-hydration step, in
+    /// milliseconds. Bodies older than this window stay cold and
+    /// are rehydrated lazily on access.
+    pub recency_window_ms: i64,
+    /// Wall-clock anchor for the recency window. Set by the
+    /// orchestrator at the start of the restore call.
+    pub now_ms: i64,
+}
+
+impl Default for BackupSource {
+    /// Caller-friendly default: nil UUID + empty device id + a
+    /// 30-day recency window + zero `now_ms`. The orchestrator
+    /// will reject these defaults at the entry point because the
+    /// nil UUID has no corresponding manifest in the sink — this
+    /// default exists only so structs that embed `BackupSource`
+    /// can derive `Default` (e.g. config snapshots).
+    fn default() -> Self {
+        const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        Self {
+            manifest_id: Uuid::nil(),
+            device_id: String::new(),
+            recency_window_ms: THIRTY_DAYS_MS,
+            now_ms: 0,
+        }
+    }
+}
 
 /// Result of [`KChatCore::register_device`].
 ///
