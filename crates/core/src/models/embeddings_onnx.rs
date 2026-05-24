@@ -675,10 +675,21 @@ impl OnnxTextEmbedder {
         model_path: &std::path::Path,
         tokenizer_path: &std::path::Path,
     ) -> Result<Self> {
-        let (session, report) =
-            create_xlmr_session(model_path).map_err(map_ort_error("session_create"))?;
+        // Load the tokenizer first so a missing / malformed
+        // `tokenizer.json` fails fast *before* we pay the
+        // ONNX-graph optimise + EP registration cost of
+        // `create_xlmr_session` (which is ~100ms+ for XLM-R).
+        // Tokenizer parsing is a single JSON read, on the order of
+        // a millisecond, so the cheap check belongs in front of the
+        // expensive one. The session is dropped on `?` if the
+        // tokenizer is fine but session creation fails — that's
+        // unavoidable since the tokenizer cannot fail-validate the
+        // model — but we no longer waste session-build work when
+        // the artifact pair is incomplete on the tokenizer side.
         let tokenizer = load_xlmr_tokenizer(tokenizer_path)?;
         let pad_token_id = resolve_pad_token_id(&tokenizer);
+        let (session, report) =
+            create_xlmr_session(model_path).map_err(map_ort_error("session_create"))?;
         Ok(Self {
             session: std::sync::Mutex::new(session),
             tokenizer,
