@@ -556,8 +556,25 @@ impl ModelDownloader for HttpModelDownloader {
                     // the loop reaches this point on `attempt` 0 and
                     // 1 only — attempt 2 short-circuits via `is_last`
                     // above, so the `base << 2` slot is never used.
+                    //
+                    // Defensive bounds: `checked_shl` on a u64 panics
+                    // in debug / wraps to `0` in release when the
+                    // shift count is >= 64. If a future change ever
+                    // bumps `HTTP_MODEL_DOWNLOAD_RETRY_ATTEMPTS` past
+                    // 64 (or some caller increments `attempt` by
+                    // hand) the shift would either kill the worker
+                    // or silently degrade the backoff to "no sleep".
+                    // Cap the shift via `checked_shl`; on overflow,
+                    // fall back to `u64::MAX` so the sleep saturates
+                    // at the 584-million-year mark — i.e. the
+                    // function never gets back to retry, but
+                    // crucially does *not* panic and does *not*
+                    // silently disable the backoff.
                     if self.retry_backoff_base_millis > 0 {
-                        let backoff_ms = self.retry_backoff_base_millis << attempt;
+                        let backoff_ms = self
+                            .retry_backoff_base_millis
+                            .checked_shl(attempt)
+                            .unwrap_or(u64::MAX);
                         std::thread::sleep(Duration::from_millis(backoff_ms));
                     }
                 }
