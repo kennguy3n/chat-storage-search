@@ -324,10 +324,16 @@ pub fn argmax_next_token(
     if seq_len == 0 || vocab_size == 0 {
         return None;
     }
-    if logits.len() < seq_len * vocab_size {
+    // Use `checked_mul` defensively: in practice
+    // `seq_len * vocab_size` is at most ~448 * ~52000 ≈ 23 M
+    // and fits in even a 32-bit `usize`, but a malformed shape
+    // from the decoder should surface as `None` instead of
+    // panicking on overflow.
+    let expected = seq_len.checked_mul(vocab_size)?;
+    if logits.len() < expected {
         return None;
     }
-    let start = (seq_len - 1) * vocab_size;
+    let start = (seq_len - 1).checked_mul(vocab_size)?;
     let row = &logits[start..start + vocab_size];
 
     let mut best_idx = 0usize;
