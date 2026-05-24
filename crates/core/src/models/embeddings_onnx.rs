@@ -728,11 +728,23 @@ impl OnnxTextEmbedder {
         debug_assert_eq!(input_ids.len(), self.max_length);
         debug_assert_eq!(attention_mask.len(), self.max_length);
 
-        let shape: Vec<i64> = vec![1, self.max_length as i64];
-        let ids_tensor = ort::value::Tensor::from_array((shape.clone(), input_ids.clone()))
-            .map_err(map_ort_error)?;
-        let mask_tensor = ort::value::Tensor::from_array((shape.clone(), attention_mask.clone()))
-            .map_err(map_ort_error)?;
+        // Build the two input tensors. `input_ids` is consumed
+        // by `Tensor::from_array` (XLM-R does not reuse it
+        // downstream) so we move it. `attention_mask` is reused
+        // by `mask_aware_mean_pool` after `session.run` to
+        // weight the pooled output, so we clone it once into the
+        // tensor and keep the owned vec for the pool step. The
+        // shape vec is moved into the second call and built
+        // inline for the first — `vec![…]` is two i64s, cheaper
+        // than a heap clone.
+        let ids_tensor =
+            ort::value::Tensor::from_array((vec![1_i64, self.max_length as i64], input_ids))
+                .map_err(map_ort_error)?;
+        let mask_tensor = ort::value::Tensor::from_array((
+            vec![1_i64, self.max_length as i64],
+            attention_mask.clone(),
+        ))
+        .map_err(map_ort_error)?;
 
         // Hold the session lock across `run` AND the tensor
         // extraction: `SessionOutputs<'s>` borrows from the
