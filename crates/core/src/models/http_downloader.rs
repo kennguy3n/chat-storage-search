@@ -40,10 +40,17 @@
 //! ## Retry policy
 //!
 //! Retries match the [`crate::transport::http_client::HttpTransportClient`]
-//! policy: three attempts at 1 s / 2 s / 4 s exponential backoff for
-//! transient transport errors and HTTP status `429` / `5xx`. Per-attempt
-//! timeout defaults to 120 s (model artifacts can be tens of megabytes,
-//! and ranged resumes still need full-body timeouts for large tails).
+//! policy: up to three attempts with exponential backoff between them.
+//! The backoff sleeps are 1 s after attempt #1 and 2 s after attempt #2;
+//! a third attempt is issued immediately at t = 3 s and a failure on
+//! attempt #3 is returned without further sleeping (the 4 s slot from
+//! `1 << 2` would be a sleep-then-return, so we skip it). Transient
+//! transport errors (network) and HTTP `429` / `5xx` are retryable; every
+//! other non-success status (including `416 Range Not Satisfiable`
+//! against a stale partial — see [`HttpModelDownloader::run_attempt`])
+//! is reclassified inline by `run_attempt`. Per-attempt timeout defaults
+//! to 120 s (model artifacts can be tens of megabytes, and ranged
+//! resumes still need full-body timeouts for large tails).
 //!
 //! The module is gated on the `http-transport` cargo feature so the
 //! workspace build does not pull `reqwest` or `rustls`. Bridges flip the
@@ -134,11 +141,28 @@ impl DownloadEntry {
 /// The downloader is `Send + Sync`-safe: every field is either
 /// immutable after construction (`client`, `auth_token`) or behind a
 /// concurrency primitive (`registry: RwLock<…>`).
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually so the bearer token (if any) is
+/// redacted from formatted output — matches the posture of
+/// [`crate::transport::http_client::HttpTransportClient`] (see the
+/// `http_client_debug_redacts_auth_token` test).
 pub struct HttpModelDownloader {
     client: reqwest::blocking::Client,
     auth_token: Option<String>,
     registry: RwLock<HashMap<(String, String), DownloadEntry>>,
+}
+
+impl std::fmt::Debug for HttpModelDownloader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpModelDownloader")
+            .field("client", &self.client)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("registry_len", &self.registry_len())
+            .finish()
+    }
 }
 
 impl HttpModelDownloader {
@@ -171,15 +195,17 @@ impl HttpModelDownloader {
 
     /// Attach a bearer token. All subsequent downloads carry
     /// `Authorization: Bearer <token>`. Pass an empty `String` to
-    /// reset to unauthenticated.
+    /// reset to unauthenticated — the empty case is filtered into
+    /// `None` rather than sending a broken `Authorization: Bearer `
+    /// header that servers would reject as `401`.
     ///
     /// The token is stored verbatim — call sites are responsible for
     /// zeroizing the original buffer if they care. The token is
-    /// **not** redacted from `Debug` output; the downloader is not
-    /// intended to be logged. Bridges that need redaction should wrap
-    /// the downloader in a thin shim.
+    /// redacted from `Debug` output (see the manual `Debug` impl on
+    /// [`HttpModelDownloader`]).
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        let token = token.into();
+        self.auth_token = if token.is_empty() { None } else { Some(token) };
         self
     }
 
@@ -301,6 +327,26 @@ impl HttpModelDownloader {
             // onto `Network` so `is_retryable_error` returns true),
             // every other non-success is terminal (route onto
             // `Server`).
+            //
+            // Special-case `416 Range Not Satisfiable` when we sent
+            // a `Range: bytes=<existing>-` header. This means the
+            // partial file on disk is larger than the artifact the
+            // server is willing to serve (disk corruption, an
+            // external tool that tampered with the partial, or a
+            // server-side artifact replacement). Delete the partial
+            // so the next attempt restarts from byte 0, and surface
+            // the error as a retryable `Network` so the outer loop
+            // re-runs `run_attempt` without the stale partial.
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && existing_size > 0 {
+                let _ = std::fs::remove_file(partial_path);
+                return Err(Error::Transport(crate::transport::TransportError::Network(
+                    format!(
+                        "model-download: HTTP 416 from {url} \
+                         (partial size {existing_size} exceeds artifact); \
+                         deleted partial, will restart from byte 0"
+                    ),
+                )));
+            }
             let msg = format!("model-download: HTTP {status} from {url}");
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 return Err(Error::Transport(crate::transport::TransportError::Network(
@@ -552,6 +598,44 @@ mod tests {
             .expect("new")
             .with_auth_token("abc-123");
         assert_eq!(d.auth_token.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn with_auth_token_empty_string_resets_to_none() {
+        // The builder consumes `self`, so the only way to "reset" is to
+        // pass an empty string. Confirm that path doesn't leave us with
+        // a `Some("")` that would later send `Authorization: Bearer `
+        // (which servers reject as 401).
+        let d = HttpModelDownloader::new()
+            .expect("new")
+            .with_auth_token("abc")
+            .with_auth_token("");
+        assert!(
+            d.auth_token.is_none(),
+            "empty token should reset auth to None, got {:?}",
+            d.auth_token
+        );
+    }
+
+    #[test]
+    fn debug_redacts_auth_token() {
+        // Matches the posture of
+        // `crate::transport::http_client::HttpTransportClient` which
+        // also redacts its bearer token from `Debug`. Operationally
+        // important: log lines that include the downloader should
+        // never leak the artifact-distribution credential.
+        let d = HttpModelDownloader::new()
+            .expect("new")
+            .with_auth_token("super-secret-key-do-not-leak");
+        let dbg = format!("{d:?}");
+        assert!(
+            !dbg.contains("super-secret-key-do-not-leak"),
+            "Debug output must redact auth token, got: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output should mark the token as redacted, got: {dbg}"
+        );
     }
 
     #[test]

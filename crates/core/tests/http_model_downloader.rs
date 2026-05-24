@@ -459,6 +459,84 @@ fn bearer_token_propagates_to_request() {
 }
 
 #[test]
+fn oversized_partial_416_recovers_via_partial_delete_and_restart() {
+    // Robustness against a corrupted / externally-tampered partial
+    // file: the partial on disk is *larger* than the artifact the
+    // server is willing to serve, so the `Range: bytes=<too_large>-`
+    // request elicits `416 Range Not Satisfiable`. The downloader
+    // must:
+    //   1) detect the 416 and delete the stale partial,
+    //   2) classify the failure as retryable (network class), and
+    //   3) restart from byte 0 on the next attempt so the download
+    //      ultimately succeeds with the correct SHA-256.
+    //
+    // Without this handling the partial would block every future
+    // attempt until manually removed.
+    let full = random_payload(11, 7000);
+    let expected_sha = sha256_of(&full);
+    let full_arc = Arc::new(full.clone());
+    // The on-disk partial is bigger than the server's artifact so the
+    // server has nothing to serve from byte `len(partial)` onwards.
+    let bogus_partial = random_payload(12, full.len() + 4096);
+
+    let server = spawn_server(move |mut s, n| {
+        let (method, _path, headers) = read_request(&mut s);
+        assert_eq!(method, "GET");
+        let range = headers
+            .iter()
+            .find(|(k, _)| k == "range")
+            .map(|(_, v)| v.clone());
+        if n == 1 {
+            // First attempt: client sends a Range header derived from
+            // the bogus oversized partial. Server replies 416.
+            assert!(range.is_some(), "first attempt must carry a Range header");
+            write_response(&mut s, 416, b"out of range", &[]);
+        } else {
+            // Subsequent attempts: partial has been deleted, so the
+            // client issues a plain GET (no Range). Serve the full
+            // body so the retry succeeds.
+            assert!(
+                range.is_none(),
+                "after 416 the client must restart without a Range \
+                 header (got range={:?} on attempt {n})",
+                range
+            );
+            write_response(&mut s, 200, &full_arc, &[]);
+        }
+    });
+
+    let d = HttpModelDownloader::new().expect("new");
+    d.register_entry(
+        "xlmr",
+        "xlmr@v1",
+        DownloadEntry::new(format!("{}/xlmr.onnx", server.url()), Quantization::Int8),
+    )
+    .expect("register");
+
+    let dest = temp_dest("416-recovery");
+    let partial = HttpModelDownloader::partial_path(&dest);
+    std::fs::write(&partial, &bogus_partial).expect("seed oversized partial");
+
+    // Note: the downloader sleeps 1 s of backoff between attempt 1 (416)
+    // and attempt 2 (200), so this test takes ~1 s.
+    let artifact = d
+        .download_model("xlmr", "xlmr@v1", &dest)
+        .expect("download must succeed after 416-driven partial reset");
+    assert_eq!(artifact.size_bytes as usize, full.len());
+    assert_eq!(
+        artifact.sha256, expected_sha,
+        "SHA-256 must match the full artifact after restart"
+    );
+    let on_disk = std::fs::read(&dest).expect("read final");
+    assert_eq!(on_disk, full);
+    assert!(
+        !partial.exists(),
+        "partial must be cleaned up after successful restart"
+    );
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[test]
 fn partial_suffix_matches_constant() {
     // PR-level invariant: callers that sweep on the `.partial`
     // extension (`find /models -name '*.partial'`) rely on this exact
