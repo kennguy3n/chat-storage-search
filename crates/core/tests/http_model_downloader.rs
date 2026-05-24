@@ -318,8 +318,7 @@ fn server_ignoring_range_returns_200_restart() {
 #[test]
 fn transient_5xx_then_200_succeeds_via_retry() {
     // First two attempts: 503; third attempt: 200. The client should
-    // exhaust its retry budget (3 attempts at 1s/2s/4s backoff) and
-    // succeed on the third.
+    // exhaust its retry budget (3 attempts) and succeed on the third.
     let full = random_payload(5, 4096);
     let expected_sha = sha256_of(&full);
     let full_arc = Arc::new(full.clone());
@@ -333,7 +332,13 @@ fn transient_5xx_then_200_succeeds_via_retry() {
         }
     });
 
-    let d = HttpModelDownloader::new().expect("new");
+    // Compress the 1 s + 2 s = 3 s of production backoff to ~3 ms so
+    // the retry path is still exercised end-to-end without dominating
+    // the test suite wall-clock. Production callers use the default
+    // base of 1 000 ms (see `HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS`).
+    let d = HttpModelDownloader::new()
+        .expect("new")
+        .with_retry_backoff_base_millis(1);
     d.register_entry(
         "xlmr",
         "xlmr@v1",
@@ -342,8 +347,6 @@ fn transient_5xx_then_200_succeeds_via_retry() {
     .expect("register");
 
     let dest = temp_dest("retry");
-    // Note: the downloader sleeps 1s + 2s = 3s of backoff between
-    // attempts 1→2 and 2→3. This test takes ~3s to run.
     let artifact = d
         .download_model("xlmr", "xlmr@v1", &dest)
         .expect("download");
@@ -364,7 +367,11 @@ fn persistent_5xx_exhausts_retries_and_errors() {
         write_response(&mut s, 500, b"boom", &[]);
     });
 
-    let d = HttpModelDownloader::new().expect("new");
+    // Compress backoff for the same reason as in
+    // `transient_5xx_then_200_succeeds_via_retry`.
+    let d = HttpModelDownloader::new()
+        .expect("new")
+        .with_retry_backoff_base_millis(1);
     d.register_entry(
         "xlmr",
         "xlmr@v1",
@@ -373,7 +380,6 @@ fn persistent_5xx_exhausts_retries_and_errors() {
     .expect("register");
 
     let dest = temp_dest("persistent5xx");
-    // Note: 1s + 2s = 3s of backoff between attempts.
     let err = d
         .download_model("xlmr", "xlmr@v1", &dest)
         .expect_err("should fail");
@@ -505,7 +511,10 @@ fn oversized_partial_416_recovers_via_partial_delete_and_restart() {
         }
     });
 
-    let d = HttpModelDownloader::new().expect("new");
+    // Compress backoff so the retry path runs in milliseconds.
+    let d = HttpModelDownloader::new()
+        .expect("new")
+        .with_retry_backoff_base_millis(1);
     d.register_entry(
         "xlmr",
         "xlmr@v1",
@@ -517,8 +526,6 @@ fn oversized_partial_416_recovers_via_partial_delete_and_restart() {
     let partial = HttpModelDownloader::partial_path(&dest);
     std::fs::write(&partial, &bogus_partial).expect("seed oversized partial");
 
-    // Note: the downloader sleeps 1 s of backoff between attempt 1 (416)
-    // and attempt 2 (200), so this test takes ~1 s.
     let artifact = d
         .download_model("xlmr", "xlmr@v1", &dest)
         .expect("download must succeed after 416-driven partial reset");

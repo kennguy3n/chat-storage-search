@@ -84,6 +84,14 @@ pub const HTTP_MODEL_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// [`crate::transport::http_client::HTTP_TRANSPORT_RETRY_ATTEMPTS`].
 pub const HTTP_MODEL_DOWNLOAD_RETRY_ATTEMPTS: u32 = 3;
 
+/// Default base for the exponential-backoff sleep between attempts.
+/// The Nth retry (0-indexed) sleeps `base << N` milliseconds, so with
+/// the default 1 000 ms the sleeps are 1 s after attempt #1 and 2 s
+/// after attempt #2. Tests override this via
+/// [`HttpModelDownloader::with_retry_backoff_base_millis`] to compress
+/// the wall-clock cost without losing coverage of the retry path.
+pub const HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS: u64 = 1_000;
+
 /// Streaming-read chunk size used when copying the response body into
 /// the partial file. 64 KiB matches the buffer size `reqwest::blocking`
 /// uses internally for `copy_to`, but the explicit loop here lets us
@@ -150,6 +158,13 @@ pub struct HttpModelDownloader {
     client: reqwest::blocking::Client,
     auth_token: Option<String>,
     registry: RwLock<HashMap<(String, String), DownloadEntry>>,
+    /// Base sleep (milliseconds) for the exponential backoff between
+    /// retry attempts. Production callers leave this at the default
+    /// [`HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS`]; tests override it
+    /// via [`HttpModelDownloader::with_retry_backoff_base_millis`] so
+    /// the retry path is still exercised without the 1–2 s real-time
+    /// sleeps. `0` disables the sleeps entirely.
+    retry_backoff_base_millis: u64,
 }
 
 impl std::fmt::Debug for HttpModelDownloader {
@@ -161,6 +176,7 @@ impl std::fmt::Debug for HttpModelDownloader {
                 &self.auth_token.as_ref().map(|_| "<redacted>"),
             )
             .field("registry_len", &self.registry_len())
+            .field("retry_backoff_base_millis", &self.retry_backoff_base_millis)
             .finish()
     }
 }
@@ -190,7 +206,23 @@ impl HttpModelDownloader {
             client,
             auth_token: None,
             registry: RwLock::new(HashMap::new()),
+            retry_backoff_base_millis: HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS,
         })
+    }
+
+    /// Override the base sleep (milliseconds) between retry attempts.
+    ///
+    /// Used exclusively by integration tests to compress the 1–2 s
+    /// real-time sleeps from the default policy so the retry path is
+    /// still exercised end-to-end without dominating the test suite
+    /// wall-clock. Production callers should leave this at the default
+    /// (see [`HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS`]). `0` disables
+    /// the sleeps entirely; the loop still runs all
+    /// [`HTTP_MODEL_DOWNLOAD_RETRY_ATTEMPTS`] attempts but transitions
+    /// between them with no wait.
+    pub fn with_retry_backoff_base_millis(mut self, base_ms: u64) -> Self {
+        self.retry_backoff_base_millis = base_ms;
+        self
     }
 
     /// Attach a bearer token. All subsequent downloads carry
@@ -405,23 +437,34 @@ impl HttpModelDownloader {
             }
         }
 
-        if !server_resumed && existing_size > 0 {
+        // Open the partial write handle. Two cases:
+        //
+        // * Server ignored our `Range` and is sending the full body
+        //   (200 OK with `existing_size > 0`) — reset the hasher and
+        //   open the partial in a single `create + write + truncate`
+        //   syscall sequence so there is no handle-less window
+        //   between truncation and re-open.
+        // * Otherwise (206 resume, or no prior partial) — open with
+        //   `create + append` so the body stream extends whatever is
+        //   already on disk in place.
+        let mut partial = if !server_resumed && existing_size > 0 {
             hasher = Sha256::new();
             existing_size = 0;
             std::fs::OpenOptions::new()
+                .create(true)
                 .write(true)
                 .truncate(true)
                 .open(partial_path)
                 .map_err(|e| {
-                    Error::Storage(format!("model-download: truncate partial: {e}").into())
-                })?;
-        }
-
-        let mut partial = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(partial_path)
-            .map_err(|e| Error::Storage(format!("model-download: open partial: {e}").into()))?;
+                    Error::Storage(format!("model-download: open/truncate partial: {e}").into())
+                })?
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(partial_path)
+                .map_err(|e| Error::Storage(format!("model-download: open partial: {e}").into()))?
+        };
 
         let mut body = response;
         let mut buf = vec![0u8; COPY_CHUNK_BYTES];
@@ -508,8 +551,32 @@ impl ModelDownloader for HttpModelDownloader {
                         return Err(e);
                     }
                     last_err = Some(e);
-                    let backoff_ms = 1_000u64 << attempt; // 1s, 2s, 4s
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    // Exponential backoff between attempts. With the
+                    // default `HTTP_MODEL_DOWNLOAD_RETRY_ATTEMPTS = 3`,
+                    // the loop reaches this point on `attempt` 0 and
+                    // 1 only — attempt 2 short-circuits via `is_last`
+                    // above, so the `base << 2` slot is never used.
+                    //
+                    // Defensive bounds: `checked_shl` on a u64 panics
+                    // in debug / wraps to `0` in release when the
+                    // shift count is >= 64. If a future change ever
+                    // bumps `HTTP_MODEL_DOWNLOAD_RETRY_ATTEMPTS` past
+                    // 64 (or some caller increments `attempt` by
+                    // hand) the shift would either kill the worker
+                    // or silently degrade the backoff to "no sleep".
+                    // Cap the shift via `checked_shl`; on overflow,
+                    // fall back to `u64::MAX` so the sleep saturates
+                    // at the 584-million-year mark — i.e. the
+                    // function never gets back to retry, but
+                    // crucially does *not* panic and does *not*
+                    // silently disable the backoff.
+                    if self.retry_backoff_base_millis > 0 {
+                        let backoff_ms = self
+                            .retry_backoff_base_millis
+                            .checked_shl(attempt)
+                            .unwrap_or(u64::MAX);
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
+                    }
                 }
             }
         }
@@ -549,12 +616,26 @@ fn map_reqwest_err(label: &str, err: reqwest::Error) -> Error {
 /// * `bytes */<total>` (unsatisfied range — rejected here because
 ///   the call site only invokes this on `206 Partial Content`).
 ///
-/// Returns `None` for any header value that does not have the expected
-/// `bytes <start>-` prefix or whose start byte does not parse as a
-/// `u64`. Whitespace between `bytes` and the range is tolerated.
+/// RFC 7233 §4.2 ABNF requires a single SP (`" "`) between the
+/// `bytes` unit and the range-spec. We require at least one ASCII
+/// whitespace character there — a header like `bytes1024-2047/2048`
+/// is non-conformant and is rejected even though a permissive parser
+/// could extract `1024` from it. Returns `None` for any header value
+/// that does not match the expected prefix or whose start byte does
+/// not parse as a `u64`.
 fn parse_content_range_first_byte(header: &str) -> Option<u64> {
     let trimmed = header.trim();
-    let rest = trimmed.strip_prefix("bytes")?.trim_start();
+    let after_unit = trimmed.strip_prefix("bytes")?;
+    // RFC 7233 §4.2 ABNF: `byte-content-range = bytes-unit SP
+    // byte-range-resp`. The SP separator is mandatory; reject any
+    // header that runs the unit and range together so a malformed
+    // server response is observed and aborted here rather than
+    // silently parsing into a plausible-looking start byte.
+    let first = after_unit.chars().next()?;
+    if !first.is_ascii_whitespace() {
+        return None;
+    }
+    let rest = after_unit.trim_start();
     if rest.starts_with('*') {
         // `bytes */<total>` — server is signalling an unsatisfied
         // range; we should not reach this on `206 Partial Content`.
@@ -750,6 +831,49 @@ mod tests {
         assert_eq!(parse_content_range_first_byte(""), None);
         // Wrong unit (e.g. items, pages — non-standard).
         assert_eq!(parse_content_range_first_byte("items 0-9/100"), None);
+    }
+
+    #[test]
+    fn content_range_parser_requires_space_after_unit() {
+        // RFC 7233 §4.2 ABNF mandates SP between `bytes` and the
+        // range-spec. A non-conformant header that runs them together
+        // must be rejected — otherwise a permissive parser would
+        // extract a plausible-looking start byte from a malformed
+        // response and silently accept corrupt data.
+        assert_eq!(
+            parse_content_range_first_byte("bytes1024-2047/2048"),
+            None,
+            "no space after `bytes` must be rejected"
+        );
+        assert_eq!(
+            parse_content_range_first_byte("bytes-1024/2048"),
+            None,
+            "dash directly after `bytes` (no SP) must be rejected"
+        );
+        // Tabs are valid ASCII whitespace per the ABNF (LWSP-char
+        // tolerance in legacy HTTP), so we accept them.
+        assert_eq!(
+            parse_content_range_first_byte("bytes\t512-1023/1024"),
+            Some(512),
+            "tab separator must be accepted"
+        );
+    }
+
+    #[test]
+    fn with_retry_backoff_base_millis_overrides_default() {
+        let d = HttpModelDownloader::new()
+            .expect("new")
+            .with_retry_backoff_base_millis(7);
+        assert_eq!(d.retry_backoff_base_millis, 7);
+    }
+
+    #[test]
+    fn new_uses_default_backoff_base_millis() {
+        let d = HttpModelDownloader::new().expect("new");
+        assert_eq!(
+            d.retry_backoff_base_millis,
+            HTTP_MODEL_DOWNLOAD_BACKOFF_BASE_MILLIS
+        );
     }
 
     #[test]
