@@ -770,6 +770,20 @@ impl OnnxTextEmbedder {
             // …), so we look it up by index. The shape
             // contract is fixed at the graph level:
             // `[batch, seq_len, hidden_size]`.
+            //
+            // Guard the index access. In practice `session.run`
+            // returning `Ok(_)` from an XLM-R graph always yields
+            // at least one output, but a misconfigured /
+            // corrupted graph (or a future ORT version that
+            // changed the empty-output semantics) could surface
+            // an empty `SessionOutputs`, and a bare `outputs[0]`
+            // would panic instead of producing a typed error.
+            if outputs.len() == 0 {
+                return Err(crate::Error::Model(ModelError::Custom(
+                    "xlmr session returned zero outputs; expected at least the last hidden state at index 0"
+                        .to_string(),
+                )));
+            }
             let (out_shape, hidden) = outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(map_ort_error)?;
