@@ -55,6 +55,7 @@
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::backup::manifest_builder::SealedBackupManifest;
 use crate::backup::segment_builder::BuiltBackupSegment;
@@ -268,7 +269,17 @@ impl SealedSegmentBundle {
         k_segment: &KeyMaterial,
         k_backup_root: &KeyMaterial,
     ) -> Result<Self> {
-        let mut k_segment_bytes = [0u8; KEY_LEN];
+        // Mirror the codebase-wide key-hygiene idiom
+        // (`crates/core/src/archive/epoch_keys.rs:55-71`,
+        // `crypto/key_hierarchy.rs:75-78` etc.): the staging copy
+        // of the per-segment key sits inside a `Zeroizing<[u8;
+        // KEY_LEN]>` so the bytes scrub on drop *unconditionally*
+        // — even on the `?` early-return from `wrap_k_asset`,
+        // even on a panic, and even if a future contributor adds
+        // another fallible operation between the copy and the
+        // wrap. A bare `[u8; 32]` + manual `.fill(0)` would only
+        // scrub on the happy path.
+        let mut k_segment_bytes = Zeroizing::new([0u8; KEY_LEN]);
         k_segment_bytes.copy_from_slice(k_segment.as_bytes());
         let wrapped = wrap_k_asset(&k_segment_bytes, k_backup_root).map_err(Error::Crypto)?;
         // Cast event_count `usize -> u32` defensively. A backup
