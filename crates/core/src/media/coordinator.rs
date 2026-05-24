@@ -12,19 +12,21 @@
 //!   to write image / keyframe embeddings into the
 //!   `search_vector` table on media ingest.
 //! * `ocr_bridge` — platform OCR seam
-//!   ([`crate::models::ocr::OcrBridge`]). Today only the
-//!   install / `has_ocr_bridge` surface is wired so the bridge
-//!   can be registered from the platform layer; production
-//!   callers will be added when the media-caption pipeline
-//!   (`docs/DESIGN.md §7.6`) lights up, at which point an
-//!   `ocr_bridge` lookup accessor can be added alongside its
-//!   first caller — no scaffolded accessor is shipped here.
+//!   ([`crate::models::ocr::OcrBridge`]). Read by
+//!   [`crate::core_impl::CoreImpl::maybe_run_ocr_on_image_message`]
+//!   to write per-image recognized-text rows into the
+//!   `media_search_index` table, plus a flattened `search_fts`
+//!   / `search_fuzzy` / optional XLM-R fan-out keyed by the
+//!   message id (same shape as audio transcription and document
+//!   page extraction) so OCR text shows up in `core.search()`
+//!   alongside captions, transcripts, and document pages.
 //! * `whisper_transcriber` — on-device Whisper
 //!   transcription seam
 //!   ([`crate::models::whisper::WhisperTranscriber`]). Read by
 //!   [`crate::core_impl::CoreImpl::maybe_transcribe_audio_message`]
 //!   to write per-message transcripts into the
-//!   `media_search_index`.
+//!   `media_search_index` and the cross-modal FTS / fuzzy /
+//!   XLM-R indices.
 //! * `document_extractor` — on-device document
 //!   text-extraction seam
 //!   ([`crate::models::document::DocumentExtractor`]). Read by
@@ -54,6 +56,7 @@
 //! coordinator deliberately does **not** own the
 //! media-orchestrator methods themselves
 //! ([`crate::core_impl::CoreImpl::maybe_embed_image_message`],
+//! [`crate::core_impl::CoreImpl::maybe_run_ocr_on_image_message`],
 //! [`crate::core_impl::CoreImpl::maybe_transcribe_audio_message`],
 //! [`crate::core_impl::CoreImpl::maybe_extract_document_pages`],
 //! [`crate::core_impl::CoreImpl::maybe_embed_video_keyframes`],
@@ -103,10 +106,10 @@ pub(crate) struct Coordinator {
     image_embedder: OnceLock<Arc<dyn ImageEmbedder>>,
 
     /// platform OCR bridge. Write-once via
-    /// [`Self::install_ocr_bridge`]. Install / `has_*` only
-    /// today — no production caller invokes
-    /// [`OcrBridge::recognize_text`] yet, so no lookup accessor
-    /// is shipped (it would be dead scaffolding).
+    /// [`Self::install_ocr_bridge`]. Lock-free atomic-load
+    /// reads via [`Self::ocr_bridge`] from the media-ingest hot
+    /// path in
+    /// [`crate::core_impl::CoreImpl::maybe_run_ocr_on_image_message`].
     ocr_bridge: OnceLock<Arc<dyn OcrBridge>>,
 
     /// on-device Whisper transcription seam.
@@ -191,11 +194,16 @@ impl Coordinator {
         self.ocr_bridge.get().is_some()
     }
 
-    // No lock-free lookup accessor is exposed for `ocr_bridge`
-    // yet — see the field-level doc comment and the
-    // module-level doc for the rationale. When the media-caption
-    // pipeline lands, add an `ocr_bridge` accessor here
-    // alongside its first production caller.
+    /// Lock-free atomic load of the installed OCR bridge.
+    /// Returns `None` when no bridge has been installed yet —
+    /// the caller treats that as "skip OCR for this image
+    /// message". Mirrors the shape of
+    /// [`Self::whisper_transcriber`] /
+    /// [`Self::document_extractor`]; see the module-level doc
+    /// for the per-bridge install / read contract.
+    pub(crate) fn ocr_bridge(&self) -> Option<Arc<dyn OcrBridge>> {
+        self.ocr_bridge.get().map(Arc::clone)
+    }
 
     // ----------------------------------------------------------------
     // whisper_transcriber

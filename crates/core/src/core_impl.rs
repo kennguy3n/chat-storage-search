@@ -2754,6 +2754,147 @@ impl CoreImpl {
         }
     }
 
+    /// Best-effort platform OCR on image media. Runs only when
+    /// (a) an [`crate::models::ocr::OcrBridge`] is installed,
+    /// (b) `mime_type` indicates an image, and (c) the optional
+    /// [`crate::models::resource_gate::ResourceProbe`] reports
+    /// the device is willing to run OCR work (no probe installed
+    /// = always allowed). Mirrors the fan-out shape of
+    /// [`Self::maybe_transcribe_audio_message`] /
+    /// [`Self::maybe_extract_document_pages`]:
+    ///
+    /// * `media_search_index` keyed by `asset_id` with kind
+    ///   `"ocr"`, holding the concatenated recognized-text for
+    ///   the asset, the first non-`None` language tag the
+    ///   bridge reported, and the mean per-region confidence.
+    /// * `search_fts` and `search_fuzzy`, keyed by the audio
+    ///   message's `message_id` so an OCR'd screenshot ranks
+    ///   alongside text bodies, captions, transcripts, and
+    ///   document pages.
+    /// * Optionally [`crate::models::embeddings::LocalStoreEmbeddingCache`]
+    ///   under `XLMR_MODEL_VERSION` when a `TextEmbedder` is
+    ///   installed, so semantic-search picks up the OCR'd text.
+    ///
+    /// All errors — bridge failures, gate failures, DB write
+    /// failures — are absorbed; the message is already
+    /// persisted and FTS-searchable through its caption.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_run_ocr_on_image_message(
+        &self,
+        db: &LocalStoreDb,
+        message_id: &str,
+        asset_id: &str,
+        sender_id: &str,
+        conversation_id: &str,
+        created_at_ms: i64,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::models::resource_gate::ResourceGate;
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
+
+        if !mime_type.starts_with("image/") {
+            return;
+        }
+        // Resource-gate OCR work. OCR uses the same loose gate
+        // as embedding (`should_run_ocr`); skip entirely when
+        // the gate refuses. Lock-free atomic load — the
+        // resource probe is installed once at boot.
+        if let Some(probe) = self.resource_probe.get() {
+            let gate = ResourceGate::default();
+            if !gate.should_run_ocr(&probe.current_resources()) {
+                return;
+            }
+        }
+
+        let Some(bridge) = self.media.ocr_bridge() else {
+            return;
+        };
+        let regions = match bridge.recognize_text(plaintext, mime_type) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if regions.is_empty() {
+            return;
+        }
+
+        // Flatten the per-region recognized text into one row
+        // per asset, separated by `\n`. The platform OCR stacks
+        // (Apple Vision, ML Kit, Windows.Media.Ocr) all emit
+        // multiple regions per image; collapsing them into a
+        // single FTS-indexable string is consistent with how
+        // the audio transcriber and document extractor surface
+        // their multi-segment / multi-page output to the same
+        // table.
+        let mut combined = String::new();
+        let mut detected_lang: Option<String> = None;
+        let mut confidence_sum: f32 = 0.0;
+        let mut confidence_count: u32 = 0;
+        for region in &regions {
+            let trimmed = region.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(trimmed);
+            if detected_lang.is_none() {
+                detected_lang = region.language.clone();
+            }
+            confidence_sum += region.confidence;
+            confidence_count += 1;
+        }
+        let combined = combined.trim();
+        if combined.is_empty() {
+            return;
+        }
+        let language = detected_lang.as_deref();
+        let confidence = if confidence_count > 0 {
+            Some(confidence_sum / confidence_count as f32)
+        } else {
+            None
+        };
+
+        // (1) Legacy media-side index.
+        let _ = db.insert_media_search_index(asset_id, "ocr", combined, language, confidence);
+
+        // (2) Cross-modal FTS / fuzzy index keyed by
+        // `message_id` so a `core.search()` ranks the OCR'd
+        // image alongside captions, transcripts, and document
+        // pages. Duplicate `(message_id, text)` rows are
+        // tolerated for the same reason as the audio fan-out.
+        let _ = db.connection().execute(
+            "INSERT INTO search_fts(
+                message_id, conversation_id, sender_id,
+                created_at_ms, text_content
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                message_id,
+                conversation_id,
+                sender_id,
+                created_at_ms,
+                combined,
+            ],
+        );
+        let _ = FuzzyIndexWriter::new(db).index_message(message_id, combined);
+
+        // (3) Optional XLM-R embedding so semantic search picks
+        // up the OCR'd body. Lock-free atomic load — the text
+        // embedder is installed once at boot.
+        if let Some(embedder) = self.text_embedder.get() {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                if let Ok(vec) = embedder.embed(combined) {
+                    let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
+                }
+            }
+        }
+    }
+
     /// Best-effort Whisper transcription for audio media. Runs
     /// only when (a) a
     /// [`crate::models::whisper::WhisperTranscriber`] is
@@ -4687,6 +4828,23 @@ impl KChatCore for CoreImpl {
             // Failures are absorbed; the message is already
             // persisted and FTS-searchable through its caption.
             self.maybe_embed_image_message(&db, &skel.message_id, mime_type, &plaintext);
+
+            // best-effort platform OCR
+            // on image media. Recognized text fans out into
+            // `media_search_index` (kind="ocr"), `search_fts`,
+            // `search_fuzzy`, and the shared XLM-R embedding
+            // cache. Resource-gated on `should_run_ocr`.
+            // Failures are absorbed.
+            self.maybe_run_ocr_on_image_message(
+                &db,
+                &skel.message_id,
+                &asset_id.to_string(),
+                &skel.sender_id,
+                &skel.conversation_id,
+                skel.created_at_ms,
+                mime_type,
+                &plaintext,
+            );
 
             // best-effort
             // Whisper transcription for audio media. Fans the
@@ -11128,6 +11286,246 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 0, "no caption rows for image-only media");
+        });
+    }
+
+    // ----------------------------------------------------------------
+    // OCR bridge fan-out tests. Pin the integration contract for
+    // `maybe_run_ocr_on_image_message`: bridge installed +
+    // image MIME -> rows land in `media_search_index` (kind=ocr),
+    // `search_fts`, `search_fuzzy`, and (when a text-embedder is
+    // installed) the XLM-R embedding cache. Resource-gate +
+    // mime-type checks must also short-circuit before bridge
+    // dispatch.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn send_media_writes_ocr_into_media_search_index_when_bridge_installed() {
+        use crate::models::ocr::MockOcrBridge;
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let rows: Vec<(String, String, Option<String>, Option<f32>)> = db
+                .connection()
+                .prepare(
+                    "SELECT kind, text, language, confidence
+                     FROM media_search_index WHERE asset_id = ?1",
+                )
+                .unwrap()
+                .query_map([res.asset_id.to_string()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<f32>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let ocr = rows
+                .iter()
+                .find(|(k, _, _, _)| k == "ocr")
+                .expect("media_search_index row with kind='ocr' is missing");
+            assert!(ocr.1.contains("mock ocr"), "ocr text must be persisted");
+            // MockOcrBridge emits two `en` regions; the flatten
+            // path keeps both lines and reports `en` as the row
+            // language.
+            assert_eq!(ocr.2.as_deref(), Some("en"));
+            let conf = ocr.3.expect("confidence must be populated");
+            assert!((0.85..=0.95).contains(&conf), "mean of 0.95 and 0.85 = 0.9");
+            assert!(
+                ocr.1.contains("line 1") && ocr.1.contains("line 2"),
+                "multi-region flatten must keep both regions"
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_indexes_ocr_text_into_fts_and_fuzzy() {
+        use crate::models::ocr::MockOcrBridge;
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            // FTS row keyed by the image message_id is present.
+            let fts_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE message_id = ?1",
+                    [mid.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fts_count >= 1, "ocr text should land in search_fts");
+
+            // Fuzzy index has at least one row keyed by
+            // message_id. MockOcrBridge text starts with
+            // `"mock ocr ..."`, so probe with `"mock"`.
+            let fuzzy = FuzzySearchEngine::new(db.connection());
+            let hits = fuzzy.search_fuzzy("mock", 16).unwrap();
+            assert!(
+                hits.iter().any(|h| h.message_id == mid.to_string()),
+                "ocr text should land in search_fuzzy"
+            );
+        });
+    }
+
+    #[test]
+    fn send_media_skips_ocr_for_non_image_mime() {
+        use crate::models::ocr::MockOcrBridge;
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, b"voice-msg".to_vec(), "audio/wav", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'ocr'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "no ocr row should be written for audio media");
+        });
+    }
+
+    #[test]
+    fn send_media_skips_ocr_when_resource_gate_blocks() {
+        use crate::models::ocr::MockOcrBridge;
+        use crate::models::resource_gate::{
+            DeviceResources, NetworkType, ResourceProbe, ThermalState,
+        };
+
+        // A probe that reports critical thermal — every gate
+        // refuses, including `should_run_ocr`.
+        #[derive(Debug)]
+        struct CriticalProbe;
+        impl ResourceProbe for CriticalProbe {
+            fn current_resources(&self) -> DeviceResources {
+                DeviceResources {
+                    battery_level: 1.0,
+                    is_charging: true,
+                    thermal_state: ThermalState::Critical,
+                    network_type: NetworkType::WiFi,
+                }
+            }
+        }
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+        core.install_resource_probe(std::sync::Arc::new(CriticalProbe))
+            .expect("install resource probe");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'ocr'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "ocr should be gated off by ResourceGate");
+        });
+    }
+
+    #[test]
+    fn send_media_writes_xlmr_embedding_for_ocr_when_text_embedder_installed() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, XLMR_MODEL_VERSION,
+        };
+        use crate::models::ocr::MockOcrBridge;
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+        core.install_text_embedder(Arc::new(MockTextEmbedder::default()))
+            .expect("install text embedder");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        core.send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let vec = cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .expect("cache lookup")
+                .expect("xlm-r row should land in the embedding cache");
+            assert!(!vec.is_empty(), "stored embedding must be non-empty");
+        });
+    }
+
+    #[test]
+    fn send_media_skips_ocr_when_no_bridge_installed() {
+        let core = fresh_core();
+        // Deliberately *do not* install an OCR bridge.
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+
+        let res = core
+            .send_media(conv, mid, fake_image_bytes(), "image/png", None)
+            .expect("send_media");
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'ocr'",
+                    [res.asset_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "no ocr row without a bridge");
         });
     }
 

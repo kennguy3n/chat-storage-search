@@ -92,6 +92,70 @@ impl OcrBridge for NoopOcrBridge {
     }
 }
 
+/// Deterministic mock [`OcrBridge`] keyed by a BLAKE3 hash of
+/// `(mime_type, image_data)`. Used by integration tests to
+/// stand in for a real platform OCR backend without standing
+/// up the Vision / ML Kit / Windows.Media.Ocr glue.
+///
+/// Mirrors the construction of
+/// [`crate::models::whisper::MockWhisperTranscriber`] and
+/// [`crate::models::document::MockDocumentExtractor`]: identical
+/// inputs always yield the same `Vec<OcrResult>` and distinct
+/// inputs always diverge, so test assertions against the
+/// recognized-text-driven `media_search_index` / `search_fts`
+/// / `search_fuzzy` fan-out are stable across reruns.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MockOcrBridge;
+
+impl OcrBridge for MockOcrBridge {
+    fn recognize_text(&self, image_data: &[u8], mime_type: &str) -> Result<Vec<OcrResult>> {
+        if !mime_type.starts_with("image/") {
+            return Err(crate::Error::Model(
+                crate::models::ModelError::MediaDecode {
+                    op: "recognize_text",
+                    detail: format!("MockOcrBridge rejects non-image mime_type: {mime_type}"),
+                },
+            ));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(mime_type.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(image_data);
+        let hash = hasher.finalize();
+        let hex = hash.to_hex();
+        let prefix: String = hex.as_str().chars().take(16).collect();
+        // Two synthetic regions so test assertions against the
+        // multi-region flatten path have something to bite on.
+        // Confidence is fixed (high) so the mean-confidence
+        // computation in `maybe_run_ocr_on_image_message` is
+        // stable across runs.
+        Ok(vec![
+            OcrResult {
+                text: format!("mock ocr {prefix} line 1"),
+                language: Some("en".to_string()),
+                confidence: 0.95,
+                bounding_box: Some(BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 30.0,
+                }),
+            },
+            OcrResult {
+                text: format!("mock ocr {prefix} line 2"),
+                language: Some("en".to_string()),
+                confidence: 0.85,
+                bounding_box: Some(BoundingBox {
+                    x: 0.0,
+                    y: 35.0,
+                    width: 200.0,
+                    height: 30.0,
+                }),
+            },
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
