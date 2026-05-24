@@ -759,6 +759,21 @@ impl OnnxTextEmbedder {
             }
             let seq_len = out_shape[1] as usize;
             let hidden_size = out_shape[2] as usize;
+            // Pin the hidden-size invariant inline. The
+            // `EmbeddingCache` schema (and downstream cosine /
+            // ANN reranking that consumes these vectors) all
+            // assume a fixed `XLMR_EMBEDDING_DIM`-element blob;
+            // a wrong model export silently producing a
+            // different `hidden_size` would corrupt the cache
+            // on first write. Surface it loudly here instead.
+            if hidden_size != crate::models::embeddings::XLMR_EMBEDDING_DIM {
+                return Err(crate::Error::Model(ModelError::Custom(format!(
+                    "xlmr session produced hidden_size={hidden_size}, \
+                     expected XLMR_EMBEDDING_DIM={}; refusing to write a \
+                     wrong-shape blob to the embedding cache",
+                    crate::models::embeddings::XLMR_EMBEDDING_DIM,
+                ))));
+            }
             mask_aware_mean_pool(hidden, &attention_mask, seq_len, hidden_size).ok_or_else(
                 || {
                     crate::Error::Model(ModelError::Custom(format!(
