@@ -965,6 +965,29 @@ mod with_ort {
                 })?
                 .1;
             let (shape, data) = out.try_extract_tensor::<f32>().map_err(map_ort_error)?;
+            // Decoder output must be exactly `[1, prefix_len,
+            // vocab_size]` — 3 dims, batch == 1, sequence axis ==
+            // prefix_len. Mirrors the rank+leading-dim assertion
+            // we run on the encoder output: without the rank
+            // check a malformed tensor shaped `[N, prefix_len/N,
+            // vocab_size]` with N evenly dividing `prefix_len`
+            // would slip through the length equality, mis-layout
+            // the logits buffer, and feed `argmax_next_token` the
+            // wrong row.
+            let shape_slice: &[i64] = shape.as_ref();
+            if shape_slice.len() != 3
+                || shape_slice[0] != 1
+                || shape_slice[1] != prefix_len as i64
+                || shape_slice[2] != self.vocab_size as i64
+            {
+                return Err(crate::Error::Model(ModelError::Ort {
+                    op: "whisper_decoder_output_shape",
+                    detail: format!(
+                        "decoder output expected `[1, {prefix_len}, {}]`, got `{:?}`",
+                        self.vocab_size, shape
+                    ),
+                }));
+            }
             let total = prefix_len.checked_mul(self.vocab_size).ok_or_else(|| {
                 crate::Error::Model(ModelError::Ort {
                     op: "whisper_decoder_output_overflow",
@@ -1030,18 +1053,22 @@ mod with_ort {
 
             // 2. Encoder: [1, 80, 3000] → [1, 1500, d_model].
             let encoder_hidden = self.run_encoder(mel)?;
-            // d_model is whatever the encoder emits — we sniffed
-            // the total length and the leading dims are fixed,
-            // so divide out to recover it.
-            if encoder_hidden.is_empty() || encoder_hidden.len() % WHISPER_ENCODER_FRAMES != 0 {
-                return Err(crate::Error::Model(ModelError::Ort {
-                    op: "whisper_encoder_output_shape",
-                    detail: format!(
-                        "encoder output length {} not divisible by encoder frames {WHISPER_ENCODER_FRAMES}",
-                        encoder_hidden.len()
-                    ),
-                }));
-            }
+            // `run_encoder` already enforces that
+            // `encoder_hidden.len() == WHISPER_ENCODER_FRAMES *
+            // d_model_dim` where `d_model_dim >= 1` (the
+            // shape-rank + shape-value + length-equality
+            // gauntlet at the end of `run_encoder`). That means
+            // by the time we land here, `encoder_hidden` is
+            // non-empty AND length is divisible by
+            // `WHISPER_ENCODER_FRAMES` — both unconditionally.
+            // We keep a `debug_assert!` to document the invariant
+            // for future readers without paying a runtime check.
+            debug_assert!(
+                !encoder_hidden.is_empty()
+                    && encoder_hidden.len() % WHISPER_ENCODER_FRAMES == 0,
+                "run_encoder is required to guarantee `encoder_hidden.len() == WHISPER_ENCODER_FRAMES * d_model_dim` with d_model_dim >= 1; got len = {}",
+                encoder_hidden.len()
+            );
             let encoder_d_model = encoder_hidden.len() / WHISPER_ENCODER_FRAMES;
 
             // 3. Wrap the encoder hidden state in an ORT tensor
