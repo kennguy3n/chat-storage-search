@@ -360,6 +360,51 @@ impl HttpModelDownloader {
         }
 
         let server_resumed = status == reqwest::StatusCode::PARTIAL_CONTENT;
+
+        // Defense-in-depth: when the server returns 206, validate the
+        // `Content-Range` start byte matches the `existing_size` we sent
+        // in the request's `Range` header. Without this check, a
+        // misbehaving or compromised server could send arbitrary bytes
+        // appended to our partial; the SHA-256 mismatch would only be
+        // caught downstream by `ModelManager::verify_integrity` after a
+        // wasted full-body download (potentially 75-150 MB). Catching
+        // it here aborts the attempt immediately so the retry budget
+        // can attempt recovery (currently as a terminal `Server`
+        // error -- a misbehaving server is unlikely to self-heal on
+        // retry against the same URL).
+        if server_resumed {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            match content_range
+                .as_deref()
+                .and_then(parse_content_range_first_byte)
+            {
+                Some(start) if start == existing_size => {
+                    // Server-claimed start matches our partial size; OK.
+                }
+                Some(start) => {
+                    return Err(Error::Transport(crate::transport::TransportError::Server(
+                        format!(
+                            "model-download: 206 Content-Range start {start} \
+                             does not match partial size {existing_size} for {url}"
+                        ),
+                    )));
+                }
+                None => {
+                    return Err(Error::Transport(crate::transport::TransportError::Server(
+                        format!(
+                            "model-download: 206 response missing parseable \
+                             Content-Range header from {url} \
+                             (header={content_range:?})"
+                        ),
+                    )));
+                }
+            }
+        }
+
         if !server_resumed && existing_size > 0 {
             hasher = Sha256::new();
             existing_size = 0;
@@ -493,6 +538,31 @@ fn map_reqwest_err(label: &str, err: reqwest::Error) -> Error {
     } else {
         Error::Transport(crate::transport::TransportError::Server(msg))
     }
+}
+
+/// Parse the first byte of an HTTP `Content-Range` header value.
+///
+/// Accepts the RFC 7233 §4.2 byte-range form:
+///
+/// * `bytes <start>-<end>/<total>` (regular case),
+/// * `bytes <start>-<end>/*` (unknown total),
+/// * `bytes */<total>` (unsatisfied range — rejected here because
+///   the call site only invokes this on `206 Partial Content`).
+///
+/// Returns `None` for any header value that does not have the expected
+/// `bytes <start>-` prefix or whose start byte does not parse as a
+/// `u64`. Whitespace between `bytes` and the range is tolerated.
+fn parse_content_range_first_byte(header: &str) -> Option<u64> {
+    let trimmed = header.trim();
+    let rest = trimmed.strip_prefix("bytes")?.trim_start();
+    if rest.starts_with('*') {
+        // `bytes */<total>` — server is signalling an unsatisfied
+        // range; we should not reach this on `206 Partial Content`.
+        return None;
+    }
+    let dash = rest.find('-')?;
+    let start = &rest[..dash];
+    start.trim().parse::<u64>().ok()
 }
 
 /// Whether a captured [`crate::Error`] should trigger a retry.
@@ -636,6 +706,50 @@ mod tests {
             dbg.contains("<redacted>"),
             "Debug output should mark the token as redacted, got: {dbg}"
         );
+    }
+
+    #[test]
+    fn content_range_parser_extracts_first_byte() {
+        // Regular case (RFC 7233 §4.2 byte-range with known total).
+        assert_eq!(
+            parse_content_range_first_byte("bytes 1024-2047/2048"),
+            Some(1024)
+        );
+        // Unknown total — `bytes <start>-<end>/*`.
+        assert_eq!(
+            parse_content_range_first_byte("bytes 4096-8191/*"),
+            Some(4096)
+        );
+        // Zero start byte.
+        assert_eq!(parse_content_range_first_byte("bytes 0-1023/1024"), Some(0));
+        // Whitespace tolerance — some servers add extra space after `bytes`.
+        assert_eq!(
+            parse_content_range_first_byte("bytes   512-1023/1024"),
+            Some(512)
+        );
+        // Leading/trailing whitespace on the header value itself.
+        assert_eq!(
+            parse_content_range_first_byte("  bytes 100-200/300  "),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn content_range_parser_rejects_malformed_headers() {
+        // `bytes */<total>` is RFC's "unsatisfied range" form; not
+        // expected on a 206 response. Reject it so the call site
+        // surfaces a Server error instead of trusting the body.
+        assert_eq!(parse_content_range_first_byte("bytes */1024"), None);
+        // Missing the `bytes` unit prefix.
+        assert_eq!(parse_content_range_first_byte("0-1023/1024"), None);
+        // Non-numeric start byte.
+        assert_eq!(parse_content_range_first_byte("bytes abc-1023/1024"), None);
+        // No dash in the range.
+        assert_eq!(parse_content_range_first_byte("bytes 1024/2048"), None);
+        // Empty input.
+        assert_eq!(parse_content_range_first_byte(""), None);
+        // Wrong unit (e.g. items, pages — non-standard).
+        assert_eq!(parse_content_range_first_byte("items 0-9/100"), None);
     }
 
     #[test]

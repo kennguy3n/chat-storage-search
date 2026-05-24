@@ -537,6 +537,80 @@ fn oversized_partial_416_recovers_via_partial_delete_and_restart() {
 }
 
 #[test]
+fn corrupt_content_range_on_206_is_rejected_as_server_error() {
+    // Defense-in-depth: a 206 Partial Content response whose
+    // `Content-Range` start byte does NOT match the partial size we
+    // sent in the `Range` request header is treated as a server
+    // misbehaviour. Without this check the downloader would silently
+    // append wrong bytes to the partial and only catch the corruption
+    // downstream via SHA-256 mismatch (after wasting a full
+    // potentially-multi-MB body read).
+    //
+    // The downloader must surface this as a non-retryable Server
+    // error so it exits the retry loop immediately rather than
+    // repeatedly downloading the same bad bytes.
+    let prefix_len: usize = 5000;
+    let tail_len: usize = 3000;
+    let full = random_payload(21, prefix_len + tail_len);
+    let prefix = full[..prefix_len].to_vec();
+    let tail = full[prefix_len..].to_vec();
+    let full_len = full.len();
+    let tail_arc = Arc::new(tail.clone());
+
+    let server = spawn_server(move |mut s, _n| {
+        let (_method, _path, headers) = read_request(&mut s);
+        let range = headers.iter().find(|(k, _)| k == "range");
+        assert!(
+            range.is_some(),
+            "the test pre-seeds a partial so the client must send a Range header"
+        );
+        // Lie: claim the bytes start at 0 when the client asked for
+        // `bytes={prefix_len}-`. The downloader should detect the
+        // mismatch and abort the attempt.
+        let last = full_len - 1;
+        write_response(
+            &mut s,
+            206,
+            &tail_arc,
+            &[("Content-Range", format!("bytes 0-{last}/{full_len}"))],
+        );
+    });
+
+    let d = HttpModelDownloader::new().expect("new");
+    d.register_entry(
+        "xlmr",
+        "xlmr@v1",
+        DownloadEntry::new(format!("{}/xlmr.onnx", server.url()), Quantization::Int8),
+    )
+    .expect("register");
+
+    let dest = temp_dest("badrange");
+    let partial = HttpModelDownloader::partial_path(&dest);
+    std::fs::write(&partial, &prefix).expect("seed partial");
+
+    let err = d
+        .download_model("xlmr", "xlmr@v1", &dest)
+        .expect_err("download must reject lying Content-Range");
+    match &err {
+        Error::Transport(t) => {
+            let msg = format!("{t:?}");
+            assert!(
+                msg.contains("Content-Range"),
+                "error must mention Content-Range, got {msg}"
+            );
+        }
+        other => panic!("expected Transport(Server) error, got {other:?}"),
+    }
+    // The final destination must never exist when validation fails.
+    assert!(
+        !dest.exists(),
+        "dest must not be promoted on bad Content-Range"
+    );
+    let _ = std::fs::remove_file(&partial);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[test]
 fn partial_suffix_matches_constant() {
     // PR-level invariant: callers that sweep on the `.partial`
     // extension (`find /models -name '*.partial'`) rely on this exact
