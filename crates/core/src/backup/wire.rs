@@ -578,11 +578,25 @@ mod tests {
         let back = SealedManifestBundle::decode(&bytes).unwrap();
         let k_man_at_open =
             derive_backup_manifest(&backup_root, back.manifest.manifest_id.as_bytes()).unwrap();
+        // Reconstruct the AAD using *only* fields the restoring
+        // side reads back from the on-wire bundle — `back.device_id`
+        // rather than the local `device_id` variable. Mirrors the
+        // production restore path (`core_impl.rs::fetch_and_decode_
+        // manifest_bundle` consumes `bundle.device_id` when rebuilding
+        // the AAD; it does not have access to a side-band original).
+        // Catches a hypothetical future regression where
+        // `device_id` round-tripping diverges from the seal-time
+        // value: the AEAD open would fail here even though the
+        // CBOR round-trip looked correct.
+        assert_eq!(
+            back.device_id, device_id,
+            "device_id must survive the CBOR round-trip byte-for-byte",
+        );
         let aad = crate::backup::manifest_builder::build_manifest_aad(
             &back.manifest.manifest_id,
             back.manifest.generation,
             &back.manifest.merkle_root,
-            device_id,
+            &back.device_id,
         );
         let opened = crate::crypto::aead::xchacha20_poly1305::open(
             k_man_at_open.as_bytes(),
