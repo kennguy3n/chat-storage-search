@@ -74,12 +74,37 @@ use crate::models::whisper::{TranscriptionResult, WhisperTranscriber};
 /// `encoder_hidden_states[:, 1500, d_model]`.
 pub const WHISPER_ENCODER_FRAMES: usize = WHISPER_N_FRAMES / 2;
 
-/// Whisper's per-window decoder context limit. The original
-/// `multilingual.tiktoken` vocabulary is sized for 448 tokens
-/// of prefix; our greedy loop refuses to emit beyond this both
-/// to bound runtime and to avoid wandering into garbage tokens
-/// past the trained context.
-pub const WHISPER_MAX_DECODE_TOKENS: usize = 448;
+/// Whisper's per-window decoder body-token cap — the maximum
+/// number of *content* tokens the greedy loop will emit before
+/// it is forced to stop. Matches OpenAI Whisper's reference
+/// `whisper.decoding.DecodingTask.run` which clamps `sample_len`
+/// to `n_ctx // 2 = 224` for transcription tasks.
+///
+/// The trained decoder context window (`n_ctx`) is 448 positions
+/// total — that pool is shared between the 3–4 token prefix
+/// (`[SOT, <|lang|>, <|task|>, <|notimestamps|>?]`) and the body
+/// tokens. Letting the body run all the way to 448 would walk
+/// past trained positional embeddings (since the prefix already
+/// consumed positions 0..=3) and degrade quality on long audio.
+/// The reference 224 cap leaves comfortable headroom for the
+/// prefix and matches the behaviour Whisper was trained against.
+///
+/// Callers can override per-instance via
+/// [`OnnxWhisperTranscriber::with_max_decode_tokens`] (e.g. to
+/// 1 for unit tests). The greedy loop also enforces a hard
+/// `prefix.len() + body_tokens <= WHISPER_DECODER_CONTEXT_TOKENS`
+/// ceiling as defence-in-depth against future drift.
+pub const WHISPER_MAX_DECODE_TOKENS: usize = 224;
+
+/// Whisper decoder's full positional-embedding pool — 448
+/// positions total. Shared between the decoder prefix and the
+/// greedy-loop body tokens. Used as the hard ceiling in the
+/// greedy loop: `prefix.len() + emitted_body_tokens` MUST never
+/// exceed this, regardless of the per-instance
+/// `max_decode_tokens` override. Mirrors `model.dims.n_ctx` on
+/// every shipped Whisper variant (tiny / base / small / medium /
+/// large).
+pub const WHISPER_DECODER_CONTEXT_TOKENS: usize = 448;
 
 /// Token spacing (in seconds) of Whisper's timestamp tokens.
 /// `<|0.00|>` is `TIMESTAMP_BEGIN`, `<|0.02|>` is
@@ -577,9 +602,9 @@ pub const WHISPER_DEFAULT_ENCODER_FILENAME: &str = "encoder_model.onnx";
 #[cfg(feature = "onnx-runtime")]
 mod with_ort {
     use super::{
-        WhisperSpecialTokens, WhisperTask, WHISPER_DEFAULT_DECODER_FILENAME,
-        WHISPER_DEFAULT_ENCODER_FILENAME, WHISPER_DEFAULT_TOKENIZER_FILENAME,
-        WHISPER_ENCODER_FRAMES, WHISPER_MAX_DECODE_TOKENS,
+        WhisperSpecialTokens, WhisperTask, WHISPER_DECODER_CONTEXT_TOKENS,
+        WHISPER_DEFAULT_DECODER_FILENAME, WHISPER_DEFAULT_ENCODER_FILENAME,
+        WHISPER_DEFAULT_TOKENIZER_FILENAME, WHISPER_ENCODER_FRAMES, WHISPER_MAX_DECODE_TOKENS,
     };
     use crate::models::embeddings_onnx::{
         map_ort_error, select_provider, OnnxExecutionProvider, OnnxProviderReport, OrtDirectMlProbe,
@@ -686,13 +711,24 @@ mod with_ort {
         language: Option<String>,
         /// Whether to emit `<|notimestamps|>` in the prefix.
         with_timestamps: bool,
-        /// Maximum decode-loop iteration count. Defaults to
-        /// [`WHISPER_MAX_DECODE_TOKENS`].
+        /// Maximum decode-loop iteration count (body tokens).
+        /// Defaults to [`WHISPER_MAX_DECODE_TOKENS`]. The loop
+        /// further enforces a hard ceiling of
+        /// [`WHISPER_DECODER_CONTEXT_TOKENS`] on
+        /// `prefix.len() + emitted body tokens`.
         max_decode_tokens: usize,
         /// Vocabulary cardinality sniffed from the tokenizer at
         /// construction time. Used to validate decoder logits
         /// tensor shapes.
         vocab_size: usize,
+        /// Pre-computed greedy-decode suppression set, cached on
+        /// the struct because it depends only on `special` /
+        /// `special.languages` which are immutable after
+        /// construction. Stored sorted-deduped so
+        /// [`super::argmax_next_token`]'s `binary_search`
+        /// contract holds. See [`Self::build_suppression_set`]
+        /// for the construction rule.
+        suppress: Vec<u32>,
     }
 
     impl std::fmt::Debug for OnnxWhisperTranscriber {
@@ -744,6 +780,11 @@ mod with_ort {
             let tokenizer = load_whisper_tokenizer(tokenizer_path)?;
             let special = resolve_special_tokens(&tokenizer)?;
             let vocab_size = tokenizer.get_vocab_size(true);
+            // `special` is immutable for the lifetime of the
+            // struct, so the suppression set is too. Compute it
+            // once here and reuse on every `transcribe` call —
+            // see Devin Review ANALYSIS_0002 on 64f347f.
+            let suppress = Self::compute_suppression_set(&special);
 
             Ok(Self {
                 encoder: std::sync::Mutex::new(encoder),
@@ -758,6 +799,7 @@ mod with_ort {
                 with_timestamps: true,
                 max_decode_tokens: WHISPER_MAX_DECODE_TOKENS,
                 vocab_size,
+                suppress,
             })
         }
 
@@ -800,9 +842,14 @@ mod with_ort {
             self
         }
 
-        /// Override the decode-loop iteration ceiling. Defaults
-        /// to [`WHISPER_MAX_DECODE_TOKENS`] (448 — Whisper's
-        /// trained context limit).
+        /// Override the body-token cap for the greedy decode
+        /// loop. Defaults to [`WHISPER_MAX_DECODE_TOKENS`] (224 —
+        /// matches OpenAI Whisper's `sample_len = n_ctx // 2`).
+        /// The greedy loop additionally enforces the hard
+        /// `prefix.len() + body_tokens <= WHISPER_DECODER_CONTEXT_TOKENS`
+        /// ceiling, so passing a value larger than 444 (= 448 −
+        /// 4 max prefix tokens) just means the context ceiling
+        /// becomes the effective cap.
         pub fn with_max_decode_tokens(mut self, max: usize) -> Self {
             self.max_decode_tokens = max.max(1);
             self
@@ -1119,8 +1166,9 @@ mod with_ort {
             };
 
             // 5. Build the real decode prefix, now that we have
-            //    a language token in hand.
-            let suppress = self.build_suppression_set();
+            //    a language token in hand. Suppression set is
+            //    cached on `self` (computed once at construction)
+            //    — see Devin Review ANALYSIS_0002 on 64f347f.
             let mut prefix = super::build_decoder_prefix(
                 &self.special,
                 Some(language_token),
@@ -1130,25 +1178,52 @@ mod with_ort {
             let prefix_initial_len = prefix.len();
 
             // 6. Greedy decode loop.
+            //
+            // The body-token budget is the *minimum* of two
+            // ceilings:
+            //
+            //   a) `self.max_decode_tokens` — the per-instance
+            //      cap, defaulting to `WHISPER_MAX_DECODE_TOKENS`
+            //      = 224 (matches OpenAI Whisper's
+            //      `sample_len = n_ctx // 2`).
+            //   b) `WHISPER_DECODER_CONTEXT_TOKENS - prefix_initial_len`
+            //      — the hard ceiling imposed by the decoder's
+            //      trained positional-embedding pool (448 total
+            //      positions, shared with the prefix). Even if a
+            //      caller overrides `with_max_decode_tokens(444)`
+            //      we MUST NOT walk past position 448, or we'd
+            //      drive the decoder past trained positions and
+            //      silently corrupt output quality. See Devin
+            //      Review ANALYSIS_0001 on 64f347f.
+            let context_budget = WHISPER_DECODER_CONTEXT_TOKENS.saturating_sub(prefix_initial_len);
+            let body_budget = self.max_decode_tokens.min(context_budget);
             let mut emitted: Vec<u32> = Vec::new();
-            for _ in 0..self.max_decode_tokens {
+            for _ in 0..body_budget {
                 let logits = self.run_decoder(&prefix, &hidden_tensor)?;
-                let next =
-                    super::argmax_next_token(&logits, prefix.len(), self.vocab_size, &suppress)
-                        .ok_or_else(|| {
-                            crate::Error::Model(ModelError::Ort {
-                                op: "whisper_decoder_argmax",
-                                detail:
-                                    "every vocabulary position was suppressed; refusing to advance"
-                                        .into(),
-                            })
-                        })?;
+                let next = super::argmax_next_token(
+                    &logits,
+                    prefix.len(),
+                    self.vocab_size,
+                    &self.suppress,
+                )
+                .ok_or_else(|| {
+                    crate::Error::Model(ModelError::Ort {
+                        op: "whisper_decoder_argmax",
+                        detail: "every vocabulary position was suppressed; refusing to advance"
+                            .into(),
+                    })
+                })?;
                 if next == self.special.end_of_text {
                     break;
                 }
                 emitted.push(next);
                 prefix.push(next);
             }
+            debug_assert!(
+                prefix.len() <= WHISPER_DECODER_CONTEXT_TOKENS,
+                "greedy loop overran decoder context: prefix.len() = {}, ceiling = {WHISPER_DECODER_CONTEXT_TOKENS}",
+                prefix.len()
+            );
 
             // 7. Decode token stream → text + segments.
             let tokenizer = &self.tokenizer;
@@ -1208,21 +1283,35 @@ mod with_ort {
         /// threads the resulting language token into the decoder
         /// prefix. Once language is in the prefix it should never
         /// appear in the body, so the suppression is correct.
-        fn build_suppression_set(&self) -> Vec<u32> {
+        ///
+        /// This is a free function on the type (not `&self`)
+        /// because `new_with_paths` calls it BEFORE the
+        /// `OnnxWhisperTranscriber` value is constructed — the
+        /// suppression set is cached on `self.suppress` and
+        /// reused on every `transcribe` call (see Devin Review
+        /// ANALYSIS_0002 on 64f347f).
+        pub(crate) fn compute_suppression_set(special: &WhisperSpecialTokens) -> Vec<u32> {
             let mut suppress = vec![
-                self.special.start_of_transcript,
-                self.special.transcribe,
-                self.special.translate,
-                self.special.no_timestamps,
+                special.start_of_transcript,
+                special.transcribe,
+                special.translate,
+                special.no_timestamps,
             ];
-            if let Some(ns) = self.special.no_speech {
+            if let Some(ns) = special.no_speech {
                 suppress.push(ns);
             }
-            suppress.extend(self.special.languages.values().copied());
+            suppress.extend(special.languages.values().copied());
             // Do NOT suppress `end_of_text` or timestamp tokens.
             suppress.sort_unstable();
             suppress.dedup();
             suppress
+        }
+
+        /// Expose the cached suppression set for telemetry /
+        /// debugging. Pinned by `compute_suppression_set`'s
+        /// sorted-deduped contract.
+        pub fn suppression_set(&self) -> &[u32] {
+            &self.suppress
         }
     }
 
@@ -1510,6 +1599,39 @@ mod tests {
         let logits = vec![0.0_f32; 8];
         let pick = argmax_next_token(&logits, 3, 4, &[]);
         assert_eq!(pick, None);
+    }
+
+    #[test]
+    fn max_decode_tokens_matches_whisper_reference_sample_len() {
+        // Pins the constant value against the OpenAI Whisper
+        // reference implementation. Whisper's
+        // `whisper.decoding.DecodingTask.run` sets
+        // `sample_len = self.n_ctx // 2` for transcription tasks
+        // (n_ctx = 448, so sample_len = 224). Letting the greedy
+        // loop run beyond 224 would walk the decoder past trained
+        // positional embeddings (positions 0..=3 are consumed by
+        // the prefix; bodies that span 224 emitted tokens land
+        // exactly at position 227, well within the 448 pool).
+        assert_eq!(WHISPER_MAX_DECODE_TOKENS, 224);
+        assert_eq!(WHISPER_DECODER_CONTEXT_TOKENS, 448);
+        // Body cap MUST leave headroom for the longest possible
+        // prefix (`[SOT, <|lang|>, <|task|>, <|notimestamps|>]`
+        // = 4 tokens). The greedy loop also enforces this at
+        // runtime via `context_budget`, but the constants alone
+        // should satisfy `MAX_DECODE + longest_prefix <= CONTEXT`.
+        // Compute the available headroom into a runtime value so
+        // clippy doesn't flag the assertion as constant-folded
+        // (the relationship is what we want to lock in, not a
+        // tautology).
+        let headroom =
+            WHISPER_DECODER_CONTEXT_TOKENS.saturating_sub(WHISPER_MAX_DECODE_TOKENS);
+        assert!(
+            headroom >= 4,
+            "body cap {} + longest prefix 4 must fit decoder context {} (headroom = {})",
+            WHISPER_MAX_DECODE_TOKENS,
+            WHISPER_DECODER_CONTEXT_TOKENS,
+            headroom,
+        );
     }
 
     #[test]
