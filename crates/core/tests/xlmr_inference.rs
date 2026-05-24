@@ -25,13 +25,50 @@ use kchat_core::models::embeddings::XLMR_EMBEDDING_DIM;
 use kchat_core::models::embeddings_onnx::OnnxTextEmbedder;
 use std::path::PathBuf;
 
-/// Returns `(model_path, tokenizer_path)` from env vars, or
-/// `None` if either is unset. Centralised so the optional
-/// integration test stays terse.
+/// Env var a CI config sets to `1` when it intends to run the env-gated
+/// XLM-R tests. With this flag set, [`require_artifact_paths`] panics
+/// when `KCHAT_XLMR_MODEL_PATH` or `KCHAT_XLMR_TOKENIZER_PATH` is
+/// missing instead of skipping — so a misconfigured CI matrix that
+/// forgot to mount the artifact fails loudly rather than silently
+/// passing a no-op test. Local developer runs leave this unset and
+/// get the standard skip-on-missing behaviour.
+const E2E_REQUIRED_ENV: &str = "KCHAT_XLMR_E2E_REQUIRED";
+
+/// Resolve `(model_path, tokenizer_path)` from `KCHAT_XLMR_MODEL_PATH`
+/// and `KCHAT_XLMR_TOKENIZER_PATH`. Returns `None` when either env var
+/// is unset; the test caller decides whether to skip (default) or fail
+/// (when `KCHAT_XLMR_E2E_REQUIRED=1` makes the test mandatory).
 fn artifact_paths() -> Option<(PathBuf, PathBuf)> {
     let model = std::env::var_os("KCHAT_XLMR_MODEL_PATH")?;
     let tokenizer = std::env::var_os("KCHAT_XLMR_TOKENIZER_PATH")?;
     Some((PathBuf::from(model), PathBuf::from(tokenizer)))
+}
+
+/// Return the artifact paths, or `None` after `eprintln!`-ing a clearly
+/// marked `[SKIP]` line on the test's name. When the caller has opted
+/// into mandatory mode by setting `KCHAT_XLMR_E2E_REQUIRED=1`, panic
+/// instead of returning `None` so the silent-skip path cannot mask a
+/// misconfigured CI matrix.
+fn require_artifact_paths(test_name: &str) -> Option<(PathBuf, PathBuf)> {
+    if let Some(paths) = artifact_paths() {
+        return Some(paths);
+    }
+    let mandatory = std::env::var_os(E2E_REQUIRED_ENV)
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    if mandatory {
+        panic!(
+            "{E2E_REQUIRED_ENV}=1 but KCHAT_XLMR_MODEL_PATH / \
+             KCHAT_XLMR_TOKENIZER_PATH are missing — refusing to \
+             silently skip `{test_name}`",
+        );
+    }
+    eprintln!(
+        "[SKIP] {test_name}: set KCHAT_XLMR_MODEL_PATH + \
+         KCHAT_XLMR_TOKENIZER_PATH to run, or {E2E_REQUIRED_ENV}=1 to \
+         fail on missing artifacts",
+    );
+    None
 }
 
 #[test]
@@ -73,11 +110,12 @@ fn new_with_tokenizer_returns_tokenizer_error_when_only_tokenizer_missing() {
     // Skip when no real model artifact is staged — without one
     // we cannot drive the session-create step to success and
     // therefore cannot isolate the tokenizer-load failure.
-    let Some((model_path, _real_tokenizer_path)) = artifact_paths() else {
-        eprintln!(
-            "skipping new_with_tokenizer_returns_tokenizer_error_when_only_tokenizer_missing — \
-             set KCHAT_XLMR_MODEL_PATH + KCHAT_XLMR_TOKENIZER_PATH to run"
-        );
+    // `require_artifact_paths` panics instead of returning `None`
+    // when `KCHAT_XLMR_E2E_REQUIRED=1`, so a CI config that demands
+    // this test runs cannot silently fall through to a no-op pass.
+    let Some((model_path, _real_tokenizer_path)) = require_artifact_paths(
+        "new_with_tokenizer_returns_tokenizer_error_when_only_tokenizer_missing",
+    ) else {
         return;
     };
     let bogus_tokenizer = PathBuf::from("/definitely/does/not/exist/tokenizer.json");
@@ -94,11 +132,15 @@ fn new_with_tokenizer_returns_tokenizer_error_when_only_tokenizer_missing() {
 fn embed_text_against_real_xlmr_model() {
     // Optional end-to-end test: only runs when both env vars
     // point at a real XLM-R ONNX export and its tokenizer.
-    let Some((model_path, tokenizer_path)) = artifact_paths() else {
-        eprintln!(
-            "skipping embed_text_against_real_xlmr_model — \
-             set KCHAT_XLMR_MODEL_PATH + KCHAT_XLMR_TOKENIZER_PATH to run"
-        );
+    // `require_artifact_paths` makes the skip explicit (clearly
+    // marked `[SKIP]` line on the test's name in stderr) and
+    // upgrades it to a panic when `KCHAT_XLMR_E2E_REQUIRED=1`, so a
+    // CI matrix that intends to exercise the real inference pipeline
+    // fails loudly rather than silently passing when the artifact
+    // env vars are absent.
+    let Some((model_path, tokenizer_path)) =
+        require_artifact_paths("embed_text_against_real_xlmr_model")
+    else {
         return;
     };
 
