@@ -117,6 +117,17 @@ pub const WHISPER_TIMESTAMP_STEP_SECONDS: f32 = 0.02;
 /// segment-builder math stays integer-only.
 pub const WHISPER_TIMESTAMP_STEP_MS: u64 = 20;
 
+/// Number of distinct Whisper timestamp tokens, inclusive on
+/// both ends: `<|0.00|>` through `<|30.00|>` is `30 / 0.02 + 1
+/// = 1501` ids occupying the contiguous range
+/// `[timestamp_begin, timestamp_begin + 1500]`. Used by the
+/// timestamp-aware suppression set built in
+/// [`OnnxWhisperTranscriber::compute_suppression_set_no_timestamps`]
+/// so the greedy decoder cannot emit timestamps when
+/// `with_timestamps = false`, matching the reference
+/// `whisper.decoding.SuppressTokens` behaviour.
+pub const WHISPER_TIMESTAMP_TOKEN_COUNT: u32 = 1_501;
+
 // ---------------------------------------------------------------------------
 // Pure: WhisperTask
 // ---------------------------------------------------------------------------
@@ -605,6 +616,7 @@ mod with_ort {
         WhisperSpecialTokens, WhisperTask, WHISPER_DECODER_CONTEXT_TOKENS,
         WHISPER_DEFAULT_DECODER_FILENAME, WHISPER_DEFAULT_ENCODER_FILENAME,
         WHISPER_DEFAULT_TOKENIZER_FILENAME, WHISPER_ENCODER_FRAMES, WHISPER_MAX_DECODE_TOKENS,
+        WHISPER_TIMESTAMP_TOKEN_COUNT,
     };
     use crate::models::embeddings_onnx::{
         map_ort_error, select_provider, OnnxExecutionProvider, OnnxProviderReport, OrtDirectMlProbe,
@@ -721,14 +733,34 @@ mod with_ort {
         /// construction time. Used to validate decoder logits
         /// tensor shapes.
         vocab_size: usize,
-        /// Pre-computed greedy-decode suppression set, cached on
-        /// the struct because it depends only on `special` /
+        /// Pre-computed greedy-decode suppression set used when
+        /// the transcriber is configured with
+        /// `with_timestamps = true`. Depends only on `special` /
         /// `special.languages` which are immutable after
-        /// construction. Stored sorted-deduped so
-        /// [`super::argmax_next_token`]'s `binary_search`
-        /// contract holds. See [`Self::build_suppression_set`]
-        /// for the construction rule.
+        /// construction, so cached on the struct. Stored sorted-
+        /// deduped to satisfy [`super::argmax_next_token`]'s
+        /// `binary_search` contract.
         suppress: Vec<u32>,
+        /// Pre-computed greedy-decode suppression set used when
+        /// the transcriber is configured with
+        /// `with_timestamps = false`. Same contents as
+        /// [`Self::suppress`] PLUS the full Whisper timestamp
+        /// token range
+        /// `[timestamp_begin, timestamp_begin + 1500]`
+        /// (1501 ids) so the greedy decoder cannot emit a
+        /// timestamp even if the `<|notimestamps|>` prefix
+        /// conditioning is overridden by the model.
+        ///
+        /// Mirrors the reference
+        /// `whisper.decoding.SuppressTokens` behaviour which
+        /// extends the base suppression list with all timestamp
+        /// ids when `without_timestamps=True`. Stored sorted-
+        /// deduped so the same `binary_search` fast-path applies.
+        ///
+        /// Cached because the cost (1.5 K-element vec sort) is
+        /// non-trivial and the inputs are immutable post-
+        /// construction.
+        suppress_no_timestamps: Vec<u32>,
     }
 
     impl std::fmt::Debug for OnnxWhisperTranscriber {
@@ -785,6 +817,8 @@ mod with_ort {
             // once here and reuse on every `transcribe` call —
             // see Devin Review ANALYSIS_0002 on 64f347f.
             let suppress = Self::compute_suppression_set(&special);
+            let suppress_no_timestamps =
+                Self::compute_suppression_set_no_timestamps(&special);
 
             Ok(Self {
                 encoder: std::sync::Mutex::new(encoder),
@@ -800,6 +834,7 @@ mod with_ort {
                 max_decode_tokens: WHISPER_MAX_DECODE_TOKENS,
                 vocab_size,
                 suppress,
+                suppress_no_timestamps,
             })
         }
 
@@ -977,9 +1012,27 @@ mod with_ort {
         }
 
         /// Run the decoder once over the current prefix and a
-        /// pre-built encoder hidden-state tensor; return the
-        /// logits as a flat row-major `Vec<f32>` of length
-        /// `prefix.len() * vocab_size`.
+        /// pre-built encoder hidden-state tensor; return ONLY
+        /// the last-position row of the logits as a `Vec<f32>`
+        /// of length `vocab_size`.
+        ///
+        /// The decoder output's natural shape is
+        /// `[1, prefix_len, vocab_size]`, but greedy
+        /// autoregressive decoding only consumes the row at
+        /// position `prefix_len - 1` (the argmax that picks the
+        /// next token). Returning the whole flat buffer would
+        /// force a `Vec` allocation of `prefix_len * vocab_size`
+        /// floats on every greedy step — for whisper-base
+        /// (`vocab_size ≈ 51865`) the final iterations would
+        /// each copy ~90 MiB of logits just to argmax the last
+        /// `~200 KiB` row, totalling O(n²) bytes of transient
+        /// allocation per 30-second window.
+        ///
+        /// Slicing the last row at extraction time caps the
+        /// per-step allocation at `vocab_size * 4 B`
+        /// (~200 KiB for whisper-base) regardless of
+        /// `prefix_len`, eliminating the quadratic memory churn
+        /// without touching the decoder ONNX graph.
         ///
         /// `hidden_tensor` is borrowed (not consumed) so the
         /// caller can reuse it across every greedy iteration
@@ -1070,10 +1123,12 @@ mod with_ort {
         fn detect_language(&self, hidden_tensor: &Tensor<f32>) -> Result<u32> {
             let probe_prefix = [self.special.start_of_transcript];
             let logits = self.run_decoder(&probe_prefix, hidden_tensor)?;
-            // `run_decoder` already validated that `data.len()
-            // == prefix_len * vocab_size`; with a single-token
-            // prefix the position-0 row is the whole buffer.
-            let row = &logits[..self.vocab_size];
+            // `run_decoder` now returns ONLY the last-position
+            // row (`vocab_size` floats). With a single-token
+            // `[SOT]` prefix, the last position IS position 0, so
+            // the returned buffer is the row we need verbatim —
+            // no `&logits[..vocab_size]` slice required.
+            let row: &[f32] = &logits;
             let language_ids: Vec<u32> = self.special.languages.values().copied().collect();
             super::argmax_language_token(row, &language_ids).ok_or_else(|| {
                 crate::Error::Model(ModelError::Ort {
@@ -1200,11 +1255,19 @@ mod with_ort {
             let mut emitted: Vec<u32> = Vec::new();
             for _ in 0..body_budget {
                 let logits = self.run_decoder(&prefix, &hidden_tensor)?;
+                // `run_decoder` returns ONLY the last-position
+                // row of the decoder output (`vocab_size` floats)
+                // — see its doc comment for the rationale
+                // (avoid the per-step `O(prefix_len ·
+                // vocab_size)` copy that a `data.to_vec()` of the
+                // whole `[1, prefix_len, vocab_size]` buffer
+                // would cost). So `seq_len = 1` for the argmax
+                // call, NOT `prefix.len()`.
                 let next = super::argmax_next_token(
                     &logits,
-                    prefix.len(),
+                    1,
                     self.vocab_size,
-                    &self.suppress,
+                    self.effective_suppression_set(),
                 )
                 .ok_or_else(|| {
                     crate::Error::Model(ModelError::Ort {
@@ -1307,11 +1370,64 @@ mod with_ort {
             suppress
         }
 
-        /// Expose the cached suppression set for telemetry /
-        /// debugging. Pinned by `compute_suppression_set`'s
-        /// sorted-deduped contract.
+        /// Variant of [`Self::compute_suppression_set`] used
+        /// when the transcriber is configured with
+        /// `with_timestamps = false`. Returns the base
+        /// suppression set PLUS the full Whisper timestamp
+        /// token range (`timestamp_begin` through
+        /// `timestamp_begin + 1500`, inclusive — 1501 ids).
+        ///
+        /// This is a hard-suppression complement to the
+        /// `<|notimestamps|>` prefix conditioning: even if the
+        /// model decoder were to emit a timestamp token despite
+        /// the prefix (degraded export, distribution shift,
+        /// adversarial input), the greedy argmax will skip every
+        /// timestamp id and the `segments_from_tokens` builder
+        /// will return the single-segment
+        /// `start_ms = end_ms = 0` shape promised by
+        /// [`OnnxWhisperTranscriberBuilder::with_timestamps`]'s
+        /// docs.
+        ///
+        /// Mirrors the reference
+        /// `whisper.decoding.SuppressTokens` rule under
+        /// `without_timestamps=True`.
+        pub(crate) fn compute_suppression_set_no_timestamps(
+            special: &WhisperSpecialTokens,
+        ) -> Vec<u32> {
+            let mut suppress = Self::compute_suppression_set(special);
+            // `WHISPER_TIMESTAMP_TOKEN_COUNT = 1501` covers
+            // `<|0.00|>` (offset 0) through `<|30.00|>` (offset
+            // 1500) inclusive, matching
+            // `timestamp_token_to_ms`'s `offset > 1_500` cutoff.
+            suppress.reserve(WHISPER_TIMESTAMP_TOKEN_COUNT as usize);
+            for offset in 0..WHISPER_TIMESTAMP_TOKEN_COUNT {
+                suppress.push(special.timestamp_begin + offset);
+            }
+            suppress.sort_unstable();
+            suppress.dedup();
+            suppress
+        }
+
+        /// Pick the suppression set the greedy decoder should
+        /// use for the currently-configured `with_timestamps`
+        /// flag. Both sets are pre-sorted / pre-deduped so the
+        /// `argmax_next_token` `binary_search` fast-path applies
+        /// to either.
+        pub(crate) fn effective_suppression_set(&self) -> &[u32] {
+            if self.with_timestamps {
+                &self.suppress
+            } else {
+                &self.suppress_no_timestamps
+            }
+        }
+
+        /// Expose the active (`with_timestamps`-aware)
+        /// suppression set for telemetry / debugging. Pinned by
+        /// `compute_suppression_set` /
+        /// `compute_suppression_set_no_timestamps`'s sorted-
+        /// deduped contract.
         pub fn suppression_set(&self) -> &[u32] {
-            &self.suppress
+            self.effective_suppression_set()
         }
     }
 
@@ -1812,6 +1928,84 @@ mod tests {
             99,
             "Whisper supports 99 languages"
         );
+    }
+
+    // ---- ONNX-runtime-only suppression-set tests ----
+
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn compute_suppression_set_no_timestamps_adds_full_timestamp_range() {
+        // The base set must hard-suppress every timestamp id in
+        // `[timestamp_begin, timestamp_begin + 1500]` so the
+        // greedy decoder cannot emit a timestamp even if the
+        // `<|notimestamps|>` prefix conditioning fails — matches
+        // the reference `whisper.decoding.SuppressTokens`
+        // behaviour under `without_timestamps=True`.
+        let timestamp_begin = 50_363;
+        let added = synthetic_added_tokens(timestamp_begin);
+        let s = WhisperSpecialTokens::resolve_from_added_tokens(&added).unwrap();
+        let base = OnnxWhisperTranscriber::compute_suppression_set(&s);
+        let extended = OnnxWhisperTranscriber::compute_suppression_set_no_timestamps(&s);
+
+        // Sorted-deduped contract holds (argmax_next_token relies
+        // on `binary_search`).
+        let mut sorted_check = extended.clone();
+        sorted_check.sort_unstable();
+        sorted_check.dedup();
+        assert_eq!(
+            extended, sorted_check,
+            "extended suppression set must be sorted and deduped"
+        );
+
+        // Base set is a strict subset of the extended set.
+        for id in &base {
+            assert!(
+                extended.binary_search(id).is_ok(),
+                "extended set missing base id {id}"
+            );
+        }
+
+        // Every timestamp id in the inclusive range is present.
+        for offset in 0..WHISPER_TIMESTAMP_TOKEN_COUNT {
+            let id = timestamp_begin + offset;
+            assert!(
+                extended.binary_search(&id).is_ok(),
+                "extended set missing timestamp id {id} (offset {offset})"
+            );
+        }
+
+        // Just past the range is NOT suppressed.
+        let beyond = timestamp_begin + WHISPER_TIMESTAMP_TOKEN_COUNT;
+        assert!(
+            extended.binary_search(&beyond).is_err(),
+            "extended set should not include {beyond} (one past the inclusive range)"
+        );
+
+        // `<|endoftext|>` MUST remain unsuppressed (greedy loop
+        // depends on emitting EOS to stop).
+        assert!(
+            extended.binary_search(&s.end_of_text).is_err(),
+            "extended set must NOT suppress end_of_text"
+        );
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn compute_suppression_set_excludes_timestamp_tokens() {
+        // Regression guard: the timestamps-allowed branch must
+        // NOT include any timestamp ids — otherwise the decoder
+        // could never emit timestamps even when configured to.
+        let timestamp_begin = 50_363;
+        let added = synthetic_added_tokens(timestamp_begin);
+        let s = WhisperSpecialTokens::resolve_from_added_tokens(&added).unwrap();
+        let base = OnnxWhisperTranscriber::compute_suppression_set(&s);
+        for offset in 0..WHISPER_TIMESTAMP_TOKEN_COUNT {
+            let id = timestamp_begin + offset;
+            assert!(
+                base.binary_search(&id).is_err(),
+                "base set must not suppress timestamp id {id}"
+            );
+        }
     }
 
     // ---- Stub-only tests (feature off) ----
