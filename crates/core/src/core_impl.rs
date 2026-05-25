@@ -4050,6 +4050,59 @@ impl CoreImpl {
         self.backup
             .commit_compaction(sealed_manifest.manifest.clone(), new_ledger_local)?;
 
+        // Upload the compacted segments and the post-compaction
+        // manifest to the installed BackupSink, if any. Same
+        // best-effort-with-strict-error-propagation contract as
+        // the incremental path in
+        // [`Self::run_incremental_backup_inner`]: the
+        // post-compaction ledger + manifest tail is already
+        // committed both in-memory and on-disk by the calls
+        // above, so a failed upload here does not corrupt local
+        // state. The caller can retry by re-running
+        // `compact_backup` — but because the policy will see no
+        // newly-eligible groups, the practical recovery path is a
+        // subsequent `run_incremental_backup` whose manifest cut
+        // re-references every ledger entry (including the
+        // compacted ones the sink is missing) and republishes the
+        // chain tail.
+        //
+        // Critically: without this upload step a restore against
+        // the new head manifest would fetch segment ids that only
+        // exist locally, because `compact_backup` mints fresh
+        // `new_segment_id`s the sink has never seen. The
+        // restoring side's `fetch_backup_segment` would 404 on
+        // every compacted entry. Mirroring the incremental
+        // upload semantics here closes that lifecycle gap.
+        let (segments_uploaded, manifest_uploaded) = match self.backup_sink.get() {
+            None => (0u64, false),
+            Some(sink) => {
+                let mut uploaded = 0u64;
+                for tracked in &compacted_outputs {
+                    let segment_bundle = crate::backup::wire::SealedSegmentBundle::from_built(
+                        &tracked.built,
+                        &tracked.k_segment,
+                        &backup_root,
+                    )?;
+                    let segment_bytes = segment_bundle.encode()?;
+                    sink.upload_backup_segment(
+                        &tracked.built.segment_id.to_string(),
+                        &segment_bytes,
+                    )?;
+                    uploaded += 1;
+                }
+                let manifest_bundle = crate::backup::wire::SealedManifestBundle::from_sealed(
+                    &sealed_manifest,
+                    keys.device_id.clone(),
+                );
+                let manifest_bytes = manifest_bundle.encode()?;
+                sink.upload_backup_manifest(
+                    &sealed_manifest.manifest.manifest_id.to_string(),
+                    &manifest_bytes,
+                )?;
+                (uploaded, true)
+            }
+        };
+
         Ok(BackupCompactionResult {
             groups_compacted,
             segments_superseded,
@@ -4057,6 +4110,8 @@ impl CoreImpl {
             bytes_before,
             bytes_after,
             manifest_generation: Some(manifest_generation),
+            segments_uploaded,
+            manifest_uploaded,
         })
     }
 
@@ -4380,6 +4435,15 @@ pub struct BackupCompactionResult {
     /// `generation` of the manifest cut after the rewrite. `None`
     /// when the run was a noop.
     pub manifest_generation: Option<u64>,
+    /// Number of compacted segments uploaded through the
+    /// installed [`crate::backup::sinks::BackupSink`]. Always
+    /// `<= segments_emitted`. `0` when no sink is installed or
+    /// when the run was a noop.
+    pub segments_uploaded: u64,
+    /// Whether the post-compaction manifest was uploaded through
+    /// the installed sink. `false` when no sink is installed or
+    /// when the run was a noop.
+    pub manifest_uploaded: bool,
 }
 
 impl KChatCore for CoreImpl {
@@ -8975,6 +9039,128 @@ mod tests {
         install_test_backup_keys(&core);
         let result = core.compact_backup(1_900_000_000_000).expect("noop");
         assert_eq!(result, BackupCompactionResult::default());
+    }
+
+    #[test]
+    fn compact_backup_uploads_compacted_segments_and_manifest_to_sink() {
+        // Restore-after-compaction lifecycle: the compaction path
+        // must upload the freshly-minted segments + the new
+        // manifest through the installed `BackupSink`. Without
+        // this step, restoring against the post-compaction
+        // manifest would 404 on every compacted segment id
+        // (`compact_backup` mints fresh `new_segment_id`s the sink
+        // has never seen).
+        use crate::backup::sinks::memory::MemoryBackupSink;
+        use crate::backup::sinks::BackupSink;
+        use crate::backup::wire::SealedSegmentBundle;
+
+        const DAY_MS: i64 = 86_400_000;
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let sink = Arc::new(MemoryBackupSink::new());
+        core.install_backup_sink(sink.clone())
+            .expect("install sink");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Three daily segments, each 10 days old (eligible for
+        // compaction into a single weekly).
+        build_aged_segments(&core, conv, 10, 3, now_ms);
+
+        // Sanity: the three incremental runs uploaded three
+        // originals plus three manifest tails.
+        assert_eq!(sink.segment_count(), 3);
+        assert_eq!(sink.manifest_count(), 3);
+
+        let result = core.compact_backup(now_ms).expect("compact");
+        assert_eq!(result.groups_compacted, 1);
+        assert_eq!(result.segments_emitted, 1);
+        assert_eq!(result.segments_uploaded, 1);
+        assert!(result.manifest_uploaded);
+
+        // The sink now carries (a) the three pre-compaction
+        // segments (we do not delete them on the sink side; the
+        // ledger no longer references them) plus (b) the single
+        // compacted segment, and (c) four manifests (three
+        // incremental + one compaction).
+        assert_eq!(sink.segment_count(), 4);
+        assert_eq!(sink.manifest_count(), 4);
+
+        // The compacted segment id is reachable from the sink, and
+        // the bytes round-trip through the wire decoder.
+        let post = core.backup.tracked_segments().unwrap();
+        assert_eq!(post.len(), 1);
+        let compacted_id_str = post[0].built.segment_id.to_string();
+        let compacted_bytes = sink
+            .fetch_backup_segment(&compacted_id_str)
+            .expect("fetch compacted segment from sink");
+        let decoded = SealedSegmentBundle::decode(&compacted_bytes)
+            .expect("decode compacted sealed bundle from sink");
+        assert_eq!(decoded.segment_id, post[0].built.segment_id);
+        // The compacted manifest id is also reachable from the
+        // sink. Cross-check that the cleartext manifest in the
+        // bundle references the compacted segment id.
+        let manifest_bytes = sink
+            .list_backup_manifests()
+            .expect("list manifests")
+            .into_iter()
+            .map(|id| {
+                let bytes = sink.fetch_backup_manifest(&id).expect("fetch manifest");
+                (id, bytes)
+            })
+            .find_map(|(_, bytes)| {
+                let bundle = crate::backup::wire::SealedManifestBundle::decode(&bytes).ok()?;
+                if bundle
+                    .manifest
+                    .segments
+                    .iter()
+                    .any(|s| s.segment_id == post[0].built.segment_id)
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            });
+        assert!(
+            manifest_bytes.is_some(),
+            "no uploaded manifest references the compacted segment id"
+        );
+
+        // Sanity: events compacted into a single weekly segment
+        // were preserved across the seal/upload/decode round trip.
+        let payload = crate::backup::segment_builder::decrypt_backup_segment(
+            &post[0].built,
+            &post[0].k_segment,
+        )
+        .unwrap();
+        assert_eq!(payload.events.len(), 3);
+        for ev in &payload.events {
+            assert!(ev.created_at_ms <= now_ms - 7 * DAY_MS);
+        }
+    }
+
+    #[test]
+    fn compact_backup_without_sink_reports_zero_uploads() {
+        // Symmetric to the sink-installed test: without a sink the
+        // compaction still succeeds locally, but the upload
+        // counters MUST stay at the default (`0` / `false`) so the
+        // caller can distinguish "compacted locally only" from
+        // "compacted + uploaded".
+        let now_ms = 1_900_000_000_000_i64;
+        let core = fresh_core();
+        install_test_backup_keys(&core);
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        build_aged_segments(&core, conv, 10, 3, now_ms);
+
+        let result = core.compact_backup(now_ms).expect("compact");
+        assert_eq!(result.groups_compacted, 1);
+        assert_eq!(result.segments_emitted, 1);
+        assert_eq!(result.segments_uploaded, 0);
+        assert!(!result.manifest_uploaded);
     }
 
     #[test]
