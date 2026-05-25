@@ -2673,9 +2673,26 @@ impl CoreImpl {
             // (`media_search_index` / `search_fts` /
             // `search_fuzzy` / `LocalStoreEmbeddingCache`).
             // Skipped entirely when no pipeline produced output.
+            //
+            // Lock acquisition is intentionally best-effort here:
+            // phase 3 already committed the `Evicted ->
+            // OriginalLocal` state transition, so a poisoned mutex
+            // (e.g. an unrelated thread panicked while we were
+            // running ML inference for tens of seconds) must NOT
+            // cause us to drop the freshly-decrypted plaintext
+            // and propagate Err to the caller. Doing so would
+            // make the asset permanently un-rehydratable — the
+            // next attempt hits `prepare_rehydration`'s "already
+            // original_local" rejection. This matches the
+            // documented contract of `commit_post_rehydration_ml`
+            // ("All errors are absorbed") and the sibling
+            // `maybe_*` helpers, which are all called inside
+            // `let _ = ...` from `send_media` and never propagate
+            // their failures.
             if bundle.has_any_writes() {
-                let db = self.db_writer.lock().map_err(poisoned)?;
-                self.commit_post_rehydration_ml(&db, bundle, &meta);
+                if let Ok(db) = self.db_writer.lock().map_err(poisoned) {
+                    self.commit_post_rehydration_ml(&db, bundle, &meta);
+                }
             }
         }
 
