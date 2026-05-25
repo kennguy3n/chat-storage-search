@@ -554,6 +554,118 @@ pub struct UploadedShardMetadata {
 // see `crate::util` for the rationale.
 use crate::util::base64_urlsafe_encode;
 
+// ----------------------------------------------------------------
+// Post-rehydration ML fan-out structures (`docs/DESIGN.md §5.5`
+// extension).
+//
+// Received media arrives as an encrypted `MediaDescriptor` at
+// ingest; the plaintext only materializes later, inside
+// `CoreImpl::rehydrate_media_for_message`, after the chunked
+// download / AEAD-open / BLAKE3-verify pipeline finishes. The
+// `compute_post_rehydration_*` helpers run the same OCR /
+// image embedding / transcription / document extraction /
+// keyframe sampling pipelines that `send_media` runs against
+// outbound media — but with the writer mutex DROPPED during ML
+// inference. Each helper returns a structured `*MlWrite` value
+// describing what to write; `commit_post_rehydration_ml`
+// reacquires the mutex briefly and fans the writes out into
+// `media_search_index` / `search_fts` / `search_fuzzy` /
+// `LocalStoreEmbeddingCache`.
+// ----------------------------------------------------------------
+
+/// Structured output of a successful OCR pipeline run on
+/// freshly-rehydrated image plaintext.
+#[derive(Debug, Clone)]
+pub(crate) struct OcrMlWrite {
+    pub(crate) combined_text: String,
+    pub(crate) language: Option<String>,
+    pub(crate) confidence: Option<f32>,
+    pub(crate) xlmr_embedding: Option<Vec<f32>>,
+}
+
+/// Structured output of the audio transcription pipeline.
+#[derive(Debug, Clone)]
+pub(crate) struct TranscribeMlWrite {
+    pub(crate) transcript: String,
+    pub(crate) language: Option<String>,
+    pub(crate) xlmr_embedding: Option<Vec<f32>>,
+}
+
+/// One page returned by the document extraction pipeline,
+/// already paired with an optional pre-computed XLM-R
+/// embedding of the page text.
+#[derive(Debug, Clone)]
+pub(crate) struct DocumentPageMlWrite {
+    pub(crate) page_number: u32,
+    pub(crate) text: String,
+    pub(crate) language: Option<String>,
+    pub(crate) xlmr_embedding: Option<Vec<f32>>,
+}
+
+/// Structured output of the document extraction pipeline.
+#[derive(Debug, Clone)]
+pub(crate) struct DocumentMlWrite {
+    pub(crate) pages: Vec<DocumentPageMlWrite>,
+}
+
+/// One keyframe produced by the video pipeline, paired with
+/// its MobileCLIP-S2 image embedding.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyframeMlWrite {
+    pub(crate) frame_index: u32,
+    pub(crate) embedding: Vec<f32>,
+}
+
+/// Structured output of the video keyframe sampling +
+/// embedding pipeline.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyframesMlWrite {
+    pub(crate) frames: Vec<KeyframeMlWrite>,
+}
+
+/// Bundle of structured ML pipeline outputs to commit after
+/// rehydration. Each field is `Option<_>` so a pipeline that
+/// is gated off (resource gate refused, bridge not installed,
+/// MIME mismatch, empty output, …) leaves the commit step a
+/// no-op for that pipeline without forcing the caller to
+/// branch on every variant.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PostRehydrationMlBundle {
+    pub(crate) ocr: Option<OcrMlWrite>,
+    pub(crate) image_embed: Option<Vec<f32>>,
+    pub(crate) transcribe: Option<TranscribeMlWrite>,
+    pub(crate) document: Option<DocumentMlWrite>,
+    pub(crate) keyframes: Option<KeyframesMlWrite>,
+}
+
+impl PostRehydrationMlBundle {
+    /// True if any pipeline produced an output that needs a
+    /// commit-side DB write. The rehydration caller uses
+    /// this to skip the brief writer-lock re-acquisition
+    /// entirely when no ML fired.
+    pub(crate) fn has_any_writes(&self) -> bool {
+        self.ocr.is_some()
+            || self.image_embed.is_some()
+            || self.transcribe.is_some()
+            || self.document.is_some()
+            || self.keyframes.is_some()
+    }
+}
+
+/// Skeleton-metadata snapshot read once at the start of
+/// rehydration so the post-ML commit step can write to
+/// `media_search_index` / `search_fts` / `search_fuzzy` with
+/// the same shape that `send_media` uses.
+#[derive(Debug, Clone)]
+pub(crate) struct RehydrationMlMeta {
+    pub(crate) message_id: String,
+    pub(crate) asset_id: String,
+    pub(crate) sender_id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) created_at_ms: i64,
+    pub(crate) mime_type: String,
+}
+
 impl CoreImpl {
     /// Construct a new core, opening the SQLCipher database at
     /// `{config.data_dir}/kchat.db` with `key`. No transport
@@ -2487,12 +2599,21 @@ impl CoreImpl {
     ) -> Result<Option<Vec<u8>>> {
         let mid = message_id.to_string();
 
-        // read all metadata under the db lock, then drop
+        // Phase 1: read all metadata under the db lock, then drop
         // the guard so the long-running chunked download in
         // phase 2 doesn't block concurrent
         // `send_text` / `search` / `ingest` callers
         // (Task 2 of the /4 batch).
-        let plan = {
+        //
+        // We also snapshot the skeleton metadata
+        // (`sender_id` / `conversation_id` / `created_at_ms`) and
+        // the asset's `mime_type` so the post-rehydration ML
+        // fan-out in phase 4 can write to `media_search_index` /
+        // `search_fts` / `search_fuzzy` with the same shape that
+        // `send_media` uses. Reading them here (still under the
+        // existing phase-1 lock) avoids a second lock-acquire for
+        // metadata after the download.
+        let (plan, ml_meta) = {
             let db = self.db_writer.lock().map_err(poisoned)?;
             let Some(asset) = db
                 .get_media_asset_by_message(&mid)
@@ -2500,16 +2621,30 @@ impl CoreImpl {
             else {
                 return Ok(None);
             };
-            crate::media::download::prepare_rehydration(&db, &asset.asset_id)?
+            let asset_id = asset.asset_id.clone();
+            let mime_type = asset.mime_type.clone();
+            let plan = crate::media::download::prepare_rehydration(&db, &asset_id)?;
+            let ml_meta = db
+                .get_message_skeleton(&mid)
+                .map_err(|e| Error::Storage(e.to_string().into()))?
+                .map(|skel| RehydrationMlMeta {
+                    message_id: skel.message_id,
+                    asset_id,
+                    sender_id: skel.sender_id,
+                    conversation_id: skel.conversation_id,
+                    created_at_ms: skel.created_at_ms,
+                    mime_type,
+                });
+            (plan, ml_meta)
             // MutexGuard drops here on the closing brace.
         };
 
-        // chunked download, AEAD-open, BLAKE3 verify
-        // no db reference held.
+        // Phase 2: chunked download, AEAD-open, BLAKE3 verify.
+        // No db reference held.
         let plaintext =
             crate::media::download::execute_rehydration_download(&plan, transport, wrapping_key)?;
 
-        // re-acquire the db lock and flip the state
+        // Phase 3: re-acquire the db lock and flip the state
         // machine + bytes_local under SAVEPOINT.
         {
             let db = self.db_writer.lock().map_err(poisoned)?;
@@ -2519,6 +2654,29 @@ impl CoreImpl {
                 plan.from_state,
                 plaintext.len(),
             )?;
+        }
+
+        // Phase 4a: run OCR / image embedding / Whisper
+        // transcription / document extraction / video keyframe
+        // sampling pipelines against the freshly-decrypted
+        // plaintext, OUTSIDE the writer mutex. ML inference can
+        // take hundreds of ms (OCR) to tens of seconds
+        // (Whisper) and must not block concurrent
+        // `send_text` / `search` / `ingest` callers. Each
+        // pipeline is resource-gated and returns `None` when
+        // gated off / bridge not installed / MIME mismatch /
+        // empty output, so the cumulative cost is bounded.
+        if let Some(meta) = ml_meta {
+            let bundle = self.run_post_rehydration_ml(&meta.mime_type, &plaintext);
+            // Phase 4b: re-acquire the writer mutex briefly to
+            // commit the per-pipeline DB writes
+            // (`media_search_index` / `search_fts` /
+            // `search_fuzzy` / `LocalStoreEmbeddingCache`).
+            // Skipped entirely when no pipeline produced output.
+            if bundle.has_any_writes() {
+                let db = self.db_writer.lock().map_err(poisoned)?;
+                self.commit_post_rehydration_ml(&db, bundle, &meta);
+            }
         }
 
         Ok(Some(plaintext))
@@ -3237,6 +3395,360 @@ impl CoreImpl {
                 }
                 Err(_) => {
                     // Inference failures are absorbed.
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Post-rehydration ML fan-out methods.
+    //
+    // See the structs above this `impl` block for the contract;
+    // these methods own the per-pipeline compute + commit logic.
+    // Lock discipline (mirrors the rehydration download phase):
+    //   * compute_* helpers do all expensive ML inference and
+    //     return structured `*MlWrite` values. NO `&LocalStoreDb`,
+    //     NO writer-lock acquisition.
+    //   * commit_post_rehydration_ml takes a writer-lock guard
+    //     once and fans the structured values out in a single
+    //     brief acquisition.
+    // ----------------------------------------------------------------
+
+    /// Run all five media-ML pipelines against freshly-decrypted
+    /// rehydration plaintext. Holds NO writer mutex; safe to
+    /// call from outside any lock acquisition.
+    ///
+    /// Each pipeline mirrors its `send_media` counterpart's
+    /// resource-gate + bridge / sampler / model availability
+    /// checks. A pipeline that is gated off or returns empty
+    /// output leaves the corresponding bundle field `None`.
+    pub(crate) fn run_post_rehydration_ml(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> PostRehydrationMlBundle {
+        PostRehydrationMlBundle {
+            ocr: self.compute_post_rehydration_ocr(mime_type, plaintext),
+            image_embed: self.compute_post_rehydration_image_embed(mime_type, plaintext),
+            transcribe: self.compute_post_rehydration_transcribe(mime_type, plaintext),
+            document: self.compute_post_rehydration_document(mime_type, plaintext),
+            keyframes: self.compute_post_rehydration_keyframes(mime_type, plaintext),
+        }
+    }
+
+    fn compute_post_rehydration_ocr(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> Option<OcrMlWrite> {
+        use crate::models::resource_gate::ResourceGate;
+        if !mime_type.starts_with("image/") {
+            return None;
+        }
+        if let Some(probe) = self.resource_probe.get() {
+            let gate = ResourceGate::default();
+            if !gate.should_run_ocr(&probe.current_resources()) {
+                return None;
+            }
+        }
+        let bridge = self.media.ocr_bridge()?;
+        let regions = bridge.recognize_text(plaintext, mime_type).ok()?;
+        if regions.is_empty() {
+            return None;
+        }
+        let mut combined = String::new();
+        let mut detected_lang: Option<String> = None;
+        let mut confidence_sum: f32 = 0.0;
+        let mut confidence_count: u32 = 0;
+        for region in &regions {
+            let trimmed = region.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(trimmed);
+            if detected_lang.is_none() {
+                detected_lang = region.language.clone();
+            }
+            confidence_sum += region.confidence;
+            confidence_count += 1;
+        }
+        let combined = combined.trim().to_string();
+        if combined.is_empty() {
+            return None;
+        }
+        let confidence = if confidence_count > 0 {
+            Some(confidence_sum / confidence_count as f32)
+        } else {
+            None
+        };
+        // Compute XLM-R embedding of the OCR text outside the
+        // writer lock when a text embedder is installed. The
+        // commit-side cache.get() still short-circuits the write
+        // if a previous rehydration already cached the row, so
+        // doing this inference here is at worst a bounded
+        // one-time cost per rehydration event.
+        let xlmr_embedding = self
+            .text_embedder
+            .get()
+            .and_then(|embedder| embedder.embed(&combined).ok());
+        Some(OcrMlWrite {
+            combined_text: combined,
+            language: detected_lang,
+            confidence,
+            xlmr_embedding,
+        })
+    }
+
+    fn compute_post_rehydration_image_embed(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> Option<Vec<f32>> {
+        if !mime_type.starts_with("image/") {
+            return None;
+        }
+        let embedder = self.media.image_embedder()?;
+        embedder.embed_image(plaintext, mime_type).ok()
+    }
+
+    fn compute_post_rehydration_transcribe(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> Option<TranscribeMlWrite> {
+        use crate::models::resource_gate::ResourceGate;
+        if !mime_type.starts_with("audio/") {
+            return None;
+        }
+        if let Some(probe) = self.resource_probe.get() {
+            let gate = ResourceGate::default();
+            if !gate.should_run_transcription(&probe.current_resources()) {
+                return None;
+            }
+        }
+        let transcriber = self.media.whisper_transcriber()?;
+        let result = transcriber.transcribe(plaintext, mime_type).ok()?;
+        let transcript = result.text.trim().to_string();
+        if transcript.is_empty() {
+            return None;
+        }
+        let xlmr_embedding = self
+            .text_embedder
+            .get()
+            .and_then(|embedder| embedder.embed(&transcript).ok());
+        Some(TranscribeMlWrite {
+            transcript,
+            language: result.language,
+            xlmr_embedding,
+        })
+    }
+
+    fn compute_post_rehydration_document(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> Option<DocumentMlWrite> {
+        use crate::models::document::is_supported_document_mime;
+        if !is_supported_document_mime(mime_type) {
+            return None;
+        }
+        let extractor = self.media.document_extractor()?;
+        let pages = extractor.extract_text(plaintext, mime_type).ok()?;
+        let mut out: Vec<DocumentPageMlWrite> = Vec::with_capacity(pages.len());
+        for page in pages {
+            let trimmed = page.text.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let xlmr_embedding = self
+                .text_embedder
+                .get()
+                .and_then(|embedder| embedder.embed(&trimmed).ok());
+            out.push(DocumentPageMlWrite {
+                page_number: page.page_number,
+                text: trimmed,
+                language: page.language,
+                xlmr_embedding,
+            });
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(DocumentMlWrite { pages: out })
+    }
+
+    fn compute_post_rehydration_keyframes(
+        &self,
+        mime_type: &str,
+        plaintext: &[u8],
+    ) -> Option<KeyframesMlWrite> {
+        if !mime_type.starts_with("video/") {
+            return None;
+        }
+        let sampler = self.media.video_keyframe_sampler()?;
+        let embedder = self.media.image_embedder()?;
+        let frames = sampler.extract_keyframes(plaintext, mime_type, 5).ok()?;
+        let mut out: Vec<KeyframeMlWrite> = Vec::with_capacity(frames.len());
+        for frame in frames {
+            if let Ok(vec) = embedder.embed_image(&frame.image_data, &frame.mime_type) {
+                out.push(KeyframeMlWrite {
+                    frame_index: frame.frame_index,
+                    embedding: vec,
+                });
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(KeyframesMlWrite { frames: out })
+    }
+
+    /// Commit a [`PostRehydrationMlBundle`] under the writer
+    /// mutex. Mirrors the index-write shapes that the
+    /// `send_media`-side `maybe_*` methods produce, so a search
+    /// across received media surfaces the same FTS / fuzzy /
+    /// `media_search_index` / embedding-cache rows that outbound
+    /// media would.
+    ///
+    /// Caller MUST hold the writer mutex and pass `&LocalStoreDb`
+    /// from that lock guard. All errors are absorbed — matching
+    /// the best-effort contract on the sibling `maybe_*` helpers.
+    pub(crate) fn commit_post_rehydration_ml(
+        &self,
+        db: &LocalStoreDb,
+        bundle: PostRehydrationMlBundle,
+        meta: &RehydrationMlMeta,
+    ) {
+        use crate::models::clip::MOBILECLIP_S2_MODEL_VERSION;
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::search::fuzzy_search::FuzzyIndexWriter;
+
+        let message_id = meta.message_id.as_str();
+        let asset_id = meta.asset_id.as_str();
+        let sender_id = meta.sender_id.as_str();
+        let conversation_id = meta.conversation_id.as_str();
+        let created_at_ms = meta.created_at_ms;
+
+        // --- OCR ---------------------------------------------------
+        if let Some(ocr) = bundle.ocr {
+            let language = ocr.language.as_deref();
+            let _ = db.insert_media_search_index(
+                asset_id,
+                "ocr",
+                &ocr.combined_text,
+                language,
+                ocr.confidence,
+            );
+            let _ = db.connection().execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    message_id,
+                    conversation_id,
+                    sender_id,
+                    created_at_ms,
+                    ocr.combined_text.as_str(),
+                ],
+            );
+            let _ = FuzzyIndexWriter::new(db).index_message(message_id, &ocr.combined_text);
+            if let Some(vec) = ocr.xlmr_embedding {
+                let cache = LocalStoreEmbeddingCache::new(db.connection());
+                if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                    let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
+                }
+            }
+        }
+
+        // --- Image embedding (MobileCLIP-S2) ----------------------
+        if let Some(vec) = bundle.image_embed {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+                let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &vec);
+            }
+        }
+
+        // --- Whisper transcription --------------------------------
+        if let Some(t) = bundle.transcribe {
+            let language = t.language.as_deref();
+            let _ =
+                db.insert_media_search_index(asset_id, "transcript", &t.transcript, language, None);
+            let _ = db.connection().execute(
+                "INSERT INTO search_fts(
+                    message_id, conversation_id, sender_id,
+                    created_at_ms, text_content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    message_id,
+                    conversation_id,
+                    sender_id,
+                    created_at_ms,
+                    t.transcript.as_str(),
+                ],
+            );
+            let _ = FuzzyIndexWriter::new(db).index_message(message_id, &t.transcript);
+            if let Some(vec) = t.xlmr_embedding {
+                let cache = LocalStoreEmbeddingCache::new(db.connection());
+                if let Ok(None) = cache.get(message_id, XLMR_MODEL_VERSION) {
+                    let _ = cache.put(message_id, XLMR_MODEL_VERSION, &vec);
+                }
+            }
+        }
+
+        // --- Document pages ---------------------------------------
+        if let Some(doc) = bundle.document {
+            for page in doc.pages {
+                let language = page.language.as_deref();
+                let formatted = format!("[page {}] {}", page.page_number, page.text);
+                let _ =
+                    db.insert_media_search_index(asset_id, "caption", &formatted, language, None);
+                let page_row_id = format!("{}#page{}", message_id, page.page_number);
+                let _ = db.connection().execute(
+                    "INSERT INTO search_fts(
+                        message_id, conversation_id, sender_id,
+                        created_at_ms, text_content
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        page_row_id.as_str(),
+                        conversation_id,
+                        sender_id,
+                        created_at_ms,
+                        page.text.as_str(),
+                    ],
+                );
+                let _ = FuzzyIndexWriter::new(db).index_message(&page_row_id, &page.text);
+                if let Some(vec) = page.xlmr_embedding {
+                    let cache = LocalStoreEmbeddingCache::new(db.connection());
+                    if let Ok(None) = cache.get(&page_row_id, XLMR_MODEL_VERSION) {
+                        let _ = cache.put(&page_row_id, XLMR_MODEL_VERSION, &vec);
+                    }
+                }
+            }
+        }
+
+        // --- Video keyframes --------------------------------------
+        if let Some(kf) = bundle.keyframes {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            for (idx, frame) in kf.frames.iter().enumerate() {
+                let suffix_key = format!(
+                    "{}_frame_{}",
+                    MOBILECLIP_S2_MODEL_VERSION, frame.frame_index
+                );
+                if let Ok(Some(_)) = cache.get(message_id, &suffix_key) {
+                    continue;
+                }
+                let _ = cache.put(message_id, &suffix_key, &frame.embedding);
+                if idx == 0 {
+                    if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+                        let _ =
+                            cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &frame.embedding);
+                    }
                 }
             }
         }
@@ -12731,5 +13243,615 @@ mod tests {
             .find(|t| t.operation == "enforce_storage_budget")
             .expect("eviction trace");
         assert!(!evict.metadata.contains_key("migration_scheduled"));
+    }
+
+    // ----------------------------------------------------------------
+    // Post-rehydration ML fan-out tests.
+    //
+    // Pin the architectural contract that received media gets
+    // OCR / image embedding / Whisper / document extraction /
+    // video keyframe sampling indexed into the same shards that
+    // outbound `send_media` populates — but with the writer
+    // mutex DROPPED during ML inference. The end-to-end test
+    // drives the full `rehydrate_media_for_message` pipeline
+    // with an installed mock OCR bridge + text embedder; the
+    // remaining tests pin per-pipeline contracts and the
+    // resource-gate / idempotency invariants.
+    // ----------------------------------------------------------------
+
+    fn rehydrate_ml_meta_fixture(
+        message_id: &str,
+        asset_id: &str,
+        conv: &Uuid,
+        mime_type: &str,
+    ) -> RehydrationMlMeta {
+        RehydrationMlMeta {
+            message_id: message_id.to_string(),
+            asset_id: asset_id.to_string(),
+            sender_id: "u-sender".into(),
+            conversation_id: conv.to_string(),
+            created_at_ms: 100,
+            mime_type: mime_type.to_string(),
+        }
+    }
+
+    fn seed_skeleton_and_asset(
+        core: &CoreImpl,
+        conv: &Uuid,
+        mid: &Uuid,
+        asset_id: &str,
+        mime_type: &str,
+        bytes_total: i64,
+    ) {
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "u-sender".into(),
+                created_at_ms: 100,
+                received_at_ms: 110,
+                kind: MessageKind::Media,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: Some(MediaState::OriginalLocal),
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+            db.insert_media_asset(&MediaAsset {
+                asset_id: asset_id.to_string(),
+                message_id: mid.to_string(),
+                mime_type: mime_type.to_string(),
+                bytes_total,
+                bytes_local: bytes_total,
+                media_state: MediaState::OriginalLocal,
+                wrapped_k_asset: vec![0u8; 32],
+                chunk_count: 1,
+                merkle_root: vec![0u8; 32],
+                blob_id: format!("blob-{asset_id}"),
+                storage_sink: "kchat_backend".into(),
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_writes_ocr_indexes() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "image/png", 256);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "image/png");
+        let bundle = PostRehydrationMlBundle {
+            ocr: Some(OcrMlWrite {
+                combined_text: "rehydrated ocr line one\nrehydrated ocr line two".into(),
+                language: Some("en".into()),
+                confidence: Some(0.92),
+                xlmr_embedding: Some(vec![0.5_f32; 8]),
+            }),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, bundle, &meta);
+        });
+
+        core.with_db(|db| {
+            let (kind, text, lang, conf): (String, String, Option<String>, Option<f32>) = db
+                .connection()
+                .query_row(
+                    "SELECT kind, text, language, confidence
+                     FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'ocr'",
+                    [asset_id.as_str()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<f32>>(3)?,
+                        ))
+                    },
+                )
+                .expect("media_search_index row missing");
+            assert_eq!(kind, "ocr");
+            assert!(text.contains("line one") && text.contains("line two"));
+            assert_eq!(lang.as_deref(), Some("en"));
+            let c = conf.expect("confidence populated");
+            assert!((0.91..=0.93).contains(&c));
+
+            let fts_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE message_id = ?1",
+                    [mid.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fts_count >= 1, "ocr text must land in search_fts");
+
+            let fuzzy = FuzzySearchEngine::new(db.connection());
+            let hits = fuzzy.search_fuzzy("rehydrated", 8).unwrap();
+            assert!(
+                hits.iter().any(|h| h.message_id == mid.to_string()),
+                "ocr text must land in search_fuzzy"
+            );
+
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let vec = cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .expect("cache get")
+                .expect("xlm-r row must be cached");
+            assert_eq!(vec.len(), 8);
+        });
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_writes_image_embedding_cache() {
+        use crate::models::clip::MOBILECLIP_S2_MODEL_VERSION;
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "image/png", 256);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "image/png");
+        let bundle = PostRehydrationMlBundle {
+            image_embed: Some(vec![0.25_f32; 16]),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, bundle, &meta);
+        });
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let vec = cache
+                .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
+                .expect("cache get")
+                .expect("mobileclip row missing");
+            assert_eq!(vec.len(), 16);
+        });
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_writes_transcription_indexes() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "audio/wav", 1024);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "audio/wav");
+        let bundle = PostRehydrationMlBundle {
+            transcribe: Some(TranscribeMlWrite {
+                transcript: "rehydrated whisper transcript words".into(),
+                language: Some("en".into()),
+                xlmr_embedding: Some(vec![0.1_f32; 8]),
+            }),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, bundle, &meta);
+        });
+
+        core.with_db(|db| {
+            let count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'transcript'",
+                    [asset_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "transcript row must land in media_search_index");
+
+            let fts: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE message_id = ?1",
+                    [mid.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fts >= 1, "transcript text must land in search_fts");
+
+            let fuzzy = FuzzySearchEngine::new(db.connection());
+            let hits = fuzzy.search_fuzzy("transcript", 8).unwrap();
+            assert!(
+                hits.iter().any(|h| h.message_id == mid.to_string()),
+                "transcript text must land in search_fuzzy"
+            );
+
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            assert!(cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_writes_document_pages() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+        use crate::search::fuzzy_search::FuzzySearchEngine;
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "application/pdf", 4096);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "application/pdf");
+        let bundle = PostRehydrationMlBundle {
+            document: Some(DocumentMlWrite {
+                pages: vec![
+                    DocumentPageMlWrite {
+                        page_number: 1,
+                        text: "rehydrated pdf alpha section".into(),
+                        language: Some("en".into()),
+                        xlmr_embedding: Some(vec![0.4_f32; 4]),
+                    },
+                    DocumentPageMlWrite {
+                        page_number: 2,
+                        text: "rehydrated pdf bravo section".into(),
+                        language: Some("en".into()),
+                        xlmr_embedding: Some(vec![0.5_f32; 4]),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, bundle, &meta);
+        });
+
+        core.with_db(|db| {
+            let rows: Vec<(String, String)> = db
+                .connection()
+                .prepare(
+                    "SELECT kind, text FROM media_search_index
+                     WHERE asset_id = ?1 ORDER BY text",
+                )
+                .unwrap()
+                .query_map([asset_id.as_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            // Both rows are `kind = 'caption'`, ordered by text;
+            // `[page 1]` sorts before `[page 2]`.
+            assert!(rows[0].1.contains("[page 1]"));
+            assert!(rows[1].1.contains("[page 2]"));
+
+            let fuzzy = FuzzySearchEngine::new(db.connection());
+            let page_one_key = format!("{}#page1", mid);
+            let page_two_key = format!("{}#page2", mid);
+            let alpha = fuzzy.search_fuzzy("alpha", 8).unwrap();
+            assert!(alpha.iter().any(|h| h.message_id == page_one_key));
+            let bravo = fuzzy.search_fuzzy("bravo", 8).unwrap();
+            assert!(bravo.iter().any(|h| h.message_id == page_two_key));
+
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            assert!(cache
+                .get(&page_one_key, XLMR_MODEL_VERSION)
+                .unwrap()
+                .is_some());
+            assert!(cache
+                .get(&page_two_key, XLMR_MODEL_VERSION)
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_writes_keyframes_cache() {
+        use crate::models::clip::MOBILECLIP_S2_MODEL_VERSION;
+        use crate::models::embeddings::{EmbeddingCache, LocalStoreEmbeddingCache};
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "video/mp4", 65_536);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "video/mp4");
+        let bundle = PostRehydrationMlBundle {
+            keyframes: Some(KeyframesMlWrite {
+                frames: vec![
+                    KeyframeMlWrite {
+                        frame_index: 0,
+                        embedding: vec![0.1_f32; 4],
+                    },
+                    KeyframeMlWrite {
+                        frame_index: 1,
+                        embedding: vec![0.2_f32; 4],
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, bundle, &meta);
+        });
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            // Per-frame suffixed rows.
+            for idx in 0..2u32 {
+                let key = format!("{}_frame_{}", MOBILECLIP_S2_MODEL_VERSION, idx);
+                assert!(
+                    cache.get(&mid.to_string(), &key).unwrap().is_some(),
+                    "keyframe {idx} missing from cache"
+                );
+            }
+            // Frame 0 mirrors into the unsuffixed canonical key.
+            assert!(cache
+                .get(&mid.to_string(), MOBILECLIP_S2_MODEL_VERSION)
+                .unwrap()
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn run_post_rehydration_ml_gates_off_when_resource_probe_critical() {
+        use crate::models::ocr::MockOcrBridge;
+        use crate::models::resource_gate::{
+            DeviceResources, NetworkType, ResourceProbe, ThermalState,
+        };
+
+        #[derive(Debug)]
+        struct CriticalProbe;
+        impl ResourceProbe for CriticalProbe {
+            fn current_resources(&self) -> DeviceResources {
+                DeviceResources {
+                    battery_level: 1.0,
+                    is_charging: true,
+                    thermal_state: ThermalState::Critical,
+                    network_type: NetworkType::WiFi,
+                }
+            }
+        }
+
+        let core = fresh_core();
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+        core.install_resource_probe(Arc::new(CriticalProbe))
+            .expect("install resource probe");
+
+        // Image MIME + installed bridge would normally trigger
+        // OCR; the critical-thermal probe gates it off.
+        let bundle = core.run_post_rehydration_ml("image/png", &fake_image_bytes());
+        assert!(
+            bundle.ocr.is_none(),
+            "ocr must be gated off by critical thermal"
+        );
+        // Image embedding has no resource gate (only model
+        // availability), so it remains None here because no
+        // image embedder is installed.
+        assert!(bundle.image_embed.is_none());
+        assert!(!bundle.has_any_writes());
+    }
+
+    #[test]
+    fn commit_post_rehydration_ml_is_idempotent_for_xlmr_cache() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, XLMR_MODEL_VERSION,
+        };
+
+        let core = fresh_core();
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+        let mid = Uuid::now_v7();
+        let asset_id = Uuid::now_v7().to_string();
+        seed_skeleton_and_asset(&core, &conv, &mid, &asset_id, "image/png", 256);
+
+        let meta = rehydrate_ml_meta_fixture(&mid.to_string(), &asset_id, &conv, "image/png");
+
+        // First commit: the new XLM-R embedding lands.
+        let make_bundle = || PostRehydrationMlBundle {
+            ocr: Some(OcrMlWrite {
+                combined_text: "idempotent ocr text".into(),
+                language: Some("en".into()),
+                confidence: Some(0.9),
+                xlmr_embedding: Some(vec![0.3_f32; 4]),
+            }),
+            ..Default::default()
+        };
+
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, make_bundle(), &meta);
+        });
+
+        // Second commit attempts a different vector for the same
+        // (message_id, XLMR_MODEL_VERSION). The cache.get()
+        // short-circuit MUST keep the first write and ignore the
+        // second.
+        let make_replacement = || PostRehydrationMlBundle {
+            ocr: Some(OcrMlWrite {
+                combined_text: "idempotent ocr text".into(),
+                language: Some("en".into()),
+                confidence: Some(0.9),
+                xlmr_embedding: Some(vec![0.99_f32; 4]),
+            }),
+            ..Default::default()
+        };
+        core.with_db(|db| {
+            core.commit_post_rehydration_ml(db, make_replacement(), &meta);
+        });
+
+        core.with_db(|db| {
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            let stored = cache
+                .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                .unwrap()
+                .expect("cached row");
+            // Original `0.3` MUST still be there; the `0.99`
+            // overwrite is suppressed.
+            assert!((stored[0] - 0.3_f32).abs() < 1e-6);
+        });
+    }
+
+    #[test]
+    fn rehydrate_media_for_message_runs_post_rehydration_ml_pipeline() {
+        use crate::models::embeddings::{
+            EmbeddingCache, LocalStoreEmbeddingCache, MockTextEmbedder, XLMR_MODEL_VERSION,
+        };
+        use crate::models::ocr::MockOcrBridge;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let core = Arc::new(fresh_core());
+        core.install_ocr_bridge(Arc::new(MockOcrBridge))
+            .expect("install ocr bridge");
+        core.install_text_embedder(Arc::new(MockTextEmbedder::default()))
+            .expect("install text embedder");
+
+        let conv = Uuid::now_v7();
+        seed_conversation(&core, &conv);
+
+        // Build a real chunked + AEAD-sealed PNG so the
+        // download phase exercises the honest ciphertext +
+        // Merkle root path. `process_media` produces sealed
+        // chunks; we stage them into a no-gate transport that
+        // serves chunks immediately.
+        let wrapping = [0x37u8; 32];
+        let plaintext = fake_image_bytes();
+        let processed = crate::media::processor::process_media(
+            &plaintext,
+            "image/png",
+            &wrapping,
+            BlobClass::Media,
+            false,
+        )
+        .expect("process_media");
+        let descriptor = &processed.descriptor;
+
+        let mid = Uuid::now_v7();
+        let asset_id = descriptor.asset_id.to_string();
+        let blob_id = descriptor.blob_id.to_string();
+        let merkle_root = descriptor.merkle_root.to_vec();
+        let wrapped_k_asset = descriptor.wrapped_k_asset.clone();
+        let chunk_count = descriptor.chunk_count as i32;
+        core.with_db(|db| {
+            let skel = MessageSkeleton {
+                message_id: mid.to_string(),
+                conversation_id: conv.to_string(),
+                sender_id: "u-sender".into(),
+                created_at_ms: 100,
+                received_at_ms: 110,
+                kind: MessageKind::Media,
+                body_state: BodyState::LocalPlainAvailable,
+                media_state: Some(MediaState::Evicted),
+                archive_state: ArchiveState::NotArchived,
+                backup_state: BackupState::NotBackedUp,
+                reply_to: None,
+                edited_at_ms: None,
+                deleted_at_ms: None,
+            };
+            db.insert_message_skeleton(&skel).unwrap();
+            db.insert_media_asset(&MediaAsset {
+                asset_id: asset_id.clone(),
+                message_id: mid.to_string(),
+                mime_type: "image/png".into(),
+                bytes_total: plaintext.len() as i64,
+                bytes_local: 0,
+                media_state: MediaState::Evicted,
+                wrapped_k_asset: wrapped_k_asset.clone(),
+                chunk_count,
+                merkle_root: merkle_root.clone(),
+                blob_id: blob_id.clone(),
+                storage_sink: "kchat_backend".into(),
+            })
+            .unwrap();
+        });
+
+        // Pre-release the GatedTransport's gate so chunks are
+        // served immediately and the test isn't gated on a
+        // signal pulse.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let _ = tx.send(());
+        let transport = GatedTransport::new(rx, Arc::new(AtomicBool::new(false)));
+        transport.put_chunks(&blob_id, &processed.sealed_chunks);
+
+        let recovered = core
+            .rehydrate_media_for_message(&transport, mid, &wrapping)
+            .expect("rehydrate")
+            .expect("plaintext returned");
+        assert_eq!(recovered, plaintext);
+
+        // Phase 3 still flips the state machine.
+        core.with_db(|db| {
+            let asset = db.get_media_asset(&asset_id).unwrap().expect("asset");
+            assert_eq!(asset.media_state, MediaState::OriginalLocal);
+            assert_eq!(asset.bytes_local, plaintext.len() as i64);
+        });
+
+        // Phase 4: OCR / FTS / fuzzy / XLM-R embedding all
+        // populated against the freshly-decrypted plaintext.
+        core.with_db(|db| {
+            let ocr_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM media_search_index
+                     WHERE asset_id = ?1 AND kind = 'ocr'",
+                    [asset_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                ocr_count, 1,
+                "rehydration must fan ocr into media_search_index"
+            );
+
+            let fts_count: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM search_fts WHERE message_id = ?1",
+                    [mid.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(fts_count >= 1, "rehydration must fan ocr into search_fts");
+
+            let cache = LocalStoreEmbeddingCache::new(db.connection());
+            assert!(
+                cache
+                    .get(&mid.to_string(), XLMR_MODEL_VERSION)
+                    .unwrap()
+                    .is_some(),
+                "rehydration must fan ocr text into the xlm-r embedding cache"
+            );
+        });
     }
 }
