@@ -152,125 +152,133 @@ pub fn select_provider<P: DirectMlProbe + ?Sized>(probe: &P) -> OnnxProviderRepo
 #[cfg(feature = "onnx-runtime")]
 pub type OrtSessionResult<T> = ort::Result<T>;
 
+/// Production [`DirectMlProbe`] backed by
+/// [`ort::ep::DirectML::is_available`] on Windows builds and a
+/// fixed `false` on every other target.
+///
+/// Defined once at the module top level so the DirectML
+/// availability probe carries the same type name across
+/// platforms — telemetry / EP-tuning callers can wire
+/// `OrtDirectMlProbe` without conditional `use` paths. On
+/// non-Windows hosts the probe is a no-op (`directml_available`
+/// returns `false`) which short-circuits [`select_provider`] to
+/// the CPU branch.
+///
+/// Returns `false` on any error from ORT instead of
+/// propagating, mirroring the cv-guard
+/// `OnnxInferenceBridge::probeDirectMlAvailability` contract.
+#[cfg(feature = "onnx-runtime")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrtDirectMlProbe;
+
 #[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
-mod windows_directml {
-    use super::{
-        select_provider, DirectMlProbe, OnnxExecutionProvider, OnnxProviderReport, OrtSessionResult,
-    };
-    use ort::ep::{DirectML, ExecutionProvider, CPU};
-    use ort::session::Session;
-    use std::path::Path;
-
-    /// Production [`DirectMlProbe`] backed by
-    /// [`ort::ep::DirectML::is_available`]. Returns `false` on
-    /// any error from ORT instead of propagating.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct OrtDirectMlProbe;
-
-    impl DirectMlProbe for OrtDirectMlProbe {
-        fn directml_available(&self) -> bool {
-            DirectML::default().is_available().unwrap_or(false)
-        }
+impl DirectMlProbe for OrtDirectMlProbe {
+    fn directml_available(&self) -> bool {
+        ort::ep::DirectML::default().is_available().unwrap_or(false)
     }
+}
 
-    /// Create an `ort::Session` for the XLM-R text encoder
-    /// loaded from `model_path`.
-    ///
-    /// Tries DirectML first (per [`select_provider`]); falls
-    /// back to CPU if DirectML registration on the
-    /// [`SessionBuilder`] returns an error. The returned
-    /// [`OnnxProviderReport`] reflects the EP that was actually
-    /// registered on the resulting session, not the original
-    /// intent — i.e. if the probe reported DirectML available
-    /// but registration failed, the report reads
-    /// `provider: Cpu, directml_attempted: true`.
-    ///
-    /// This is the scaffold: the inference loop
-    /// (input-tensor encode → `session.run` → mean-pool →
-    /// `Vec<f32>`) is intentionally not wired here yet — that
-    /// lands together with the SentencePiece tokenizer in a
-    /// follow-up. Callers that need a working text-embedding
-    /// hook in the meantime should keep using the
-    /// [`crate::models::embeddings::EmbeddingCache`] surface.
-    pub fn create_xlmr_session(
-        model_path: &Path,
-    ) -> OrtSessionResult<(Session, OnnxProviderReport)> {
-        let intent = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder()?;
+#[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
+impl DirectMlProbe for OrtDirectMlProbe {
+    fn directml_available(&self) -> bool {
+        false
+    }
+}
 
-        let actual_provider = match intent.provider {
-            OnnxExecutionProvider::DirectMl => {
+/// Single-source EP-aware [`ort::Session`] creator shared by
+/// every on-device ONNX model wrapper.
+///
+/// This is the canonical owner of the DirectML → CPU best-
+/// effort fallback state machine. Previously each model module
+/// (`embeddings_onnx` for XLM-R, `clip` for MobileCLIP-S2,
+/// `whisper_onnx` for Whisper) carried its own copy of the
+/// `select_provider → SessionBuilder → DirectML register →
+/// CPU fallback → commit_from_file` sequence, with platform
+/// `#[cfg]` splits duplicated three times over. Consolidating
+/// into one helper means that adding the next EP (CoreML on
+/// Apple, NNAPI on Android, OpenVINO on Linux, …) is a single
+/// edit instead of a three-site sweep.
+///
+/// On Windows the helper attempts to register the DirectML EP
+/// first when [`select_provider`] reports availability,
+/// transparently falling back to the CPU EP if DirectML
+/// registration on the [`ort::session::builder::SessionBuilder`]
+/// returns an error (no compatible adapter, driver issues, the
+/// model carries operators DirectML cannot run, etc.). On every
+/// other target only the CPU EP is registered.
+///
+/// The returned [`OnnxProviderReport`] reflects the EP that was
+/// actually registered on the resulting session, not the
+/// original intent — i.e. if the probe reported DirectML
+/// available but registration failed, the report reads
+/// `provider: Cpu, directml_attempted: true`. CPU registration
+/// is treated as best-effort because ORT auto-registers a
+/// default CPU EP at commit time anyway, so a failed explicit
+/// `CPU::register` does not abort session creation.
+#[cfg(feature = "onnx-runtime")]
+pub fn create_onnx_session(
+    model_path: &std::path::Path,
+) -> OrtSessionResult<(ort::session::Session, OnnxProviderReport)> {
+    use ort::ep::{ExecutionProvider, CPU};
+    use ort::session::Session;
+
+    let intent = select_provider(&OrtDirectMlProbe);
+    let mut builder = Session::builder()?;
+
+    let actual_provider = match intent.provider {
+        OnnxExecutionProvider::DirectMl => {
+            #[cfg(target_os = "windows")]
+            {
+                use ort::ep::DirectML;
                 if DirectML::default().register(&mut builder).is_ok() {
                     OnnxExecutionProvider::DirectMl
                 } else {
-                    // DirectML probe lied (or registration failed
-                    // for a model-specific reason). Fall back to
-                    // CPU; CPU registration is best-effort because
-                    // ORT auto-registers a default CPU EP at
-                    // commit time anyway.
                     let _ = CPU::default().register(&mut builder);
                     OnnxExecutionProvider::Cpu
                 }
             }
-            OnnxExecutionProvider::Cpu => {
+            #[cfg(not(target_os = "windows"))]
+            {
+                // `select_provider` is supposed to short-circuit
+                // to CPU off Windows; reaching this arm off-
+                // Windows means a probe lied — degrade
+                // gracefully rather than panic.
                 let _ = CPU::default().register(&mut builder);
                 OnnxExecutionProvider::Cpu
             }
-        };
-
-        let session = builder.commit_from_file(model_path)?;
-        Ok((
-            session,
-            OnnxProviderReport {
-                provider: actual_provider,
-                directml_attempted: intent.directml_attempted,
-            },
-        ))
-    }
-}
-
-#[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
-pub use windows_directml::{create_xlmr_session, OrtDirectMlProbe};
-
-#[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
-mod posix_cpu {
-    use super::{select_provider, DirectMlProbe, OnnxProviderReport, OrtSessionResult};
-    use ort::ep::{ExecutionProvider, CPU};
-    use ort::session::Session;
-    use std::path::Path;
-
-    /// Non-Windows [`DirectMlProbe`] — DirectML never available.
-    /// Provided for parity so callers can name the same type
-    /// across platforms when wiring telemetry.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct OrtDirectMlProbe;
-
-    impl DirectMlProbe for OrtDirectMlProbe {
-        fn directml_available(&self) -> bool {
-            false
         }
-    }
+        OnnxExecutionProvider::Cpu => {
+            let _ = CPU::default().register(&mut builder);
+            OnnxExecutionProvider::Cpu
+        }
+    };
 
-    /// macOS / Linux flavor of the XLM-R session creator.
-    ///
-    /// Always registers the CPU EP. The cross-platform
-    /// inference seam (CoreML EP on Apple, NNAPI EP on Android,
-    /// etc.) is layered above this; this entry point focuses on
-    /// the Windows DirectML path called out in
-    /// `docs/ARCHITECTURE.md §11.4`.
-    pub fn create_xlmr_session(
-        model_path: &Path,
-    ) -> OrtSessionResult<(Session, OnnxProviderReport)> {
-        let report = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder()?;
-        let _ = CPU::default().register(&mut builder);
-        let session = builder.commit_from_file(model_path)?;
-        Ok((session, report))
-    }
+    let session = builder.commit_from_file(model_path)?;
+    Ok((
+        session,
+        OnnxProviderReport {
+            provider: actual_provider,
+            directml_attempted: intent.directml_attempted,
+        },
+    ))
 }
 
-#[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
-pub use posix_cpu::{create_xlmr_session, OrtDirectMlProbe};
+/// Create an [`ort::Session`] for the XLM-R text encoder
+/// loaded from `model_path`.
+///
+/// Named seam over [`create_onnx_session`]; preserved for
+/// documentation continuity and so call sites can express
+/// intent (`create_xlmr_session(...)` vs the generic
+/// `create_onnx_session(...)`). The DirectML → CPU EP fallback
+/// state machine lives inside [`create_onnx_session`] — see
+/// that function for the registration contract and the
+/// [`OnnxProviderReport`] semantics.
+#[cfg(feature = "onnx-runtime")]
+pub fn create_xlmr_session(
+    model_path: &std::path::Path,
+) -> OrtSessionResult<(ort::session::Session, OnnxProviderReport)> {
+    create_onnx_session(model_path)
+}
 
 /// INT4 (`MatMulNBits`)
 /// flavor of [`create_xlmr_session`].
