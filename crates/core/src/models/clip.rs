@@ -56,90 +56,31 @@ pub const MOBILECLIP_S2_INT8_FILENAME: &str = "mobileclip_s2-v1-int8.onnx";
 /// MobileCLIP-S2 artifact shipped to tight-storage devices.
 pub const MOBILECLIP_S2_INT4_FILENAME: &str = "mobileclip_s2-v1-int4.onnx";
 
-#[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
-mod windows_directml {
-    use super::{OnnxExecutionProvider, OnnxProviderReport, OrtDirectMlProbe, OrtSessionResult};
-    use crate::models::embeddings_onnx::select_provider;
-    use ort::ep::{DirectML, ExecutionProvider, CPU};
-    use ort::session::Session;
-    use std::path::Path;
-
-    /// Create an `ort::Session` for MobileCLIP-S2 loaded from
-    /// `model_path`.
-    ///
-    /// Same DirectML → CPU best-effort contract as
-    /// [`crate::models::embeddings_onnx::create_xlmr_session`]:
-    /// DirectML registration is attempted first, with CPU as
-    /// the fallback if registration fails. The returned
-    /// [`OnnxProviderReport`] reflects the EP actually
-    /// registered, not the original intent.
-    ///
-    /// The image-tensor encode step (downsample to 224×224 RGB,
-    /// NCHW float32, ImageNet-style normalization) lives in a
-    /// follow-up alongside the [`crate::models::embeddings`]
-    /// inference loop.
-    pub fn create_mobileclip_session(
-        model_path: &Path,
-    ) -> OrtSessionResult<(Session, OnnxProviderReport)> {
-        let intent = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder()?;
-
-        let actual_provider = match intent.provider {
-            OnnxExecutionProvider::DirectMl => {
-                if DirectML::default().register(&mut builder).is_ok() {
-                    OnnxExecutionProvider::DirectMl
-                } else {
-                    let _ = CPU::default().register(&mut builder);
-                    OnnxExecutionProvider::Cpu
-                }
-            }
-            OnnxExecutionProvider::Cpu => {
-                let _ = CPU::default().register(&mut builder);
-                OnnxExecutionProvider::Cpu
-            }
-        };
-
-        let session = builder.commit_from_file(model_path)?;
-        Ok((
-            session,
-            OnnxProviderReport {
-                provider: actual_provider,
-                directml_attempted: intent.directml_attempted,
-            },
-        ))
-    }
+/// Create an [`ort::Session`] for MobileCLIP-S2 loaded from
+/// `model_path`.
+///
+/// Named seam over
+/// [`crate::models::embeddings_onnx::create_onnx_session`];
+/// preserved so call sites can express intent
+/// (`create_mobileclip_session(...)` vs the generic
+/// `create_onnx_session(...)`) and so future MobileCLIP-S2-
+/// specific tweaks (graph-optimisation levels, intra-thread
+/// counts, etc.) have a dedicated landing spot.
+///
+/// The shared DirectML → CPU best-effort fallback contract
+/// lives in
+/// [`crate::models::embeddings_onnx::create_onnx_session`] —
+/// see that function for the registration contract and the
+/// [`OnnxProviderReport`] semantics. The image-tensor encode
+/// step (downsample to 224×224 RGB, NCHW float32, ImageNet-
+/// style normalization) lives above the session creator in
+/// [`OnnxImageEmbedder`].
+#[cfg(feature = "onnx-runtime")]
+pub fn create_mobileclip_session(
+    model_path: &std::path::Path,
+) -> OrtSessionResult<(ort::session::Session, OnnxProviderReport)> {
+    crate::models::embeddings_onnx::create_onnx_session(model_path)
 }
-
-#[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
-pub use windows_directml::create_mobileclip_session;
-
-#[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
-mod posix_cpu {
-    use super::{OnnxProviderReport, OrtDirectMlProbe, OrtSessionResult};
-    use crate::models::embeddings_onnx::select_provider;
-    use ort::ep::{ExecutionProvider, CPU};
-    use ort::session::Session;
-    use std::path::Path;
-
-    /// macOS / Linux flavor of the MobileCLIP-S2 session
-    /// creator. Always registers the CPU EP. The cross-platform
-    /// inference seam (CoreML EP on Apple, NNAPI EP on Android)
-    /// is layered above this; this entry point focuses on the
-    /// Windows DirectML path called out in
-    /// `docs/ARCHITECTURE.md §11.4`.
-    pub fn create_mobileclip_session(
-        model_path: &Path,
-    ) -> OrtSessionResult<(Session, OnnxProviderReport)> {
-        let report = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder()?;
-        let _ = CPU::default().register(&mut builder);
-        let session = builder.commit_from_file(model_path)?;
-        Ok((session, report))
-    }
-}
-
-#[cfg(all(not(target_os = "windows"), feature = "onnx-runtime"))]
-pub use posix_cpu::create_mobileclip_session;
 
 /// INT4 (`MatMulNBits`)
 /// flavor of [`create_mobileclip_session`].

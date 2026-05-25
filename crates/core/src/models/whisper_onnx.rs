@@ -618,68 +618,30 @@ mod with_ort {
         WHISPER_DEFAULT_TOKENIZER_FILENAME, WHISPER_ENCODER_FRAMES, WHISPER_MAX_DECODE_TOKENS,
         WHISPER_TIMESTAMP_TOKEN_COUNT,
     };
-    use crate::models::embeddings_onnx::{
-        map_ort_error, select_provider, OnnxExecutionProvider, OnnxProviderReport, OrtDirectMlProbe,
-    };
+    use crate::models::embeddings_onnx::{create_onnx_session, map_ort_error, OnnxProviderReport};
     use crate::models::whisper::{TranscriptionResult, TranscriptionSegment, WhisperTranscriber};
     use crate::models::whisper_audio::{
         whisper_log_mel_from_wav, WhisperMelKernel, WHISPER_N_FRAMES, WHISPER_N_MELS,
     };
     use crate::models::ModelError;
     use crate::Result;
-    use ort::ep::{ExecutionProvider, CPU};
     use ort::session::Session;
     use ort::value::Tensor;
     use std::path::Path;
 
-    /// Create one encoder/decoder ONNX session using the same
-    /// best-effort DirectML → CPU EP state machine as
-    /// [`crate::models::embeddings_onnx::create_xlmr_session`].
+    /// Create one encoder/decoder ONNX session by delegating to
+    /// the shared
+    /// [`crate::models::embeddings_onnx::create_onnx_session`]
+    /// helper, then routing any ORT error through the curried
+    /// `map_ort_error(op)` builder so the resulting
+    /// [`ModelError::Ort { op, detail }`] carries the
+    /// call-site label (`"whisper_encoder_session_create"` /
+    /// `"whisper_decoder_session_create"`).
     fn create_whisper_session(
         model_path: &Path,
         op: &'static str,
     ) -> Result<(Session, OnnxProviderReport)> {
-        let intent = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder().map_err(map_ort_error(op))?;
-
-        let actual_provider = match intent.provider {
-            OnnxExecutionProvider::DirectMl => {
-                #[cfg(target_os = "windows")]
-                {
-                    use ort::ep::DirectML;
-                    if DirectML::default().register(&mut builder).is_ok() {
-                        OnnxExecutionProvider::DirectMl
-                    } else {
-                        let _ = CPU::default().register(&mut builder);
-                        OnnxExecutionProvider::Cpu
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    // `select_provider` is supposed to short-
-                    // circuit to CPU off Windows; reaching this
-                    // branch off-Windows means a probe lied —
-                    // degrade gracefully.
-                    let _ = CPU::default().register(&mut builder);
-                    OnnxExecutionProvider::Cpu
-                }
-            }
-            OnnxExecutionProvider::Cpu => {
-                let _ = CPU::default().register(&mut builder);
-                OnnxExecutionProvider::Cpu
-            }
-        };
-
-        let session = builder
-            .commit_from_file(model_path)
-            .map_err(map_ort_error(op))?;
-        Ok((
-            session,
-            OnnxProviderReport {
-                provider: actual_provider,
-                directml_attempted: intent.directml_attempted,
-            },
-        ))
+        create_onnx_session(model_path).map_err(map_ort_error(op))
     }
 
     /// Long-lived ONNX Runtime wrapper for Whisper transcription.
