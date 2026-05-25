@@ -618,9 +618,21 @@ pub(crate) struct KeyframeMlWrite {
 
 /// Structured output of the video keyframe sampling +
 /// embedding pipeline.
+///
+/// `canonical_first_embedding` mirrors `send_media`'s
+/// `idx == 0` semantics: it is `Some` only when the FIRST
+/// frame returned by the sampler embedded successfully, so
+/// the commit step writes the unsuffixed canonical
+/// `MOBILECLIP_S2_MODEL_VERSION` key with that embedding.
+/// When the first sampler-output frame fails to embed it
+/// stays `None` and the canonical key is left empty — even
+/// if later frames succeeded — matching `maybe_embed_video_keyframes`
+/// exactly. Decoupling this from `frames` (which only carries
+/// successfully-embedded frames) is what preserves the parity.
 #[derive(Debug, Clone)]
 pub(crate) struct KeyframesMlWrite {
     pub(crate) frames: Vec<KeyframeMlWrite>,
+    pub(crate) canonical_first_embedding: Option<Vec<f32>>,
 }
 
 /// Bundle of structured ML pipeline outputs to commit after
@@ -3609,18 +3621,31 @@ impl CoreImpl {
         let embedder = self.media.image_embedder()?;
         let frames = sampler.extract_keyframes(plaintext, mime_type, 5).ok()?;
         let mut out: Vec<KeyframeMlWrite> = Vec::with_capacity(frames.len());
-        for frame in frames {
+        // Track the first sampler-output frame's embedding so
+        // commit can write the canonical `MOBILECLIP_S2_MODEL_VERSION`
+        // key with the same semantics as `send_media`'s
+        // `maybe_embed_video_keyframes` (`idx == 0` in raw
+        // sampler order, NOT the first successfully embedded
+        // frame).
+        let mut canonical_first_embedding: Option<Vec<f32>> = None;
+        for (idx, frame) in frames.into_iter().enumerate() {
             if let Ok(vec) = embedder.embed_image(&frame.image_data, &frame.mime_type) {
+                if idx == 0 {
+                    canonical_first_embedding = Some(vec.clone());
+                }
                 out.push(KeyframeMlWrite {
                     frame_index: frame.frame_index,
                     embedding: vec,
                 });
             }
         }
-        if out.is_empty() {
+        if out.is_empty() && canonical_first_embedding.is_none() {
             return None;
         }
-        Some(KeyframesMlWrite { frames: out })
+        Some(KeyframesMlWrite {
+            frames: out,
+            canonical_first_embedding,
+        })
     }
 
     /// Commit a [`PostRehydrationMlBundle`] under the writer
@@ -3752,7 +3777,7 @@ impl CoreImpl {
         // --- Video keyframes --------------------------------------
         if let Some(kf) = bundle.keyframes {
             let cache = LocalStoreEmbeddingCache::new(db.connection());
-            for (idx, frame) in kf.frames.iter().enumerate() {
+            for frame in kf.frames.iter() {
                 let suffix_key = format!(
                     "{}_frame_{}",
                     MOBILECLIP_S2_MODEL_VERSION, frame.frame_index
@@ -3761,11 +3786,18 @@ impl CoreImpl {
                     continue;
                 }
                 let _ = cache.put(message_id, &suffix_key, &frame.embedding);
-                if idx == 0 {
-                    if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
-                        let _ =
-                            cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &frame.embedding);
-                    }
+            }
+            // Canonical write decoupled from the per-frame loop
+            // so it depends on the FIRST SAMPLER-OUTPUT frame's
+            // success (carried in `canonical_first_embedding`),
+            // not on the first SUCCESSFUL frame as the previous
+            // `idx == 0` inside the loop would have implied.
+            // Matches `maybe_embed_video_keyframes` exactly: if
+            // the first sampler frame fails to embed, no
+            // canonical key is written.
+            if let Some(canonical) = kf.canonical_first_embedding {
+                if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
+                    let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &canonical);
                 }
             }
         }
@@ -13614,6 +13646,7 @@ mod tests {
                         embedding: vec![0.2_f32; 4],
                     },
                 ],
+                canonical_first_embedding: Some(vec![0.1_f32; 4]),
             }),
             ..Default::default()
         };
