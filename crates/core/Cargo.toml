@@ -31,7 +31,7 @@ test-support = []
 # `cfg(target_os = "windows")` (DirectML attempt) or
 # `cfg(not(target_os = "windows"))` (CPU EP only). See
 # `docs/ARCHITECTURE.md §11.4`.
-onnx-runtime = ["dep:ort"]
+onnx-runtime = ["dep:ort", "dep:tokenizers"]
 # production HTTP
 # transport. Off by default so the workspace build doesn't pull
 # `reqwest` and its transitive deps; bridge crates flip it on
@@ -103,10 +103,17 @@ ort = { workspace = true, optional = true }
 # log-mel spectrogram in `crates/core/src/models/whisper_audio.rs`
 # — that module's mel filterbank, hanning window, and forward FFT
 # are pure CPU code (no ORT), so unit tests on every host
-# exercise the spectrogram path end-to-end. The future
+# exercise the spectrogram path end-to-end. The
 # `OnnxWhisperTranscriber` (`onnx-runtime` feature) reuses the
 # same `WhisperMelKernel` to feed its encoder input tensor.
 rustfft = { workspace = true }
+
+# HuggingFace `tokenizers` backs the XLM-R and Whisper inference
+# loops. Pulled in only when the `onnx-runtime` feature is on
+# (the pure-CPU code paths don't need it). Both pipelines share a
+# single workspace pin so a tokenizer version bump propagates to
+# every encoder/decoder wrapper in lock-step.
+tokenizers = { workspace = true, optional = true }
 # production
 # HTTP transport. Pinned with `rustls-tls` so we don't drag in
 # system OpenSSL on iOS / Android / desktop builds. `blocking`
