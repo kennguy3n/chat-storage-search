@@ -36,22 +36,6 @@ license = "LicenseRef-Proprietary"
 # that is not in `ort-sys` 2.0.0-rc.12's `OrtApi`).
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "copy-dylibs", "api-24", "tls-rustls"] }
 
-# HuggingFace `tokenizers` — backs the SentencePiece / WordPiece
-# tokenization step of the XLM-R inference loop in
-# `crates/core/src/models/embeddings_onnx.rs`. We disable default
-# features and re-enable only `onig` — the upstream crate
-# unconditionally references `onig::Regex` outside the
-# `unstable_wasm` cfg gate (see
-# `tokenizers/src/utils/mod.rs`), so the `onig` (Oniguruma)
-# regex backend is the only viable choice for a native build;
-# `progressbar` and `esaxx_fast` are training-time tooling we
-# don't need at inference. The `onig` C library builds from
-# bundled source via `onig_sys`, which works for all our
-# cross-compile targets (Linux/macOS/Windows/Android/iOS).
-# Pinned through the `onnx-runtime` cargo feature so the
-# standard workspace build does not pull this crate.
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
-
 # Pure-Rust FFT used by `crates/core/src/models/whisper_audio.rs` for
 # the log-mel spectrogram step of the Whisper inference loop. Pinned
 # at a single workspace version so the `whisper_audio` mel kernel
@@ -63,3 +47,16 @@ tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 # Rust — no native libs to link — so it compiles cleanly for every
 # cross-target (Linux/macOS/Windows/iOS/Android).
 rustfft = { version = "6.2", default-features = false }
+
+# HuggingFace `tokenizers` — backs both the XLM-R inference loop
+# (`crates/core/src/models/embeddings_onnx.rs`) and the Whisper
+# inference loop (`crates/core/src/models/whisper_onnx.rs`).
+# Both ONNX exports ship a HuggingFace-compatible `tokenizer.json`
+# next to the `.onnx` artifact, so the same `Tokenizer::from_file`
+# entry point loads either model's vocab + merges + special tokens.
+# `default-features = false` drops the `progressbar` + `http`
+# features we don't need on-device; `onig` is the Oniguruma regex
+# backend the GPT-2 byte-level pre-tokeniser uses for Whisper, and
+# is also the dependency XLM-R selects via its sentencepiece
+# normaliser path inside `tokenizers/src/utils/mod.rs`.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
