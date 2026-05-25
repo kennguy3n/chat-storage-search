@@ -174,6 +174,11 @@ pub struct OrtDirectMlProbe;
 #[cfg(all(target_os = "windows", feature = "onnx-runtime"))]
 impl DirectMlProbe for OrtDirectMlProbe {
     fn directml_available(&self) -> bool {
+        // `is_available` is a method on the `ExecutionProvider`
+        // trait, which must be in scope for the call to resolve.
+        // Scope the import to this impl so the trait does not
+        // leak into the rest of the module surface.
+        use ort::ep::ExecutionProvider;
         ort::ep::DirectML::default().is_available().unwrap_or(false)
     }
 }
