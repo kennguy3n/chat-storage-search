@@ -3658,6 +3658,25 @@ impl CoreImpl {
     /// Caller MUST hold the writer mutex and pass `&LocalStoreDb`
     /// from that lock guard. All errors are absorbed — matching
     /// the best-effort contract on the sibling `maybe_*` helpers.
+    ///
+    /// NOTE on transactionality: unlike `send_media`'s
+    /// `SAVEPOINT send_media`, the per-pipeline writes here are
+    /// NOT wrapped in a SAVEPOINT. This is intentional. The
+    /// rehydration's storage-engine-visible result (the
+    /// `Evicted → OriginalLocal` state transition) is already
+    /// committed by phase 3 before this method runs; the ML
+    /// fan-out is a deferred best-effort layer on top of it.
+    /// Wrapping the fan-out in a SAVEPOINT would either be a
+    /// no-op (if we never rollback) or actively harmful (if we
+    /// did rollback, a failed OCR write would undo a successful
+    /// Whisper write that already happened earlier in the same
+    /// savepoint). Independent per-pipeline writes with their
+    /// own `let _ = ...` failure-absorption is the right shape;
+    /// idempotency is guaranteed by `cache.get`-then-`put`
+    /// guards on the embedding cache, content-addressed
+    /// `(message_id, text_content)` dedup on FTS, and ON CONFLICT
+    /// on `media_search_index`, so a future re-index-media API
+    /// can retroactively fill in any partial-write residue.
     pub(crate) fn commit_post_rehydration_ml(
         &self,
         db: &LocalStoreDb,
@@ -3792,9 +3811,23 @@ impl CoreImpl {
             // success (carried in `canonical_first_embedding`),
             // not on the first SUCCESSFUL frame as the previous
             // `idx == 0` inside the loop would have implied.
-            // Matches `maybe_embed_video_keyframes` exactly: if
+            // This restores send_media's primary semantic: if
             // the first sampler frame fails to embed, no
             // canonical key is written.
+            //
+            // One downstream divergence from `maybe_embed_video_keyframes`
+            // that this also fixes as a side-effect: if frame 0's
+            // suffix-key happens to be cached but the canonical
+            // row was lost (e.g. a previous run's canonical `put`
+            // silently failed, or a future LRU eviction policy
+            // drops canonical while keeping suffix rows), the
+            // original code's `continue` short-circuits without
+            // ever writing the canonical key, leaving the asset
+            // unsearchable by the unsuffixed mirror it's supposed
+            // to provide. The decoupled write here recovers that
+            // state on the next rehydration. Strictly an
+            // improvement — the canonical-mirror's whole purpose
+            // is to be present whenever any frame embedding exists.
             if let Some(canonical) = kf.canonical_first_embedding {
                 if let Ok(None) = cache.get(message_id, MOBILECLIP_S2_MODEL_VERSION) {
                     let _ = cache.put(message_id, MOBILECLIP_S2_MODEL_VERSION, &canonical);
