@@ -94,6 +94,18 @@ pub struct BackupManifestBuildRequest<'a> {
     /// orchestrator can attribute manifests to the device that
     /// produced them.
     pub device_id: String,
+    /// Caller-supplied `manifest_id`. Use `Some(id)` when the
+    /// caller already derived `k_backup_manifest` from a known id
+    /// (the production `restore_from_backup` path requires this:
+    /// the restoring side derives
+    /// `K_backup_manifest = derive_backup_manifest(K_backup_root,
+    /// manifest_id)` from the on-wire manifest id, so the producer
+    /// must seal under the same derivation). Use `None` (the
+    /// historical default) to let the builder pick a fresh UUID v7
+    /// — the caller is then on the hook for opening with the same
+    /// `k_backup_manifest` they sealed with (legacy tests use this
+    /// path).
+    pub manifest_id: Option<Uuid>,
 }
 
 /// Build a single backup-manifest record.
@@ -136,7 +148,7 @@ pub fn build_backup_manifest(
     let mut manifest = BackupManifest {
         magic: BACKUP_MANIFEST_MAGIC.to_string(),
         version: MANIFEST_VERSION,
-        manifest_id: Uuid::now_v7(),
+        manifest_id: request.manifest_id.unwrap_or_else(Uuid::now_v7),
         generation,
         previous_manifest_hash,
         segments: segment_refs,
@@ -307,6 +319,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -336,6 +349,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -350,6 +364,7 @@ mod tests {
                 tombstones: vec![],
                 previous: Some(&gen0.manifest),
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -375,6 +390,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -396,6 +412,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -417,6 +434,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -438,6 +456,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -463,6 +482,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -477,6 +497,7 @@ mod tests {
                 tombstones: vec![],
                 previous: Some(&gen0.manifest),
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,
@@ -491,6 +512,7 @@ mod tests {
                 tombstones: vec![],
                 previous: Some(&gen1.manifest),
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &sk,
             &k_man,

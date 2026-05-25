@@ -26,6 +26,8 @@
 
 pub mod android;
 pub mod icloud;
+#[cfg(any(test, feature = "test-support"))]
+pub mod memory;
 pub mod zk_fabric;
 
 /// Routing seam for backup uploads / fetches / lists.

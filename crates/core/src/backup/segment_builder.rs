@@ -107,9 +107,32 @@ impl BackupSegmentBuilder {
     /// `k_backup_segment` is `K_backup_segment(segment_id)`
     /// the caller derives it from `K_backup_root` via
     /// [`crate::crypto::key_hierarchy::derive_backup_segment`].
+    ///
+    /// Convenience wrapper around [`Self::build_segment_with_id`]
+    /// that allocates a fresh UUID v7 internally. **Callers that
+    /// derive `k_backup_segment` from a specific id (the production
+    /// `run_incremental_backup` path does this) MUST use
+    /// [`Self::build_segment_with_id`] instead.** Otherwise the
+    /// builder's freshly-allocated id will not match the id the
+    /// caller derived the key from, and the restore path will
+    /// reject the segment as "wrapped-key disagrees with
+    /// `K_backup_segment(segment_id)` derived from `K_backup_root`".
     pub fn build_segment(
         &self,
         request: BackupSegmentBuildRequest,
+        k_backup_segment: &KeyMaterial,
+    ) -> Result<BuiltBackupSegment, Error> {
+        self.build_segment_with_id(request, Uuid::now_v7(), k_backup_segment)
+    }
+
+    /// Build a single backup segment under a caller-supplied
+    /// `segment_id`. The caller is responsible for ensuring
+    /// `k_backup_segment` was derived from this id (see
+    /// [`crate::crypto::key_hierarchy::derive_backup_segment`]).
+    pub fn build_segment_with_id(
+        &self,
+        request: BackupSegmentBuildRequest,
+        segment_id: Uuid,
         k_backup_segment: &KeyMaterial,
     ) -> Result<BuiltBackupSegment, Error> {
         if request.events.is_empty() {
@@ -145,11 +168,9 @@ impl BackupSegmentBuilder {
                 })
             })?;
 
-        // 4) Allocate a fresh segment_id and AEAD-seal the
-        // compressed payload. AAD ties the segment_id and
-        // merkle_root to the ciphertext so swapping ciphertexts
-        // between segments fails the open.
-        let segment_id = Uuid::now_v7();
+        // 4) AEAD-seal the compressed payload. AAD ties the
+        // segment_id and merkle_root to the ciphertext so
+        // swapping ciphertexts between segments fails the open.
         let mut nonce = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce);
         let aad = build_segment_aad(&segment_id, &merkle_root);

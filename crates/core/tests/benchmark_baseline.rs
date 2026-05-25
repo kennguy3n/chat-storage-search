@@ -246,6 +246,7 @@ fn benchmark_baseline() {
                 tombstones: vec![],
                 previous: None,
                 device_id: "device-bench".into(),
+                manifest_id: None,
             },
             &signing,
             &k_man,

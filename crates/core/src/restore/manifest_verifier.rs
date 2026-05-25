@@ -216,6 +216,7 @@ mod tests {
                     tombstones: vec![],
                     previous: prev,
                     device_id: "device-A".into(),
+                    manifest_id: None,
                 },
                 signing_key,
                 &k_man,
@@ -285,6 +286,7 @@ mod tests {
                 tombstones: vec![],
                 previous: None, // genesis-shape but with generation forced below
                 device_id: "device-A".into(),
+                manifest_id: None,
             },
             &signing,
             &k_man,
