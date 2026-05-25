@@ -640,7 +640,7 @@ mod with_ort {
         op: &'static str,
     ) -> Result<(Session, OnnxProviderReport)> {
         let intent = select_provider(&OrtDirectMlProbe);
-        let mut builder = Session::builder().map_err(map_ort_error)?;
+        let mut builder = Session::builder().map_err(map_ort_error(op))?;
 
         let actual_provider = match intent.provider {
             OnnxExecutionProvider::DirectMl => {
@@ -670,12 +670,9 @@ mod with_ort {
             }
         };
 
-        let _ = op; // op is currently informational; logged at
-                    // the wrapper level so encoder / decoder
-                    // error sites carry distinct names.
         let session = builder
             .commit_from_file(model_path)
-            .map_err(map_ort_error)?;
+            .map_err(map_ort_error(op))?;
         Ok((
             session,
             OnnxProviderReport {
@@ -817,8 +814,7 @@ mod with_ort {
             // once here and reuse on every `transcribe` call —
             // see Devin Review ANALYSIS_0002 on 64f347f.
             let suppress = Self::compute_suppression_set(&special);
-            let suppress_no_timestamps =
-                Self::compute_suppression_set_no_timestamps(&special);
+            let suppress_no_timestamps = Self::compute_suppression_set_no_timestamps(&special);
 
             Ok(Self {
                 encoder: std::sync::Mutex::new(encoder),
@@ -918,14 +914,14 @@ mod with_ort {
                 vec![1_i64, WHISPER_N_MELS as i64, WHISPER_N_FRAMES as i64],
                 mel,
             ))
-            .map_err(map_ort_error)?;
+            .map_err(map_ort_error("whisper_encoder_input_tensor"))?;
 
             let mut encoder = self.encoder.lock().map_err(|_| {
                 crate::Error::Model(ModelError::LockPoisoned("whisper_encoder_session"))
             })?;
             let outputs = encoder
                 .run(ort::inputs!["input_features" => mel_tensor])
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("whisper_encoder_infer"))?;
             // The encoder export emits its single hidden-state
             // output under one of `last_hidden_state` /
             // `hidden_states` / index 0. We pull the first
@@ -940,7 +936,9 @@ mod with_ort {
                     })
                 })?
                 .1;
-            let (shape, data) = out.try_extract_tensor::<f32>().map_err(map_ort_error)?;
+            let (shape, data) = out
+                .try_extract_tensor::<f32>()
+                .map_err(map_ort_error("whisper_encoder_output_extract"))?;
             // Encoder output must be exactly `[1, WHISPER_ENCODER_FRAMES,
             // d_model]` — 3 dims, batch == 1, time axis == 1500. The
             // total-element-count check below catches "data length
@@ -1008,7 +1006,7 @@ mod with_ort {
                 vec![1_i64, WHISPER_ENCODER_FRAMES as i64, encoder_d_model as i64],
                 encoder_hidden,
             ))
-            .map_err(map_ort_error)
+            .map_err(map_ort_error("whisper_hidden_tensor_build"))
         }
 
         /// Run the decoder once over the current prefix and a
@@ -1043,7 +1041,7 @@ mod with_ort {
             let input_ids: Vec<i64> = prefix.iter().map(|&t| i64::from(t)).collect();
             let prefix_len = input_ids.len();
             let ids_tensor = Tensor::from_array((vec![1_i64, prefix_len as i64], input_ids))
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("whisper_decoder_input_tensor"))?;
 
             let mut decoder = self.decoder.lock().map_err(|_| {
                 crate::Error::Model(ModelError::LockPoisoned("whisper_decoder_session"))
@@ -1053,7 +1051,7 @@ mod with_ort {
                     "input_ids" => ids_tensor,
                     "encoder_hidden_states" => hidden_tensor,
                 ])
-                .map_err(map_ort_error)?;
+                .map_err(map_ort_error("whisper_decoder_infer"))?;
             let out = outputs
                 .iter()
                 .next()
@@ -1064,7 +1062,9 @@ mod with_ort {
                     })
                 })?
                 .1;
-            let (shape, data) = out.try_extract_tensor::<f32>().map_err(map_ort_error)?;
+            let (shape, data) = out
+                .try_extract_tensor::<f32>()
+                .map_err(map_ort_error("whisper_decoder_output_extract"))?;
             // Decoder output must be exactly `[1, prefix_len,
             // vocab_size]` — 3 dims, batch == 1, sequence axis ==
             // prefix_len. Mirrors the rank+leading-dim assertion
@@ -1754,8 +1754,7 @@ mod tests {
         // clippy doesn't flag the assertion as constant-folded
         // (the relationship is what we want to lock in, not a
         // tautology).
-        let headroom =
-            WHISPER_DECODER_CONTEXT_TOKENS.saturating_sub(WHISPER_MAX_DECODE_TOKENS);
+        let headroom = WHISPER_DECODER_CONTEXT_TOKENS.saturating_sub(WHISPER_MAX_DECODE_TOKENS);
         assert!(
             headroom >= 4,
             "body cap {} + longest prefix 4 must fit decoder context {} (headroom = {})",
