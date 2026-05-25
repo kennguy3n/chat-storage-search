@@ -2690,7 +2690,7 @@ impl CoreImpl {
             // `let _ = ...` from `send_media` and never propagate
             // their failures.
             if bundle.has_any_writes() {
-                if let Ok(db) = self.db_writer.lock().map_err(poisoned) {
+                if let Ok(db) = self.db_writer.lock() {
                     self.commit_post_rehydration_ml(&db, bundle, &meta);
                 }
             }
